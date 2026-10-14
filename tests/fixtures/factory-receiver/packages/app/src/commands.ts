@@ -81,3 +81,40 @@ export function listDistant() {
   const client = distantClient();
   return client.listRuns();
 }
+
+/** A member of the annotated factory's result, called inline. */
+export function showInline(id: string) {
+  return createClient().getRun(id);
+}
+
+/** The same, awaited, from a factory that promises the class. */
+export async function showInlineRemote(id: string) {
+  return (await openClient()).getRun(id);
+}
+
+/** The same, through a factory that returns another factory's call. */
+export function listInline() {
+  return getClient().listRuns();
+}
+
+/** The factory is a parameter, so nothing says which function it is. */
+export function showInlineInjected(
+  createClient: () => { getRun(id: string): string },
+) {
+  return createClient().getRun("x");
+}
+
+/** An interface names no class. */
+export function showInlineReader(id: string) {
+  return createReader().getRun(id);
+}
+
+/** One level only: the member called on the member's result is not read. */
+export function showInlineChained(id: string) {
+  return createClient().getRun(id).toUpperCase();
+}
+
+/** The assertion states a type of its own, and it is no class. */
+export function showInlineAsserted(id: string) {
+  return (createClient() as ReturnType<typeof createReader>).getRun(id);
+}

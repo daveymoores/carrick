@@ -20,8 +20,10 @@ invented, a sibling's route, and one correct path. Rows whose id starts with
 `model:` join no candidate, so they have no span and are placed by their line.
 
 Rows that take the request their call reaches (`commands.ts` lines 9, 15, 21,
-46 and 101; `hooks.ts` lines 9, 14 and 19) carry the reached operation, the
-source `request_summary`, the role `wrapper_call` and `reaches_request`. Line
+46, 101, 133 and 139; `hooks.ts` lines 9, 14 and 19) carry the reached
+operation, the source `request_summary`, the role `wrapper_call` and
+`reaches_request`. Line 133 calls the client method on the factory's result
+inline (`getClient().getRun(id)`), and line 139 calls that command. Line
 21 is stated twice by the model and is one row afterwards. The correct row
 (`commands.ts:28`) keeps its `model` source and its type entry, and gains the
 role and the link.

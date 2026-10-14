@@ -1,5 +1,5 @@
 import { ping, send } from "@fixture/client";
-import { createClient } from "./api-client";
+import { createClient, getClient } from "./api-client";
 import { createProbedClient } from "./probed-client";
 import type { Run, SavedRun, Status } from "./types";
 
@@ -126,4 +126,16 @@ async function audited<T>(work: Promise<T>) {
 export async function postAudited(target: string) {
   const reply = await audited(fetch(target, { method: "POST" }));
   return reply;
+}
+
+/** A client method called on the factory's result, inline. */
+export async function showRunInline(id: string) {
+  const run = await getClient().getRun(id);
+  return run;
+}
+
+/** A command that calls the inline one. */
+export async function showLatestInline() {
+  const run = await showRunInline("latest");
+  return run;
 }

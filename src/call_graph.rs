@@ -602,21 +602,25 @@ impl ImportedBindings {
 
 /// The definition each resolved call site reaches, keyed by the file the site
 /// is written in (as walked, like [`FileCallIndex::path`]) and the site's
-/// span start in the discovery source map.
+/// span start and end in the discovery source map.
 ///
 /// The edge list on a [`FunctionDefinition`] says WHICH functions a function
 /// calls; it cannot say which call reaches which, because it is deduplicated
 /// and carries a line, not a span. A request summary is instantiated per call
 /// site with that site's own arguments (carrick#1555), so it needs the site.
+///
+/// Keyed by start AND end: a call made on what another call returns
+/// (`getClient().getRun(id)`) starts where that call does, and both are
+/// resolved sites (carrick#1146).
 #[derive(Debug, Default)]
 pub struct CallSiteTargets {
-    /// Span start -> the site's span end and the definition it reaches.
-    by_file: HashMap<PathBuf, HashMap<u32, ReachedAt>>,
+    /// (span start, span end) -> the definition the site reaches.
+    by_file: HashMap<PathBuf, BTreeMap<(u32, u32), ReachedAt>>,
 }
 
-/// A resolved call site's span end, the definition (file as walked,
-/// definition key) it reaches, and the line that definition opens on.
-type ReachedAt = (u32, (PathBuf, String), u32);
+/// The definition (file as walked, definition key) a resolved call site
+/// reaches, and the line that definition opens on.
+type ReachedAt = ((PathBuf, String), u32);
 
 impl CallSiteTargets {
     fn record(&mut self, file: &Path, span: swc_common::Span, target: &Target) {
@@ -624,12 +628,8 @@ impl CallSiteTargets {
             return;
         }
         self.by_file.entry(file.to_path_buf()).or_default().insert(
-            span.lo.0,
-            (
-                span.hi.0,
-                (target.file.clone(), target.key.clone()),
-                target.line,
-            ),
+            (span.lo.0, span.hi.0),
+            ((target.file.clone(), target.key.clone()), target.line),
         );
     }
 
@@ -642,7 +642,7 @@ impl CallSiteTargets {
         self.by_file.get(file).into_iter().flat_map(|sites| {
             sites
                 .iter()
-                .map(|(lo, (hi, (target, _), line))| (*lo, *hi, target.as_path(), *line))
+                .map(|((lo, hi), ((target, _), line))| (*lo, *hi, target.as_path(), *line))
         })
     }
 
@@ -650,14 +650,15 @@ impl CallSiteTargets {
     /// starts at `span_lo` in `file` reaches, if resolution followed it.
     ///
     /// A call made on what another call returns (`make().send()`) starts
-    /// where that call does, so this names the inner call's definition for
-    /// both; [`Self::target_at`] tells them apart. The request summaries
-    /// still read this one (carrick#1695).
+    /// where that call does, so this names the shortest call at that start,
+    /// the inner one; [`Self::target_at`] tells them apart. The request
+    /// summaries still read this one (carrick#1695).
     pub fn target(&self, file: &Path, span_lo: u32) -> Option<&(PathBuf, String)> {
         self.by_file
             .get(file)?
-            .get(&span_lo)
-            .map(|(_, target, _)| target)
+            .range((span_lo, 0)..=(span_lo, u32::MAX))
+            .next()
+            .map(|(_, (target, _))| target)
     }
 
     /// The definition the call spanning exactly `span_lo..span_hi` reaches
@@ -665,9 +666,8 @@ impl CallSiteTargets {
     pub fn target_at(&self, file: &Path, span_lo: u32, span_hi: u32) -> Option<&(PathBuf, String)> {
         self.by_file
             .get(file)?
-            .get(&span_lo)
-            .filter(|(hi, _, _)| *hi == span_hi)
-            .map(|(_, target, _)| target)
+            .get(&(span_lo, span_hi))
+            .map(|(target, _)| target)
     }
 }
 
@@ -990,6 +990,12 @@ impl<'a> CallResolver<'a> {
                 self.resolve_class_member(index, &declared, &callee.name)
             }
             CalleeShape::Member(_) => self.resolve_member(index, callee),
+            // `f().x()`: the member of the class `f`'s declaration states,
+            // exactly as for `const c = f(); c.x()` (carrick#1146).
+            CalleeShape::FactoryResult => {
+                let factory = callee.receiver.factory.as_ref()?;
+                self.resolve_factory_member(&ModuleRef::Indexed(index), factory, &callee.name)
+            }
         }
     }
 
@@ -1619,6 +1625,48 @@ mod tests {
     };
     use swc_ecma_visit::VisitWith;
     use tempfile::TempDir;
+
+    /// `getClient().getRun(id)`: the outer call starts where the inner one
+    /// does. Both are kept (carrick#1146); `target` still answers the inner
+    /// call, as it did when only one call per start was recorded, and
+    /// `target_at` answers each.
+    #[test]
+    fn two_sites_with_one_start_are_both_kept() {
+        let file = Path::new("/repo/src/commands.ts");
+        let reached = |key: &str, line: u32| Target {
+            file: PathBuf::from("/repo/src/client.ts"),
+            key: key.to_string(),
+            line,
+        };
+        let span = |lo: u32, hi: u32| {
+            swc_common::Span::new(swc_common::BytePos(lo), swc_common::BytePos(hi))
+        };
+        let mut sites = CallSiteTargets::default();
+        // Outer first, so an insert keyed by start alone would lose it.
+        sites.record(file, span(10, 32), &reached("Client.getRun", 7));
+        sites.record(file, span(10, 21), &reached("getClient", 3));
+
+        let answer = |found: Option<&(PathBuf, String)>| found.map(|(_, key)| key.clone());
+        assert_eq!(
+            answer(sites.target(file, 10)),
+            Some("getClient".to_string())
+        );
+        assert_eq!(
+            answer(sites.target_at(file, 10, 21)),
+            Some("getClient".to_string())
+        );
+        assert_eq!(
+            answer(sites.target_at(file, 10, 32)),
+            Some("Client.getRun".to_string())
+        );
+        assert_eq!(sites.target_at(file, 10, 30), None);
+        let mut listed: Vec<(u32, u32, u32)> = sites
+            .sites_in(file)
+            .map(|(lo, hi, _, line)| (lo, hi, line))
+            .collect();
+        listed.sort();
+        assert_eq!(listed, vec![(10, 21, 3), (10, 32, 7)]);
+    }
 
     /// Parse each `(relative path, source)` pair into the same shape discovery
     /// builds: the merged definition map plus the per-file call index.

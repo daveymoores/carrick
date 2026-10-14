@@ -201,3 +201,69 @@ fn a_factory_that_states_no_class_records_only_its_own_call() {
         "each of these must record only its factory call: {wrong:?}"
     );
 }
+
+/// `createClient().getRun(id)`: a member called on the factory's result
+/// inline is read as the same member on a `const` bound by that call, and
+/// the factory call keeps its own edge on the same line.
+#[test]
+fn a_member_called_on_a_factory_calls_result_records_the_member_edge() {
+    let edges = scan_edges();
+    let mut wrong = Vec::new();
+    for (caller, expected) in [
+        // An annotation that names the class.
+        (
+            "showInline",
+            vec![
+                edge("Client.getRun", SDK, 87),
+                edge("createClient", SDK, 87),
+            ],
+        ),
+        // An awaited factory that promises the class.
+        (
+            "showInlineRemote",
+            vec![edge("Client.getRun", SDK, 92), edge("openClient", SDK, 92)],
+        ),
+        // A factory that returns another factory's call.
+        (
+            "listInline",
+            vec![
+                edge("Client.listRuns", SDK, 97),
+                edge("getClient", SESSION, 97),
+            ],
+        ),
+        // One level only: `.toUpperCase()` on `getRun`'s result is not read.
+        (
+            "showInlineChained",
+            vec![
+                edge("Client.getRun", SDK, 114),
+                edge("createClient", SDK, 114),
+            ],
+        ),
+    ] {
+        if edges.get(caller) != Some(&expected) {
+            wrong.push((caller, edges.get(caller)));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+/// The inline call states no class wherever the bound one states none.
+#[test]
+fn a_member_called_on_a_factory_call_that_states_no_class_records_no_member_edge() {
+    let edges = scan_edges();
+    let mut wrong = Vec::new();
+    for caller in [
+        // The factory is a parameter that shadows the import of that name.
+        "showInlineInjected",
+        // An interface.
+        "showInlineReader",
+        // An assertion to a type that is no class.
+        "showInlineAsserted",
+    ] {
+        let found = edges.get(caller).expect("the caller is indexed");
+        if found.iter().any(|edge| edge.callee.starts_with("Client.")) {
+            wrong.push((caller, found));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
