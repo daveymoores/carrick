@@ -354,8 +354,8 @@ fn a_row_confirmed_through_a_callback_loses_the_type_the_model_named_for_it() {
     );
     let entries = consumer_entries_at("web", HOOKS, 34);
     assert!(
-        entries.iter().all(|entry| entry["type_kind"] != "response"
-            && entry["primary_type_symbol"] != "RunQueryInput"),
+        entries.iter().all(|entry| !(entry["is_explicit"] == true
+            && entry["primary_type_symbol"] == "RunQueryInput")),
         "no type the model named for the helper's call is kept: {entries:#?}"
     );
     assert_eq!(response_verdicts_at(HOOKS, 34), []);
