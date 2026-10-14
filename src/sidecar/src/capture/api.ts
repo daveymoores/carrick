@@ -229,6 +229,10 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    serialised itself, and at least one return builds that string in a way
  *    the inferrer cannot trace to a typed value, so it publishes no part of
  *    the contract (carrick#2200).
+ *  - `argument_not_the_body`: the located request value is an argument of a
+ *    function the repository declares (or that function's call), and what the
+ *    function sends cannot be read as that argument or as an object literal it
+ *    builds from its parameters (carrick#2115).
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
@@ -243,6 +247,7 @@ export type TypeProvenanceReason =
   | 'no_request_body'
   | 'projected_value_only'
   | 'serialised_body_unread'
+  | 'argument_not_the_body'
   | 'not_recorded';
 
 /**
