@@ -97,6 +97,36 @@ export function statesNoBody(type: ts.Type): boolean {
 }
 
 /**
+ * Whether a payload type states no shape (carrick#2116): at its root, or as
+ * a member of its root union, it is
+ *
+ *  - the checker's own empty object type, which is what narrowing `unknown`
+ *    yields (`if (cached != null) return cached`). It has no property, no
+ *    signature, no index signature and, unlike every `{}` the source writes,
+ *    no symbol: an empty object literal carries `__object`, a declared `{}`
+ *    carries `__type`, an empty interface carries its own; or
+ *  - the `object` keyword type.
+ *
+ * Printed, the first reads `{}` like an empty object a handler really sends,
+ * so only the source program can tell them apart. A reader answers `unknown`
+ * for such a type, as it does for one that is `unknown` at its root. A
+ * member's own type is not looked at: `meta: {}` stays a member.
+ */
+export function statesNoShape(checker: ts.TypeChecker, type: ts.Type): boolean {
+  const members = type.isUnion() ? type.types : [type];
+  return members.some(
+    (member) =>
+      (member.flags & ts.TypeFlags.NonPrimitive) !== 0 ||
+      ((member.flags & ts.TypeFlags.Object) !== 0 &&
+        member.symbol === undefined &&
+        checker.getPropertiesOfType(member).length === 0 &&
+        checker.getSignaturesOfType(member, ts.SignatureKind.Call).length === 0 &&
+        checker.getSignaturesOfType(member, ts.SignatureKind.Construct).length === 0 &&
+        checker.getIndexInfosOfType(member).length === 0)
+  );
+}
+
+/**
  * What a response table's success rows carry, read for a consumer:
  *  - `body`: the 2xx rows' value types, at least one of which states a body;
  *  - `no_body`: the table has no 2xx row, or every 2xx row states nothing.
