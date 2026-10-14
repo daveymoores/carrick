@@ -1,0 +1,36 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "owner_node": "app",
+      "method": "GET",
+      "path": "/admin/keys",
+      "handler_name": "anonymous",
+      "pattern_matched": ".get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:8",
+      "line_number": 8,
+      "owner_node": "app",
+      "method": "GET",
+      "path": "/public/keys",
+      "handler_name": "anonymous",
+      "pattern_matched": ".get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}

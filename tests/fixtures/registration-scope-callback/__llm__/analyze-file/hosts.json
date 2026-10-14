@@ -1,0 +1,38 @@
+{
+  "mounts": [
+    {
+      "line_number": 4,
+      "parent_node": "app",
+      "child_node": "api",
+      "mount_path": "/twice",
+      "import_source": null,
+      "pattern_matched": "app.register("
+    },
+    {
+      "line_number": 10,
+      "parent_node": "app",
+      "child_node": "api",
+      "mount_path": "/computed",
+      "import_source": null,
+      "pattern_matched": "app.register("
+    },
+    {
+      "line_number": 16,
+      "parent_node": "app",
+      "child_node": "api",
+      "mount_path": "/built",
+      "import_source": null,
+      "pattern_matched": "app.register("
+    },
+    {
+      "line_number": 22,
+      "parent_node": "app",
+      "child_node": "api",
+      "mount_path": "/spread",
+      "import_source": null,
+      "pattern_matched": "app.register("
+    }
+  ],
+  "endpoints": [],
+  "data_calls": []
+}

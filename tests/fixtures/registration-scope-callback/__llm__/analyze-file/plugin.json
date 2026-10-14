@@ -1,0 +1,22 @@
+{
+  "mounts": [
+    {
+      "line_number": 12,
+      "parent_node": "app",
+      "child_node": "api",
+      "mount_path": "opts.prefix ?? '/api/v1'",
+      "import_source": null,
+      "pattern_matched": "app.register("
+    },
+    {
+      "line_number": 14,
+      "parent_node": "api",
+      "child_node": "orderRoutes",
+      "mount_path": "",
+      "import_source": "./orders",
+      "pattern_matched": "api.register("
+    }
+  ],
+  "endpoints": [],
+  "data_calls": []
+}

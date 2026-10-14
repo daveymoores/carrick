@@ -1325,8 +1325,8 @@ fn template_pattern_matches(quasis: &[String], topic: &str) -> bool {
 /// `local_name` is what the defining module calls it (`routes`), when its
 /// export table names it at all.
 #[derive(Debug, Clone)]
-struct MountBinding {
-    child_node: String,
+pub(crate) struct MountBinding {
+    pub(crate) child_node: String,
     local_name: Option<String>,
 }
 
@@ -3969,6 +3969,7 @@ impl FileOrchestrator {
             &mut file_results,
             &unstated_registrations,
             Path::new(""),
+            service_modules,
         );
         if source_mounts > 0 {
             debug!(
@@ -11211,7 +11212,7 @@ impl FileOrchestrator {
     /// or `file_results` keys that are not paths on disk (in-memory tests, a
     /// graph rebuilt away from the checkout). Callers fall back to the name
     /// map there.
-    fn resolve_mount_bindings(
+    pub(crate) fn resolve_mount_bindings(
         file_results: &HashMap<String, FileAnalysisResult>,
         file_root: &Path,
     ) -> HashMap<String, Vec<MountBinding>> {

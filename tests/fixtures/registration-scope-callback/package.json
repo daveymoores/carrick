@@ -1,0 +1,7 @@
+{
+  "name": "registration-scope-callback",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ]
+}

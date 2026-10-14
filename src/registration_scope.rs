@@ -53,6 +53,7 @@ use crate::binding_scope::{BindingKey, ident_key};
 use crate::graphql_document_sites::unwrap_expression;
 use crate::import_bindings::BindingResolver;
 use crate::request_summary::literal_specifier;
+use crate::workspace_resolver::WorkspaceIndex;
 
 /// How many bindings a prefix read may follow before it gives up.
 const MAX_BINDING_DEPTH: usize = 4;
@@ -103,6 +104,41 @@ pub struct RegistrationSite {
     /// What the callback registers on the instance it is handed, in source
     /// order (carrick#2303).
     pub inner_registrations: Vec<InnerRegistration>,
+    /// What the callback hands its instance to through an option of the
+    /// function the registration is written in, in source order
+    /// (carrick#2316).
+    pub hand_outs: Vec<HandOut>,
+}
+
+/// A call `O.k(…, P, …)` inside a registration callback, where `P` is the
+/// callback's instance and `O` a parameter of the named function the
+/// registration is written in, both by binding (carrick#2316):
+///
+/// ```ts
+/// export async function routesPlugin(app, opts) {
+///   await app.register(async (api) => {
+///     await opts.registerExtra(api);        // the hand-out
+///   }, { prefix: '/api/v1' });
+/// }
+/// ```
+///
+/// The function `k` names is supplied by whoever passes `routesPlugin` an
+/// options object, often another package: see
+/// [`mount_unstated_registrations`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandOut {
+    /// The call's start line.
+    pub line: u32,
+    /// The name of the function the registration is written in.
+    pub function: String,
+    /// Which parameter of that function `O` is, counted from 0.
+    pub options_position: usize,
+    /// `k`, written as a plain name.
+    pub key: String,
+    /// Which argument of the call is the instance, counted from 0.
+    pub position: usize,
+    /// `O.k(`, kept for the emitted row's `pattern_matched`.
+    pub pattern: String,
 }
 
 /// A call inside a registration callback that hands the callback's instance
@@ -241,6 +277,8 @@ pub fn collect_registration_sites(
         source_map,
         values: None,
         sites: Vec::new(),
+        enclosing: Vec::new(),
+        naming: None,
     };
     module.visit_with(&mut probe);
     if probe.sites.is_empty() {
@@ -252,6 +290,8 @@ pub fn collect_registration_sites(
         source_map,
         values: Some(&values),
         sites: Vec::new(),
+        enclosing: Vec::new(),
+        naming: None,
     };
     module.visit_with(&mut finder);
     finder.sites
@@ -357,12 +397,115 @@ impl Visit for InnerFinder<'_> {
     }
 }
 
+/// The named function a registration is written in: its name and each
+/// parameter's binding, `None` where the parameter is not one name.
+#[derive(Debug, Clone)]
+struct Enclosing {
+    name: String,
+    params: Vec<Option<BindingKey>>,
+}
+
+impl Enclosing {
+    fn of<'p>(name: String, params: impl Iterator<Item = &'p Pat>) -> Self {
+        let params = params
+            .map(|param| match param {
+                Pat::Ident(ident) => Some(ident_key(&ident.id)),
+                // `opts = {}`: the default changes nothing about the binding.
+                Pat::Assign(assign) => match assign.left.as_ref() {
+                    Pat::Ident(ident) => Some(ident_key(&ident.id)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        Self { name, params }
+    }
+}
+
+/// Reads the hand-outs inside one registration callback (carrick#2316): calls
+/// `O.k(…, P, …)` and `O.k?.(…, P, …)`, `O` a parameter of the enclosing
+/// function and `P` the callback's instance, both by binding. A computed key,
+/// a spread argument or an instance written twice is not recorded.
+struct HandOutFinder<'s> {
+    source_map: &'s Lrc<SourceMap>,
+    enclosing: &'s Enclosing,
+    param: BindingKey,
+    found: Vec<HandOut>,
+}
+
+impl HandOutFinder<'_> {
+    fn consider(&mut self, span: swc_common::Span, callee: &Expr, args: &[ExprOrSpread]) {
+        let member = match unwrap_expression(callee) {
+            Expr::Member(member) => member,
+            Expr::OptChain(chain) => match chain.base.as_ref() {
+                OptChainBase::Member(member) => member,
+                OptChainBase::Call(_) => return,
+            },
+            _ => return,
+        };
+        let Expr::Ident(options) = unwrap_expression(&member.obj) else {
+            return;
+        };
+        let MemberProp::Ident(key) = &member.prop else {
+            return;
+        };
+        let options_key = ident_key(options);
+        let Some(options_position) = self
+            .enclosing
+            .params
+            .iter()
+            .position(|param| param.as_ref() == Some(&options_key))
+        else {
+            return;
+        };
+        if args.iter().any(|arg| arg.spread.is_some()) {
+            return;
+        }
+        let mut positions = args.iter().enumerate().filter(|(_, arg)| {
+            matches!(unwrap_expression(&arg.expr), Expr::Ident(passed) if ident_key(passed) == self.param)
+        });
+        let (Some((position, _)), None) = (positions.next(), positions.next()) else {
+            return;
+        };
+        self.found.push(HandOut {
+            line: u32::try_from(self.source_map.lookup_char_pos(span.lo).line).unwrap_or(0),
+            function: self.enclosing.name.clone(),
+            options_position,
+            key: key.sym.to_string(),
+            position,
+            pattern: format!("{}.{}(", options.sym, key.sym),
+        });
+    }
+}
+
+impl Visit for HandOutFinder<'_> {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        call.visit_children_with(self);
+        if let Callee::Expr(callee) = &call.callee {
+            self.consider(call.span, callee, &call.args);
+        }
+    }
+
+    fn visit_opt_chain_expr(&mut self, chain: &OptChainExpr) {
+        chain.visit_children_with(self);
+        if let OptChainBase::Call(call) = chain.base.as_ref() {
+            self.consider(call.span, &call.callee, &call.args);
+        }
+    }
+}
+
 /// Finds the sites. Without `values` it only finds them (their arguments
 /// read as unread); with them it reads each argument value.
 struct SiteFinder<'s> {
     source_map: &'s Lrc<SourceMap>,
     values: Option<&'s DeclaredValues>,
     sites: Vec<RegistrationSite>,
+    /// The functions around the call being read, innermost last; `None` for
+    /// one with no name of its own (carrick#2316).
+    enclosing: Vec<Option<Enclosing>>,
+    /// The name a declarator gives the function it is initialised with,
+    /// until that function is entered.
+    naming: Option<String>,
 }
 
 impl SiteFinder<'_> {
@@ -423,6 +566,7 @@ impl SiteFinder<'_> {
         };
         let span = callback.span();
         let mut inner_registrations = Vec::new();
+        let mut hand_outs = Vec::new();
         if let Some(values) = self.values {
             let mut inner = InnerFinder {
                 source_map: self.source_map,
@@ -433,6 +577,19 @@ impl SiteFinder<'_> {
             callback.visit_with(&mut inner);
             inner.found.sort_by_key(|found| found.line);
             inner_registrations = inner.found;
+            // The call is read before the callback is entered, so the
+            // innermost function around it is the one it is written in.
+            if let Some(Some(enclosing)) = self.enclosing.last() {
+                let mut finder = HandOutFinder {
+                    source_map: self.source_map,
+                    enclosing,
+                    param: ident_key(&param.id),
+                    found: Vec::new(),
+                };
+                callback.visit_with(&mut finder);
+                finder.found.sort_by_key(|found| found.line);
+                hand_outs = finder.found;
+            }
         }
         let mut option_values = Vec::new();
         for expr in &others {
@@ -464,6 +621,7 @@ impl SiteFinder<'_> {
             option_values,
             options_text: others.first().map(|expr| self.snippet(expr)),
             inner_registrations,
+            hand_outs,
         });
     }
 }
@@ -472,6 +630,52 @@ impl Visit for SiteFinder<'_> {
     fn visit_call_expr(&mut self, call: &CallExpr) {
         self.consider(call);
         call.visit_children_with(self);
+    }
+
+    fn visit_fn_decl(&mut self, decl: &FnDecl) {
+        self.naming = Some(decl.ident.sym.to_string());
+        decl.visit_children_with(self);
+    }
+
+    fn visit_fn_expr(&mut self, function: &FnExpr) {
+        if let Some(name) = &function.ident {
+            self.naming = Some(name.sym.to_string());
+        }
+        function.visit_children_with(self);
+    }
+
+    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
+        let named = match (&declarator.name, declarator.init.as_deref()) {
+            (Pat::Ident(name), Some(init))
+                if matches!(unwrap_expression(init), Expr::Arrow(_) | Expr::Fn(_)) =>
+            {
+                Some(name.id.sym.to_string())
+            }
+            _ => None,
+        };
+        declarator.name.visit_with(self);
+        self.naming = named;
+        declarator.init.visit_with(self);
+        self.naming = None;
+    }
+
+    /// A function body, a method's included: named only when a declaration,
+    /// a named expression or a declarator just named it.
+    fn visit_function(&mut self, function: &Function) {
+        let name = self.naming.take();
+        self.enclosing.push(
+            name.map(|name| Enclosing::of(name, function.params.iter().map(|param| &param.pat))),
+        );
+        function.visit_children_with(self);
+        self.enclosing.pop();
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        let name = self.naming.take();
+        self.enclosing
+            .push(name.map(|name| Enclosing::of(name, arrow.params.iter())));
+        arrow.visit_children_with(self);
+        self.enclosing.pop();
     }
 }
 
@@ -819,8 +1023,8 @@ pub struct UnstatedRegistrations {
 
 impl UnstatedRegistrations {
     /// The sites of one file, when its joined rows leave at least one inner
-    /// registration without a mount at its line. A file whose every inner
-    /// registration the model stated holds nothing to decide.
+    /// registration or hand-out without a mount at its line. A file whose
+    /// every one the model stated holds nothing to decide.
     pub fn of(
         result: &FileAnalysisResult,
         sites: &[RegistrationSite],
@@ -829,8 +1033,13 @@ impl UnstatedRegistrations {
     ) -> Option<Self> {
         sites
             .iter()
-            .flat_map(|site| &site.inner_registrations)
-            .any(|inner| !mount_stated_at(result, inner.line))
+            .flat_map(|site| {
+                site.inner_registrations
+                    .iter()
+                    .map(|inner| inner.line)
+                    .chain(site.hand_outs.iter().map(|hand_out| hand_out.line))
+            })
+            .any(|line| !mount_stated_at(result, line))
             .then(|| Self {
                 file_key: file_key.to_string(),
                 file: file.to_string(),
@@ -1168,6 +1377,657 @@ impl InstanceTrace<'_> {
     }
 }
 
+/// The one function the scanned repository supplies under a hand-out's key,
+/// read from the supplying file's source (carrick#2316).
+#[derive(Debug, Clone)]
+struct Supplier {
+    /// The supplying file, canonical.
+    file: PathBuf,
+    /// The supplying call's start line.
+    line: u32,
+    /// What the supplied function hands the instance it receives to.
+    hands_on: Vec<InnerRegistration>,
+}
+
+/// What one call that passes a hand-out's enclosing function says about the
+/// hand-out's key.
+enum Supplied {
+    /// The call's options do not hold the key.
+    Nothing,
+    /// An inline function, with what it hands the instance to.
+    Inline(u32, Vec<InnerRegistration>),
+    /// A function the supplying file declares, by name.
+    Declared(u32, String),
+    /// The call may supply the key and its source does not say what.
+    Unknown(&'static str),
+}
+
+/// A property's key as written: a plain name, or one the source computes.
+enum PropKey {
+    Named(String),
+    Computed,
+}
+
+fn prop_key(prop: &Prop) -> PropKey {
+    let name = match prop {
+        Prop::Shorthand(ident) => return PropKey::Named(ident.sym.to_string()),
+        Prop::KeyValue(kv) => &kv.key,
+        Prop::Method(method) => &method.key,
+        Prop::Getter(getter) => &getter.key,
+        Prop::Setter(setter) => &setter.key,
+        Prop::Assign(assign) => return PropKey::Named(assign.key.sym.to_string()),
+    };
+    match name {
+        PropName::Ident(ident) => PropKey::Named(ident.sym.to_string()),
+        PropName::Str(text) => PropKey::Named(text.value.to_string_lossy().into_owned()),
+        PropName::Num(number) => PropKey::Named(number.value.to_string()),
+        _ => PropKey::Computed,
+    }
+}
+
+/// Reads one file for the calls that pass a hand-out's enclosing function
+/// with options, and what each supplies under the key.
+struct SupplierFinder<'s> {
+    source_map: &'s Lrc<SourceMap>,
+    values: &'s DeclaredValues,
+    resolver: &'s mut BindingResolver,
+    /// The file read, canonical.
+    file: &'s Path,
+    /// The hand-out's file, canonical.
+    target: &'s Path,
+    hand_out: &'s HandOut,
+    found: Vec<Supplied>,
+}
+
+impl SupplierFinder<'_> {
+    /// Whether `ident` is the hand-out's enclosing function, by binding: an
+    /// import that resolves to its declaration, or the declaration itself.
+    fn names_the_function(&mut self, ident: &Ident) -> bool {
+        let key = ident_key(ident);
+        if let Some(specifier) = self.values.imports.get(&key) {
+            return self
+                .resolver
+                .resolve(self.file, specifier, &ident.sym)
+                .is_some_and(|resolved| {
+                    resolved.file.canonicalize().ok().as_deref() == Some(self.target)
+                        && resolved.local_name.as_deref() == Some(self.hand_out.function.as_str())
+                });
+        }
+        self.file == self.target
+            && self.values.functions.contains(&key)
+            && *ident.sym == *self.hand_out.function
+    }
+
+    fn passes_the_function(&mut self, expr: &Expr) -> bool {
+        matches!(unwrap_expression(expr), Expr::Ident(ident) if self.names_the_function(ident))
+    }
+
+    fn line(&self, span: swc_common::Span) -> u32 {
+        u32::try_from(self.source_map.lookup_char_pos(span.lo).line).unwrap_or(0)
+    }
+
+    /// What an options object supplies under the key. A spread or a computed
+    /// key written after the key's last mention may replace it, so the value
+    /// is decided only when nothing follows it that could.
+    fn read_options(&self, line: u32, object: &ObjectLit) -> Supplied {
+        let mut value: Option<(usize, &Prop)> = None;
+        let mut unknown_at: Option<usize> = None;
+        for (index, prop) in object.props.iter().enumerate() {
+            match prop {
+                PropOrSpread::Spread(_) => unknown_at = Some(index),
+                PropOrSpread::Prop(prop) => match prop_key(prop) {
+                    PropKey::Named(name) if name == self.hand_out.key => {
+                        value = Some((index, prop.as_ref()))
+                    }
+                    PropKey::Named(_) => {}
+                    PropKey::Computed => unknown_at = Some(index),
+                },
+            }
+        }
+        match (value, unknown_at) {
+            (Some((index, prop)), unknown) if unknown.is_none_or(|at| at < index) => {
+                self.read_value(line, prop)
+            }
+            (_, Some(_)) => Supplied::Unknown("a spread or a computed key may hold it"),
+            (_, None) => Supplied::Nothing,
+        }
+    }
+
+    fn read_value(&self, line: u32, prop: &Prop) -> Supplied {
+        match prop {
+            Prop::KeyValue(kv) => match unwrap_expression(&kv.value) {
+                Expr::Arrow(arrow) => self.inline(line, arrow.params.iter(), |finder| {
+                    arrow.body.visit_with(finder)
+                }),
+                Expr::Fn(function) => self.inline(
+                    line,
+                    function.function.params.iter().map(|param| &param.pat),
+                    |finder| function.function.body.visit_with(finder),
+                ),
+                Expr::Ident(ident) => self.declared(line, ident),
+                _ => Supplied::Unknown("the value is not a function the file declares"),
+            },
+            Prop::Shorthand(ident) => self.declared(line, ident),
+            Prop::Method(method) => self.inline(
+                line,
+                method.function.params.iter().map(|param| &param.pat),
+                |finder| method.function.body.visit_with(finder),
+            ),
+            _ => Supplied::Unknown("the value is not a function the file declares"),
+        }
+    }
+
+    fn declared(&self, line: u32, ident: &Ident) -> Supplied {
+        if self.values.functions.contains(&ident_key(ident)) {
+            Supplied::Declared(line, ident.sym.to_string())
+        } else {
+            Supplied::Unknown("the value is not a function the file declares")
+        }
+    }
+
+    /// An inline function: what it hands the parameter at the hand-out's
+    /// position to. A function with no plain parameter there hands nothing.
+    fn inline<'p>(
+        &self,
+        line: u32,
+        mut params: impl Iterator<Item = &'p Pat>,
+        read_body: impl Fn(&mut InnerFinder<'_>),
+    ) -> Supplied {
+        let Some(Pat::Ident(param)) = params.nth(self.hand_out.position) else {
+            return Supplied::Inline(line, Vec::new());
+        };
+        let mut finder = InnerFinder {
+            source_map: self.source_map,
+            values: self.values,
+            param: ident_key(&param.id),
+            found: Vec::new(),
+        };
+        read_body(&mut finder);
+        finder.found.sort_by_key(|found| found.line);
+        Supplied::Inline(line, finder.found)
+    }
+
+    /// What one argument that is not the function supplies, when it may be
+    /// the options.
+    fn read_argument(&self, line: u32, expr: &Expr) -> Supplied {
+        match unwrap_expression(expr) {
+            Expr::Object(object) => self.read_options(line, object),
+            Expr::Lit(_) | Expr::Tpl(_) | Expr::Arrow(_) | Expr::Fn(_) => Supplied::Nothing,
+            _ => Supplied::Unknown("the options are built elsewhere"),
+        }
+    }
+}
+
+impl Visit for SupplierFinder<'_> {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        call.visit_children_with(self);
+        let Callee::Expr(callee) = &call.callee else {
+            return;
+        };
+        let line = self.line(call.span);
+        // `routesPlugin(app, opts)`: the options are the argument at the
+        // enclosing function's own position.
+        if self.passes_the_function(callee) {
+            let position = self.hand_out.options_position;
+            if call
+                .args
+                .iter()
+                .take(position + 1)
+                .any(|arg| arg.spread.is_some())
+            {
+                self.found
+                    .push(Supplied::Unknown("a spread argument may hold the options"));
+                return;
+            }
+            let supplied = match call.args.get(position) {
+                Some(arg) => self.read_argument(line, &arg.expr),
+                None => Supplied::Nothing,
+            };
+            self.found.push(supplied);
+            return;
+        }
+        // `app.register(routesPlugin, opts)`: whatever calls the function
+        // passes it the options. An object literal among the other arguments
+        // is read; with none, any other value may be them.
+        let mut passes = false;
+        let mut others: Vec<&Expr> = Vec::new();
+        for arg in &call.args {
+            if arg.spread.is_none() && self.passes_the_function(&arg.expr) {
+                passes = true;
+            } else {
+                others.push(&arg.expr);
+            }
+        }
+        if !passes {
+            return;
+        }
+        if call.args.iter().any(|arg| arg.spread.is_some()) {
+            self.found
+                .push(Supplied::Unknown("a spread argument may hold the options"));
+            return;
+        }
+        let literals: Vec<&ObjectLit> = others
+            .iter()
+            .filter_map(|expr| match unwrap_expression(expr) {
+                Expr::Object(object) => Some(object),
+                _ => None,
+            })
+            .collect();
+        if literals.is_empty() {
+            for expr in others {
+                let supplied = self.read_argument(line, expr);
+                if !matches!(supplied, Supplied::Nothing) {
+                    self.found.push(supplied);
+                    return;
+                }
+            }
+            self.found.push(Supplied::Nothing);
+            return;
+        }
+        for object in literals {
+            let supplied = self.read_options(line, object);
+            self.found.push(supplied);
+        }
+    }
+}
+
+/// The relative specifier from `from`'s directory to `to`, both canonical:
+/// `./notes.ts`, `../routes/notes.ts`. The file's own extension is kept, so
+/// the specifier names that file and no sibling.
+fn relative_specifier(from: &Path, to: &Path) -> Option<String> {
+    let from_dir = from.parent()?;
+    let from_parts: Vec<_> = from_dir.components().collect();
+    let to_parts: Vec<_> = to.components().collect();
+    let shared = from_parts
+        .iter()
+        .zip(&to_parts)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if shared == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for _ in shared..from_parts.len() {
+        parts.push("..".to_string());
+    }
+    for part in &to_parts[shared..] {
+        parts.push(part.as_os_str().to_str()?.to_string());
+    }
+    let joined = parts.join("/");
+    Some(if joined.starts_with("..") {
+        joined
+    } else {
+        format!("./{joined}")
+    })
+}
+
+/// Follows a hand-out to the function the scanned repository supplies under
+/// its key, and from there to the functions of this service the instance
+/// reaches (carrick#2316).
+struct CallbackTrace<'w> {
+    modules: &'w WorkspaceIndex,
+    /// Resolves through workspace package names and aliases: the supplying
+    /// package names this one by its package name.
+    packages: BindingResolver,
+    /// Each hand-out's one supplier, or why there is none, by (file,
+    /// enclosing function, key).
+    suppliers: HashMap<(PathBuf, String, String), Result<Supplier, String>>,
+    walking: Vec<(PathBuf, String, usize)>,
+}
+
+impl CallbackTrace<'_> {
+    /// The files a supplier can be written in: those of the package holding
+    /// the hand-out, and of every workspace package that depends on it, as a
+    /// scan of each would read them (no tests, no build output).
+    fn candidate_files(&self, hand_out_file: &Path) -> Vec<PathBuf> {
+        let root = self.modules.repo_root();
+        let mut dirs: Vec<PathBuf> = match self.modules.package_holding(hand_out_file) {
+            Some((name, dir)) => std::iter::once(dir)
+                .chain(self.modules.dependents_of(&name))
+                .collect(),
+            None => vec![PathBuf::new()],
+        };
+        dirs.sort();
+        dirs.dedup();
+        // A package nested in another one is read with it.
+        let outer: Vec<PathBuf> = dirs
+            .iter()
+            .filter(|dir| {
+                !dirs
+                    .iter()
+                    .any(|other| other != *dir && dir.starts_with(other))
+            })
+            .cloned()
+            .collect();
+        let mut files: Vec<PathBuf> = outer
+            .iter()
+            .flat_map(|dir| {
+                crate::file_finder::find_files(
+                    &root.join(dir).to_string_lossy(),
+                    &crate::packages::MANIFEST_SKIP_DIRS,
+                )
+                .0
+            })
+            .filter_map(|file| file.canonicalize().ok())
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    /// The one call in the scanned repository that supplies the hand-out's
+    /// key, or why none is decided.
+    fn supplier(
+        &mut self,
+        heads: &mut FunctionHeads,
+        hand_out_file: &Path,
+        hand_out: &HandOut,
+    ) -> Result<Supplier, String> {
+        let cache_key = (
+            hand_out_file.to_path_buf(),
+            hand_out.function.clone(),
+            hand_out.key.clone(),
+        );
+        if let Some(known) = self.suppliers.get(&cache_key) {
+            return known.clone();
+        }
+        let found = self.find_supplier(heads, hand_out_file, hand_out);
+        self.suppliers.insert(cache_key, found.clone());
+        found
+    }
+
+    fn find_supplier(
+        &mut self,
+        heads: &mut FunctionHeads,
+        hand_out_file: &Path,
+        hand_out: &HandOut,
+    ) -> Result<Supplier, String> {
+        let mut supplied: Vec<(PathBuf, Supplied)> = Vec::new();
+        for file in self.candidate_files(hand_out_file) {
+            // A cost gate only: the decision below is by binding.
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            if !text.contains(hand_out.function.as_str()) {
+                continue;
+            }
+            let Some(module) = crate::parser::parse_file(&file, &heads.source_map, &heads.handler)
+            else {
+                continue;
+            };
+            let mut values = DeclaredValues::default();
+            module.visit_with(&mut values);
+            let mut finder = SupplierFinder {
+                source_map: &heads.source_map,
+                values: &values,
+                resolver: &mut self.packages,
+                file: &file,
+                target: hand_out_file,
+                hand_out,
+                found: Vec::new(),
+            };
+            module.visit_with(&mut finder);
+            supplied.extend(finder.found.into_iter().map(|found| (file.clone(), found)));
+        }
+        let mut one: Option<(PathBuf, Supplied)> = None;
+        let mut count = 0usize;
+        for (file, found) in supplied {
+            match found {
+                Supplied::Nothing => {}
+                Supplied::Unknown(why) => {
+                    return Err(format!("{}:{}: {why}", file.display(), hand_out.line));
+                }
+                other => {
+                    count += 1;
+                    one = Some((file, other));
+                }
+            }
+        }
+        let (file, found) = match (one, count) {
+            (Some(one), 1) => one,
+            (_, 0) => return Err("no call in the scanned repository supplies it".to_string()),
+            (_, count) => return Err(format!("{count} calls supply it")),
+        };
+        match found {
+            Supplied::Inline(line, hands_on) => Ok(Supplier {
+                file,
+                line,
+                hands_on,
+            }),
+            Supplied::Declared(line, name) => {
+                let hands_on = heads
+                    .head(&file, &name)
+                    .map(|head| {
+                        head.passes_on
+                            .iter()
+                            .filter(|(from, _)| *from == hand_out.position)
+                            .map(|(_, pass)| pass.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(Supplier {
+                    file,
+                    line,
+                    hands_on,
+                })
+            }
+            Supplied::Nothing | Supplied::Unknown(_) => {
+                Err("no call in the scanned repository supplies it".to_string())
+            }
+        }
+    }
+
+    /// The function `file` names as `registration` hands the instance to,
+    /// resolved through workspace packages: its declaring module, canonical,
+    /// and its name there.
+    fn declaration(
+        &mut self,
+        file: &Path,
+        registration: &InnerRegistration,
+    ) -> Option<(PathBuf, String)> {
+        match &registration.import_source {
+            Some(specifier) => {
+                let resolved = self
+                    .packages
+                    .resolve(file, specifier, &registration.identifier)?;
+                Some((resolved.file.canonicalize().ok()?, resolved.local_name?))
+            }
+            None => Some((file.to_path_buf(), registration.identifier.clone())),
+        }
+    }
+
+    /// The functions of this service the instance reaches from `file`'s call
+    /// `registration`, each one that registers on the parameter it receives
+    /// ([`InstanceTrace::registers`]). A function outside this service is
+    /// read from its source only, for what it hands the instance on to, at
+    /// most [`MAX_PASS_ON_DEPTH`] functions on.
+    #[allow(clippy::too_many_arguments)]
+    fn reach(
+        &mut self,
+        trace: &mut InstanceTrace<'_>,
+        file_results: &HashMap<String, FileAnalysisResult>,
+        file: &Path,
+        registration: &InnerRegistration,
+        depth: usize,
+        reached: &mut Vec<Reached>,
+    ) {
+        let Some((declaring, name)) = self.declaration(file, registration) else {
+            return;
+        };
+        if trace.key_by_canonical.contains_key(&declaring) {
+            let mut hand_ons = Vec::new();
+            if trace.registers(
+                file_results,
+                &declaring,
+                &name,
+                registration.position,
+                depth,
+                &mut hand_ons,
+            ) && !reached
+                .iter()
+                .any(|known| known.file == declaring && known.name == name)
+            {
+                reached.push(Reached {
+                    file: declaring,
+                    name,
+                    hand_ons,
+                });
+            }
+            return;
+        }
+        if depth >= MAX_PASS_ON_DEPTH {
+            return;
+        }
+        let walked = (declaring.clone(), name.clone(), registration.position);
+        if self.walking.contains(&walked) {
+            return;
+        }
+        let passes_on: Vec<InnerRegistration> = match trace.heads.head(&declaring, &name) {
+            Some(head) => head
+                .passes_on
+                .iter()
+                .filter(|(from, _)| *from == registration.position)
+                .map(|(_, pass)| pass.clone())
+                .collect(),
+            None => return,
+        };
+        self.walking.push(walked);
+        for pass in passes_on {
+            self.reach(trace, file_results, &declaring, &pass, depth + 1, reached);
+        }
+        self.walking.pop();
+    }
+
+    /// The mount rows one hand-out makes in its file (see
+    /// [`mount_unstated_registrations`]), and the hand-ons the functions it
+    /// mounts make in theirs, pushed to `hand_ons`.
+    #[allow(clippy::too_many_arguments)]
+    fn mount_rows(
+        &mut self,
+        trace: &mut InstanceTrace<'_>,
+        file_results: &HashMap<String, FileAnalysisResult>,
+        file_root: &Path,
+        importer: &Path,
+        file: &str,
+        site: &RegistrationSite,
+        hand_out: &HandOut,
+        hand_ons: &mut Vec<(String, MountResult)>,
+    ) -> Vec<MountResult> {
+        let at = format!("{file}:{}", hand_out.line);
+        let supplier = match self.supplier(&mut trace.heads, importer, hand_out) {
+            Ok(supplier) => supplier,
+            Err(why) => {
+                debug!(
+                    "Hand-out at {at} not followed: {} '{}' ({why}); the routes it reaches keep \
+                     their paths",
+                    hand_out.function, hand_out.key
+                );
+                return Vec::new();
+            }
+        };
+        let mut reached: Vec<Reached> = Vec::new();
+        for registration in &supplier.hands_on {
+            self.reach(
+                trace,
+                file_results,
+                &supplier.file,
+                registration,
+                0,
+                &mut reached,
+            );
+        }
+        if reached.is_empty() {
+            return Vec::new();
+        }
+        let bindings = crate::agents::file_orchestrator::FileOrchestrator::resolve_mount_bindings(
+            file_results,
+            file_root,
+        );
+        let mut rows = Vec::new();
+        for function in reached {
+            let Some(key) = trace.key_by_canonical.get(&function.file) else {
+                continue;
+            };
+            let Some(declared_rows) = file_results.get(key) else {
+                continue;
+            };
+            let Some((start, end)) = trace
+                .heads
+                .head(&function.file, &function.name)
+                .map(|head| (head.start_line, head.end_line))
+            else {
+                continue;
+            };
+            if !holds_every_row_of_its_file(declared_rows, start, end) {
+                debug!(
+                    "Hand-out at {at} reaches {} in {key}, which shares its file with rows it does \
+                     not hold; not mounted",
+                    function.name
+                );
+                continue;
+            }
+            if bindings.get(key).is_some_and(|known| {
+                known
+                    .iter()
+                    .any(|binding| binding.child_node != function.name)
+            }) {
+                debug!(
+                    "Hand-out at {at} reaches {} in {key}, which another mount already resolves \
+                     to; not mounted",
+                    function.name
+                );
+                continue;
+            }
+            let Some(specifier) = relative_specifier(importer, &function.file) else {
+                continue;
+            };
+            debug!(
+                "Mount read from the source at {at}: {} hands {} to {} supplied at {}:{}, and the \
+                 instance reaches {}",
+                hand_out.function,
+                site.param,
+                hand_out.key,
+                supplier.file.display(),
+                supplier.line,
+                function.name
+            );
+            hand_ons.extend(function.hand_ons);
+            rows.push(MountResult {
+                line_number: i32::try_from(hand_out.line).unwrap_or(i32::MAX),
+                parent_node: site.param.clone(),
+                child_node: function.name,
+                mount_path: String::new(),
+                import_source: Some(specifier),
+                pattern_matched: hand_out.pattern.clone(),
+            });
+        }
+        rows
+    }
+}
+
+/// A function of this service an instance reaches through a supplied
+/// callback, with the hand-ons its own body makes.
+struct Reached {
+    /// Its declaring file, canonical.
+    file: PathBuf,
+    name: String,
+    hand_ons: Vec<(String, MountResult)>,
+}
+
+/// Whether a function holds every row its file states: the graph gives a
+/// mounted file's routes to the binding that resolves to the file, whole
+/// (`resolve_endpoint_owner`), so a function that shares its file with
+/// routes registered elsewhere cannot be mounted alone (carrick#2334).
+fn holds_every_row_of_its_file(rows: &FileAnalysisResult, start_line: u32, end_line: u32) -> bool {
+    let inside =
+        |line: i32| u32::try_from(line).is_ok_and(|line| line >= start_line && line <= end_line);
+    rows.endpoints
+        .iter()
+        .filter(|endpoint| is_served_path(&endpoint.path))
+        .all(|endpoint| inside(endpoint.line_number))
+        && rows.mounts.iter().all(|mount| inside(mount.line_number))
+}
+
 /// State the mounts a registration callback makes and the model did not
 /// (carrick#2303). Returns how many mount rows the files gained, and the
 /// scopes this made whose prefix the source does not state as a literal.
@@ -1196,12 +2056,33 @@ impl InstanceTrace<'_> {
 /// records nothing, and the rows already hanging from the scope id no longer
 /// hang from the parameter's name.
 ///
+/// A hand-out, `O.k(P)`, becomes one mount row of its file for each function
+/// the instance reaches through the function the scanned repository supplies
+/// under `k` (carrick#2316), when:
+///
+/// * the file's rows hold no mount at that line;
+/// * exactly one call in the hand-out's package, or in a workspace package
+///   that depends on it, passes the enclosing function with an object
+///   literal that writes `k` as an inline function or a function that file
+///   declares, and no call may supply `k` unseen (a spread or a computed key
+///   after it, options built elsewhere): [`CallbackTrace::supplier`];
+/// * the function is declared in this service's own files, registers on the
+///   parameter it receives, holds every row its file states, and no other
+///   mount already resolves to its file.
+///
+/// The row names the function as its file declares it, with a relative
+/// specifier to that file, so the graph attributes the file's routes to the
+/// scope the hand-out is written in. The supplying package's own rows are
+/// never read or changed.
+///
 /// `file_root` is the directory the `file_results` keys resolve against on
-/// disk. No method, option, library or framework name is read.
+/// disk, and `modules` the service's module index, which names the workspace
+/// packages. No method, option, library or framework name is read.
 pub fn mount_unstated_registrations(
     file_results: &mut HashMap<String, FileAnalysisResult>,
     pending: &[UnstatedRegistrations],
     file_root: &Path,
+    modules: &WorkspaceIndex,
 ) -> (usize, Vec<UnreadPrefix>) {
     let mut unread = Vec::new();
     if pending.is_empty() {
@@ -1219,6 +2100,12 @@ pub fn mount_unstated_registrations(
         root: file_root.canonicalize().ok(),
         resolver: BindingResolver::new(),
         heads: FunctionHeads::new(),
+        walking: Vec::new(),
+    };
+    let mut callbacks = CallbackTrace {
+        modules,
+        packages: BindingResolver::with_workspace(modules.clone()),
+        suppliers: HashMap::new(),
         walking: Vec::new(),
     };
     let mut emitted = 0usize;
@@ -1256,6 +2143,21 @@ pub fn mount_unstated_registrations(
                     ) {
                         rows.push(inner.mount_row(&site.param, &node));
                     }
+                }
+                for hand_out in &site.hand_outs {
+                    if mount_stated_at(result, hand_out.line) {
+                        continue;
+                    }
+                    rows.extend(callbacks.mount_rows(
+                        &mut trace,
+                        file_results,
+                        file_root,
+                        &importer,
+                        &file.file,
+                        site,
+                        hand_out,
+                        &mut hand_ons,
+                    ));
                 }
             }
             if rows.is_empty() {
@@ -1576,5 +2478,62 @@ mod tests {
         assert!(is_scope_id(&scope_id("api", "src/a.ts", 3)));
         assert!(!is_scope_id("api"));
         assert!(!is_scope_id("@scope/pkg"));
+    }
+
+    fn hand_outs_of(source: &str) -> Vec<(u32, String, usize, String, usize)> {
+        sites(source)
+            .iter()
+            .flat_map(|site| site.hand_outs.clone())
+            .map(|hand_out| {
+                (
+                    hand_out.line,
+                    hand_out.function,
+                    hand_out.options_position,
+                    hand_out.key,
+                    hand_out.position,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_callback_records_the_option_it_hands_its_instance_to() {
+        // A declaration, a declarator, an optional call, a defaulted
+        // parameter and the instance written second.
+        let source = "export async function plugin(app, opts) {\n  app.register(async (api) => {\n    await opts.registerExtra(api);\n    opts.onReady?.(api);\n  }, { prefix: '/v1' });\n}\nexport const other = async (app, deps, opts = {}) => {\n  app.register(async (api) => { opts.extend(deps, api); });\n};";
+        assert_eq!(
+            hand_outs_of(source),
+            vec![
+                (3, "plugin".to_string(), 1, "registerExtra".to_string(), 0),
+                (4, "plugin".to_string(), 1, "onReady".to_string(), 0),
+                (8, "other".to_string(), 2, "extend".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hand_out_that_names_no_option_of_the_enclosing_function_is_not_recorded() {
+        // A computed key, a receiver that is not a parameter, the plugin's
+        // own instance, a spread, and a registration in an unnamed function.
+        let source = "export async function plugin(app, opts) {\n  const local = opts;\n  app.register(async (api) => {\n    opts[key](api);\n    local.registerExtra(api);\n    opts.registerExtra(app);\n    opts.registerExtra(...[api]);\n  });\n}\nexport default async (app, opts) => {\n  app.register(async (api) => { opts.registerExtra(api); });\n};";
+        assert_eq!(hand_outs_of(source), vec![]);
+    }
+
+    #[test]
+    fn a_relative_specifier_names_the_declaring_file() {
+        assert_eq!(
+            relative_specifier(
+                Path::new("/r/a/src/index.ts"),
+                Path::new("/r/a/src/notes.ts")
+            ),
+            Some("./notes.ts".to_string())
+        );
+        assert_eq!(
+            relative_specifier(
+                Path::new("/r/a/src/index.ts"),
+                Path::new("/r/b/lib/notes.ts")
+            ),
+            Some("../../b/lib/notes.ts".to_string())
+        );
     }
 }

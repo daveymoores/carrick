@@ -1,0 +1,12 @@
+{
+  "services": [
+    {
+      "serviceName": "routes",
+      "directory": "packages/routes"
+    },
+    {
+      "serviceName": "server",
+      "directory": "packages/server"
+    }
+  ]
+}

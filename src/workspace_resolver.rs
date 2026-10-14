@@ -218,6 +218,10 @@ struct InternalPackage {
     /// package root. See [`WorkspaceIndex::resolve_exports`] for what is read
     /// off it.
     exports: Option<serde_json::Value>,
+    /// Every package name the manifest declares in any of its four dependency
+    /// maps, so the packages that may import this one can be named
+    /// ([`WorkspaceIndex::dependents_of`]).
+    depends_on: BTreeSet<String>,
 }
 
 /// The repo's manifests, reduced to what specifier resolution needs.
@@ -306,6 +310,15 @@ impl WorkspaceIndex {
             };
             let main = facts.main;
             let exports = facts.exports;
+            let package = &facts.package;
+            let depends_on: BTreeSet<String> = package
+                .dependencies
+                .keys()
+                .chain(package.dev_dependencies.keys())
+                .chain(package.peer_dependencies.keys())
+                .chain(package.optional_dependencies.keys())
+                .cloned()
+                .collect();
             // Two directories can declare the same package name — a vendored
             // copy, a fork kept alongside the original. Keeping the
             // lexicographically smallest directory makes the choice a property
@@ -314,8 +327,15 @@ impl WorkspaceIndex {
             match internal_packages.get(name) {
                 Some(existing) if existing.dir <= dir => {}
                 _ => {
-                    internal_packages
-                        .insert(name.to_string(), InternalPackage { dir, main, exports });
+                    internal_packages.insert(
+                        name.to_string(),
+                        InternalPackage {
+                            dir,
+                            main,
+                            exports,
+                            depends_on,
+                        },
+                    );
                 }
             }
         }
@@ -392,6 +412,36 @@ impl WorkspaceIndex {
             None => return false,
         };
         self.external_packages.contains(&name) || self.dev_packages.contains(&name)
+    }
+
+    /// The directory the repo's manifests were read under.
+    pub(crate) fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
+    /// The workspace package whose directory holds `file`, the deepest when
+    /// packages nest: its name and repo-relative directory.
+    pub(crate) fn package_holding(&self, file: &Path) -> Option<(String, PathBuf)> {
+        let relative = self.repo_relative(file);
+        self.internal_packages
+            .iter()
+            .filter(|(_, package)| relative.starts_with(&package.dir))
+            .max_by_key(|(name, package)| (package.dir.components().count(), name.as_str()))
+            .map(|(name, package)| (name.clone(), package.dir.clone()))
+    }
+
+    /// The repo-relative directories of the workspace packages whose manifest
+    /// declares `name` as a dependency of any kind, sorted.
+    pub(crate) fn dependents_of(&self, name: &str) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self
+            .internal_packages
+            .values()
+            .filter(|package| package.depends_on.contains(name))
+            .map(|package| package.dir.clone())
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
     }
 
     /// Every workspace package's name and repo-relative directory.
