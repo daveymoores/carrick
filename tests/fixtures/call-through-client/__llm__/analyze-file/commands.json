@@ -12,8 +12,8 @@
       "call_expression_line": 9,
       "payload_expression_text": null,
       "payload_expression_line": null,
-      "primary_type_symbol": null,
-      "type_import_source": null
+      "primary_type_symbol": "Run",
+      "type_import_source": "./types"
     },
     {
       "candidate_id": "@line:15",
@@ -77,8 +77,8 @@
       "call_expression_line": 46,
       "payload_expression_text": null,
       "payload_expression_line": null,
-      "primary_type_symbol": null,
-      "type_import_source": null
+      "primary_type_symbol": "SavedRun",
+      "type_import_source": "./types"
     },
     {
       "candidate_id": "@line:57",

@@ -558,6 +558,10 @@ pub struct Settled {
     pub reaches_none: usize,
     /// Rows left alone because their call reaches more than one operation.
     pub reaches_several: usize,
+    /// Corrected rows whose consumer type entries were dropped, because the
+    /// row's call is not the call that reaches the request: what it returns
+    /// is another function's result.
+    pub types_not_carried: usize,
 }
 
 /// Settle every model call row whose call reaches exactly one request
@@ -566,8 +570,16 @@ pub struct Settled {
 /// | Reached | The row |
 /// |---|---|
 /// | One operation, the row's own | stays the model's and keeps its type anchors; gains `role: wrapper_call` and `reaches_request` |
-/// | One operation, another | takes the reached row's method, target, base and dispatch value; its source becomes `request_summary`; its consumer type entries go |
+/// | One operation, another | takes the reached row's method, target, base and dispatch value; its source becomes `request_summary`; its consumer type entries are keyed to the reached operation |
 /// | None, or several | left as it is, and counted |
+///
+/// A corrected row keeps the types anchored at it only where the row's call
+/// is itself the call that reaches the request (its own callee decided):
+/// what that call returns is what the caller reads of the request, so the
+/// pair is judged against the reached operation's producer. Where a spread
+/// call or a callback decided, the row's call is another function's (a hook,
+/// a runner), the anchor names that function's result, and the entries are
+/// dropped and counted.
 pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     let graph = ReachGraph::of(services.iter().map(|service| &*service.data));
     let mut settled = Settled::default();
@@ -577,9 +589,15 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
             match graph.decide(row) {
                 Reach::None => settled.reaches_none += 1,
                 Reach::Several => settled.reaches_several += 1,
-                Reach::One(reached) => match apply(service.data, row, reached) {
+                Reach::One {
+                    request,
+                    by_own_callee,
+                } => match apply(service.data, row, request, by_own_callee) {
                     Some(Change::Relabelled) => settled.relabelled += 1,
-                    Some(Change::Corrected) => corrected += 1,
+                    Some(Change::Corrected { types_dropped }) => {
+                        corrected += 1;
+                        settled.types_not_carried += usize::from(types_dropped);
+                    }
                     None => {}
                 },
             }
@@ -593,8 +611,12 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         }
     }
     debug!(
-        "Call-through rows settled: {} confirmed, {} corrected; left alone: {} reach no request row, {} reach several operations (carrick#1146)",
-        settled.relabelled, settled.corrected, settled.reaches_none, settled.reaches_several
+        "Call-through rows settled: {} confirmed, {} corrected ({} lost the types anchored at a call that is not the request's); left alone: {} reach no request row, {} reach several operations (carrick#1146)",
+        settled.relabelled,
+        settled.corrected,
+        settled.types_not_carried,
+        settled.reaches_none,
+        settled.reaches_several
     );
     settled
 }
@@ -615,7 +637,11 @@ struct Reached {
 enum Reach<'g> {
     None,
     Several,
-    One(&'g Reached),
+    One {
+        request: &'g Reached,
+        /// The row's own callee reached it, not a spread call or a callback.
+        by_own_callee: bool,
+    },
 }
 
 /// Every service's definitions and the requests each one writes.
@@ -724,7 +750,7 @@ impl ReachGraph {
 
     /// The request the first step of `row` that reaches any decides.
     fn decide(&self, row: &SiteRow) -> Reach<'_> {
-        for step in &row.steps {
+        for (position, step) in row.steps.iter().enumerate() {
             // By site, so a request two paths reach is one request.
             let mut reached: BTreeMap<&str, &Reached> = BTreeMap::new();
             for definition in step {
@@ -744,7 +770,10 @@ impl ReachGraph {
                 })
                 .collect();
             return match operations.len() {
-                1 => Reach::One(first),
+                1 => Reach::One {
+                    request: first,
+                    by_own_callee: position == 0,
+                },
                 _ => Reach::Several,
             };
         }
@@ -797,13 +826,22 @@ fn site_of(call: &DataFetchingCall) -> Option<(&str, u32)> {
 
 enum Change {
     Relabelled,
-    Corrected,
+    Corrected {
+        /// The row held consumer type entries and they were dropped, because
+        /// the row's call is not the call that reaches the request.
+        types_dropped: bool,
+    },
 }
 
 /// Change the one row of `data` that `row` names to what `reached` states.
 /// `None` when the blob holds no such row: the graph build keeps fewer rows
 /// than the analysis stated.
-fn apply(data: &mut CloudRepoData, row: &SiteRow, reached: &Reached) -> Option<Change> {
+fn apply(
+    data: &mut CloudRepoData,
+    row: &SiteRow,
+    reached: &Reached,
+    by_own_callee: bool,
+) -> Option<Change> {
     let location = format!("{}:{}", row.file, row.line);
     let graph = data.mount_graph.as_mut()?;
     let index = graph.data_calls.iter().position(|call| {
@@ -884,19 +922,26 @@ fn apply(data: &mut CloudRepoData, row: &SiteRow, reached: &Reached) -> Option<C
             operation.key = OperationKey::http(&reached.method, reached.canonical_path.clone());
             operation.dispatch = reached.dispatch.clone();
             operation.resolution_source = Some(ResolutionSource::RequestSummary);
-            operation.request_type = None;
-            operation.response_type = None;
+            if !by_own_callee {
+                operation.request_type = None;
+                operation.response_type = None;
+            }
         }
     }
 
-    // The types the model anchored at the site were anchored for a request
-    // the site does not make. No type is asked for at a call through, as at
-    // a row the request summaries restate at a caller.
+    // The types anchored at the site were captured under the operation the
+    // model stated. Where the row's call is the call that reaches the
+    // request, what it returns is what the caller reads of that request: the
+    // entries keep their captured types (the alias names the site, not the
+    // operation) and take the reached operation's key, so the cross-service
+    // check judges them against its producer. Where another call decided, or
+    // the site already holds a row for the reached operation, they go.
+    let mut types_dropped = false;
     if let (Some(manifest), Some((method, path))) = (data.type_manifest.as_mut(), before.as_http())
     {
         let method = normalize_manifest_method(method);
-        manifest.retain(|entry| {
-            let at_the_row = entry.role == ManifestRole::Consumer
+        let at_the_row = |entry: &crate::cloud_storage::TypeManifestEntry| {
+            entry.role == ManifestRole::Consumer
                 && entry.file_path == row.file
                 && entry.line_number == row.line
                 && entry
@@ -904,11 +949,23 @@ fn apply(data: &mut CloudRepoData, row: &SiteRow, reached: &Reached) -> Option<C
                     .as_http()
                     .is_some_and(|(entry_method, entry_path)| {
                         entry_method == method && entry_path == path
-                    });
-            !at_the_row
-        });
+                    })
+        };
+        if by_own_callee && !twin {
+            let carried = OperationKey::http(
+                &normalize_manifest_method(&reached.method),
+                reached.canonical_path.clone(),
+            );
+            for entry in manifest.iter_mut().filter(|entry| at_the_row(entry)) {
+                entry.key = carried.clone();
+            }
+        } else {
+            let before = manifest.len();
+            manifest.retain(|entry| !at_the_row(entry));
+            types_dropped = !twin && manifest.len() < before;
+        }
     }
-    Some(Change::Corrected)
+    Some(Change::Corrected { types_dropped })
 }
 
 #[cfg(test)]

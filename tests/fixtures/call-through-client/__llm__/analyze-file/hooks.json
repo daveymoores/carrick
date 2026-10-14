@@ -25,8 +25,8 @@
       "call_expression_line": 14,
       "payload_expression_text": null,
       "payload_expression_line": null,
-      "primary_type_symbol": null,
-      "type_import_source": null
+      "primary_type_symbol": "RunList",
+      "type_import_source": "./models"
     },
     {
       "candidate_id": "model:19",
