@@ -14090,6 +14090,7 @@ export * from "./aFetch.js";"#,
                 ..Default::default()
             },
             &candidate_map,
+            None,
             &[],
             "src/client.ts",
             false,
