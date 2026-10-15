@@ -1,0 +1,8 @@
+{
+  "name": "@fixture/cli",
+  "version": "1.0.0",
+  "main": "src/commands.ts",
+  "dependencies": {
+    "@fixture/client": "workspace:*"
+  }
+}

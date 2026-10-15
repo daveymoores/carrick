@@ -272,6 +272,19 @@ impl ServiceBoundary {
         self.time_limits_run_out.get_or_insert_default().merge(cost);
     }
 
+    /// Read the call counts again once the scan has settled this service's
+    /// call-through rows (carrick#1146): `corrected` of its model rows took
+    /// the operation their call reaches, and are no longer the model's alone.
+    ///
+    /// Separate from [`Self::collect`] for the same reason as
+    /// [`Self::fold_sdk_unresolved`]: the rows are settled over every service
+    /// of the run at once, after each service's own analysis.
+    pub fn fold_settled_calls(&mut self, data: &CloudRepoData, corrected: usize) {
+        self.model_only_rows = self.model_only_rows.saturating_sub(corrected);
+        self.unknown_call_paths = unknown_call_paths(data);
+        self.calls_without_expected_type = operations_without_a_type(data, ManifestRole::Consumer);
+    }
+
     /// Fold in what the cross-repo SDK join could not resolve for this service.
     ///
     /// Separate from [`Self::collect`] because the join needs the peers' SDK
@@ -553,6 +566,26 @@ fn untyped_operations(
             typed_operations.insert(key);
         }
     }
+    // A call through a declaration states no request at its own line, so no
+    // type is asked for there (carrick#1146): where the manifest anchors
+    // nothing at such a row, there is no expected type to be missing. A
+    // call-through row the manifest does anchor is read like any other call.
+    let calls_through: HashSet<(String, &str)> = match role {
+        ManifestRole::Producer => HashSet::new(),
+        ManifestRole::Consumer => data
+            .mount_graph
+            .iter()
+            .flat_map(|graph| graph.get_data_calls())
+            .filter(|call| call.role == Some(crate::mount_graph::ConsumerRole::WrapperCall))
+            .map(|call| {
+                (
+                    crate::operation::OperationKey::http(&call.method, call.canonical_path.clone())
+                        .canonical(),
+                    call.file_location.as_str(),
+                )
+            })
+            .collect(),
+    };
     operations.iter().filter_map(move |operation| {
         let location = operation.file_path.to_string_lossy();
         let (file, line) = match location.rsplit_once(':') {
@@ -562,6 +595,9 @@ fn untyped_operations(
         let key = operation.key.canonical();
         let site = (key.clone(), file.to_string());
         if typed.contains(&site) {
+            return None;
+        }
+        if !anchored.contains(&site) && calls_through.contains(&(key.clone(), location.as_ref())) {
             return None;
         }
         if role == ManifestRole::Producer

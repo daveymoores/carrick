@@ -172,6 +172,10 @@ impl ModelSetup {
 pub struct ServiceAnalysis {
     pub data: CloudRepoData,
     pub deferred: Option<String>,
+    /// The definitions each model call row's call goes through, read while
+    /// the service's files are in hand and settled once every service is
+    /// (carrick#1146). Never serialised.
+    pub call_through: crate::call_through::CallThroughSites,
 }
 
 /// The model work one service still owes once its analysis has run.

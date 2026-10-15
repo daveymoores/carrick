@@ -614,9 +614,9 @@ pub struct CallSiteTargets {
     by_file: HashMap<PathBuf, HashMap<u32, ReachedAt>>,
 }
 
-/// A resolved call site's span end, and the definition (file as walked,
-/// definition key) it reaches.
-type ReachedAt = (u32, (PathBuf, String));
+/// A resolved call site's span end, the definition (file as walked,
+/// definition key) it reaches, and the line that definition opens on.
+type ReachedAt = (u32, (PathBuf, String), u32);
 
 impl CallSiteTargets {
     fn record(&mut self, file: &Path, span: swc_common::Span, target: &Target) {
@@ -625,8 +625,25 @@ impl CallSiteTargets {
         }
         self.by_file.entry(file.to_path_buf()).or_default().insert(
             span.lo.0,
-            (span.hi.0, (target.file.clone(), target.key.clone())),
+            (
+                span.hi.0,
+                (target.file.clone(), target.key.clone()),
+                target.line,
+            ),
         );
+    }
+
+    /// Every call site of `file` that resolution followed: its span start and
+    /// end in the discovery source map, and the file and opening line of the
+    /// definition it reaches. The file and line are how a definition is named
+    /// across services, where a definition key is one service's own
+    /// (carrick#1146).
+    pub fn sites_in(&self, file: &Path) -> impl Iterator<Item = (u32, u32, &Path, u32)> {
+        self.by_file.get(file).into_iter().flat_map(|sites| {
+            sites
+                .iter()
+                .map(|(lo, (hi, (target, _), line))| (*lo, *hi, target.as_path(), *line))
+        })
     }
 
     /// The definition (file as walked, definition key) the call whose span
@@ -640,7 +657,7 @@ impl CallSiteTargets {
         self.by_file
             .get(file)?
             .get(&span_lo)
-            .map(|(_, target)| target)
+            .map(|(_, target, _)| target)
     }
 
     /// The definition the call spanning exactly `span_lo..span_hi` reaches
@@ -649,8 +666,8 @@ impl CallSiteTargets {
         self.by_file
             .get(file)?
             .get(&span_lo)
-            .filter(|(hi, _)| *hi == span_hi)
-            .map(|(_, target)| target)
+            .filter(|(hi, _, _)| *hi == span_hi)
+            .map(|(_, target, _)| target)
     }
 }
 

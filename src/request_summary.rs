@@ -1024,7 +1024,7 @@ struct OwnGetter {
 impl FileIr {
     /// A span start this file's [`BindingUse`]s record (discovery
     /// numbering) in SWC numbering, as [`Site::span_start`] is.
-    fn swc_start(&self, lo: u32) -> u32 {
+    pub(crate) fn swc_start(&self, lo: u32) -> u32 {
         lo.saturating_sub(self.source_start) + SWC_SPAN_BASE
     }
 
@@ -6055,6 +6055,11 @@ impl RequestSummaryIndex {
     pub fn passes_body(&self, file: &Path, function: &str) -> bool {
         self.passes_body
             .contains(&(file.to_path_buf(), function.to_string()))
+    }
+
+    /// Every function [`Self::passes_body`] answers yes for.
+    pub fn passes_body_set(&self) -> &HashSet<(PathBuf, String)> {
+        &self.passes_body
     }
 
     /// Rows read through library semantics (carrick#1564).

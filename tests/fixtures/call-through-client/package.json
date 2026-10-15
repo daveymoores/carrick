@@ -1,0 +1,5 @@
+{
+  "name": "call-through-client",
+  "private": true,
+  "workspaces": ["packages/*", "apps/*", "services/*"]
+}
