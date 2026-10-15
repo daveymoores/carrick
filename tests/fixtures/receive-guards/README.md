@@ -37,6 +37,23 @@ chain.
   route registered under an imported constant with spread handlers, which
   states no guard.
 - `handler-tables/`: a module-scope handler table with name keys, indexed
-  with a message field.
+  with a message field; a handler table handed to a package's constructor;
+  and a `Map` filled with `.set(Ops.SAVE, fn)`, where `Ops` is a `const`
+  object in a sibling file.
+
+Slice B2b (carrick#2386) adds the calls that name an operation in their
+arguments: a registration (a name and a function), an emission (a name and no
+function) and a construction (`new X(…)` with a name). Each `<name>.calls.json`
+holds every such call one fixture makes, with its names, its functions, the
+chain its callee is followed down, and the package receiver the library-site
+reader places it on, where it places one.
+
+- `listeners-and-sends/`: a class whose field is a runtime emitter, emitting
+  in one file and listened to in another; a listener on a package import; a
+  listener on a parameter with one in-repo caller; and a send on a package
+  maker's instance.
+- `message-switch/`, `constant-routes/` and `handler-tables/` also hold a
+  `.calls.json` key: the listeners, the sends, and a route registered under
+  an imported constant with spread handlers.
 
 Lines are 1-based. Files are relative to the fixture root.
