@@ -102,6 +102,9 @@ pub enum HoleReason {
     /// The function is handed to a call whose callee is none of a
     /// parameter, an import or a global.
     CalleeUnread,
+    /// A call that names an operation calls a function this repository
+    /// defines: what it does with the names is that function's.
+    OwnFunction,
     /// A named function nothing calls, hands on or exports.
     NoCallerNotExported,
     /// A function written in a body that is held in a local, returned or
@@ -299,6 +302,15 @@ pub enum GuardShape {
     Unresolved,
 }
 
+/// The shape of text a guard or a call states.
+fn shape_of(text: &str) -> GuardShape {
+    if is_producer_route_path(text) {
+        GuardShape::Path
+    } else {
+        GuardShape::Name
+    }
+}
+
 /// One literal a function compares a value against.
 #[derive(Debug, Clone)]
 pub(super) struct GuardIr {
@@ -334,6 +346,9 @@ pub(super) struct WrittenIn {
     callee: String,
     arg: usize,
     path: Vec<String>,
+    /// The call is a construction (`new X(…)`), kept in
+    /// [`FnIr::constructions`].
+    constructed: bool,
 }
 
 impl WrittenIn {
@@ -343,8 +358,24 @@ impl WrittenIn {
             callee: callee.to_string(),
             arg,
             path: Vec::new(),
+            constructed: false,
         }
     }
+}
+
+/// The text one argument of a call states, or one field of an object-literal
+/// argument does, as the value flow reads names ([`text_pieces`]), with no
+/// parameter in it: what a call that names an operation names. Read once
+/// every module's uses are known ([`LinkedNames`]).
+#[derive(Debug, Clone)]
+pub(super) struct ArgName {
+    arg: usize,
+    field: Option<String>,
+    pieces: Vec<TextPiece>,
+    /// The source text, kept when a piece is a constant, for one that does
+    /// not read as text.
+    written: String,
+    constant: Option<Constant>,
 }
 
 /// One entry of an object-literal table a module declares.
@@ -560,9 +591,16 @@ impl WalkState {
         })
     }
 
-    /// Record where each function written inside `expr`, an argument, sits.
+    /// Record where each function written inside `expr`, an argument, sits:
+    /// the argument itself, or a value inside the objects and arrays it
+    /// writes.
     pub(super) fn place_functions_in(&mut self, expr: &Expr, written_in: &WrittenIn) {
-        place(expr, written_in, &mut Vec::new(), &mut self.placed, 0);
+        let start = match unwrap_expression(expr) {
+            Expr::Arrow(arrow) => arrow.span.lo.0,
+            Expr::Fn(function) => function.function.span.lo.0,
+            _ => return place(expr, written_in, &mut Vec::new(), &mut self.placed, 0),
+        };
+        self.placed.insert(start, written_in.clone());
     }
 
     /// Where the function whose node is `span` sits in an argument, if it
@@ -796,13 +834,12 @@ impl Reader<'_> {
     /// for every position from a spread on.
     pub(super) fn arg_subjects(
         &self,
-        call: &CallExpr,
+        args: &[ExprOrSpread],
         scope: &Scope<'_>,
         bound: &Bound,
     ) -> Vec<Option<Subject>> {
         let mut spread = false;
-        call.args
-            .iter()
+        args.iter()
             .map(|arg| {
                 spread |= arg.spread.is_some();
                 match &*arg.expr {
@@ -820,12 +857,12 @@ impl Reader<'_> {
     /// down to it.
     pub(super) fn handed(
         &self,
-        call: &CallExpr,
+        args: &[ExprOrSpread],
         scope: &Scope<'_>,
         bound: &Bound,
     ) -> Vec<(usize, Vec<String>, String)> {
         let mut handed = Vec::new();
-        for (index, arg) in call.args.iter().enumerate() {
+        for (index, arg) in args.iter().enumerate() {
             if arg.spread.is_some() {
                 break;
             }
@@ -846,6 +883,71 @@ impl Reader<'_> {
             }
         }
         handed
+    }
+
+    /// The text each argument before any spread states, and each field of an
+    /// object-literal argument, as the value flow reads names: a literal, a
+    /// constant, or text built from them, never a parameter (what a caller
+    /// decides). A function written in place states none.
+    pub(super) fn arg_names(&self, args: &[ExprOrSpread], scope: &Scope<'_>) -> Vec<ArgName> {
+        let mut names = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            if arg.spread.is_some() {
+                break;
+            }
+            match unwrap_expression(&arg.expr) {
+                Expr::Arrow(_) | Expr::Fn(_) => {}
+                Expr::Object(object) => {
+                    for prop in &object.props {
+                        let PropOrSpread::Prop(prop) = prop else {
+                            continue;
+                        };
+                        match &**prop {
+                            Prop::KeyValue(kv) => {
+                                if let Some(key) = prop_name(&kv.key) {
+                                    names.extend(self.arg_name(index, Some(key), &kv.value, scope));
+                                }
+                            }
+                            Prop::Shorthand(ident) => {
+                                let value = Expr::Ident(ident.clone());
+                                let key = Some(ident.sym.to_string());
+                                names.extend(self.arg_name(index, key, &value, scope));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                expr => names.extend(self.arg_name(index, None, expr, scope)),
+            }
+        }
+        names
+    }
+
+    fn arg_name(
+        &self,
+        arg: usize,
+        field: Option<String>,
+        expr: &Expr,
+        scope: &Scope<'_>,
+    ) -> Option<ArgName> {
+        let pieces = text_pieces(expr, scope)?;
+        if names_a_param(&pieces) {
+            return None;
+        }
+        let literal = pieces
+            .iter()
+            .all(|piece| matches!(piece, TextPiece::Lit(_)));
+        Some(ArgName {
+            arg,
+            field,
+            constant: constant_of(&pieces, scope),
+            written: if literal {
+                String::new()
+            } else {
+                self.text(expr.span())
+            },
+            pieces,
+        })
     }
 
     /// Record where each binding `pat` declares from `init` comes from, by
@@ -1038,12 +1140,18 @@ fn names_a_param(pieces: &[TextPiece]) -> bool {
     })
 }
 
-/// Whether a builder's call is among `pieces`: what it returns is a
-/// constant only when it reads as text.
-fn calls_a_builder(pieces: &[TextPiece]) -> bool {
-    pieces
-        .iter()
-        .any(|piece| matches!(piece, TextPiece::Named(named) if named.args.is_some()))
+/// The import a constant is read through, when `pieces` is one named piece
+/// the module imports.
+fn constant_of(pieces: &[TextPiece], scope: &Scope<'_>) -> Option<Constant> {
+    let [TextPiece::Named(named)] = pieces else {
+        return None;
+    };
+    let (specifier, export) = scope.module.guards.imports.get(&named.binding)?;
+    Some(Constant {
+        specifier: specifier.clone(),
+        export: export.clone(),
+        path: named.path.clone(),
+    })
 }
 
 /// The text of `pieces` when every piece is literal.
@@ -1133,24 +1241,58 @@ impl CallWalker<'_, '_, '_> {
         {
             return None;
         }
-        let constant =
-            match pieces.as_slice() {
-                [TextPiece::Named(named)] => {
-                    self.scope.module.guards.imports.get(&named.binding).map(
-                        |(specifier, export)| Constant {
-                            specifier: specifier.clone(),
-                            export: export.clone(),
-                            path: named.path.clone(),
-                        },
-                    )
-                }
-                _ => None,
-            };
         Some(GuardLiteral::Named {
+            constant: constant_of(&pieces, self.scope),
             pieces,
             written: self.reader.text(expr.span()),
-            constant,
         })
+    }
+
+    /// `new X(…)` of a constructor that is not the language's own: kept as a
+    /// call is, apart from the calls, with each function written in its
+    /// arguments placed in it.
+    pub(super) fn record_construction(&mut self, new: &NewExpr) {
+        let site = self.reader.site(new.span);
+        let callee_text = self.reader.text(new.callee.span());
+        let args = new.args.as_deref().unwrap_or_default();
+        for (index, arg) in args.iter().enumerate() {
+            let written_in = WrittenIn {
+                constructed: true,
+                ..WrittenIn::argument(site, &callee_text, index)
+            };
+            self.guard.place_functions_in(&arg.expr, &written_in);
+        }
+        let spread = args.iter().any(|arg| arg.spread.is_some());
+        let callee = match unwrap_expression(&new.callee) {
+            Expr::Ident(ident) => ident.sym.to_string(),
+            Expr::Member(member) => member_prop(member).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let bound = &self.guard.bound;
+        let construction = CallIr {
+            site,
+            callee,
+            args: Vec::new(),
+            request: None,
+            waited: false,
+            inert: false,
+            invokes_param: None,
+            receiver: None,
+            site_args: (!spread).then(|| {
+                args.iter()
+                    .map(|arg| super::library_sites::site_arg(&arg.expr, self.scope))
+                    .collect()
+            }),
+            name_line: self.reader.line(new.callee.span()),
+            jsx: false,
+            arg_subjects: self.reader.arg_subjects(args, self.scope, bound),
+            callee_subject: Some(self.reader.subject(&new.callee, self.scope, bound)),
+            callee_text,
+            tested: None,
+            handed: self.reader.handed(args, self.scope, bound),
+            names: self.reader.arg_names(args, self.scope),
+        };
+        self.ir.constructions.push(construction);
     }
 
     /// The literal one operand states.
@@ -1410,6 +1552,9 @@ pub enum Hop {
         steps: Vec<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         args: Vec<HopArg>,
+        /// The call is a construction (`new X(…)`).
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        constructed: bool,
     },
     /// Out to an enclosing function, whose parameter it is.
     Enclosed { file: String, line: u32 },
@@ -1435,6 +1580,8 @@ pub struct Within {
     pub path: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<HopArg>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub constructed: bool,
 }
 
 /// Where a chain ends.
@@ -1556,6 +1703,8 @@ struct Chains<'a> {
     nodes: Vec<Node<'a>>,
     /// (file, span start, span end) of each call -> (node, call index).
     calls: HashMap<(&'a Path, u32, u32), (usize, usize)>,
+    /// The same for each construction.
+    constructions: HashMap<(&'a Path, u32, u32), (usize, usize)>,
     /// Each definition's in-repo callers: (file, span start, span end).
     callers: HashMap<(PathBuf, String), Vec<CallerSite>>,
     /// (file, function name) -> each call that hands it on.
@@ -1565,9 +1714,17 @@ struct Chains<'a> {
 /// A call site that reaches a definition: its file, span start and end.
 type CallerSite = (PathBuf, u32, u32);
 
-/// A call that hands a function on: (node, call index, argument, keys down
-/// to the function inside the argument).
-type HandedAt = (usize, usize, usize, Vec<String>);
+/// One call or construction of a node, by its index in [`FnIr::calls`] or
+/// [`FnIr::constructions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum At {
+    Call(usize),
+    New(usize),
+}
+
+/// A call that hands a function on: (node, the call, argument, keys down to
+/// the function inside the argument).
+type HandedAt = (usize, At, usize, Vec<String>);
 
 /// Every chain the guards in `inputs` state, sorted, with each file named
 /// relative to `root`.
@@ -1598,6 +1755,7 @@ impl<'a> Chains<'a> {
             names: LinkedNames::link(&inputs.files, &inputs.bindings),
             nodes: Vec::new(),
             calls: HashMap::new(),
+            constructions: HashMap::new(),
             callers: HashMap::new(),
             handed: HashMap::new(),
         };
@@ -1626,16 +1784,23 @@ impl<'a> Chains<'a> {
             chains.collect(path, None, false, &file.module_level, None, &by_start);
         }
         for (index, node) in chains.nodes.iter().enumerate() {
-            for (call_index, call) in node.ir.calls.iter().enumerate() {
-                chains
-                    .calls
-                    .insert((node.file, call.site.lo, call.site.hi), (index, call_index));
+            let every = (node.ir.calls.iter().enumerate())
+                .map(|(i, call)| (At::Call(i), call))
+                .chain(
+                    (node.ir.constructions.iter().enumerate()).map(|(i, call)| (At::New(i), call)),
+                );
+            for (at, call) in every {
+                let (map, i) = match at {
+                    At::Call(i) => (&mut chains.calls, i),
+                    At::New(i) => (&mut chains.constructions, i),
+                };
+                map.insert((node.file, call.site.lo, call.site.hi), (index, i));
                 for (arg, path, name) in &call.handed {
                     chains
                         .handed
                         .entry((node.file, name.clone()))
                         .or_default()
-                        .push((index, call_index, *arg, path.clone()));
+                        .push((index, at, *arg, path.clone()));
                 }
             }
         }
@@ -1701,34 +1866,26 @@ impl<'a> Chains<'a> {
     }
 
     /// The literal a guard compares with, its shape, and the import an
-    /// unread constant comes through. `None` for a builder's call that
-    /// reads as no text: what a call returns is no constant, so neither side
-    /// is known to be the literal.
+    /// unread constant comes through. A constant that reads as no text, a
+    /// builder's call among them, is kept as written: the hole and its
+    /// reason are what the model reads.
     fn literal(
         &self,
         node: usize,
         literal: &GuardLiteral,
-    ) -> Option<(String, GuardShape, Option<Constant>)> {
-        let shape = |text: &str| {
-            if is_producer_route_path(text) {
-                GuardShape::Path
-            } else {
-                GuardShape::Name
-            }
-        };
+    ) -> (String, GuardShape, Option<Constant>) {
         match literal {
-            GuardLiteral::Text(text) => Some((text.clone(), shape(text), None)),
+            GuardLiteral::Text(text) => (text.clone(), shape_of(text), None),
             GuardLiteral::Named {
                 pieces,
                 written,
                 constant,
             } => match self.names.text(self.nodes[node].file, pieces) {
                 Some(text) => {
-                    let shape = shape(&text);
-                    Some((text, shape, None))
+                    let shape = shape_of(&text);
+                    (text, shape, None)
                 }
-                None if calls_a_builder(pieces) => None,
-                None => Some((written.clone(), GuardShape::Unresolved, constant.clone())),
+                None => (written.clone(), GuardShape::Unresolved, constant.clone()),
             },
         }
     }
@@ -1764,14 +1921,27 @@ impl<'a> Chains<'a> {
         {
             handed.extend(calls.iter().cloned());
         }
-        if let Some(written_in) = &current.ir.written_in
-            && let Some(&(n, c)) =
-                self.calls
-                    .get(&(current.file, written_in.site.lo, written_in.site.hi))
-        {
-            handed.push((n, c, written_in.arg, written_in.path.clone()));
+        if let Some(written_in) = &current.ir.written_in {
+            let (map, at): (_, fn(usize) -> At) = if written_in.constructed {
+                (&self.constructions, At::New)
+            } else {
+                (&self.calls, At::Call)
+            };
+            if let Some(&(n, c)) = map.get(&(current.file, written_in.site.lo, written_in.site.hi))
+            {
+                handed.push((n, at(c), written_in.arg, written_in.path.clone()));
+            }
         }
         handed
+    }
+
+    /// The call or construction `at` of `node`.
+    fn call(&self, node: usize, at: At) -> &'a CallIr {
+        let ir = self.nodes[node].ir;
+        match at {
+            At::Call(index) => &ir.calls[index],
+            At::New(index) => &ir.constructions[index],
+        }
     }
 
     /// The calls `node` is handed to, as a chain that stops inside it with
@@ -1779,9 +1949,9 @@ impl<'a> Chains<'a> {
     fn within(&self, node: usize) -> Vec<Within> {
         self.handed_at(node)
             .into_iter()
-            .map(|(caller, call_index, arg, path)| {
+            .map(|(caller, at, arg, path)| {
                 let file = self.nodes[caller].file;
-                let call = &self.nodes[caller].ir.calls[call_index];
+                let call = self.call(caller, at);
                 Within {
                     file: self.rel(file),
                     line: call.site.line,
@@ -1789,6 +1959,7 @@ impl<'a> Chains<'a> {
                     arg,
                     path,
                     args: self.other_args(file, call, arg),
+                    constructed: matches!(at, At::New(_)),
                 }
             })
             .collect()
@@ -1820,9 +1991,7 @@ impl<'a> Chains<'a> {
     }
 
     fn of_guard(&self, node: usize, guard: &GuardIr) -> Vec<GuardChain> {
-        let Some((literal, shape, constant)) = self.literal(node, &guard.literal) else {
-            return Vec::new();
-        };
+        let (literal, shape, constant) = self.literal(node, &guard.literal);
         let returns = &self.nodes[node].ir.returns_tests;
         let is_predicate = !returns.is_empty() && returns.iter().all(|test| *test);
         let branch = match &guard.branch {
@@ -2013,8 +2182,8 @@ impl<'a> Chains<'a> {
         // Handed to a call: by name, or written in one of its arguments.
         let handed = self.handed_at(node);
         if !handed.is_empty() {
-            for (caller, call_index, arg, path) in handed {
-                self.handed_to(caller, call_index, arg, path, index, trace.clone(), ends);
+            for (caller, at, arg, path) in handed {
+                self.handed_to(caller, at, arg, path, index, trace.clone(), ends);
             }
             return;
         }
@@ -2036,7 +2205,7 @@ impl<'a> Chains<'a> {
     fn handed_to(
         &self,
         node: usize,
-        call_index: usize,
+        at: At,
         arg: usize,
         path: Vec<String>,
         param: usize,
@@ -2044,7 +2213,7 @@ impl<'a> Chains<'a> {
         ends: &mut Ends,
     ) {
         let file = self.nodes[node].file;
-        let call = &self.nodes[node].ir.calls[call_index];
+        let call = self.call(node, at);
         trace.hops.push(Hop::HandedTo {
             file: self.rel(file),
             line: call.site.line,
@@ -2054,6 +2223,7 @@ impl<'a> Chains<'a> {
             param,
             steps: trace.subject.rendered_steps(),
             args: self.other_args(file, call, arg),
+            constructed: matches!(at, At::New(_)),
         });
         let at_call = |reason, text: Option<String>| ChainEnd::Hole {
             reason,
@@ -2103,6 +2273,376 @@ impl<'a> Chains<'a> {
                 ends.push(trace, at_call(HoleReason::CalleeUnread, text));
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The calls that name an operation.
+
+/// What a named call is: a name and a function (`bus.on("item", fn)`,
+/// `table.set(Ops.SAVE, fn)`), a name and no function (`sender.send("DONE",
+/// data)`), or a construction that names one (`new Channel({ handlers: {
+/// PING: fn } })`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallStart {
+    Registration,
+    Emission,
+    Construction,
+}
+
+/// Where a call's name is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameFrom {
+    /// The argument itself.
+    Argument,
+    /// A field of an object-literal argument (`{ type: "START" }`).
+    Field,
+    /// The key a function sits under in an object argument (`{ handlers: {
+    /// PING: fn } }`).
+    Key,
+}
+
+/// One name a call states: text, or a constant the value flow cannot read,
+/// kept as written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CallName {
+    pub arg: usize,
+    pub from: NameFrom,
+    /// The field, or the keys down to the function.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
+    pub text: String,
+    pub shape: GuardShape,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constant: Option<Constant>,
+}
+
+/// One function a call is handed: written in an argument, or named there.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct CallFunction {
+    pub arg: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
+    /// The function's name, for one the module declares and the call hands
+    /// on by name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Where a named call's callee comes from: the hops out of the function the
+/// call is written in, and the end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CallChain {
+    pub hops: Vec<Hop>,
+    pub end: ChainEnd,
+}
+
+/// The package receiver the library-site reader places a call on
+/// ([`super::library_sites`]): the import, each receiver id it may be made
+/// through, and the member path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LibraryReceiver {
+    pub specifier: String,
+    pub export: String,
+    pub receivers: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+}
+
+/// One call that names an operation in its arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NamedCall {
+    pub start: CallStart,
+    pub site: ChainSite,
+    /// The callee as written.
+    pub callee: String,
+    /// The member called, when the callee is a member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    /// A call on a runtime global, or one of the language's collections,
+    /// that sends nothing.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub inert: bool,
+    /// An argument is spread: positions after it are not read.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub spread: bool,
+    pub names: Vec<CallName>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub functions: Vec<CallFunction>,
+    pub chains: Vec<CallChain>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub library: Vec<LibraryReceiver>,
+}
+
+/// (file, whether a construction, span start, span end) of a call -> each
+/// function written in its arguments: the argument and the keys down to it.
+type Placed<'a> = HashMap<(&'a Path, bool, u32, u32), Vec<(usize, Vec<String>)>>;
+
+/// (file, span start, span end), SWC numbering -> the package receivers the
+/// library-site reader places the call there on.
+type Receivers = HashMap<(PathBuf, u32, u32), Vec<LibraryReceiver>>;
+
+/// Every call and construction in `inputs` that names an operation in its
+/// arguments, with the chain its callee is followed down, sorted, each file
+/// named relative to `root`. A JSX element names no operation, and a
+/// `startsWith` test is a guard.
+pub fn named_calls(inputs: &RequestSummaryInputs, root: &Path) -> Vec<NamedCall> {
+    let chains = Chains::new(inputs, root);
+    let mut receivers: Receivers = HashMap::new();
+    for site in super::library_sites::library_sites(inputs).sites {
+        // A site a caller fills is the library call inside the function the
+        // caller calls, not a call at the caller's span.
+        if site.origin.is_some() {
+            continue;
+        }
+        receivers
+            .entry((site.file.clone(), site.span_start, site.span_end))
+            .or_default()
+            .push(LibraryReceiver {
+                receivers: site.receiver_ids(),
+                specifier: site.specifier,
+                export: site.export,
+                path: site.path,
+                member: site.member,
+            });
+    }
+    let mut placed: Placed<'_> = HashMap::new();
+    for node in &chains.nodes {
+        if let Some(written_in) = &node.ir.written_in {
+            placed
+                .entry((
+                    node.file,
+                    written_in.constructed,
+                    written_in.site.lo,
+                    written_in.site.hi,
+                ))
+                .or_default()
+                .push((written_in.arg, written_in.path.clone()));
+        }
+    }
+    let mut out = Vec::new();
+    for (index, node) in chains.nodes.iter().enumerate() {
+        let tests: HashSet<(u32, u32)> = node
+            .ir
+            .guards
+            .iter()
+            .filter(|guard| guard.position == GuardPosition::StartsWith)
+            .map(|guard| (guard.site.lo, guard.site.hi))
+            .collect();
+        for (call_index, call) in node.ir.calls.iter().enumerate() {
+            if call.jsx || tests.contains(&(call.site.lo, call.site.hi)) {
+                continue;
+            }
+            out.extend(chains.named_call(index, At::Call(call_index), &placed, &receivers));
+        }
+        for call_index in 0..node.ir.constructions.len() {
+            out.extend(chains.named_call(index, At::New(call_index), &placed, &receivers));
+        }
+    }
+    out.sort_by_cached_key(|call| {
+        (
+            call.site.clone(),
+            call.callee.clone(),
+            serde_json::to_string(call).unwrap_or_default(),
+        )
+    });
+    out
+}
+
+impl<'a> Chains<'a> {
+    /// The call `at` of `node` as a named call, when it names one.
+    fn named_call(
+        &self,
+        node: usize,
+        at: At,
+        placed: &Placed<'_>,
+        receivers: &Receivers,
+    ) -> Option<NamedCall> {
+        let file = self.nodes[node].file;
+        let call = self.call(node, at);
+        let constructed = matches!(at, At::New(_));
+        let mut functions: Vec<CallFunction> = placed
+            .get(&(file, constructed, call.site.lo, call.site.hi))
+            .into_iter()
+            .flatten()
+            .map(|(arg, path)| CallFunction {
+                arg: *arg,
+                path: path.clone(),
+                name: None,
+            })
+            .chain(call.handed.iter().map(|(arg, path, name)| CallFunction {
+                arg: *arg,
+                path: path.clone(),
+                name: Some(name.clone()),
+            }))
+            .collect();
+        functions.sort();
+        functions.dedup();
+        let mut names: Vec<CallName> = call
+            .names
+            .iter()
+            .filter_map(|name| self.call_name(file, name))
+            .collect();
+        // The key a function sits under names it; an array's index does
+        // not.
+        names.extend(functions.iter().filter_map(|function| {
+            let key = function.path.last()?;
+            if key.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            Some(CallName {
+                arg: function.arg,
+                from: NameFrom::Key,
+                path: function.path.clone(),
+                text: key.clone(),
+                shape: shape_of(key),
+                constant: None,
+            })
+        }));
+        if names.is_empty() {
+            return None;
+        }
+        names.sort_by(|a, b| (a.arg, &a.path, &a.text).cmp(&(b.arg, &b.path, &b.text)));
+        let start = if constructed {
+            CallStart::Construction
+        } else if functions.is_empty() {
+            CallStart::Emission
+        } else {
+            CallStart::Registration
+        };
+        let trace = Trace {
+            subject: Subject::hole(HoleReason::UnreadExpression),
+            hops: Vec::new(),
+            branch: Some(Vec::new()),
+            negated: false,
+            passed: Vec::new(),
+        };
+        let mut ends = Ends::default();
+        self.callee_end(node, call, trace, &mut ends);
+        Some(NamedCall {
+            start,
+            site: ChainSite {
+                file: self.rel(file),
+                line: call.site.line,
+            },
+            callee: call.callee_text.clone(),
+            member: (!call.callee.is_empty() && call.callee != call.callee_text)
+                .then(|| call.callee.clone()),
+            inert: call.inert,
+            spread: call.site_args.is_none(),
+            names,
+            functions,
+            chains: ends
+                .found
+                .into_iter()
+                .map(|(trace, end)| CallChain {
+                    hops: trace.hops,
+                    end,
+                })
+                .collect(),
+            library: receivers
+                .get(&(file.to_path_buf(), call.site.span_start, call.site.span_end))
+                .cloned()
+                .unwrap_or_default(),
+        })
+    }
+
+    /// One name an argument states, read once every module's uses are
+    /// known. A binding that is known to hold no text (an import of a
+    /// function, a router, an instance a module declares) names nothing;
+    /// a constant the value flow cannot read is kept as written.
+    fn call_name(&self, file: &Path, name: &ArgName) -> Option<CallName> {
+        let (from, path) = match &name.field {
+            Some(field) => (NameFrom::Field, vec![field.clone()]),
+            None => (NameFrom::Argument, Vec::new()),
+        };
+        if let Some(text) = self.names.text(file, &name.pieces) {
+            return Some(CallName {
+                arg: name.arg,
+                from,
+                path,
+                shape: shape_of(&text),
+                text,
+                constant: None,
+            });
+        }
+        let holds_no_text = name.pieces.iter().any(|piece| {
+            matches!(piece, TextPiece::Named(named)
+                if named.args.is_none()
+                    && named.path.is_empty()
+                    && self.names.holds_no_text(file, &named.binding))
+        });
+        if holds_no_text {
+            return None;
+        }
+        Some(CallName {
+            arg: name.arg,
+            from,
+            path,
+            text: name.written.clone(),
+            shape: GuardShape::Unresolved,
+            constant: name.constant.clone(),
+        })
+    }
+
+    /// Where a named call's callee comes from, as the hop into a call a
+    /// function is handed to reads it ([`Self::handed_to`]): a parameter is
+    /// followed out to its callers; a value imported from this service is
+    /// a hole, not a package.
+    fn callee_end(&self, node: usize, call: &CallIr, mut trace: Trace, ends: &mut Ends) {
+        let file = self.nodes[node].file;
+        let at_call = |reason, text: Option<String>| ChainEnd::Hole {
+            reason,
+            file: self.rel(file),
+            line: call.site.line,
+            text,
+        };
+        if self
+            .inputs
+            .sites
+            .target_at(file, call.site.lo, call.site.hi)
+            .is_some()
+        {
+            ends.push(trace, at_call(HoleReason::OwnFunction, None));
+            return;
+        }
+        let Some(callee) = call.callee_subject.clone() else {
+            ends.push(trace, at_call(HoleReason::CalleeUnread, None));
+            return;
+        };
+        let steps = callee.rendered_steps();
+        let end = match &callee.root {
+            Root::Param(..) | Root::Outer(..) => {
+                trace.subject = callee;
+                self.follow(node, trace, ends);
+                return;
+            }
+            Root::Import {
+                local,
+                specifier,
+                export,
+            } => {
+                if self.inputs.bindings.get(file, local).is_some() {
+                    at_call(HoleReason::InRepoValueImport, Some(local.clone()))
+                } else {
+                    ChainEnd::ExternalImport {
+                        specifier: specifier.clone(),
+                        export: export.clone(),
+                        steps,
+                    }
+                }
+            }
+            Root::Global(name) => ChainEnd::Global {
+                name: name.clone(),
+                steps,
+            },
+            _ => at_call(HoleReason::CalleeUnread, callee.text.clone()),
+        };
+        ends.push(trace, end);
     }
 }
 
@@ -2268,6 +2808,186 @@ mod tests {
             "receive-guards/handler-tables",
             "handler-tables",
             Keyed::All,
+        );
+    }
+
+    /// The named calls discovery reads in the fixture at `dir`, against the
+    /// `.calls.json` key written for it by hand.
+    fn assert_named_calls(dir: &str, key: &str) {
+        let root = fixture(dir);
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let calls = serde_json::to_value(named_calls(&inputs, &root)).expect("calls serialise");
+        let key_path = fixture(&format!("receive-guards/{key}.calls.json"));
+        let expected: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&key_path).expect("the key is readable"))
+                .expect("the key is JSON");
+        assert_eq!(
+            calls,
+            expected,
+            "named calls for {dir}:\n{}",
+            serde_json::to_string_pretty(&calls).unwrap_or_default()
+        );
+    }
+
+    /// A child process's and a worker's `message` listeners are
+    /// registrations; a send with a message field is an emission.
+    #[test]
+    fn a_message_listener_is_a_registration_under_its_event_name() {
+        assert_named_calls("receive-guards/message-switch", "message-switch");
+    }
+
+    /// A route registered under an imported constant with spread handlers
+    /// states the constant's text and reads the arguments before the spread.
+    #[test]
+    fn a_route_registered_under_an_imported_constant_states_its_text() {
+        assert_named_calls("receive-guards/constant-routes", "constant-routes");
+    }
+
+    /// A handler table handed to a package's constructor names each
+    /// handler by its key; a `Map` filled under a sibling file's constants
+    /// states their text.
+    #[test]
+    fn a_handler_table_in_a_construction_names_each_handler_by_its_key() {
+        assert_named_calls("receive-guards/handler-tables", "handler-tables");
+    }
+
+    /// Listeners and sends: on a field of a runtime emitter, on a package
+    /// import, on a parameter followed to its caller, and on a package
+    /// maker's instance, each with the receiver the library-site reader
+    /// places it on.
+    #[test]
+    fn listeners_and_sends_follow_their_receiver() {
+        assert_named_calls("receive-guards/listeners-and-sends", "listeners-and-sends");
+    }
+
+    /// The named calls of one service written from `files` (path, source),
+    /// with `manifest` as its package.json.
+    fn named_calls_in(manifest: &str, files: &[(&str, &str)]) -> Vec<NamedCall> {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(dir.path().join("package.json"), manifest)
+            .expect("the manifest is writable");
+        for (path, source) in files {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("the tree");
+            std::fs::write(path, source).expect("the source is writable");
+        }
+        let inputs = crate::engine::discover_request_inputs(dir.path());
+        named_calls(&inputs, dir.path())
+    }
+
+    /// A binding a module of the service declares as no name (a function,
+    /// an instance) names nothing when handed to a call; a package's
+    /// constant, and a builder's call that reads as no text, are kept as
+    /// written, `unresolved`; a parameter is the caller's value, so names
+    /// nothing.
+    #[test]
+    fn an_argument_names_text_or_a_constant_never_a_value_the_service_declares() {
+        let calls = named_calls_in(
+            r#"{ "name": "probe", "dependencies": { "invented-app": "1.0.0", "invented-protocol": "1.0.0" } }"#,
+            &[
+                (
+                    "src/router.ts",
+                    r#"export function router(): void {}
+export const store = new Map<string, string>();
+"#,
+                ),
+                (
+                    "src/main.ts",
+                    r#"import { app } from "invented-app";
+import { Topics, topicFor } from "invented-protocol";
+import { router, store } from "./router";
+
+app.use(router);
+app.use(store);
+app.emit(Topics.CREATED);
+app.emit(topicFor("updated"));
+
+export function relay(topic: string): void {
+  app.emit(topic);
+}
+"#,
+                ),
+            ],
+        );
+        let names: Vec<(u32, String, GuardShape, Option<Constant>)> = calls
+            .iter()
+            .flat_map(|call| {
+                call.names.iter().map(|name| {
+                    (
+                        call.site.line,
+                        name.text.clone(),
+                        name.shape,
+                        name.constant.clone(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                (
+                    7,
+                    "Topics.CREATED".to_string(),
+                    GuardShape::Unresolved,
+                    Some(Constant {
+                        specifier: "invented-protocol".to_string(),
+                        export: "Topics".to_string(),
+                        path: vec!["CREATED".to_string()],
+                    })
+                ),
+                (
+                    8,
+                    r#"topicFor("updated")"#.to_string(),
+                    GuardShape::Unresolved,
+                    Some(Constant {
+                        specifier: "invented-protocol".to_string(),
+                        export: "topicFor".to_string(),
+                        path: Vec::new(),
+                    })
+                ),
+                // The builder's own call names its text argument.
+                (8, "updated".to_string(), GuardShape::Name, None),
+            ],
+            "{calls:#?}"
+        );
+    }
+
+    /// A function written in a construction's argument is handed to the
+    /// construction, so a guard in it reaches the constructor's import
+    /// rather than stopping unplaced.
+    #[test]
+    fn a_guard_in_a_function_handed_to_a_construction_reaches_the_constructor() {
+        let chains = chains_in(&[(
+            "src/server.ts",
+            r#"import { Server } from "invented-ipc";
+
+export const server = new Server({
+  onMessage: (message: { type: string }) => {
+    if (message.type === "PING") {
+      return;
+    }
+  },
+});
+"#,
+        )]);
+        let (_, hops, end) = chains
+            .iter()
+            .find(|(literal, _, _)| literal == "PING")
+            .expect("a chain for PING");
+        assert_eq!(
+            hops,
+            &serde_json::json!([{
+                "kind": "handed_to", "file": "src/server.ts", "line": 3,
+                "callee": "Server", "arg": 0, "path": ["onMessage"], "param": 0,
+                "steps": ["type"], "constructed": true
+            }])
+        );
+        assert_eq!(
+            end,
+            &serde_json::json!({
+                "kind": "external_import", "specifier": "invented-ipc",
+                "export": "Server", "steps": []
+            })
         );
     }
 
@@ -2523,11 +3243,12 @@ export function mode(): string {
         );
     }
 
-    /// A builder called with text states the text it returns; a call that
-    /// reads as no text, or one handed a parameter, is no constant, so the
-    /// comparison states no guard.
+    /// A builder called with text states the text it returns. One that
+    /// reads as no text is kept as written, `unresolved`: what it returns is
+    /// for the model to read, and silence would hide the guard. One handed a
+    /// parameter is the caller's value, so the comparison states no guard.
     #[test]
-    fn only_a_builder_that_reads_as_text_is_a_constant() {
+    fn a_builder_that_reads_as_no_text_is_kept_unresolved() {
         let chains = chains_in(&[
             (
                 "src/topics.ts",
@@ -2564,7 +3285,11 @@ export function route(event: { topic: string }, kind: string): boolean {
             .iter()
             .map(|(literal, _, _)| literal.as_str())
             .collect();
-        assert_eq!(literals, vec!["orders.created"], "{chains:#?}");
+        assert_eq!(
+            literals,
+            vec!["orders.created", r#"lookup("updated")"#],
+            "{chains:#?}"
+        );
     }
 
     /// A `typeof` test compares a type tag, not a value the code was handed,
@@ -2810,9 +3535,136 @@ export class Feed {
                 println!("    holes: {:?}", counts.holes);
                 println!("    hole texts: {:?}", counts.hole_texts);
             }
+
+            // The named calls, by start, an inert emission apart from the
+            // rest.
+            let calls = named_calls(&inputs, root);
+            #[derive(Default, Debug)]
+            struct CallCounts {
+                calls: usize,
+                chains: usize,
+                spread: usize,
+                library: usize,
+                shapes: BTreeMap<String, usize>,
+                from: BTreeMap<String, usize>,
+                ends: BTreeMap<&'static str, usize>,
+                holes: BTreeMap<String, usize>,
+                hole_texts: BTreeMap<&'static str, usize>,
+            }
+            let mut starts: BTreeMap<&'static str, CallCounts> = BTreeMap::new();
+            for call in &calls {
+                let start = match (call.start, call.inert) {
+                    (CallStart::Registration, _) => "registration",
+                    (CallStart::Emission, false) => "emission",
+                    (CallStart::Emission, true) => "emission (inert)",
+                    (CallStart::Construction, _) => "construction",
+                };
+                let counts = starts.entry(start).or_default();
+                counts.calls += 1;
+                counts.chains += call.chains.len();
+                counts.spread += usize::from(call.spread);
+                counts.library += usize::from(!call.library.is_empty());
+                for named in &call.names {
+                    *counts
+                        .shapes
+                        .entry(name(serde_json::json!(named.shape)))
+                        .or_default() += 1;
+                    *counts
+                        .from
+                        .entry(name(serde_json::json!(named.from)))
+                        .or_default() += 1;
+                }
+                for chain in &call.chains {
+                    let kind = match &chain.end {
+                        ChainEnd::EntryPoint { .. } => "entry_point",
+                        ChainEnd::Literal { .. } => "literal",
+                        ChainEnd::Env { .. } => "env",
+                        ChainEnd::Global { .. } => "global",
+                        ChainEnd::ExternalImport { .. } => "external_import",
+                        ChainEnd::Hole { reason, text, .. } => {
+                            *counts
+                                .holes
+                                .entry(name(serde_json::json!(reason)))
+                                .or_default() += 1;
+                            let kind = text.as_deref().map_or("none", text_kind);
+                            *counts.hole_texts.entry(kind).or_default() += 1;
+                            "hole"
+                        }
+                    };
+                    *counts.ends.entry(kind).or_default() += 1;
+                }
+            }
+            println!("  named calls: {}", calls.len());
+            for (start, counts) in &starts {
+                println!(
+                    "  {start}: {} call(s), {} chain(s), {} spread, {} with a library receiver",
+                    counts.calls, counts.chains, counts.spread, counts.library
+                );
+                println!("    name shapes: {:?}", counts.shapes);
+                println!("    names from: {:?}", counts.from);
+                println!("    ends: {:?}", counts.ends);
+                println!("    holes: {:?}", counts.holes);
+                println!("    hole texts: {:?}", counts.hole_texts);
+            }
+
+            // The coverage check: every socket and pub/sub row the
+            // structural passes write should have a named call at its line.
+            // No client package lists are known offline, so only the rows
+            // the passes write with none are here.
+            let mut service_files: Vec<PathBuf> = inputs.files.keys().cloned().collect();
+            service_files.sort();
+            let sockets = crate::socket_io::scan_files(&service_files, &[]);
+            let modules = crate::workspace_resolver::WorkspaceIndex::build_with_aliases(root, None);
+            let bus = crate::event_emitter::scan_files(&service_files, &sockets, &modules, &[]);
+            let at_call: HashSet<(String, u32)> = calls
+                .iter()
+                .map(|call| (call.site.file.clone(), call.site.line))
+                .collect();
+            let rows = (sockets.listeners.iter())
+                .map(|op| ("socket listener", &op.key, &op.file_path, op.line))
+                .chain(
+                    (sockets.emitters.iter())
+                        .map(|op| ("socket emitter", &op.key, &op.file_path, op.line)),
+                )
+                .chain(
+                    (bus.subscribers.iter())
+                        .map(|op| ("pubsub subscriber", &op.key, &op.file_path, op.line)),
+                )
+                .chain(
+                    (bus.publishers.iter())
+                        .map(|op| ("pubsub publisher", &op.key, &op.file_path, op.line)),
+                );
+            let mut row_count = 0;
+            let mut misses = Vec::new();
+            for (kind, key, file, line) in rows {
+                row_count += 1;
+                let rel = file
+                    .strip_prefix(root)
+                    .unwrap_or(file)
+                    .to_string_lossy()
+                    .into_owned();
+                if !at_call.contains(&(rel.clone(), line)) {
+                    misses.push(serde_json::json!({
+                        "kind": kind, "key": format!("{key:?}"), "file": rel, "line": line,
+                    }));
+                }
+            }
+            println!(
+                "  coverage: {row_count} socket and pub/sub row(s), {} with no named call at their line",
+                misses.len()
+            );
+
             if let Some(out) = out.as_mut() {
                 for chain in &chains {
                     let line = serde_json::json!({ "root": root, "chain": chain });
+                    writeln!(out, "{line}").expect("the census output is writable");
+                }
+                for call in &calls {
+                    let line = serde_json::json!({ "root": root, "call": call });
+                    writeln!(out, "{line}").expect("the census output is writable");
+                }
+                for miss in &misses {
+                    let line = serde_json::json!({ "root": root, "coverage_miss": miss });
                     writeln!(out, "{line}").expect("the census output is writable");
                 }
                 for (file, line, value, position) in &unread {

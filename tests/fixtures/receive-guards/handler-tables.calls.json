@@ -1,0 +1,139 @@
+[
+  {
+    "start": "emission",
+    "site": { "file": "src/channel.ts", "line": 4 },
+    "callee": "console.log",
+    "member": "log",
+    "inert": true,
+    "names": [
+      { "arg": 0, "from": "argument", "text": "pong", "shape": "name" }
+    ],
+    "chains": [
+      {
+        "hops": [],
+        "end": { "kind": "global", "name": "console", "steps": ["log"] }
+      }
+    ]
+  },
+  {
+    "start": "construction",
+    "site": { "file": "src/channel.ts", "line": 11 },
+    "callee": "Channel",
+    "names": [
+      {
+        "arg": 0,
+        "from": "key",
+        "path": ["handlers", "PING"],
+        "text": "PING",
+        "shape": "name"
+      },
+      {
+        "arg": 0,
+        "from": "key",
+        "path": ["handlers", "STOP"],
+        "text": "STOP",
+        "shape": "name"
+      }
+    ],
+    "functions": [
+      { "arg": 0, "path": ["handlers", "PING"] },
+      { "arg": 0, "path": ["handlers", "STOP"], "name": "halt" }
+    ],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "external_import",
+          "specifier": "invented-ipc",
+          "export": "Channel",
+          "steps": []
+        }
+      }
+    ],
+    "library": [
+      {
+        "specifier": "invented-ipc",
+        "export": "Channel",
+        "receivers": ["export"]
+      }
+    ]
+  },
+  {
+    "start": "emission",
+    "site": { "file": "src/dispatch.ts", "line": 4 },
+    "callee": "console.log",
+    "member": "log",
+    "inert": true,
+    "names": [
+      { "arg": 0, "from": "argument", "text": "store", "shape": "name" }
+    ],
+    "chains": [
+      {
+        "hops": [],
+        "end": { "kind": "global", "name": "console", "steps": ["log"] }
+      }
+    ]
+  },
+  {
+    "start": "emission",
+    "site": { "file": "src/dispatch.ts", "line": 8 },
+    "callee": "console.log",
+    "member": "log",
+    "inert": true,
+    "names": [
+      { "arg": 0, "from": "argument", "text": "drop", "shape": "name" }
+    ],
+    "chains": [
+      {
+        "hops": [],
+        "end": { "kind": "global", "name": "console", "steps": ["log"] }
+      }
+    ]
+  },
+  {
+    "start": "registration",
+    "site": { "file": "src/registry.ts", "line": 10 },
+    "callee": "handlers.set",
+    "member": "set",
+    "inert": true,
+    "names": [
+      { "arg": 0, "from": "argument", "text": "notes.save", "shape": "name" }
+    ],
+    "functions": [{ "arg": 1 }],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "hole",
+          "reason": "callee_unread",
+          "file": "src/registry.ts",
+          "line": 10,
+          "text": "handlers"
+        }
+      }
+    ]
+  },
+  {
+    "start": "registration",
+    "site": { "file": "src/registry.ts", "line": 11 },
+    "callee": "handlers.set",
+    "member": "set",
+    "inert": true,
+    "names": [
+      { "arg": 0, "from": "argument", "text": "notes.load", "shape": "name" }
+    ],
+    "functions": [{ "arg": 1, "name": "saveNote" }],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "hole",
+          "reason": "callee_unread",
+          "file": "src/registry.ts",
+          "line": 11,
+          "text": "handlers"
+        }
+      }
+    ]
+  }
+]

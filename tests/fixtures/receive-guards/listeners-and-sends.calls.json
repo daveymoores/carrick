@@ -1,0 +1,174 @@
+[
+  {
+    "start": "emission",
+    "site": { "file": "src/app.ts", "line": 4 },
+    "callee": "console.log",
+    "member": "log",
+    "inert": true,
+    "names": [
+      { "arg": 0, "from": "argument", "text": "ready", "shape": "name" }
+    ],
+    "chains": [
+      {
+        "hops": [],
+        "end": { "kind": "global", "name": "console", "steps": ["log"] }
+      }
+    ]
+  },
+  {
+    "start": "registration",
+    "site": { "file": "src/app.ts", "line": 7 },
+    "callee": "app.on",
+    "member": "on",
+    "names": [
+      { "arg": 0, "from": "argument", "text": "ready", "shape": "name" }
+    ],
+    "functions": [{ "arg": 1, "name": "onReady" }],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "external_import",
+          "specifier": "invented-app",
+          "export": "app",
+          "steps": ["on"]
+        }
+      }
+    ],
+    "library": [
+      {
+        "specifier": "invented-app",
+        "export": "app",
+        "receivers": ["export"],
+        "member": "on"
+      }
+    ]
+  },
+  {
+    "start": "emission",
+    "site": { "file": "src/feed.ts", "line": 7 },
+    "callee": "this.events.emit",
+    "member": "emit",
+    "names": [
+      { "arg": 0, "from": "argument", "text": "item", "shape": "name" }
+    ],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "hole",
+          "reason": "callee_unread",
+          "file": "src/feed.ts",
+          "line": 7,
+          "text": "this.events"
+        }
+      }
+    ],
+    "library": [
+      {
+        "specifier": "node:events",
+        "export": "EventEmitter",
+        "receivers": ["instance:new"],
+        "member": "emit"
+      }
+    ]
+  },
+  {
+    "start": "registration",
+    "site": { "file": "src/reader.ts", "line": 4 },
+    "callee": "feed.events.on",
+    "member": "on",
+    "names": [
+      { "arg": 0, "from": "argument", "text": "item", "shape": "name" }
+    ],
+    "functions": [{ "arg": 1 }],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "hole",
+          "reason": "in_repo_value_import",
+          "file": "src/reader.ts",
+          "line": 4,
+          "text": "feed"
+        }
+      }
+    ]
+  },
+  {
+    "start": "emission",
+    "site": { "file": "src/sender.ts", "line": 6 },
+    "callee": "sender.send",
+    "member": "send",
+    "names": [
+      { "arg": 0, "from": "argument", "text": "DONE", "shape": "name" }
+    ],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "hole",
+          "reason": "callee_unread",
+          "file": "src/sender.ts",
+          "line": 6,
+          "text": "sender"
+        }
+      }
+    ],
+    "library": [
+      {
+        "specifier": "invented-app",
+        "export": "createSender",
+        "receivers": ["instance:()"],
+        "member": "send"
+      }
+    ]
+  },
+  {
+    "start": "registration",
+    "site": { "file": "src/view.ts", "line": 4 },
+    "callee": "view.on",
+    "member": "on",
+    "names": [
+      { "arg": 0, "from": "argument", "text": "blur", "shape": "name" }
+    ],
+    "functions": [{ "arg": 1 }],
+    "chains": [
+      {
+        "hops": [
+          {
+            "kind": "call",
+            "file": "src/view.ts",
+            "line": 10,
+            "callee": "attach",
+            "arg": 0
+          }
+        ],
+        "end": {
+          "kind": "entry_point",
+          "file": "src/view.ts",
+          "line": 9,
+          "function": "mount",
+          "param": 0,
+          "steps": ["on"]
+        }
+      }
+    ]
+  },
+  {
+    "start": "emission",
+    "site": { "file": "src/view.ts", "line": 5 },
+    "callee": "console.log",
+    "member": "log",
+    "inert": true,
+    "names": [
+      { "arg": 0, "from": "argument", "text": "blurred", "shape": "name" }
+    ],
+    "chains": [
+      {
+        "hops": [],
+        "end": { "kind": "global", "name": "console", "steps": ["log"] }
+      }
+    ]
+  }
+]
