@@ -1292,10 +1292,16 @@ impl<'a> CallResolver<'a> {
             return self.lookup_in_file(&binding.file, [name.to_string()]);
         }
 
-        let declaring_class = binding
-            .local_name
-            .clone()
-            .unwrap_or_else(|| symbol.imported_name.clone());
+        // A binding with no local name is published under its export name. A
+        // default import's `imported_name` is the importer's own local name,
+        // so an anonymous `export default { … }` is named `default` here, the
+        // key its members are indexed under (carrick#2396). A named export
+        // with no local binding (`exports.table = { … }`) keeps its own name.
+        let declaring_class = match (&binding.local_name, &symbol.kind) {
+            (Some(local), _) => local.clone(),
+            (None, SymbolKind::Default) => DEFAULT_EXPORT.to_string(),
+            (None, _) => symbol.imported_name.clone(),
+        };
         if let Some(target) =
             self.lookup_in_file(&binding.file, member_keys(&declaring_class, name))
         {
@@ -3101,6 +3107,37 @@ mod tests {
         assert_eq!(
             callee_names(&defs, "work"),
             ["CacheStore.read", "JobQueue.push"]
+        );
+        drop(dir);
+    }
+
+    /// A member call through a default import of an anonymous `export default
+    /// { … }` reaches the member, which is keyed `default.<member>`: the
+    /// importer's own local name is not the key (carrick#2396). A default
+    /// import of a named const object reaches it under the declared name.
+    #[test]
+    fn a_member_of_a_default_exported_object_resolves_through_the_import() {
+        let (dir, defs) = scan(&[
+            (
+                "src/worker.ts",
+                "export default {\n  async fetch(request: Request) {\n    return request;\n  },\n};\n",
+            ),
+            (
+                "src/bound.ts",
+                "const handler = {\n  handle(request: Request) {\n    return request;\n  },\n};\n\
+                 export default handler;\n",
+            ),
+            (
+                "src/probe.ts",
+                "import worker from \"./worker\";\n\
+                 import bound from \"./bound\";\n\
+                 export function probe(request: Request) {\n  bound.handle(request);\n  return worker.fetch(request);\n}\n",
+            ),
+        ]);
+
+        assert_eq!(
+            callee_names(&defs, "probe"),
+            ["default.fetch", "handler.handle"]
         );
         drop(dir);
     }

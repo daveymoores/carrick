@@ -7,23 +7,33 @@
 //! The scan is read from the stored blob rather than the projection: function
 //! definitions are what this is about, and the projection carries operations.
 //!
-//! See `tests/fixtures/object-export-surface/README.md` for the shape.
+//! See `tests/fixtures/object-export-surface/README.md` for the shape, and
+//! `tests/fixtures/default-export-members/README.md` for the carrick#2396
+//! forms: the same surface written through a type check or a named `const`,
+//! and the member call that reaches it through the import.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/object-export-surface")
+fn fixture_dir(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
 }
 
-/// The function definitions of one isolated offline scan, keyed as the scan
-/// keys them.
+/// The function definitions of one isolated offline scan of this file's main
+/// fixture, keyed as the scan keys them.
 fn function_definitions() -> serde_json::Map<String, serde_json::Value> {
+    function_definitions_of("object-export-surface")
+}
+
+/// The function definitions of one isolated offline scan of `fixture`.
+fn function_definitions_of(fixture: &str) -> serde_json::Map<String, serde_json::Value> {
     let cache = tempfile::tempdir().expect("temp cache dir");
-    let cassettes = fixture_dir().join("__llm__");
+    let cassettes = fixture_dir(fixture).join("__llm__");
 
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
-        .arg(fixture_dir())
+        .arg(fixture_dir(fixture))
         .env("CARRICK_LOCAL_STORAGE_DIR", cache.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
         .env("CARRICK_MOCK_ALL", "1")
@@ -197,4 +207,127 @@ fn a_module_that_exports_by_assignment_states_its_functions() {
         sweep["is_exported"], false,
         "nothing exports sweep: {sweep:#?}"
     );
+}
+
+/// The carrick#2396 fixture's definitions, unkeyed. Two of its files each
+/// define `default.fetch`, and the merge re-keys the second (carrick#582), so
+/// these tests match a definition by `(file_path, name)`, never by key.
+fn default_export_members() -> Vec<serde_json::Value> {
+    function_definitions_of("default-export-members")
+        .into_iter()
+        .map(|(_, definition)| definition)
+        .collect()
+}
+
+/// Every definition as `(file_path, name)`, for a panic message.
+fn located(definitions: &[serde_json::Value]) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = definitions
+        .iter()
+        .map(|d| {
+            (
+                d["file_path"].as_str().unwrap_or_default().to_string(),
+                d["name"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn find_in<'a>(
+    definitions: &'a [serde_json::Value],
+    file: &str,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    definitions
+        .iter()
+        .find(|d| d["file_path"] == file && d["name"] == name)
+}
+
+fn definition_in<'a>(
+    definitions: &'a [serde_json::Value],
+    file: &str,
+    name: &str,
+) -> &'a serde_json::Value {
+    find_in(definitions, file, name)
+        .unwrap_or_else(|| panic!("no definition {name} in {file}: {:?}", located(definitions)))
+}
+
+/// carrick#2396: each exported object, in each form, states its member as an
+/// exported function, keyed by the name the module declares the object under.
+#[test]
+fn every_exported_object_form_states_its_members() {
+    let definitions = default_export_members();
+
+    for (file, name, line) in [
+        // `export default { … }`
+        ("src/anonymous.ts", "default.fetch", 3),
+        // `export default { … } satisfies Handler`
+        ("src/satisfied.ts", "default.fetch", 5),
+        // `const worker: Handler = { … }; export default worker`
+        ("src/bound.ts", "worker.fetch", 5),
+        // `export { jobs }` written before `const jobs = ({ … }) as Jobs`
+        ("src/listed.ts", "jobs.run", 8),
+        // `export { queue as tasks }`: keyed by the declared name
+        ("src/renamed.ts", "queue.drain", 4),
+        // `export const scheduled = { … } satisfies Jobs`
+        ("src/declared.ts", "scheduled.run", 5),
+        // `const store = { … }; module.exports = store`
+        ("src/assigned.js", "store.flush", 4),
+    ] {
+        let def = definition_in(&definitions, file, name);
+        assert_eq!(def["line_number"], line, "{file} {name}: {def:#?}");
+        assert_eq!(def["is_exported"], true, "{file} {name}: {def:#?}");
+    }
+
+    // The bounds: a module-local object, a `let` that is exported but can be
+    // replaced, and a function-local `const` that shares an exported name.
+    for (file, name) in [
+        ("src/bounds.ts", "internal.tidy"),
+        ("src/bounds.ts", "state.reset"),
+        ("src/bounds.ts", "state.hidden"),
+    ] {
+        assert!(
+            find_in(&definitions, file, name).is_none(),
+            "{name} is not on the module's export surface: {:?}",
+            located(&definitions)
+        );
+    }
+}
+
+/// carrick#2396: a member call through the import the module gives its object
+/// reaches that member's definition: the default import of an anonymous
+/// object, of one checked with `satisfies`, of a named const, and a named
+/// import of a const exported by name or under another name.
+#[test]
+fn a_member_call_through_the_import_reaches_the_definition() {
+    let definitions = default_export_members();
+    let dispatch = definition_in(&definitions, "src/caller.ts", "dispatch");
+
+    let mut calls: Vec<(String, String, u64)> = dispatch["calls"]
+        .as_array()
+        .expect("calls")
+        .iter()
+        .map(|c| {
+            (
+                c["file_path"].as_str().unwrap_or_default().to_string(),
+                c["name"].as_str().unwrap_or_default().to_string(),
+                c["call_site_line"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect();
+    calls.sort();
+
+    let expected: Vec<(String, String, u64)> = [
+        ("src/anonymous.ts", "default.fetch", 11),
+        ("src/bound.ts", "worker.fetch", 13),
+        ("src/declared.ts", "scheduled.run", 15),
+        ("src/listed.ts", "jobs.run", 16),
+        ("src/renamed.ts", "queue.drain", 14),
+        ("src/satisfied.ts", "default.fetch", 12),
+    ]
+    .into_iter()
+    .map(|(f, n, l)| (f.to_string(), n.to_string(), l))
+    .collect();
+    assert_eq!(calls, expected);
 }

@@ -625,7 +625,9 @@ fn collect_exports(module: &swc_ecma_ast::Module) -> ModuleExports {
             },
             // `export default routes;`, `export default async (s) => {};`
             ModuleDecl::ExportDefaultExpr(export) => {
-                let local = match &*export.expr {
+                // `export default worker satisfies Handler` names `worker` as
+                // surely as the bare form does (carrick#2396).
+                let local = match crate::swc_scanner::unwrap_expr(&export.expr) {
                     Expr::Ident(ident) => Some(ident.sym.to_string()),
                     _ => None,
                 };
