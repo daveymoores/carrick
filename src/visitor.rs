@@ -1843,6 +1843,44 @@ impl FunctionDefinitionExtractor {
         }
     }
 
+    /// Index the function-valued members of a module-scope `const` object the
+    /// module exports by name rather than in its declaration: `const worker =
+    /// { async fetch(req) {} }; export default worker`, `export { worker }`,
+    /// `export { worker as handler }`, `module.exports = worker` (carrick#2396).
+    ///
+    /// The object is the module's surface exactly as `export const worker = {
+    /// … }` is, so its members are keyed `worker.<member>` the same way, and an
+    /// importer resolves them through the binding's local name whatever it was
+    /// exported as. Runs after the module walk because the export may be
+    /// written before or after the declaration, and only over top-level
+    /// statements: `export const` declarations are collected where they are
+    /// declared, and a `const` inside a function is not the module's to offer.
+    /// `let` and `var` are skipped, since a later assignment can replace them.
+    fn collect_exported_local_objects(&mut self, module: &Module) {
+        for item in &module.body {
+            let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
+                continue;
+            };
+            if var.kind != VarDeclKind::Const {
+                continue;
+            }
+            for decl in &var.decls {
+                let Pat::Ident(ident) = &decl.name else {
+                    continue;
+                };
+                let name = ident.id.sym.to_string();
+                if !self.exported_names.contains(&name) {
+                    continue;
+                }
+                if let Some(init) = &decl.init
+                    && let Expr::Object(object) = crate::swc_scanner::unwrap_expr(init)
+                {
+                    self.collect_exported_object_members(&name, object, 0);
+                }
+            }
+        }
+    }
+
     /// The export a CommonJS assignment writes to, if it writes to one.
     ///
     /// `exports.handler` and `module.exports.handler` are the named export
@@ -1884,7 +1922,7 @@ impl FunctionDefinitionExtractor {
     /// function the module declared elsewhere: that already has a definition at
     /// its own key, and what the assignment adds is that the module offers it.
     fn record_cjs_export(&mut self, name: String, value: &Expr) {
-        match value {
+        match crate::swc_scanner::unwrap_expr(value) {
             Expr::Arrow(arrow) => {
                 self.insert_arrow_definition(name.clone(), arrow);
                 self.exported_names.insert(name);
@@ -1921,7 +1959,7 @@ impl Visit for FunctionDefinitionExtractor {
                         // exported object's function members are part of the
                         // module's surface (carrick#830).
                         if let Some(init) = &decl.init
-                            && let Expr::Object(object) = &**init
+                            && let Expr::Object(object) = crate::swc_scanner::unwrap_expr(init)
                         {
                             self.collect_exported_object_members(&name, object, 0);
                         }
@@ -1996,7 +2034,9 @@ impl Visit for FunctionDefinitionExtractor {
 
     /// Track `export default foo` (expression)
     fn visit_export_default_expr(&mut self, export: &ExportDefaultExpr) {
-        match &*export.expr {
+        // `export default { … } satisfies Handler` and `export default
+        // (worker)` export what they wrap (carrick#2396).
+        match crate::swc_scanner::unwrap_expr(&export.expr) {
             Expr::Ident(ident) => {
                 self.exported_names.insert(ident.sym.to_string());
             }
@@ -2184,6 +2224,7 @@ impl Visit for FunctionDefinitionExtractor {
     /// a call that belongs to no function still has an owner (carrick#965).
     fn visit_module(&mut self, module: &Module) {
         module.visit_children_with(self);
+        self.collect_exported_local_objects(module);
         self.record_module_scope_callees(module);
         self.finalize_call_owners();
         self.prune_empty_module_scope();
