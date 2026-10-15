@@ -2000,8 +2000,12 @@ impl FileOrchestrator {
         ) {
             // A model row at a site whose callee provably sends nothing is
             // the model reading a request into a name (carrick#1555).
-            stats.summary_rows_withdrawn +=
-                FileOrchestrator::withdraw_silent_sites(adjusted, &pf.silent_sites);
+            stats.summary_rows_withdrawn += FileOrchestrator::withdraw_silent_sites(
+                adjusted,
+                &pf.silent_sites,
+                Path::new(&pf.path_str),
+                &pf.content,
+            );
             // Carry the wrapper's own request shape onto the sites that
             // delegate to it (carrick-cloud#386). Runs first among the
             // passes over the joined rows, because it tells a
@@ -7710,16 +7714,38 @@ impl FileOrchestrator {
     /// nothing (carrick#1555): the summary composed every call the callee
     /// makes and found no request. A model row there is the model reading a
     /// request into a name.
-    fn withdraw_silent_sites(result: &mut FileAnalysisResult, silent: &BTreeSet<u32>) -> usize {
+    ///
+    /// A model row with no span (its id joined no candidate) is placed by its
+    /// line (carrick#2281): at the one outermost call that opens there, when
+    /// the row's own text writes that call ([`crate::call_through::FileCalls`]).
+    /// `content` is the file the candidates' spans were read from; it is
+    /// parsed only when such a row is in the file.
+    pub(crate) fn withdraw_silent_sites(
+        result: &mut FileAnalysisResult,
+        silent: &BTreeSet<u32>,
+        path: &Path,
+        content: &str,
+    ) -> usize {
         if silent.is_empty() {
             return 0;
         }
+        let is_model =
+            |call: &DataCallResult| call.resolution_source == Some(ResolutionSource::Model);
+        let calls = result
+            .data_calls
+            .iter()
+            .any(|call| is_model(call) && call.call_expression_span_start.is_none())
+            .then(|| crate::call_through::FileCalls::parse(path, content))
+            .flatten();
         let before = result.data_calls.len();
         result.data_calls.retain(|call| {
-            call.resolution_source != Some(ResolutionSource::Model)
-                || !call
-                    .call_expression_span_start
-                    .is_some_and(|start| silent.contains(&start))
+            if !is_model(call) {
+                return true;
+            }
+            let start = call
+                .call_expression_span_start
+                .or_else(|| calls.as_ref().and_then(|calls| calls.written_at(call)));
+            !start.is_some_and(|start| silent.contains(&start))
         });
         before - result.data_calls.len()
     }

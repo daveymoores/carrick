@@ -1,0 +1,45 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:8",
+      "line_number": 8,
+      "target": "/orders.boot",
+      "method": "GET",
+      "pattern_matched": "registerNamed(",
+      "call_expression_text": "registerNamed(\"orders.boot\", readOrder)",
+      "call_expression_line": 8,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "target": "/orders.run",
+      "method": "GET",
+      "pattern_matched": "dispatch(",
+      "call_expression_text": "dispatch(\"orders.run\")",
+      "call_expression_line": 12,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:16",
+      "line_number": 16,
+      "target": "/orders/:id/lines",
+      "method": "GET",
+      "pattern_matched": "endpoint(",
+      "call_expression_text": "endpoint(\"/orders/:id/lines\")",
+      "call_expression_line": 16,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
