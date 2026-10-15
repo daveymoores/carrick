@@ -42,12 +42,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use swc_common::Spanned;
 use swc_common::{
     SourceMap,
     errors::{ColorConfig, Handler},
     sync::Lrc,
 };
-use swc_ecma_ast::{CallExpr, Callee, Expr, Module, ModuleDecl, ModuleItem};
+use swc_ecma_ast::{
+    CallExpr, Callee, ClassMember, Decl, Expr, Module, ModuleDecl, ModuleItem, Pat, Prop, PropName,
+    PropOrSpread, Stmt,
+};
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
 
@@ -335,6 +339,10 @@ pub(crate) struct CallSite {
     /// through it (`client.list()`), so the call runs the binding's own
     /// declaration.
     pub(crate) direct: bool,
+    /// The property read off the root (`list` in `shelvesApi.list()` and in
+    /// `shelvesApi.list.cached()`), which names the member of the root's
+    /// declaration the call runs. `None` for a direct call.
+    pub(crate) member: Option<String>,
     /// What this call states about its own request (carrick#1384): a site that
     /// is a request itself states its own verb, and neither pass looks
     /// elsewhere for it.
@@ -347,8 +355,23 @@ pub(crate) struct FileCalls {
     pub(crate) sites: Vec<CallSite>,
     /// Local name → where it was imported from.
     pub(crate) imports: HashMap<String, Import>,
-    /// Every module specifier the file imports from, in source order.
-    pub(crate) specifiers: Vec<String>,
+    /// The functions and objects the file declares at its top level, with the
+    /// source each spans, so a call can be attributed to the function it sits
+    /// in (carrick#2384).
+    pub(crate) bindings: Vec<DeclaredBinding>,
+}
+
+/// One top-level declaration of a module, or one member of it.
+pub(crate) struct DeclaredBinding {
+    /// The name the module binds (`orders` in `const orders = { place() {} }`).
+    pub(crate) name: String,
+    /// The member of the binding this span is (`place`), or `None` for the
+    /// whole binding.
+    pub(crate) member: Option<String>,
+    /// Start of the declaration's source, in candidate span units.
+    pub(crate) lo: u32,
+    /// End of the declaration's source, in candidate span units.
+    pub(crate) hi: u32,
 }
 
 /// Read one file's calls and imports.
@@ -358,17 +381,8 @@ pub(crate) fn read_call_sites(file: &Path) -> Option<FileCalls> {
     let module = parse_file(file, &cm, &handler)?;
     Some(FileCalls {
         sites: call_sites(&module, &cm),
+        bindings: declared_bindings(&module, &cm),
         imports: import_table(&module),
-        specifiers: module
-            .body
-            .iter()
-            .filter_map(|item| match item {
-                ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
-                    Some(import.src.value.to_string_lossy().into_owned())
-                }
-                _ => None,
-            })
-            .collect(),
     })
 }
 
@@ -389,10 +403,134 @@ pub(crate) fn call_sites(module: &Module, cm: &Lrc<SourceMap>) -> Vec<CallSite> 
                 line: cm.lookup_char_pos(call.pos).line as u32,
                 root: call.root,
                 direct: call.direct,
+                member: call.member,
                 request: call.request,
             })
         })
         .collect()
+}
+
+/// A position in the units a candidate's span is written in.
+fn span_unit(cm: &Lrc<SourceMap>, pos: swc_common::BytePos) -> Option<u32> {
+    cm.lookup_byte_offset(pos).pos.0.checked_add(SWC_SPAN_BASE)
+}
+
+/// The functions, objects and classes a module declares at its top level, each
+/// with the source it spans. An object's or class's members are listed beside
+/// it, so a call through `orders.place()` is attributed to `place`.
+pub(crate) fn declared_bindings(module: &Module, cm: &Lrc<SourceMap>) -> Vec<DeclaredBinding> {
+    let mut found: Vec<DeclaredBinding> = Vec::new();
+    for item in &module.body {
+        let decl = match item {
+            ModuleItem::Stmt(Stmt::Decl(decl)) => decl,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => &export.decl,
+            _ => continue,
+        };
+        match decl {
+            Decl::Fn(function) => push_binding(
+                &mut found,
+                cm,
+                &function.ident.sym,
+                None,
+                function.function.span,
+            ),
+            Decl::Class(class) => {
+                let name = &class.ident.sym;
+                push_binding(&mut found, cm, name, None, class.class.span);
+                for member in &class.class.body {
+                    match member {
+                        ClassMember::Method(method) => {
+                            if let Some(key) = prop_name(&method.key) {
+                                push_binding(
+                                    &mut found,
+                                    cm,
+                                    name,
+                                    Some(&key),
+                                    method.function.span,
+                                );
+                            }
+                        }
+                        ClassMember::ClassProp(prop) => {
+                            if let (Some(key), Some(value)) = (prop_name(&prop.key), &prop.value) {
+                                push_binding(&mut found, cm, name, Some(&key), value.span());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Decl::Var(var) => {
+                for declarator in &var.decls {
+                    let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init)
+                    else {
+                        continue;
+                    };
+                    let name = &ident.id.sym;
+                    push_binding(&mut found, cm, name, None, init.span());
+                    if let Expr::Object(object) = unwrap_expression(init) {
+                        for prop in &object.props {
+                            let PropOrSpread::Prop(prop) = prop else {
+                                continue;
+                            };
+                            match &**prop {
+                                Prop::KeyValue(pair) => {
+                                    if let Some(key) = prop_name(&pair.key) {
+                                        push_binding(
+                                            &mut found,
+                                            cm,
+                                            name,
+                                            Some(&key),
+                                            pair.value.span(),
+                                        );
+                                    }
+                                }
+                                Prop::Method(method) => {
+                                    if let Some(key) = prop_name(&method.key) {
+                                        push_binding(
+                                            &mut found,
+                                            cm,
+                                            name,
+                                            Some(&key),
+                                            method.function.span,
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+fn push_binding(
+    found: &mut Vec<DeclaredBinding>,
+    cm: &Lrc<SourceMap>,
+    name: &str,
+    member: Option<&str>,
+    span: swc_common::Span,
+) {
+    if let (Some(lo), Some(hi)) = (span_unit(cm, span.lo), span_unit(cm, span.hi)) {
+        found.push(DeclaredBinding {
+            name: name.to_string(),
+            member: member.map(str::to_string),
+            lo,
+            hi,
+        });
+    }
+}
+
+/// A plain key (`place`, `"place"`), or `None` for a computed one.
+fn prop_name(key: &PropName) -> Option<String> {
+    match key {
+        PropName::Ident(ident) => Some(ident.sym.to_string()),
+        PropName::Str(text) => Some(text.value.to_string_lossy().into_owned()),
+        _ => None,
+    }
 }
 
 /// Every call written on an identifier. A callee that is not (an immediately
@@ -407,6 +545,7 @@ struct CollectedCall {
     pos: swc_common::BytePos,
     root: String,
     direct: bool,
+    member: Option<String>,
     request: RequestShapeSignal,
 }
 
@@ -419,6 +558,7 @@ impl Visit for CallCollector {
                 pos: node.span.lo,
                 root,
                 direct: matches!(unwrap_expression(expr), Expr::Ident(_)),
+                member: callee_member(expr),
                 request: call_request_verb(node, callee_property(expr).as_deref()),
             });
         }
@@ -431,6 +571,20 @@ impl Visit for CallCollector {
 fn callee_property(expr: &Expr) -> Option<String> {
     match unwrap_expression(expr) {
         Expr::Member(member) => member.prop.as_ident().map(|ident| ident.sym.to_string()),
+        _ => None,
+    }
+}
+
+/// `list` for `shelvesApi.list()` and for `shelvesApi.list.cached()`: the
+/// property read directly off the root binding. `None` for a direct call, and
+/// for a root read by a computed key.
+fn callee_member(expr: &Expr) -> Option<String> {
+    let Expr::Member(member) = unwrap_expression(expr) else {
+        return None;
+    };
+    match unwrap_expression(&member.obj) {
+        Expr::Ident(_) => member.prop.as_ident().map(|ident| ident.sym.to_string()),
+        inner @ Expr::Member(_) => callee_member(inner),
         _ => None,
     }
 }
