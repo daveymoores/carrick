@@ -14988,6 +14988,269 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
+    /// The span start a site's call carries ([`crate::request_summary`]'s
+    /// `Site::span_start`): the offset of `needle` in `source`, in SWC
+    /// numbering.
+    fn site_start(source: &str, needle: &str) -> u32 {
+        let offset = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} not in the source"));
+        u32::try_from(offset).unwrap() + crate::swc_scanner::SWC_SPAN_BASE
+    }
+
+    /// carrick#2281: a call of a function that binds a name and hands back a
+    /// callable sends nothing where it is written, at module level as inside
+    /// a body. The callable sends later, through a nested function that
+    /// forwards the name, and whether it runs is not the call's to say.
+    /// Holds whether the transport is a package the scan does not read or an
+    /// object of the repository whose method calls `fetch`.
+    #[test]
+    fn a_call_that_binds_a_name_into_a_callable_is_silent_at_module_level() {
+        let handlers = "import { bind } from \"./bind\";\n\nfunction localList() {\n  return [];\n}\n\nexport const listOrders = bind(localList, \"orders.list\", { timeoutMs: 1 });\n\nexport function later() {\n  return bind(localList, \"orders.read\", { timeoutMs: 1 });\n}\n";
+        let bind = |transport: &str| {
+            format!(
+                "import {{ transport }} from \"{transport}\";\n\nexport function bind<T>(local: T, name: string, options: {{ timeoutMs: number }}) {{\n  const timeout = options.timeoutMs;\n  return async (...rest: unknown[]) => {{\n    const send = () => transport.post(name, rest);\n    return send();\n  }};\n}}\n"
+            )
+        };
+        let package = bind("rpc-transport");
+        let own = bind("./transport");
+        let variants: [(&str, Vec<(&str, &str)>); 2] = [
+            (
+                "a package's transport",
+                vec![("src/handlers.ts", handlers), ("src/bind.ts", &package)],
+            ),
+            (
+                "the repository's transport",
+                vec![
+                    ("src/handlers.ts", handlers),
+                    ("src/bind.ts", &own),
+                    (
+                        "src/transport.ts",
+                        "const BASE = process.env.RPC_URL;\n\nexport const transport = {\n  post(name: string, args: unknown) {\n    return fetch(`${BASE}/rpc`, { method: \"POST\", body: JSON.stringify({ name, args }) });\n  },\n};\n",
+                    ),
+                ],
+            ),
+        ];
+        for (variant, files) in variants {
+            let (dir, discovery) = discover_sources(&files);
+            let silent = summaries_of(&discovery)
+                .silent(&dir.path().join("src/handlers.ts"))
+                .cloned()
+                .unwrap_or_default();
+            for needle in [
+                "bind(localList, \"orders.list\"",
+                "bind(localList, \"orders.read\"",
+            ] {
+                assert!(
+                    silent.contains(&site_start(handlers, needle)),
+                    "{variant}: `{needle}` is silent: {silent:?}"
+                );
+            }
+        }
+    }
+
+    /// The silent sites of `file` among `needles`, each named by the text its
+    /// call opens with.
+    fn silent_among<'n>(
+        dir: &tempfile::TempDir,
+        discovery: &FileDiscovery,
+        file: &str,
+        source: &str,
+        needles: &[&'n str],
+    ) -> Vec<&'n str> {
+        let silent = summaries_of(discovery)
+            .silent(&dir.path().join(file))
+            .cloned()
+            .unwrap_or_default();
+        needles
+            .iter()
+            .copied()
+            .filter(|needle| silent.contains(&site_start(source, needle)))
+            .collect()
+    }
+
+    /// carrick#2281: a call on one of the language's own collections sends
+    /// nothing, so a function that only stores a handler in a `new Map()`
+    /// sends nothing either. A callback handed to such a call is still read,
+    /// and a collection the file cannot vouch for is not one: a binding
+    /// assigned again, or a file that binds the constructor's name itself.
+    #[test]
+    fn a_call_on_a_language_collection_sends_nothing() {
+        let use_source = "import { register, registerNamed, forEach } from \"./registry\";\nimport { swap } from \"./reassigned\";\nimport { own } from \"./own-map\";\nimport { imported } from \"./imported-map\";\n\nfunction listOrders() {\n  return [];\n}\n\nregister(listOrders, \"orders.list\");\nregisterNamed(\"orders.read\", listOrders);\nforEach(\"orders.each\");\nswap(\"orders.swap\", listOrders);\nown(\"orders.own\", listOrders);\nimported(\"orders.imported\", listOrders);\n";
+        let (dir, discovery) = discover_sources(&[
+            ("src/use.ts", use_source),
+            (
+                "src/registry.ts",
+                "const table = new Map<string, () => unknown>();\n\nexport function register(handler: () => unknown, name: string) {\n  table.set(name, handler);\n}\n\nexport function registerNamed(name: string, handler: () => unknown) {\n  table.set(name, handler);\n}\n\nexport function forEach(name: string) {\n  table.forEach(() => {\n    fetch(`/api/${name}`);\n  });\n}\n",
+            ),
+            (
+                "src/reassigned.ts",
+                "let table = new Map<string, () => unknown>();\n\nexport function reset() {\n  table = new Map();\n}\n\nexport function swap(name: string, handler: () => unknown) {\n  table.set(name, handler);\n}\n",
+            ),
+            (
+                "src/own-map.ts",
+                "class Map {\n  set(name: string, value: unknown) {\n    return send(name, value);\n  }\n}\n\ndeclare function send(name: string, value: unknown): unknown;\n\nconst table = new Map();\n\nexport function own(name: string, handler: () => unknown) {\n  table.set(name, handler);\n}\n",
+            ),
+            (
+                "src/imported-map.ts",
+                "import { Map } from \"remote-collections\";\n\nconst table = new Map();\n\nexport function imported(name: string, handler: () => unknown) {\n  table.set(name, handler);\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            silent_among(
+                &dir,
+                &discovery,
+                "src/use.ts",
+                use_source,
+                &[
+                    "register(listOrders",
+                    "registerNamed(",
+                    "forEach(\"orders.each\"",
+                    "swap(",
+                    "own(",
+                    "imported(",
+                ],
+            ),
+            vec!["register(listOrders", "registerNamed("],
+            "only the calls that store into a collection the file builds and \
+             never replaces"
+        );
+    }
+
+    /// carrick#2281: a function that hands out a function that may send is
+    /// not silent at a call that writes a route, at module level or in a
+    /// body: the call may bind that route into what it hands out. A name
+    /// with no `/`, or a factory whose handed-out function is proven silent,
+    /// leaves the call silent.
+    #[test]
+    fn a_call_that_writes_a_route_into_a_handed_out_function_is_not_silent() {
+        let use_source = "import { endpoint, inert, through } from \"./endpoint\";\n\nexport const getOrder = endpoint(\"/orders/:id\");\nexport const nested = endpoint({ path: \"/orders/:id/lines\" });\nexport const named = endpoint(\"orders.read\");\nexport const quiet = inert(\"/orders/:id\");\nexport const relayed = through(\"/orders/:id/relayed\");\n\nexport function later() {\n  return endpoint(\"/orders/:id/later\");\n}\n";
+        let (dir, discovery) = discover_sources(&[
+            ("src/use.ts", use_source),
+            (
+                "src/endpoint.ts",
+                "import { client } from \"opaque-client\";\n\nexport function endpoint(path: unknown) {\n  return (id: string) => client.call(path, id);\n}\n\nexport function inert(path: string) {\n  return (id: string) => `${path}:${id}`;\n}\n\nexport function through(path: string) {\n  return endpoint(path);\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            silent_among(
+                &dir,
+                &discovery,
+                "src/use.ts",
+                use_source,
+                &[
+                    "endpoint(\"/orders/:id\")",
+                    "endpoint({",
+                    "endpoint(\"orders.read\")",
+                    "inert(",
+                    "through(",
+                    "endpoint(\"/orders/:id/later\")",
+                ],
+            ),
+            vec!["endpoint(\"orders.read\")", "inert("],
+        );
+    }
+
+    /// carrick#2281: a model row whose id joined no candidate has no span. It
+    /// is placed by its line, at the one outermost call opening there, and
+    /// withdrawn when that call is silent and the row's text writes it. The
+    /// silent set and the placement count in the same units, so a row at a
+    /// silent call goes. A row on an inner line of a multi-line call, at a
+    /// chain whose outermost call is not silent, with text naming an
+    /// argument's call, or with no text, stays.
+    #[test]
+    fn a_model_row_with_no_span_is_withdrawn_at_the_silent_call_its_line_opens() {
+        use crate::agents::file_analyzer_agent::{
+            DataCallResult, FileAnalysisResult, ResolutionSource,
+        };
+        let use_source = "import { register } from \"./registry\";\n\nfunction listOrders() {\n  return [];\n}\n\nregister(listOrders, \"orders.list\");\nregister(\n  listOrders,\n  \"orders.save\",\n);\nregister(withAudit(listOrders), \"orders.audit\");\nregister(listOrders, \"orders.then\").then(() => undefined);\n\nfunction withAudit<T>(handler: T): T {\n  return handler;\n}\n";
+        let (dir, discovery) = discover_sources(&[
+            ("src/use.ts", use_source),
+            (
+                "src/registry.ts",
+                "const table = new Map<string, () => unknown>();\n\nexport function register(handler: () => unknown, name: string) {\n  table.set(name, handler);\n}\n",
+            ),
+        ]);
+        let path = dir.path().join("src/use.ts");
+        let silent = summaries_of(&discovery)
+            .silent(&path)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            silent.contains(&site_start(
+                use_source,
+                "register(listOrders, \"orders.list\")"
+            )),
+            "the summaries' span start and the placement's are one unit: {silent:?}"
+        );
+        let row = |line: i32, text: Option<&str>| DataCallResult {
+            candidate_id: format!("@line:{line}"),
+            line_number: line,
+            target: "/stated".to_string(),
+            method: Some("GET".to_string()),
+            call_kind: None,
+            pattern_matched: String::new(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: text.map(str::to_string),
+            call_expression_line: Some(line),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            dispatch: None,
+            resolution_source: Some(ResolutionSource::Model),
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+        };
+        let multi_line = "register(\n  listOrders,\n  \"orders.save\",\n)";
+        let chain = "register(listOrders, \"orders.then\").then(() => undefined)";
+        let mut result = FileAnalysisResult {
+            data_calls: vec![
+                row(7, Some("register(listOrders, \"orders.list\")")),
+                row(8, Some(multi_line)),
+                row(10, Some(multi_line)),
+                row(
+                    12,
+                    Some("register(withAudit(listOrders), \"orders.audit\")"),
+                ),
+                row(12, Some("withAudit(listOrders)")),
+                row(13, Some("register(listOrders, \"orders.then\")")),
+                row(13, Some(chain)),
+                row(7, None),
+            ],
+            ..Default::default()
+        };
+        let withdrawn = crate::agents::file_orchestrator::FileOrchestrator::withdraw_silent_sites(
+            &mut result,
+            &silent,
+            &path,
+            use_source,
+        );
+        let kept: Vec<(i32, Option<&str>)> = result
+            .data_calls
+            .iter()
+            .map(|call| (call.line_number, call.call_expression_text.as_deref()))
+            .collect();
+        assert_eq!(withdrawn, 3, "kept: {kept:?}");
+        assert_eq!(
+            kept,
+            vec![
+                (10, Some(multi_line)),
+                (12, Some("withAudit(listOrders)")),
+                (13, Some("register(listOrders, \"orders.then\")")),
+                (13, Some(chain)),
+                (7, None),
+            ]
+        );
+    }
+
     /// The (line, method, target) of every summary row `file` states.
     fn rows_by_line(
         dir: &tempfile::TempDir,

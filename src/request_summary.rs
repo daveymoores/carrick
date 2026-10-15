@@ -1106,6 +1106,14 @@ pub fn extract_file_ir(
         class_this: library_sites::class_this(module),
         declared_below: redeclared_names(module),
         verb_aliases: crate::declared_verbs::TypeAliases::of(module),
+        own_collections: {
+            let declared = Declarations::of(module);
+            COLLECTIONS
+                .iter()
+                .copied()
+                .filter(|name| declared.declares_name(name))
+                .collect()
+        },
     };
     module_scope.receivers = import_receivers(&imports)
         .into_iter()
@@ -1471,6 +1479,10 @@ struct ModuleScope {
     /// The type aliases the file declares that name a closed set of HTTP
     /// verbs (carrick#2049).
     verb_aliases: crate::declared_verbs::TypeAliases,
+    /// The names of [`COLLECTIONS`] the file binds itself, anywhere: a
+    /// declaration or an import. `new Map()` there builds the file's own
+    /// `Map`, which is no language collection (carrick#2281).
+    own_collections: HashSet<&'static str>,
 }
 
 impl ModuleScope {
@@ -4539,16 +4551,9 @@ impl Reader<'_> {
     }
 
     /// A receiver the source builds as one of the language's own keyed
-    /// collections, whose `get` and `delete` send nothing.
+    /// collections, whose `get` and `delete` send nothing. Never in a file
+    /// that binds the constructor's name itself (carrick#2281).
     fn is_builtin_collection(&self, receiver: &Expr, scope: &Scope<'_>) -> bool {
-        const COLLECTIONS: &[&str] = &[
-            "Map",
-            "Set",
-            "WeakMap",
-            "URLSearchParams",
-            "Headers",
-            "FormData",
-        ];
         let Value::Str(pieces) = self.eval(receiver, scope) else {
             return false;
         };
@@ -4564,9 +4569,20 @@ impl Reader<'_> {
             .next()
             .unwrap_or_default()
             .trim();
-        COLLECTIONS.contains(&name)
+        COLLECTIONS.contains(&name) && !scope.module.own_collections.contains(name)
     }
 }
+
+/// The language's own keyed collections: a call on one sends nothing
+/// ([`Reader::is_builtin_collection`]).
+const COLLECTIONS: &[&str] = &[
+    "Map",
+    "Set",
+    "WeakMap",
+    "URLSearchParams",
+    "Headers",
+    "FormData",
+];
 
 /// The value a binding holds, as a URL writes it.
 ///
@@ -4940,10 +4956,15 @@ impl Visit for CallWalker<'_, '_, '_> {
             Callee::Expr(callee) if !spread => self.reader.call_receiver(callee, self.scope),
             _ => None,
         };
+        // A call on one of the language's own collections sends nothing
+        // either (carrick#2281): `table.set(name, handler)`.
         let inert = match &call.callee {
             Callee::Expr(callee) => match &**callee {
-                Expr::Member(member) => matches!(&*member.obj, Expr::Ident(obj)
-                    if INERT_GLOBALS.contains(&obj.sym.as_ref())),
+                Expr::Member(member) => {
+                    matches!(&*member.obj, Expr::Ident(obj)
+                        if INERT_GLOBALS.contains(&obj.sym.as_ref()))
+                        || self.reader.is_builtin_collection(&member.obj, self.scope)
+                }
                 _ => false,
             },
             _ => false,
@@ -5726,6 +5747,13 @@ struct Summary {
     /// that does the same (carrick#1601). A call of it is worth the body,
     /// so a row stated at that call can be typed by the call's value.
     passes_body: bool,
+    /// The function hands out a function that may send (carrick#2281): its
+    /// body writes one it does not call whose own summary is incomplete or
+    /// states a request, or a callee it calls (or a callback that callee
+    /// invokes) does. A call of it that writes a route may be binding that
+    /// route into what it hands out, so that call is never silent
+    /// ([`is_silent`]).
+    hands_out: bool,
 }
 
 /// A row this pass states at one call site.
@@ -6205,6 +6233,7 @@ impl Composer<'_> {
             complete: !ir.bodyless && !ir.unfollowed,
             invokes: ir.invoked_params.clone(),
             passes_body: false,
+            hands_out: false,
         };
         // What the functions written in this body send through its
         // parameters (carrick#1949), kept apart until `passes_body` is read:
@@ -6228,6 +6257,7 @@ impl Composer<'_> {
                 }
                 Some((_, callee)) => {
                     summary.complete &= callee.complete;
+                    summary.hands_out |= callee.hands_out;
                     for effect in &callee.effects {
                         summary
                             .effects
@@ -6238,6 +6268,7 @@ impl Composer<'_> {
                             Value::Callback(nested) if callee.invokes.contains(&index) => {
                                 let callback = self.compose(file, &ir.nested[*nested]);
                                 summary.complete &= callback.complete;
+                                summary.hands_out |= callback.hands_out;
                                 summary.effects.extend(
                                     callback
                                         .effects
@@ -6289,9 +6320,12 @@ impl Composer<'_> {
         // function returned): what it sends through this body's parameters.
         // Whether and when it runs is not this body's to say, so it never
         // makes the body complete, and what it sends without them is stated
-        // where it is written.
+        // where it is written. One that may send is handed out
+        // ([`Summary::hands_out`]).
         for detached in &ir.detached {
-            lifted.extend(self.lifted_from(file, detached));
+            let written = self.compose(file, detached);
+            summary.hands_out |= !written.complete || !written.effects.is_empty();
+            lifted.extend(lift_outer(&written));
         }
         summary.passes_body = summary.effects.len() == 1
             && !ir.body_returns.is_empty()
@@ -6378,6 +6412,27 @@ pub fn summarize(
             emit(&mut composer, path, ir, &mut index, true);
         }
     }
+    // The calls made where a module is loaded can send nothing too
+    // (carrick#2281): `export const list = bind(local, "orders.list")`. Only
+    // whether each is silent is read here. A row stated at module level would
+    // be a row no function's call states, which this pass does not make.
+    for path in &paths {
+        let module_level = &files[*path].module_level;
+        for call in &module_level.calls {
+            if call.invokes_param.is_some() {
+                continue;
+            }
+            if let Some((_, callee)) = composer.callee(path, call)
+                && is_silent(&mut composer, path, module_level, call, &callee)
+            {
+                index
+                    .silent
+                    .entry(path.to_path_buf())
+                    .or_default()
+                    .insert(call.site.span_start);
+            }
+        }
+    }
     // Every function, not only the ones a resolved call site composed: a
     // caller the model states is read against its callee by the module graph
     // (carrick#1801), whether or not the call graph resolved that call.
@@ -6431,6 +6486,46 @@ pub fn summarize(
     index
 }
 
+/// Whether a call of `callee`, written in `ir`, provably sends nothing
+/// (carrick#1555): the callee is complete and states no request, no callback
+/// it invokes states one, and the call is not an element (which reads only
+/// what its props fill in). A callee that hands out a function that may send
+/// is not silent at a call that writes a route (carrick#2281): the call may be
+/// binding that route into what it hands out.
+fn is_silent(
+    composer: &mut Composer<'_>,
+    file: &Path,
+    ir: &FnIr,
+    call: &CallIr,
+    callee: &Summary,
+) -> bool {
+    if call.jsx || !callee.complete || !callee.effects.is_empty() {
+        return false;
+    }
+    for (index, arg) in call.args.iter().enumerate() {
+        if let Value::Callback(nested) = arg
+            && callee.invokes.contains(&index)
+            && !composer
+                .compose(file, &ir.nested[*nested])
+                .effects
+                .is_empty()
+        {
+            return false;
+        }
+    }
+    !(callee.hands_out && call.args.iter().any(writes_a_route))
+}
+
+/// Whether an argument writes a route-shaped string ([`is_route_shaped`]),
+/// itself or at any depth inside an object literal.
+fn writes_a_route(value: &Value) -> bool {
+    match value {
+        Value::Str(pieces) => is_route_shaped(pieces),
+        Value::Obj(object) => object.fields.values().any(writes_a_route),
+        Value::Callback(_) => false,
+    }
+}
+
 fn emit(
     composer: &mut Composer<'_>,
     file: &Path,
@@ -6449,9 +6544,7 @@ fn emit(
                 let callee_ir = sites
                     .target(file, call.site.lo)
                     .and_then(|(target, key)| files.get(target)?.functions.get(key));
-                let mut sends = false;
                 for effect in &callee.effects {
-                    sends = true;
                     // A JSX element states only what its props fill in
                     // (carrick#1949).
                     if call.jsx && !effect.has_params() {
@@ -6530,17 +6623,7 @@ fn emit(
                         None => index.undetermined += 1,
                     }
                 }
-                for (arg_index, arg) in call.args.iter().enumerate() {
-                    if let Value::Callback(nested) = arg
-                        && callee.invokes.contains(&arg_index)
-                    {
-                        let callback = composer.compose(file, &ir.nested[*nested]);
-                        sends |= !callback.effects.is_empty();
-                    }
-                }
-                // An element is never a site a model row can be withdrawn
-                // at: it reads only what its props fill in.
-                if callee.complete && !sends && !call.jsx {
+                if is_silent(composer, file, ir, call, &callee) {
                     index
                         .silent
                         .entry(file.to_path_buf())

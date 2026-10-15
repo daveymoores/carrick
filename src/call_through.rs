@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use swc_common::{
-    BytePos, SourceMap, Span,
+    BytePos, FileName, SourceMap, Span, Spanned,
     errors::{ColorConfig, Handler},
     sync::Lrc,
 };
@@ -52,7 +52,7 @@ use crate::cloud_storage::{CloudRepoData, ManifestRole, ManifestTypeKind};
 use crate::graphql_document_sites::unwrap_expression;
 use crate::mount_graph::{ConsumerRole, DataFetchingCall};
 use crate::operation::OperationKey;
-use crate::parser::parse_file;
+use crate::parser::{parse_file, parse_source};
 use crate::request_summary::RequestSummaryInputs;
 use crate::swc_scanner::SWC_SPAN_BASE;
 use crate::type_manifest::normalize_manifest_method;
@@ -357,6 +357,7 @@ fn read_file_sites(
     let mut every = EveryCall {
         positions: &positions,
         calls: Vec::new(),
+        callees: HashMap::new(),
     };
     module.visit_with(&mut every);
 
@@ -498,22 +499,113 @@ fn place(calls: &[CallExtent], row: &DataCallResult) -> Option<CallExtent> {
     outermost.next().is_none().then_some(**first)
 }
 
-/// Every call expression of a file.
+/// Every call expression of a file, with where each one's callee is written.
 struct EveryCall<'a> {
     positions: &'a Positions<'a>,
     calls: Vec<CallExtent>,
+    /// The callee's span, by its call's span, for a callee that is an
+    /// expression (not `super` or `import`).
+    callees: HashMap<(u32, u32), (u32, u32)>,
+}
+
+impl EveryCall<'_> {
+    fn record(&mut self, call: Span, callee: Option<Span>) {
+        let extent = self.positions.extent(call);
+        if let Some(callee) = callee {
+            let callee = self.positions.extent(callee);
+            self.callees.insert(extent.span(), callee.span());
+        }
+        self.calls.push(extent);
+    }
 }
 
 impl Visit for EveryCall<'_> {
     fn visit_call_expr(&mut self, node: &CallExpr) {
-        self.calls.push(self.positions.extent(node.span));
+        let callee = match &node.callee {
+            Callee::Expr(callee) => Some(callee.span()),
+            Callee::Super(_) | Callee::Import(_) => None,
+        };
+        self.record(node.span, callee);
         node.visit_children_with(self);
     }
 
     fn visit_opt_call(&mut self, node: &OptCall) {
-        self.calls.push(self.positions.extent(node.span));
+        self.record(node.span, Some(node.callee.span()));
         node.visit_children_with(self);
     }
+}
+
+/// The calls of one file as [`place`] reads them, with the text each call's
+/// callee is written as (carrick#2281): what places a model row with no span
+/// at the call it was recorded at.
+pub(crate) struct FileCalls {
+    calls: Vec<CallExtent>,
+    /// The callee's text with every whitespace character removed, by its
+    /// call's span.
+    callees: HashMap<(u32, u32), String>,
+}
+
+impl FileCalls {
+    /// Every call of `content`, parsed as the file at `path`. `None` when it
+    /// does not parse.
+    pub(crate) fn parse(path: &Path, content: &str) -> Option<Self> {
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+        let module = parse_source(
+            path,
+            FileName::Real(path.to_path_buf()),
+            content.to_string(),
+            &cm,
+            &handler,
+        )?;
+        let positions = Positions { cm: &cm };
+        let mut every = EveryCall {
+            positions: &positions,
+            calls: Vec::new(),
+            callees: HashMap::new(),
+        };
+        module.visit_with(&mut every);
+        let local = |at: u32| usize::try_from(at.checked_sub(SWC_SPAN_BASE)?).ok();
+        let callees = every
+            .callees
+            .into_iter()
+            .filter_map(|(call, (lo, hi))| {
+                let text = content.get(local(lo)?..local(hi)?)?;
+                Some((call, squeeze(text)))
+            })
+            .collect();
+        Some(Self {
+            calls: every.calls,
+            callees,
+        })
+    }
+
+    /// The span start of the call a model row with no span was recorded at
+    /// ([`place`]), when the row's own call text writes that call: it holds
+    /// the call's callee followed by `(`, whitespace aside. A row with no
+    /// text, one whose text writes another call (an argument of the call,
+    /// say), or one at a chain of calls, names none.
+    pub(crate) fn written_at(&self, row: &DataCallResult) -> Option<u32> {
+        if row.call_expression_span_start.is_some() {
+            return None;
+        }
+        let call = place(&self.calls, row)?;
+        let callee = self.callees.get(&call.span())?;
+        let text = squeeze(row.call_expression_text.as_deref()?);
+        // A chain (`register(…).then(…)`) opens where its first call does, and
+        // a silent site is known by its start alone: the outer call would read
+        // as the inner one.
+        let chained = self
+            .calls
+            .iter()
+            .any(|other| other.lo == call.lo && other.span() != call.span());
+        (!chained && text.contains(&format!("{callee}("))).then_some(call.lo)
+    }
+}
+
+/// `text` with every whitespace character removed.
+fn squeeze(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// What one site's call expression holds.
@@ -610,6 +702,7 @@ impl SiteReader<'_> {
         let mut inner = EveryCall {
             positions: self.positions,
             calls: Vec::new(),
+            callees: HashMap::new(),
         };
         node.visit_with(&mut inner);
         inner.calls.iter().map(CallExtent::span).collect()
