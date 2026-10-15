@@ -854,7 +854,7 @@ impl RouteLiteralWitness {
         let segments: Vec<&str> = canonical.split('/').collect();
         let is_param = |segment: &str| segment.starts_with(':') || segment.starts_with('*');
         let Some(first_param) = segments.iter().position(|segment| is_param(segment)) else {
-            return self.equal.iter().any(|value| *value == canonical);
+            return self.equal.contains(&canonical);
         };
         if first_param <= 1 {
             return false;

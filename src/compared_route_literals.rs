@@ -39,7 +39,7 @@ use swc_ecma_ast::{
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
-use crate::swc_scanner::is_producer_route_path;
+use crate::swc_scanner::{is_producer_route_path, unwrap_expr};
 use crate::wrapper_request_shape::literal_string;
 
 /// Where a route literal stood.
@@ -181,7 +181,7 @@ impl ComparisonReader {
         if let Some(value) = route_literal(expr) {
             return Some(value);
         }
-        match strip_wrappers(expr) {
+        match unwrap_expr(expr) {
             Expr::Ident(ident) => self.constants.get(ident.sym.as_ref()).cloned(),
             _ => None,
         }
@@ -193,18 +193,6 @@ impl ComparisonReader {
             position,
             span,
         });
-    }
-}
-
-/// Parentheses and type assertions change no value.
-fn strip_wrappers(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::Paren(inner) => strip_wrappers(&inner.expr),
-        Expr::TsAs(inner) => strip_wrappers(&inner.expr),
-        Expr::TsNonNull(inner) => strip_wrappers(&inner.expr),
-        Expr::TsSatisfies(inner) => strip_wrappers(&inner.expr),
-        Expr::TsConstAssertion(inner) => strip_wrappers(&inner.expr),
-        other => other,
     }
 }
 
@@ -236,7 +224,7 @@ impl Visit for ComparisonReader {
         let Callee::Expr(callee) = &call.callee else {
             return;
         };
-        let Expr::Member(member) = strip_wrappers(callee) else {
+        let Expr::Member(member) = unwrap_expr(callee) else {
             return;
         };
         if !matches!(&member.prop, MemberProp::Ident(name) if name.sym.as_ref() == "startsWith") {

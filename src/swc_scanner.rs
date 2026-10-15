@@ -1530,7 +1530,7 @@ fn default_exported_class(module: &Module) -> Option<(String, &Class)> {
 
 /// Strip the wrappers that do not change which value an expression names, so
 /// `export default (new Foo() as Controller)` reads like `new Foo()`.
-fn unwrap_expr(expr: &Expr) -> &Expr {
+pub(crate) fn unwrap_expr(expr: &Expr) -> &Expr {
     match expr {
         Expr::Paren(inner) => unwrap_expr(&inner.expr),
         Expr::TsAs(inner) => unwrap_expr(&inner.expr),
