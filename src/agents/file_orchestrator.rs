@@ -7924,6 +7924,16 @@ impl FileOrchestrator {
         Some(format!("{method} {path}"))
     }
 
+    /// The callee the AST read at a candidate's span: the member invoked, or
+    /// the bare callee when the call is not a member call. This is the only
+    /// text a call row publishes as its client (carrick#2387).
+    fn callee_text(candidate: &CandidateTarget) -> String {
+        candidate
+            .callee_property
+            .clone()
+            .unwrap_or_else(|| candidate.callee_object.clone())
+    }
+
     /// The row shape every candidate-backed deterministic call shares.
     ///
     /// `pattern_matched` is the client the scanner saw, which is what the row
@@ -7944,10 +7954,7 @@ impl FileOrchestrator {
                 "http-client".to_string()
             }
             ResolutionSource::RequestSpec => candidate.callee_object.clone(),
-            _ => candidate
-                .callee_property
-                .clone()
-                .unwrap_or_else(|| candidate.callee_object.clone()),
+            _ => Self::callee_text(candidate),
         };
         DataCallResult {
             candidate_id: candidate.candidate_id.clone(),
@@ -8768,11 +8775,20 @@ impl FileOrchestrator {
                     call.line_number = candidate.line_number as i32;
                     call.call_expression_span_start = Some(candidate.span_start);
                     call.call_expression_span_end = Some(candidate.span_end);
+                    // The client the row displays is the callee the AST read
+                    // at this span, never the model's `pattern_matched`: the
+                    // model fills that field by copying the framework
+                    // guidance's samples (carrick#2387).
+                    call.pattern_matched = Self::callee_text(candidate);
                 }
                 // Preserved without a span, as before: an inline alias still
                 // resolves, and the row is the only record of a site the
                 // scanner raised no candidate for (a wrapper delegation).
-                None => unjoined += 1,
+                // With no callee read there is no client to name.
+                None => {
+                    unjoined += 1;
+                    call.pattern_matched = String::new();
+                }
             }
             calls.push(Some(call));
         }
@@ -8976,7 +8992,11 @@ impl FileOrchestrator {
         // Everything determinism does not state.
         deterministic.candidate_id = model.candidate_id;
         deterministic.call_kind = model.call_kind;
-        if !model.pattern_matched.trim().is_empty() {
+        // The client text is the callee the scanner read, which the row
+        // already carries; the model's reading (callee-derived by
+        // `join_model_rows`, or empty) only fills a row that has none
+        // (carrick#2387).
+        if deterministic.pattern_matched.trim().is_empty() {
             deterministic.pattern_matched = model.pattern_matched;
         }
         deterministic.call_expression_text = model.call_expression_text;
@@ -14026,6 +14046,75 @@ export * from "./aFetch.js";"#,
             result.data_calls[1].resolution_source,
             Some(ResolutionSource::Model)
         );
+    }
+
+    /// A guidance sample the model copies into `pattern_matched` byte for
+    /// byte, whatever the call is (carrick#2387).
+    const GUIDANCE_SAMPLE: &str = "fetch('https://api.example.com/users')";
+
+    /// The model answers with a guidance sample as its `pattern_matched`. A
+    /// row it states alone publishes the callee the AST read at the span, a
+    /// row at no candidate publishes no client, and a fact row keeps its own
+    /// pattern on the join. Putting the model's text back on any of the three
+    /// fails here.
+    #[test]
+    fn a_published_client_is_the_ast_callee_never_the_models_pattern() {
+        let candidate = candidate_with_snippet("c1", Some("/api/orders"));
+        let candidate_map = HashMap::from([("c1".to_string(), candidate)]);
+        let model_row = |id: &str, target: &str, span: u32| DataCallResult {
+            candidate_id: id.to_string(),
+            pattern_matched: GUIDANCE_SAMPLE.to_string(),
+            ..model_call("GET", target, span, "Order")
+        };
+        let mut fact = stated_call("POST", "/api/links", 500);
+        fact.pattern_matched = "links.create(".to_string();
+        let mut result = FileAnalysisResult {
+            data_calls: vec![fact],
+            ..Default::default()
+        };
+        let mut stats = ProcessingStats::default();
+        FileOrchestrator::join_model_rows(
+            &mut result,
+            FileAnalysisResult {
+                data_calls: vec![
+                    // Joins the candidate: the site's callee is `get`.
+                    model_row("c1", "/api/orders", 0),
+                    // Joins no candidate: no callee was read.
+                    model_row("span:900-940", "/api/orphans", 900),
+                    // Twin of the fact row at span 500.
+                    DataCallResult {
+                        method: Some("POST".to_string()),
+                        ..model_row("span:500-540", "/api/links", 500)
+                    },
+                ],
+                ..Default::default()
+            },
+            &candidate_map,
+            None,
+            &[],
+            "src/client.ts",
+            false,
+            &mut stats,
+        );
+
+        let graph = FileOrchestrator::new(AgentService::new()).build_mount_graph(
+            &HashMap::from([("src/client.ts".to_string(), result)]),
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let client = |path: &str| {
+            graph
+                .data_calls
+                .iter()
+                .find(|call| call.target_url == path)
+                .unwrap_or_else(|| panic!("no row for {path}"))
+                .client
+                .clone()
+        };
+        assert_eq!(client("/api/orders"), "get");
+        assert_eq!(client("/api/orphans"), "");
+        assert_eq!(client("/api/links"), "links.create(");
     }
 
     /// A data call with no method at all — what extraction emits for a site
