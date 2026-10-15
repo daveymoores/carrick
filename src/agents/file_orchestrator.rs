@@ -3471,7 +3471,50 @@ impl FileOrchestrator {
         // PHASE 1d, second half: the rows the request summaries state, now
         // that they are composed. Waiting here is waiting on the scan's last
         // asks for library semantics, which ran alongside the model's work.
-        let summaries = self.request_summaries.take().await;
+        let mut summaries = self.request_summaries.take().await;
+        // A call the source states as an endpoint registers a route, whatever
+        // else it is shaped like (carrick#2383): the request the summaries
+        // read at it is withdrawn, at the call and at every caller of the
+        // function it sits in. Every source counts: the layout, route data,
+        // decorators, and the model's rows at a site that can register one.
+        let mut registered: HashMap<PathBuf, BTreeSet<u32>> = HashMap::new();
+        for (pf, answer) in &analyzed {
+            let spans = registered.entry(PathBuf::from(&pf.path_str)).or_default();
+            spans.extend(
+                [
+                    &pf.route_endpoints,
+                    &pf.descriptor_endpoints,
+                    &pf.decorator_endpoints,
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|endpoint| endpoint.call_expression_span_start),
+            );
+            if let ModelAnswer::Answered(model) = answer {
+                spans.extend(model.endpoints.iter().filter_map(|endpoint| {
+                    pf.candidate_map
+                        .get(&endpoint.candidate_id)
+                        .filter(|candidate| {
+                            Self::candidate_can_register_a_route(candidate, endpoint.line_number)
+                        })
+                        .map(|candidate| candidate.span_start)
+                }));
+            }
+        }
+        for (path, result) in &file_results {
+            registered.entry(PathBuf::from(path)).or_default().extend(
+                result
+                    .endpoints
+                    .iter()
+                    .filter_map(|endpoint| endpoint.call_expression_span_start),
+            );
+        }
+        let withdrawn = summaries.withdraw_registrations(&registered);
+        if withdrawn > 0 {
+            debug!(
+                "Withdrew {withdrawn} request summary row(s) made by a call the source states as an endpoint"
+            );
+        }
         let no_summary_rows: BTreeMap<u32, Vec<SummaryRow>> = BTreeMap::new();
         for late in late_summary_files {
             let Some(summary_rows) = summaries.rows(&late.file_path) else {
@@ -15457,6 +15500,7 @@ export * from "./aFetch.js";"#,
             call_body: at_caller.then_some(crate::forwarded_body::CallBody::Built),
             library_semantics: Vec::new(),
             base_fallbacks: None,
+            request_at: (std::path::PathBuf::from("src/availability.ts"), 40),
         };
         for at_caller in [true, false] {
             let resolved = FileOrchestrator::summary_resolved(

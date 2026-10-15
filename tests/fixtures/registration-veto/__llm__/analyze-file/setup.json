@@ -1,0 +1,8 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {"candidate_id": "@line:6", "line_number": 6, "owner_node": "", "method": "POST", "path": "/reset", "handler_name": "anonymous", "pattern_matched": "define(", "payload_expression_text": null, "payload_expression_line": null, "response_expression_text": null, "response_expression_line": null, "primary_type_symbol": null, "type_import_source": null},
+    {"candidate_id": "@line:7", "line_number": 7, "owner_node": "", "method": "DELETE", "path": "/purge", "handler_name": "anonymous", "pattern_matched": "define(", "payload_expression_text": null, "payload_expression_line": null, "response_expression_text": null, "response_expression_line": null, "primary_type_symbol": null, "type_import_source": null}
+  ],
+  "data_calls": []
+}

@@ -5345,6 +5345,10 @@ fn is_member_call(call: &CallExpr, object: &str, property: &str) -> bool {
 struct RequestSite {
     file: PathBuf,
     line: u32,
+    /// Span start of the call, in the file's own numbering
+    /// ([`Site::span_start`]): what an endpoint row at the same call is
+    /// read against (carrick#2383).
+    span_start: u32,
 }
 
 /// One request a call to a function sends.
@@ -5375,7 +5379,7 @@ impl Effect {
     /// URL or method can go (carrick#2050, carrick#2051), or one that states
     /// no row where the source does not say which goes out
     /// ([`Alternation::Nothing`]).
-    fn from_shape(shape: &RequestShape, file: &Path, line: u32) -> Vec<Self> {
+    fn from_shape(shape: &RequestShape, file: &Path, call: Site) -> Vec<Self> {
         let (body, body_param) = match &shape.body {
             BodyValue::Fields(obj) => (string_fields(obj), None),
             BodyValue::Param(index) => (BTreeMap::new(), Some((*index, None))),
@@ -5399,7 +5403,8 @@ impl Effect {
                 let mut effect = Effect {
                     site: RequestSite {
                         file: file.to_path_buf(),
-                        line,
+                        line: call.line,
+                        span_start: call.span_start,
                     },
                     method,
                     url,
@@ -5683,6 +5688,7 @@ impl Effect {
             instantiated.site = RequestSite {
                 file: file.to_path_buf(),
                 line: site.line,
+                span_start: site.span_start,
             };
         }
         instantiated
@@ -5759,6 +5765,10 @@ pub struct SummaryRow {
     /// that module's own rows describe it. The file the row sits in has
     /// defaults of its own that say nothing about this base.
     pub base_fallbacks: Option<BTreeMap<String, String>>,
+    /// The call that makes the request: its file and span start. A row at a
+    /// caller reaches a request written elsewhere, and this is where
+    /// ([`RequestSummaryIndex::withdraw_registrations`], carrick#2383).
+    pub request_at: (PathBuf, u32),
 }
 
 /// What the summaries are composed from, as discovery leaves it: every
@@ -6076,6 +6086,34 @@ impl RequestSummaryIndex {
         self.rows.get(file)
     }
 
+    /// Withdraw every row whose request is made by a call the source states
+    /// as an endpoint (carrick#2383). `registered` holds, per file, the span
+    /// starts of the calls an endpoint row sits at, from whatever source
+    /// stated it. A call a file states as a route registers one: reading it
+    /// as the request it is shaped like (a path, an options bag, a handler)
+    /// would state it as a fact at every caller of the function it sits in.
+    /// Returns how many rows went.
+    pub fn withdraw_registrations(
+        &mut self,
+        registered: &HashMap<PathBuf, BTreeSet<u32>>,
+    ) -> usize {
+        let mut withdrawn = 0;
+        for sites in self.rows.values_mut() {
+            for rows in sites.values_mut() {
+                let before = rows.len();
+                rows.retain(|row| {
+                    !registered
+                        .get(&row.request_at.0)
+                        .is_some_and(|spans| spans.contains(&row.request_at.1))
+                });
+                withdrawn += before - rows.len();
+            }
+            sites.retain(|_, rows| !rows.is_empty());
+        }
+        self.rows.retain(|_, sites| !sites.is_empty());
+        withdrawn
+    }
+
     /// Call sites of `file` whose callee provably sends nothing, by span
     /// start.
     pub fn silent(&self, file: &Path) -> Option<&BTreeSet<u32>> {
@@ -6223,7 +6261,7 @@ impl Composer<'_> {
                 None => {
                     if let Some(request) = self.request_of(file, call) {
                         summary.effects.extend(
-                            Effect::from_shape(&request, file, call.site.line)
+                            Effect::from_shape(&request, file, call.site)
                                 .into_iter()
                                 .map(|effect| ir.settle_forward(effect)),
                         );
@@ -6528,7 +6566,7 @@ fn emit(
                         || (request.kind != RequestKind::Verb
                             && (!request.url_inline || request.fans_out_inline()))
                     {
-                        for effect in Effect::from_shape(&request, file, call.site.line) {
+                        for effect in Effect::from_shape(&request, file, call.site) {
                             let site = effect.site.clone();
                             let declared = matches!(effect.method, MethodValue::Param(_))
                                 && !request.declared_methods.is_empty();
@@ -6621,6 +6659,7 @@ fn row(
         })
         .collect();
     Some(SummaryRow {
+        request_at: (effect.site.file.clone(), effect.site.span_start),
         callee: call.callee.clone(),
         span_start: site.span_start,
         span_end: site.span_end,
@@ -7107,6 +7146,7 @@ mod tests {
             site: RequestSite {
                 file: PathBuf::from("src/client.ts"),
                 line: 1,
+                span_start: 0,
             },
             method: MethodValue::Lit("POST".to_string()),
             url,
