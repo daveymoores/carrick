@@ -1580,6 +1580,36 @@ impl<'a> LinkedNames<'a> {
         Some(out)
     }
 
+    /// Whether the binding `name` in `file` is known to hold no text: the
+    /// module that declares it, followed through the modules that re-export
+    /// it, declares it as something other than a name (a function, a
+    /// builder not called, an instance, a router). A package's binding, a
+    /// namespace's, or one the scan cannot follow may hold anything, so is
+    /// not known (carrick#2386).
+    pub(super) fn holds_no_text(&self, file: &Path, name: &str) -> bool {
+        let mut at = (file.to_path_buf(), name.to_string());
+        for _ in 0..=super::MAX_REEXPORT_HOPS {
+            let Some(ir) = self.files.get(&at.0) else {
+                return false;
+            };
+            match ir.names.get(&at.1) {
+                Some(NameValue::Builder(_)) => return true,
+                Some(_) => return false,
+                None => {}
+            }
+            if !ir.imported.contains_key(&at.1) {
+                return true;
+            }
+            match self.bindings.get(&at.0, &at.1) {
+                Some(super::ImportedBinding::Binding { file, name }) => {
+                    at = (file.clone(), name.clone());
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// `pieces`, read in `file`, as one text: `None` unless every named
     /// piece reads as text ([`Self::resolve`]). What a guard compares a
     /// value against, when it names a constant (carrick#2386).

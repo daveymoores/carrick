@@ -190,8 +190,9 @@ use guards::{GuardIr, Subject, Tested, WrittenIn};
 
 #[allow(unused_imports)]
 pub use guards::{
-    Branch, ChainEnd, ChainSite, Conjoined, Constant, GuardChain, GuardPosition, GuardShape,
-    HoleReason, Hop, HopArg, Within, guard_chains,
+    Branch, CallChain, CallFunction, CallName, CallStart, ChainEnd, ChainSite, Conjoined, Constant,
+    GuardChain, GuardPosition, GuardShape, HoleReason, Hop, HopArg, LibraryReceiver, NameFrom,
+    NamedCall, Within, guard_chains, named_calls,
 };
 
 #[allow(unused_imports)]
@@ -746,6 +747,11 @@ struct CallIr {
     /// Each name of a function this module declares that an argument hands
     /// on, by position, with the keys down to it inside the argument.
     handed: Vec<(usize, Vec<String>, String)>,
+    /// The text each argument before any spread states, or a field of an
+    /// object-literal argument does, as the value flow reads names
+    /// (carrick#2386): what a call that names an operation names. Read by
+    /// the chains alone.
+    names: Vec<guards::ArgName>,
 }
 
 /// One function body, reduced to what a request summary reads.
@@ -817,6 +823,10 @@ struct FnIr {
     /// back a test: a comparison, a negation, a logical expression, a call
     /// or a boolean.
     returns_tests: Vec<bool>,
+    /// Each `new X(…)` of a constructor that is not the language's own, read
+    /// as a call is, for the chains alone (carrick#2386): the send side never
+    /// reads it, so a construction composes into no summary.
+    constructions: Vec<CallIr>,
 }
 
 /// What one `return` hands back, read for whether a call of the function is
@@ -5111,12 +5121,13 @@ impl Visit for CallWalker<'_, '_, '_> {
                 .collect()
         });
         let bound = &self.guard.bound;
-        let arg_subjects = self.reader.arg_subjects(call, self.scope, bound);
+        let arg_subjects = self.reader.arg_subjects(&call.args, self.scope, bound);
         let callee_subject = match &call.callee {
             Callee::Expr(callee) => Some(self.reader.subject(callee, self.scope, bound)),
             _ => None,
         };
-        let handed = self.reader.handed(call, self.scope, bound);
+        let handed = self.reader.handed(&call.args, self.scope, bound);
+        let names = self.reader.arg_names(&call.args, self.scope);
         self.ir.calls.push(CallIr {
             site: call_site,
             callee,
@@ -5134,6 +5145,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             callee_text,
             tested: self.guard.tested(call.span),
             handed,
+            names,
         });
     }
 
@@ -5195,6 +5207,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 callee_text: String::new(),
                 tested: None,
                 handed: Vec::new(),
+                names: Vec::new(),
             });
         }
         element.visit_children_with(self);
@@ -5264,6 +5277,11 @@ impl Visit for CallWalker<'_, '_, '_> {
             self.scope,
         ) {
             self.ir.library.push(site);
+        }
+        // The chains read a construction as a call (carrick#2386): what its
+        // arguments name, and where each function written in them sits.
+        if !builtin {
+            self.record_construction(new);
         }
         new.visit_children_with(self);
     }
