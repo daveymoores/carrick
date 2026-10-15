@@ -186,7 +186,7 @@ use alternatives::{Alternation, Alternatives};
 // the offline census read it so far, so the binary sees it as unused.
 #[allow(dead_code)]
 mod guards;
-use guards::{GuardIr, Subject, Tested, WrittenIn};
+use guards::{GuardIr, Root, Subject, Tested, WrittenIn};
 
 #[allow(unused_imports)]
 pub use guards::{
@@ -240,8 +240,11 @@ pub enum Piece {
     /// the object the caller writes at that position.
     ParamKey(usize, String, String),
     /// A value the source names and this pass does not read, kept as written
-    /// (`process.env.API_URL`, `config.apiEndpoint`).
-    Opaque(String),
+    /// (`process.env.API_URL`, `config.apiEndpoint`), with where it comes
+    /// from as the receive side reads it (carrick#2406): an environment
+    /// read, an import, a global, or the hole reading stopped at. The text
+    /// alone decides how a target renders.
+    Opaque { text: String, end: Root },
     /// A query one of the service's own functions builds (carrick#1950):
     /// nothing, or text that starts with `?`. It ends the path and states
     /// nothing about the route, so it is read only as the last piece of a URL.
@@ -299,6 +302,25 @@ impl Piece {
     }
 }
 
+/// Where a value renamed into one opaque piece comes from (carrick#2406): a
+/// value of one piece keeps that piece's end, a key of a parameter ends at
+/// the parameter it is read from, and anything else at the expression
+/// reading stopped at.
+fn end_of(pieces: &[Piece]) -> Root {
+    match pieces {
+        [Piece::Lit(text)] => Root::Literal(text.clone()),
+        [Piece::Opaque { end, .. }] => end.clone(),
+        [Piece::Param(index, name)] => Root::Param(*index, name.clone()),
+        [Piece::ParamKey(index, ..)] => Root::Param(*index, String::new()),
+        [Piece::Outer(depth, inner)] => match &**inner {
+            Piece::Param(index, name) => Root::Outer(*depth, *index, name.clone()),
+            Piece::ParamKey(index, ..) => Root::Outer(*depth, *index, String::new()),
+            _ => Root::Hole(HoleReason::UnreadExpression),
+        },
+        _ => Root::Hole(HoleReason::UnreadExpression),
+    }
+}
+
 /// A value as far as the source states it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
@@ -349,8 +371,13 @@ impl ObjValue {
 }
 
 impl Value {
-    fn opaque(text: String) -> Self {
-        Value::Str(vec![Piece::Opaque(text)])
+    fn opaque(text: String, end: Root) -> Self {
+        Value::Str(vec![Piece::Opaque { text, end }])
+    }
+
+    /// An opaque value that ends at the hole `reason` names.
+    fn hole(text: String, reason: HoleReason) -> Self {
+        Self::opaque(text, Root::Hole(reason))
     }
 
     /// This value as string pieces. An object or a function in a string
@@ -3529,7 +3556,11 @@ impl Reader<'_> {
                             ParamOrTsParamProp::TsParamProp(prop) => match &prop.param {
                                 TsParamPropParam::Ident(ident) => {
                                     let name = ident.id.sym.to_string();
-                                    assign(name.clone(), Value::opaque(name), None, &mut fields);
+                                    // A constructor parameter: no position a
+                                    // call of the method fills.
+                                    let value =
+                                        Value::hole(name.clone(), HoleReason::UnreadExpression);
+                                    assign(name, value, None, &mut fields);
                                 }
                                 // `private fetchImpl = fetch`.
                                 TsParamPropParam::Assign(param) => {
@@ -3609,7 +3640,10 @@ impl Reader<'_> {
         fetches.retain(|name| !contested.contains(name));
         for name in contested {
             receivers.remove(&name);
-            fields.insert(name.clone(), Value::opaque(format!("this.{name}")));
+            fields.insert(
+                name.clone(),
+                Value::hole(format!("this.{name}"), HoleReason::Reassigned),
+            );
         }
         let receivers = receivers
             .into_iter()
@@ -3840,7 +3874,7 @@ impl Reader<'_> {
                             self.written_instance(init, scope)
                         };
                         let value = if unsettled {
-                            Value::opaque(name.clone())
+                            Value::hole(name.clone(), HoleReason::Reassigned)
                         } else {
                             bound(name.clone(), self.eval(init, scope))
                         };
@@ -3934,7 +3968,7 @@ impl Reader<'_> {
                     (Value::Str(_), Value::Str(_)) => {
                         Value::Str(concat([left.pieces(), right.pieces()]))
                     }
-                    _ => Value::opaque(self.text(bin.span)),
+                    _ => Value::hole(self.text(bin.span), HoleReason::UnreadExpression),
                 }
             }
             // `process.env.URL ?? "http://localhost:3000"`: the left side is
@@ -3958,14 +3992,31 @@ impl Reader<'_> {
                             pieces
                                 .into_iter()
                                 .map(|piece| match piece {
-                                    Piece::ParamKey(_, _, name) => Piece::Opaque(name),
+                                    Piece::ParamKey(_, _, name) => Piece::Opaque {
+                                        text: name,
+                                        end: Root::Hole(HoleReason::CallerArgMissing),
+                                    },
                                     other => other,
                                 })
                                 .collect(),
                         )
                     }
-                    left @ Value::Str(_) => left,
-                    _ => Value::opaque(self.text(bin.span)),
+                    // An environment read keeps the literal written beside
+                    // it on its end (carrick#2406); the text is the read's.
+                    Value::Str(mut pieces) => {
+                        if let [
+                            Piece::Opaque {
+                                end: Root::Env { fallback, .. },
+                                ..
+                            },
+                        ] = pieces.as_mut_slice()
+                            && fallback.is_none()
+                        {
+                            *fallback = crate::env_alias::fallback_literal(expr);
+                        }
+                        Value::Str(pieces)
+                    }
+                    _ => Value::hole(self.text(bin.span), HoleReason::UnreadExpression),
                 }
             }
             // The binding the identifier resolves to, never another of the
@@ -4000,7 +4051,7 @@ impl Reader<'_> {
                     }
                     return value.clone();
                 }
-                Value::opaque(name.to_string())
+                Value::opaque(name.to_string(), self.ident_end(ident, scope))
             }
             Expr::Member(member) => self.member(member, scope),
             Expr::Object(obj) => Value::Obj(self.object(obj, scope)),
@@ -4041,7 +4092,18 @@ impl Reader<'_> {
                         return inner;
                     }
                 }
-                Value::opaque(self.text(call.span))
+                let text = self.text(call.span);
+                match crate::env_alias::env_get_call_name(call) {
+                    Some(name) => Value::opaque(
+                        text.clone(),
+                        Root::Env {
+                            written: text,
+                            name,
+                            fallback: None,
+                        },
+                    ),
+                    None => Value::hole(text, HoleReason::UnreadExpression),
+                }
             }
             Expr::New(new) => self.new_url(new, scope),
             Expr::Paren(paren) => self.eval(&paren.expr, scope),
@@ -4051,7 +4113,7 @@ impl Reader<'_> {
             Expr::TsSatisfies(e) => self.eval(&e.expr, scope),
             Expr::TsTypeAssertion(e) => self.eval(&e.expr, scope),
             Expr::Await(e) => self.eval(&e.arg, scope),
-            _ => Value::opaque(self.text(expr.span())),
+            _ => Value::hole(self.text(expr.span()), HoleReason::UnreadExpression),
         }
     }
 
@@ -4083,7 +4145,7 @@ impl Reader<'_> {
                 if let Some(value) = scope.fields.and_then(|fields| fields.values.get(&name)) {
                     return value.clone();
                 }
-                return Value::opaque(format!("this.{name}"));
+                return Value::hole(format!("this.{name}"), HoleReason::UnreadExpression);
             }
         }
         // `url.href` on a URL value is the URL.
@@ -4120,7 +4182,18 @@ impl Reader<'_> {
         {
             return value.clone();
         }
-        Value::opaque(self.text(member.span))
+        // An environment read is decided by its spelling alone, with no
+        // check that `process` is the global (carrick#2406).
+        let text = self.text(member.span);
+        let end = match crate::env_alias::env_member_name(member) {
+            Some(name) => Root::Env {
+                written: text.clone(),
+                name,
+                fallback: None,
+            },
+            None => self.member_end(member, scope),
+        };
+        Value::opaque(text, end)
     }
 
     /// Whether `call` is a call of a query builder the enclosing class or
@@ -4193,7 +4266,7 @@ impl Reader<'_> {
         let is_url = matches!(&*new.callee, Expr::Ident(ident) if ident.sym == *"URL");
         let args = new.args.as_deref().unwrap_or_default();
         if !is_url || args.iter().any(|arg| arg.spread.is_some()) {
-            return Value::opaque(self.text(new.span));
+            return Value::hole(self.text(new.span), HoleReason::UnreadExpression);
         }
         match args {
             [path] => self.eval(&path.expr, scope),
@@ -4204,11 +4277,11 @@ impl Reader<'_> {
             [path, _base] => {
                 let path = self.eval(&path.expr, scope).pieces();
                 if !matches!(path.first(), Some(Piece::Lit(text)) if text.starts_with('/')) {
-                    return Value::opaque(self.text(new.span));
+                    return Value::hole(self.text(new.span), HoleReason::UnreadExpression);
                 }
                 Value::Str(path)
             }
-            _ => Value::opaque(self.text(new.span)),
+            _ => Value::hole(self.text(new.span), HoleReason::UnreadExpression),
         }
     }
 
@@ -4660,7 +4733,7 @@ impl Reader<'_> {
         let Value::Str(pieces) = self.eval(receiver, scope) else {
             return false;
         };
-        let [Piece::Opaque(text)] = pieces.as_slice() else {
+        let [Piece::Opaque { text, .. }] = pieces.as_slice() else {
             return false;
         };
         let Some(constructed) = text.strip_prefix("new ") else {
@@ -4711,16 +4784,26 @@ fn bound(name: String, value: Value) -> Value {
         [Piece::ParamKey(index, key, _)] => {
             Value::Str(vec![Piece::ParamKey(*index, key.clone(), name)])
         }
-        [Piece::Opaque(text)]
-            if text.starts_with("new ")
-                || text.starts_with("process.env.")
-                || text.starts_with("import.meta.env.")
-                || text.starts_with("Deno.env.") =>
-        {
-            value
+        [Piece::Opaque { text, .. }] if renders_as_written(text) => value,
+        // Written by the binding's name, ending where the value it holds
+        // does (carrick#2406).
+        _ => {
+            let end = end_of(pieces);
+            Value::opaque(name, end)
         }
-        _ => Value::opaque(name),
     }
+}
+
+/// Whether a binding holding only `text` is written by that text rather than
+/// by its own name ([`bound`]): a construction, or anything spelled from a
+/// runtime's environment object. A rendering rule, not the decision that a
+/// value is an environment read: it keeps `Deno.env.get(variable)` and
+/// `Deno.env.toObject()`, which [`crate::env_alias::env_read_name`] refuses.
+fn renders_as_written(text: &str) -> bool {
+    text.starts_with("new ")
+        || text.starts_with("process.env.")
+        || text.starts_with("import.meta.env.")
+        || text.starts_with("Deno.env.")
 }
 
 /// The body a value states, where it stands for one.
@@ -5694,7 +5777,11 @@ impl Effect {
             pieces
                 .iter()
                 .map(|piece| match piece {
-                    Piece::ParamKey(_, _, name) => Piece::Opaque(name.clone()),
+                    // No caller filled the key in.
+                    Piece::ParamKey(_, _, name) => Piece::Opaque {
+                        text: name.clone(),
+                        end: Root::Hole(HoleReason::CallerArgMissing),
+                    },
                     other => other.clone(),
                 })
                 .collect()
@@ -5724,9 +5811,11 @@ impl Effect {
             pieces
                 .iter()
                 .map(|piece| match piece {
-                    Piece::Outer(..) => {
-                        Piece::Opaque(piece.parameter_name().unwrap_or_default().to_string())
-                    }
+                    // No caller of the enclosing function filled it in.
+                    Piece::Outer(..) => Piece::Opaque {
+                        text: piece.parameter_name().unwrap_or_default().to_string(),
+                        end: Root::Hole(HoleReason::CallerArgMissing),
+                    },
                     other => other.clone(),
                 })
                 .collect()
@@ -5803,8 +5892,34 @@ impl Effect {
         // it is the base, and the caller's own expression is what says where
         // the request goes.
         let written = |arg: &[Piece], position: usize, name: &str| match arg {
-            [Piece::Opaque(_)] if position > 0 => vec![Piece::Opaque(name.to_string())],
+            [Piece::Opaque { end, .. }] if position > 0 => vec![Piece::Opaque {
+                text: name.to_string(),
+                end: end.clone(),
+            }],
             _ => arg.to_vec(),
+        };
+        // Where the caller's argument for a parameter piece comes from: the
+        // end of the one piece it writes there (carrick#2406).
+        let arg_end = |piece: &Piece| -> Root {
+            let hole = Root::Hole(HoleReason::UnreadExpression);
+            match piece {
+                Piece::Param(index, _) => match args.get(*index) {
+                    Some(Value::Str(arg)) => end_of(arg),
+                    _ => hole,
+                },
+                Piece::ParamKey(index, key, _) => match args.get(*index) {
+                    Some(Value::Obj(object)) => match object.fields.get(key) {
+                        Some(Value::Str(arg)) => end_of(arg),
+                        _ => hole,
+                    },
+                    Some(Value::Str(arg)) => match arg.as_slice() {
+                        [Piece::Param(outer, _)] => Root::Param(*outer, String::new()),
+                        _ => hole,
+                    },
+                    _ => hole,
+                },
+                _ => hole,
+            }
         };
         let fill = |pieces: &[Piece]| -> Vec<Piece> {
             concat(
@@ -5818,7 +5933,10 @@ impl Effect {
                         Piece::Param(_, name) | Piece::ParamKey(_, _, name)
                             if is_whole_segment(pieces, position) =>
                         {
-                            vec![Piece::Opaque(name.clone())]
+                            vec![Piece::Opaque {
+                                text: name.clone(),
+                                end: arg_end(piece),
+                            }]
                         }
                         Piece::Param(index, name) => match args.get(*index) {
                             Some(Value::Str(arg)) => written(arg, position, name),
@@ -6996,8 +7114,14 @@ fn base_reads_the_same_in(effect: &Effect, file: &Path) -> bool {
     match &effect.base_scope {
         Some(scope) if scope != file => effect.base.iter().all(|piece| match piece {
             Piece::Lit(_) => true,
-            Piece::Opaque(text) => reads_the_environment(text),
-            Piece::Param(..)
+            // An environment read written as the read itself; one a binding
+            // renamed is written by a name another file may bind otherwise.
+            Piece::Opaque {
+                text,
+                end: Root::Env { written, .. },
+            } => text == written,
+            Piece::Opaque { .. }
+            | Piece::Param(..)
             | Piece::ParamKey(..)
             | Piece::Outer(..)
             | Piece::Query
@@ -7005,38 +7129,6 @@ fn base_reads_the_same_in(effect: &Effect, file: &Path) -> bool {
         }),
         _ => true,
     }
-}
-
-/// Whether `text` is exactly an environment read, in one of the spellings the
-/// runtimes give it (as [`crate::env_alias`] reads them): `process.env.NAME`,
-/// `import.meta.env.NAME`, either with a string index, or `Deno.env.get("NAME")`.
-fn reads_the_environment(text: &str) -> bool {
-    let name = |name: &str| {
-        !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-    };
-    let quoted = |inner: &str| {
-        [('"', '"'), ('\'', '\'')].iter().any(|(open, close)| {
-            inner
-                .strip_prefix(*open)
-                .and_then(|rest| rest.strip_suffix(*close))
-                .is_some_and(name)
-        })
-    };
-    ["process.env", "import.meta.env"].iter().any(|object| {
-        text.strip_prefix(object).is_some_and(|rest| {
-            rest.strip_prefix('.').is_some_and(name)
-                || rest
-                    .strip_prefix('[')
-                    .and_then(|rest| rest.strip_suffix(']'))
-                    .is_some_and(quoted)
-        })
-    }) || text
-        .strip_prefix("Deno.env.get(")
-        .and_then(|rest| rest.strip_suffix(')'))
-        .is_some_and(quoted)
 }
 
 /// What a call sends when the call graph resolves it to nothing of this
@@ -7313,7 +7405,7 @@ fn render_target(url: &[Piece]) -> Option<String> {
         return None;
     }
     let (base, path) = match url.first()? {
-        Piece::Opaque(base) => (Some(base.as_str()), &url[1..]),
+        Piece::Opaque { text: base, .. } => (Some(base.as_str()), &url[1..]),
         _ => (None, url),
     };
     match path.first()? {
@@ -7331,7 +7423,9 @@ fn render_target(url: &[Piece]) -> Option<String> {
                 literal_segment |= route.split('/').any(|segment| !segment.is_empty());
                 rendered.push_str(text);
             }
-            Piece::Opaque(name) | Piece::Param(_, name) | Piece::ParamKey(_, _, name) => {
+            Piece::Opaque { text: name, .. }
+            | Piece::Param(_, name)
+            | Piece::ParamKey(_, _, name) => {
                 if !is_whole_segment(path, position) {
                     return None;
                 }
@@ -7380,7 +7474,10 @@ mod tests {
     }
 
     fn opaque(text: &str) -> Piece {
-        Piece::Opaque(text.to_string())
+        Piece::Opaque {
+            text: text.to_string(),
+            end: Root::Hole(HoleReason::UnreadExpression),
+        }
     }
 
     #[test]
@@ -7552,9 +7649,13 @@ mod tests {
         // an opaque value under the name the function reads it by.
         let mut based = effect(vec![keyed(0, "base"), lit("/users/"), keyed(0, "id")]);
         based.settle_keys();
+        let unfilled = |text: &str| Piece::Opaque {
+            text: text.to_string(),
+            end: Root::Hole(HoleReason::CallerArgMissing),
+        };
         assert_eq!(
             based.url,
-            vec![opaque("base"), lit("/users/"), opaque("id")]
+            vec![unfilled("base"), lit("/users/"), unfilled("id")]
         );
         assert!(!based.has_params());
         assert_eq!(
@@ -8041,5 +8142,303 @@ mod tests {
         let mut merged = BindingUse::default();
         merged.merge(&uses.uses["api"]);
         assert_eq!(merged.returned_at, uses.uses["api"].returned_at);
+    }
+
+    /// The URL the first request `function` makes in `source` reads as,
+    /// with its base joined (carrick#2406).
+    fn request_url(source: &str, function: &str) -> Vec<Piece> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.ts");
+        std::fs::write(&path, source).expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            true,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
+        let file = extract_file_ir(&module, &cm, &HashSet::new());
+        let Some(ir) = file.functions.get(function) else {
+            let names: Vec<&String> = file.functions.keys().collect();
+            panic!("no function {function} among {names:?}");
+        };
+        ir.calls
+            .iter()
+            .find_map(|call| call.request.as_ref())
+            .map(|shape| join_base(&shape.base, &shape.url))
+            .unwrap_or_else(|| panic!("{function} makes no request"))
+    }
+
+    /// The end of the URL's first piece, which must be opaque, and the
+    /// target the URL renders.
+    fn first_end(url: &[Piece]) -> (&Root, Option<String>) {
+        let Some(Piece::Opaque { end, .. }) = url.first() else {
+            panic!("the URL leads with an opaque piece: {url:?}");
+        };
+        (end, render_target(url))
+    }
+
+    fn env(written: &str, name: &str, fallback: Option<&str>) -> Root {
+        Root::Env {
+            written: written.to_string(),
+            name: name.to_string(),
+            fallback: fallback.map(str::to_string),
+        }
+    }
+
+    /// carrick#2406: an environment read ends at the variable it names, in
+    /// each runtime's spelling, with the `??` literal beside it kept on the
+    /// end and left out of the target.
+    #[test]
+    fn an_environment_read_ends_at_its_variable_with_its_fallback() {
+        let url = request_url(
+            "export function list() {\n\
+             \x20 return fetch(`${process.env.API ?? \"http://localhost:4000\"}/users`);\n\
+             }\n",
+            "list",
+        );
+        assert_eq!(
+            first_end(&url),
+            (
+                &env("process.env.API", "API", Some("http://localhost:4000")),
+                Some("${process.env.API}/users".to_string())
+            )
+        );
+        for (read, name) in [
+            ("import.meta.env.VITE_API", "VITE_API"),
+            ("process.env[\"API\"]", "API"),
+            ("Deno.env.get(\"API\")", "API"),
+        ] {
+            let source =
+                format!("export function list() {{ return fetch(`${{{read}}}/users`); }}\n");
+            let url = request_url(&source, "list");
+            assert_eq!(
+                first_end(&url),
+                (&env(read, name, None), Some(format!("${{{read}}}/users")))
+            );
+        }
+    }
+
+    /// carrick#2406: a name the file neither declares nor imports ends as a
+    /// global, an import binding at the import, and a call result where
+    /// reading stopped.
+    #[test]
+    fn a_global_an_import_and_a_call_result_end_where_the_receive_side_says() {
+        let source = "import { apiBase } from \"./config\";\n\
+                      import * as settings from \"./settings\";\n\
+                      export function global() { return fetch(`${API_BASE}/users`); }\n\
+                      export function imported() { return fetch(`${apiBase}/users`); }\n\
+                      export function member() { return fetch(`${settings.base}/users`); }\n\
+                      export function called() { return fetch(`${baseUrl()}/users`); }\n";
+        assert_eq!(
+            first_end(&request_url(source, "global")),
+            (
+                &Root::Global("API_BASE".to_string()),
+                Some("${API_BASE}/users".to_string())
+            )
+        );
+        assert_eq!(
+            first_end(&request_url(source, "imported")),
+            (
+                &Root::Import {
+                    local: "apiBase".to_string(),
+                    specifier: "./config".to_string(),
+                    export: "apiBase".to_string(),
+                },
+                Some("${apiBase}/users".to_string())
+            )
+        );
+        assert_eq!(
+            first_end(&request_url(source, "member")),
+            (
+                &Root::Import {
+                    local: "settings".to_string(),
+                    specifier: "./settings".to_string(),
+                    export: "*".to_string(),
+                },
+                Some("${settings.base}/users".to_string())
+            )
+        );
+        assert_eq!(
+            first_end(&request_url(source, "called")),
+            (
+                &Root::Hole(HoleReason::UnreadExpression),
+                Some("${baseUrl()}/users".to_string())
+            )
+        );
+    }
+
+    /// carrick#2406: a field the class writes more than once ends as
+    /// reassigned, one the field table holds nothing for where reading
+    /// stopped, and a binding set again as reassigned. Each keeps its text.
+    #[test]
+    fn a_contested_field_an_unread_field_and_an_unsettled_binding_end_at_holes() {
+        let source = "export class Client {\n\
+                      \x20 constructor(base: string) { this.base = base; }\n\
+                      \x20 rebase(next: string) { this.base = next; }\n\
+                      \x20 list() { return fetch(`${this.base}/users`); }\n\
+                      \x20 other() { return fetch(`${this.origin}/users`); }\n\
+                      }\n\
+                      export function moved(flag: boolean) {\n\
+                      \x20 let base = \"http://a\";\n\
+                      \x20 if (flag) { base = \"http://b\"; }\n\
+                      \x20 return fetch(`${base}/users`);\n\
+                      }\n";
+        assert_eq!(
+            first_end(&request_url(source, "Client.list")),
+            (
+                &Root::Hole(HoleReason::Reassigned),
+                Some("${this.base}/users".to_string())
+            )
+        );
+        assert_eq!(
+            first_end(&request_url(source, "Client.other")),
+            (
+                &Root::Hole(HoleReason::UnreadExpression),
+                Some("${this.origin}/users".to_string())
+            )
+        );
+        assert_eq!(
+            first_end(&request_url(source, "moved")),
+            (
+                &Root::Hole(HoleReason::Reassigned),
+                Some("${base}/users".to_string())
+            )
+        );
+    }
+
+    /// carrick#2406: a key of a parameter under `??` is the caller's to
+    /// leave out, so it ends as a missing argument.
+    #[test]
+    fn a_parameter_key_under_a_fallback_ends_as_a_missing_argument() {
+        let url = request_url(
+            "export function list(opts: { base?: string }) {\n\
+             \x20 return fetch(`${opts.base ?? \"http://localhost\"}/users`);\n\
+             }\n",
+            "list",
+        );
+        assert_eq!(
+            first_end(&url),
+            (
+                &Root::Hole(HoleReason::CallerArgMissing),
+                Some("${opts.base}/users".to_string())
+            )
+        );
+    }
+
+    /// carrick#2406: a key or an enclosing parameter no caller filled ends
+    /// as a missing argument; a path parameter renamed at a call carries
+    /// the end of what the caller wrote there.
+    #[test]
+    fn renamed_pieces_carry_an_end_by_rule() {
+        let missing = Root::Hole(HoleReason::CallerArgMissing);
+        let mut keyed_effect = effect(vec![keyed(0, "base"), lit("/users")]);
+        keyed_effect.settle_keys();
+        assert!(
+            matches!(keyed_effect.url.first(), Some(Piece::Opaque { end, .. }) if *end == missing)
+        );
+        let mut outer = effect(vec![
+            Piece::Param(0, "base".to_string()).enclosed(),
+            lit("/x"),
+        ]);
+        outer.settle_outer();
+        assert!(matches!(outer.url.first(), Some(Piece::Opaque { end, .. }) if *end == missing));
+
+        let segment = effect(vec![lit("/users/"), Piece::Param(0, "id".to_string())]);
+        let imported = Root::Import {
+            local: "userId".to_string(),
+            specifier: "./ids".to_string(),
+            export: "userId".to_string(),
+        };
+        let cases = [
+            (vec![lit("42")], Root::Literal("42".to_string())),
+            (
+                vec![Piece::Opaque {
+                    text: "userId".to_string(),
+                    end: imported.clone(),
+                }],
+                imported,
+            ),
+            (
+                vec![Piece::Param(1, "who".to_string())],
+                Root::Param(1, "who".to_string()),
+            ),
+            (
+                vec![lit("a"), opaque("b")],
+                Root::Hole(HoleReason::UnreadExpression),
+            ),
+        ];
+        for (arg, end) in cases {
+            let filled = segment.instantiate(&[Value::Str(arg)]);
+            assert_eq!(
+                filled.url.last(),
+                Some(&Piece::Opaque {
+                    text: "id".to_string(),
+                    end
+                })
+            );
+            assert_eq!(render_target(&filled.url).as_deref(), Some("/users/${id}"));
+        }
+    }
+
+    /// carrick#2406: the send side decides an environment read by its
+    /// spelling alone, so a file that imports its own `process` still reads
+    /// `process.env.API` as the variable. The receive side checks that
+    /// `process` is the global ([`guards`]'s tests).
+    #[test]
+    fn the_send_side_reads_an_environment_spelling_without_a_shadow_check() {
+        let url = request_url(
+            "import process from \"./fake-process\";\n\
+             export function list() { return fetch(`${process.env.API}/users`); }\n",
+            "list",
+        );
+        assert_eq!(
+            first_end(&url),
+            (
+                &env("process.env.API", "API", None),
+                Some("${process.env.API}/users".to_string())
+            )
+        );
+    }
+
+    /// carrick#2406: where the AST recogniser and the text test it replaced
+    /// disagree. A string index that is no identifier was no environment
+    /// read to the text test and is one now; a wrapped read was one to both,
+    /// as the piece's text is the read inside the wrapper.
+    #[test]
+    fn the_environment_recogniser_reads_the_ast_not_the_text() {
+        let base_in_another_file = |base: Vec<Piece>| {
+            let mut effect = effect(vec![lit("/users")]);
+            effect.base = base;
+            effect.base_scope = Some(PathBuf::from("src/client.ts"));
+            base_reads_the_same_in(&effect, Path::new("src/use.ts"))
+        };
+        for (source, read, name) in [
+            // Old answer: not an environment read (the text test refused
+            // `MY-VAR`).
+            (
+                "process.env[\"MY-VAR\"]",
+                "process.env[\"MY-VAR\"]",
+                "MY-VAR",
+            ),
+            // Old answer: an environment read, by the text inside the cast.
+            ("(process.env.API as string)", "process.env.API", "API"),
+            ("process.env.API!", "process.env.API", "API"),
+        ] {
+            let source =
+                format!("export function list() {{ return fetch(`${{{source}}}/users`); }}\n");
+            let url = request_url(&source, "list");
+            let (end, _) = first_end(&url);
+            assert_eq!(end, &env(read, name, None), "{source}");
+            assert!(base_in_another_file(url[..1].to_vec()), "{source}");
+        }
+        // A binding renamed from a read is written by its own name, which
+        // another file may bind otherwise: its base is not stated there.
+        let renamed = Piece::Opaque {
+            text: "API".to_string(),
+            end: env("process.env[\"MY-VAR\"]", "MY-VAR", None),
+        };
+        assert!(!base_in_another_file(vec![renamed]));
     }
 }

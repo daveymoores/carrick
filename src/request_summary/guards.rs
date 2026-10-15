@@ -52,9 +52,9 @@ use super::library_sites::{LinkedNames, TextPiece, text_pieces};
 use super::{
     CallIr, CallWalker, FileIr, FnIr, ImportBinding, Piece, Reader, Reassigned,
     RequestSummaryInputs, Scope, Site, Value, keyed_names, member_prop, prop_name,
-    reads_the_environment,
 };
 use crate::binding_scope::{BindingKey, Declarations, ident_key};
+use crate::env_alias::{env_get_call_name, env_member_name};
 use crate::graphql_document_sites::unwrap_expression;
 use crate::swc_scanner::is_producer_route_path;
 use crate::visitor::{FunctionDefinition, FunctionNodeType};
@@ -121,14 +121,22 @@ pub enum HoleReason {
 }
 
 /// Where a compared value comes from, before any access is applied to it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) enum Root {
+/// The send side's opaque pieces end at one too ([`super::Piece::Opaque`],
+/// carrick#2406). `pub`, not `pub(crate)`, because [`super::Piece`] is public.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Root {
     /// The function's own parameter, by position and name.
     Param(usize, String),
     /// A parameter of an enclosing function, `depth` functions out.
     Outer(u8, usize, String),
-    /// An environment read, as written (`process.env.BASE`).
-    Env(String),
+    /// An environment read: the text as written (`process.env.BASE`), the
+    /// variable it names ([`crate::env_alias::env_read_name`]), and the
+    /// `??` / `||` literal written beside it, where the send side read one.
+    Env {
+        written: String,
+        name: String,
+        fallback: Option<String>,
+    },
     /// A name the file neither declares nor imports.
     Global(String),
     /// An import binding: its local name, the specifier as written and the
@@ -237,6 +245,16 @@ impl Subject {
 
     fn rendered_steps(&self) -> Vec<String> {
         self.steps.iter().map(Step::render).collect()
+    }
+
+    /// The root the value comes from, as one opaque piece ends at it
+    /// (carrick#2406). A literal with an access after it is no literal the
+    /// piece holds, so it ends where reading stopped.
+    fn end(self) -> Root {
+        match self.root {
+            Root::Literal(_) if !self.steps.is_empty() => Root::Hole(HoleReason::UnreadExpression),
+            root => root,
+        }
     }
 }
 
@@ -747,9 +765,12 @@ impl Reader<'_> {
                         .subject(&member.obj, scope, bound)
                         .then(Step::Call(method));
                 }
-                let text = self.text(call.span);
-                if reads_the_environment(&text) {
-                    return Subject::of(Root::Env(text));
+                if let Some(name) = env_get_call_name(call) {
+                    return Subject::of(Root::Env {
+                        written: self.text(call.span),
+                        name,
+                        fallback: None,
+                    });
                 }
                 Subject::hole(HoleReason::UnreadExpression)
             }
@@ -769,11 +790,14 @@ impl Reader<'_> {
                 .stopped_at(|| self.text(member.span));
         }
         let base = self.subject(&member.obj, scope, bound);
-        if matches!(base.root, Root::Global(_)) {
-            let text = self.text(member.span);
-            if reads_the_environment(&text) {
-                return Subject::of(Root::Env(text));
-            }
+        if matches!(base.root, Root::Global(_))
+            && let Some(name) = env_member_name(member)
+        {
+            return Subject::of(Root::Env {
+                written: self.text(member.span),
+                name,
+                fallback: None,
+            });
         }
         match &member.prop {
             MemberProp::Ident(prop) => base.then(Step::Key(prop.sym.to_string())),
@@ -828,6 +852,18 @@ impl Reader<'_> {
             return Subject::hole(HoleReason::UnreadExpression);
         }
         Subject::of(Root::Global(name))
+    }
+
+    /// Where a name the send side keeps opaque comes from (carrick#2406):
+    /// the root this reader gives it.
+    pub(super) fn ident_end(&self, ident: &Ident, scope: &Scope<'_>) -> Root {
+        self.ident_subject(ident, scope, &Bound::default()).end()
+    }
+
+    /// Where a member the send side keeps opaque comes from (carrick#2406).
+    /// The caller decides an environment read first.
+    pub(super) fn member_end(&self, member: &MemberExpr, scope: &Scope<'_>) -> Root {
+        self.member_subject(member, scope, &Bound::default()).end()
     }
 
     /// Each argument's subject, `None` for a function written in place and
@@ -2055,7 +2091,7 @@ impl<'a> Chains<'a> {
         let steps = trace.subject.rendered_steps();
         match trace.subject.root.clone() {
             Root::Literal(text) => ends.push(trace, ChainEnd::Literal { text, steps }),
-            Root::Env(name) => ends.push(trace, ChainEnd::Env { name, steps }),
+            Root::Env { name, .. } => ends.push(trace, ChainEnd::Env { name, steps }),
             Root::Global(name) => ends.push(trace, ChainEnd::Global { name, steps }),
             Root::Import {
                 local,
@@ -2250,13 +2286,22 @@ impl<'a> Chains<'a> {
                 trace.subject = callee;
                 self.follow(node, trace, ends);
             }
+            // A callee imported from a module of this service is the
+            // in-repo import hole, as `follow` and a named call's callee
+            // label it (carrick#2406).
             Root::Import {
-                specifier, export, ..
+                local,
+                specifier,
+                export,
             } => {
-                let end = ChainEnd::ExternalImport {
-                    specifier: specifier.clone(),
-                    export: export.clone(),
-                    steps,
+                let end = if self.inputs.bindings.get(file, local).is_some() {
+                    at_call(HoleReason::InRepoValueImport, Some(local.clone()))
+                } else {
+                    ChainEnd::ExternalImport {
+                        specifier: specifier.clone(),
+                        export: export.clone(),
+                        steps,
+                    }
                 };
                 ends.push(trace, end);
             }
@@ -2875,6 +2920,112 @@ mod tests {
         named_calls(&inputs, dir.path())
     }
 
+    /// carrick#2406: the receive side decides an environment read by the
+    /// AST recogniser the send side uses, and names the variable rather
+    /// than its spelling. `member_subject` still checks that `process` is
+    /// the global, so a file that imports its own `process` reads none.
+    #[test]
+    fn an_environment_read_on_the_receive_side_names_its_variable() {
+        let chains = chains_in(&[
+            (
+                "src/check.ts",
+                r#"import process from "./fake-process";
+
+function check(path: string): boolean {
+  return path === "/health";
+}
+
+export function dotted(): boolean {
+  return check(process.env.API);
+}
+"#,
+            ),
+            (
+                "src/fake-process.ts",
+                "export default { env: { API: \"x\" } };\n",
+            ),
+            (
+                "src/reads.ts",
+                r#"function check(path: string): boolean {
+  return path === "/ready";
+}
+
+export function dotted(): boolean {
+  return check(process.env.API);
+}
+
+export function indexed(): boolean {
+  return check(process.env["MY-VAR"]);
+}
+
+export function cast(): boolean {
+  return check(process.env.API as string);
+}
+
+export function asserted(): boolean {
+  return check(process.env.API!);
+}
+
+export function deno(): boolean {
+  return check(Deno.env.get("API"));
+}
+"#,
+            ),
+        ]);
+        let mut ready: Vec<String> = chains
+            .iter()
+            .filter(|(literal, _, _)| literal == "/ready")
+            .map(|(_, _, end)| {
+                if end["kind"] == "env" && end["steps"] == serde_json::json!([]) {
+                    end["name"].as_str().unwrap_or_default().to_string()
+                } else {
+                    format!("not an environment read: {end}")
+                }
+            })
+            .collect();
+        ready.sort();
+        // Old answers: `process.env.API` as written for the dotted, cast
+        // and asserted reads and `Deno.env.get("API")` for the call; a
+        // global `process` with steps `env`, `MY-VAR` for the index.
+        assert_eq!(ready, ["API", "API", "API", "API", "MY-VAR"], "{chains:#?}");
+        let health = end_of(&chains, "/health");
+        assert_ne!(
+            health["kind"], "env",
+            "an imported `process` is no environment: {health}"
+        );
+    }
+
+    /// carrick#2406: a function handed to a callee imported from a module
+    /// of this service ends at the in-repo import hole on the hop, as
+    /// `follow` and a named call's callee label it, not as an external
+    /// import.
+    #[test]
+    fn a_function_handed_to_an_in_repo_import_ends_at_the_in_repo_hole() {
+        let chains = chains_in(&[
+            (
+                "src/registry.ts",
+                r#"import { createRegistry } from "invented-registry";
+
+export const registry = createRegistry();
+"#,
+            ),
+            (
+                "src/main.ts",
+                r#"import { registry } from "./registry";
+
+registry.add((path: string) => path === "/health");
+"#,
+            ),
+        ]);
+        assert_eq!(
+            end_of(&chains, "/health"),
+            &serde_json::json!({
+                "kind": "hole", "reason": "in_repo_value_import",
+                "file": "src/main.ts", "line": 3, "text": "registry"
+            })
+        );
+    }
+
     /// A binding a module of the service declares as no name (a function,
     /// an instance) names nothing when handed to a call; a package's
     /// constant, and a builder's call that reads as no text, are kept as
@@ -2957,9 +3108,14 @@ export function relay(topic: string): void {
     /// rather than stopping unplaced.
     #[test]
     fn a_guard_in_a_function_handed_to_a_construction_reaches_the_constructor() {
-        let chains = chains_in(&[(
-            "src/server.ts",
-            r#"import { Server } from "invented-ipc";
+        // The package is declared: an undeclared one may be a module of the
+        // service, and ends at the in-repo import hole (carrick#2406).
+        let manifest = r#"{ "name": "probe", "dependencies": { "invented-ipc": "1.0.0" } }"#;
+        let chains = chains_with(
+            manifest,
+            &[(
+                "src/server.ts",
+                r#"import { Server } from "invented-ipc";
 
 export const server = new Server({
   onMessage: (message: { type: string }) => {
@@ -2969,7 +3125,8 @@ export const server = new Server({
   },
 });
 "#,
-        )]);
+            )],
+        );
         let (_, hops, end) = chains
             .iter()
             .find(|(literal, _, _)| literal == "PING")
@@ -2994,8 +3151,16 @@ export const server = new Server({
     /// The chains of one service written from `files` (path, source), each
     /// as (literal, hops, end) JSON.
     fn chains_in(files: &[(&str, &str)]) -> Vec<(String, serde_json::Value, serde_json::Value)> {
+        chains_with(r#"{ "name": "probe" }"#, files)
+    }
+
+    /// [`chains_in`], with `manifest` as the service's package.json.
+    fn chains_with(
+        manifest: &str,
+        files: &[(&str, &str)],
+    ) -> Vec<(String, serde_json::Value, serde_json::Value)> {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        std::fs::write(dir.path().join("package.json"), r#"{ "name": "probe" }"#)
+        std::fs::write(dir.path().join("package.json"), manifest)
             .expect("the manifest is writable");
         for (path, source) in files {
             let path = dir.path().join(path);
@@ -3090,9 +3255,14 @@ export function fixed(href: string): boolean {
     /// to the call, as one written there is, with the keys down to it.
     #[test]
     fn a_function_named_inside_an_object_argument_is_handed_to_the_call() {
-        let chains = chains_in(&[(
-            "src/log.ts",
-            r#"import { logger } from "invented-logger";
+        // The package is declared: an undeclared one may be a module of the
+        // service, and ends at the in-repo import hole (carrick#2406).
+        let manifest = r#"{ "name": "probe", "dependencies": { "invented-logger": "1.0.0" } }"#;
+        let chains = chains_with(
+            manifest,
+            &[(
+                "src/log.ts",
+                r#"import { logger } from "invented-logger";
 
 function skipHealth(req: { path: string }): boolean {
   return req.path === "/health";
@@ -3101,7 +3271,8 @@ function skipHealth(req: { path: string }): boolean {
 logger({ skip: skipHealth });
 logger({ skipHealth });
 "#,
-        )]);
+            )],
+        );
         let mut paths: Vec<serde_json::Value> = chains
             .iter()
             .map(|(literal, hops, end)| {
