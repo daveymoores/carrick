@@ -371,7 +371,7 @@ impl ServiceBoundary {
             && !dropped.is_zero()
         {
             out.push(format!(
-                "  {} model endpoint(s) dropped: nothing in their file registers them{}",
+                "  {} route(s) found by analysis but left out of the index: their registration site could not be located{}",
                 dropped.total,
                 first_reason(dropped)
             ));
@@ -1240,7 +1240,7 @@ mod tests {
         let lines = boundary.lines("worker");
         assert!(
             lines.contains(
-                &"  2 model endpoint(s) dropped: nothing in their file registers them (e.g. src/worker.ts:14 GET /metrics)"
+                &"  2 route(s) found by analysis but left out of the index: their registration site could not be located (e.g. src/worker.ts:14 GET /metrics)"
                     .to_string()
             ),
             "{lines:?}"

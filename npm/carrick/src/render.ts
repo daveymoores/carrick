@@ -87,7 +87,7 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
   }
   push(
     boundary.model_endpoints_dropped_unanchored,
-    "model endpoint(s) dropped: nothing in their file registers them",
+    "route(s) found by analysis but left out of the index: their registration site could not be located",
   );
   // One event, one line: the stage when the scan recorded one, otherwise the
   // sentence it wrote about the same event (carrick#997 item 3).
