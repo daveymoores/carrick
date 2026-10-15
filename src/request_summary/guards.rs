@@ -19,6 +19,17 @@
 //! - and, with no caller and no call it is handed to, to the function itself
 //!   when the module offers it (an entry point) or to a hole.
 //!
+//! The same positions name operations other than routes: `case "READY":`
+//! on a message field, `HANDLERS[event.type]`. So any string literal is read,
+//! and each chain states its [`GuardShape`]: a route path, another name, or
+//! a constant this pass cannot read. A constant (`url.pathname ===
+//! HEALTH_ROUTE`, `msg.kind === Kinds.STOP`) is read by the value flow the
+//! request summaries read names with ([`LinkedNames`], carrick#1562), once
+//! every module's uses of it are known. A hop into a call also states the
+//! text at the call's other arguments (`child.on("message", <fn>)`), and a
+//! chain that stops inside its own function states the calls that function
+//! is handed to.
+//!
 //! Every chain ends at one of a short list of kinds ([`ChainEnd`]), or at a
 //! hole with a reason from a closed list ([`HoleReason`]). Nothing here names
 //! what a package or a global is; the end says which one it is, and what it
@@ -37,9 +48,11 @@ use swc_common::{Span, Spanned};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use super::library_sites::{LinkedNames, TextPiece, text_pieces};
 use super::{
-    CallWalker, FileIr, FnIr, ImportBinding, Piece, Reader, Reassigned, RequestSummaryInputs,
-    Scope, Site, Value, keyed_names, member_prop, prop_name, reads_the_environment,
+    CallIr, CallWalker, FileIr, FnIr, ImportBinding, Piece, Reader, Reassigned,
+    RequestSummaryInputs, Scope, Site, Value, keyed_names, member_prop, prop_name,
+    reads_the_environment,
 };
 use crate::binding_scope::{BindingKey, Declarations, ident_key};
 use crate::graphql_document_sites::unwrap_expression;
@@ -157,6 +170,9 @@ impl Step {
 pub(super) struct Subject {
     root: Root,
     steps: Vec<Step>,
+    /// For a hole, the source text it stopped at (`this.client`,
+    /// `parse(raw)`), when one expression is where it stopped.
+    text: Option<String>,
 }
 
 impl Subject {
@@ -164,11 +180,21 @@ impl Subject {
         Self {
             root,
             steps: Vec::new(),
+            text: None,
         }
     }
 
     fn hole(reason: HoleReason) -> Self {
         Self::of(Root::Hole(reason))
+    }
+
+    /// A hole that names no text yet stopped at `expr`: the innermost
+    /// expression read names it first.
+    fn stopped_at(mut self, text: impl FnOnce() -> String) -> Self {
+        if matches!(self.root, Root::Hole(_)) && self.text.is_none() {
+            self.text = Some(text());
+        }
+        self
     }
 
     /// One more access. A hole stays the hole it is.
@@ -192,6 +218,7 @@ impl Subject {
         Self {
             root,
             steps: self.steps.clone(),
+            text: self.text.clone(),
         }
     }
 
@@ -238,10 +265,44 @@ pub(super) enum GuardBranch {
     None,
 }
 
-/// One route-shaped literal a function compares a value against.
+/// What a guard's literal side states: text, or a constant the value flow
+/// reads once every module's uses of it are known (carrick#1562).
+#[derive(Debug, Clone)]
+pub(super) enum GuardLiteral {
+    Text(String),
+    Named {
+        pieces: Vec<TextPiece>,
+        /// The source text, kept when the constant does not read as text.
+        written: String,
+        constant: Option<Constant>,
+    },
+}
+
+/// The import a constant a guard compares with is read through, when it
+/// does not read as text: the specifier as written, the export it names,
+/// and the entries walked into it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Constant {
+    pub specifier: String,
+    pub export: String,
+    pub path: Vec<String>,
+}
+
+/// What a guard's literal is: a route path, any other name, or a constant
+/// this pass cannot read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardShape {
+    /// The text passes [`is_producer_route_path`].
+    Path,
+    Name,
+    Unresolved,
+}
+
+/// One literal a function compares a value against.
 #[derive(Debug, Clone)]
 pub(super) struct GuardIr {
-    literal: String,
+    literal: GuardLiteral,
     position: GuardPosition,
     /// Written as `!==` or `!=`, or under `!`.
     negated: bool,
@@ -585,6 +646,11 @@ impl Reader<'_> {
     /// `bound` holds the bindings the walk declared in the blocks it is in
     /// ([`CallWalker::bind_block`]).
     pub(super) fn subject(&self, expr: &Expr, scope: &Scope<'_>, bound: &Bound) -> Subject {
+        self.subject_of(expr, scope, bound)
+            .stopped_at(|| self.text(expr.span()))
+    }
+
+    fn subject_of(&self, expr: &Expr, scope: &Scope<'_>, bound: &Bound) -> Subject {
         match unwrap_expression(expr) {
             expr @ (Expr::Lit(Lit::Str(_)) | Expr::Tpl(_)) => match literal_string(expr) {
                 Some(text) => Subject::of(Root::Literal(text)),
@@ -659,6 +725,11 @@ impl Reader<'_> {
     }
 
     fn member_subject(&self, member: &MemberExpr, scope: &Scope<'_>, bound: &Bound) -> Subject {
+        // `this.<field>` is where reading stops, not `this`.
+        if matches!(unwrap_expression(&member.obj), Expr::This(_)) {
+            return Subject::hole(HoleReason::UnreadExpression)
+                .stopped_at(|| self.text(member.span));
+        }
         let base = self.subject(&member.obj, scope, bound);
         if matches!(base.root, Root::Global(_)) {
             let text = self.text(member.span);
@@ -957,6 +1028,24 @@ impl Visit for WrittenThrough {
     }
 }
 
+/// Whether a parameter is among `pieces`, or among the arguments a builder
+/// in them is called with: a value the caller decides, not a constant.
+fn names_a_param(pieces: &[TextPiece]) -> bool {
+    pieces.iter().any(|piece| match piece {
+        TextPiece::Lit(_) => false,
+        TextPiece::Param(_) => true,
+        TextPiece::Named(named) => named.args.iter().flatten().any(|arg| names_a_param(arg)),
+    })
+}
+
+/// Whether a builder's call is among `pieces`: what it returns is a
+/// constant only when it reads as text.
+fn calls_a_builder(pieces: &[TextPiece]) -> bool {
+    pieces
+        .iter()
+        .any(|piece| matches!(piece, TextPiece::Named(named) if named.args.is_some()))
+}
+
 /// The text of `pieces` when every piece is literal.
 fn literal_text(pieces: &[Piece]) -> Option<String> {
     pieces
@@ -1016,31 +1105,100 @@ impl CallWalker<'_, '_, '_> {
         self.guard.bound.extend(subjects);
     }
 
-    /// The route-shaped literal `expr` states: a string literal, a template
-    /// with no interpolation, or a name the scope reads as one.
-    fn route_literal(&self, expr: &Expr) -> Option<String> {
-        let text = match literal_string(unwrap_expression(expr)) {
-            Some(text) => text,
+    /// The text `expr` states: a string literal, a template with no
+    /// interpolation, or a name the scope reads as one.
+    fn plain_literal(&self, expr: &Expr) -> Option<String> {
+        match literal_string(unwrap_expression(expr)) {
+            Some(text) => Some(text),
             None => match unwrap_expression(expr) {
                 Expr::Ident(_) => match self.reader.eval(expr, self.scope) {
-                    Value::Str(pieces) => literal_text(&pieces)?,
-                    _ => return None,
+                    Value::Str(pieces) => literal_text(&pieces),
+                    _ => None,
                 },
-                _ => return None,
+                _ => None,
             },
-        };
-        is_producer_route_path(&text).then_some(text)
+        }
+    }
+
+    /// The constant `expr` names, as the value flow reads names
+    /// ([`text_pieces`]): an import, an entry of a constant object, a
+    /// builder called with text, or text built from them, with no parameter
+    /// anywhere in it.
+    fn named_literal(&self, expr: &Expr) -> Option<GuardLiteral> {
+        let pieces = text_pieces(expr, self.scope)?;
+        if names_a_param(&pieces)
+            || !pieces
+                .iter()
+                .any(|piece| matches!(piece, TextPiece::Named(_)))
+        {
+            return None;
+        }
+        let constant =
+            match pieces.as_slice() {
+                [TextPiece::Named(named)] => {
+                    self.scope.module.guards.imports.get(&named.binding).map(
+                        |(specifier, export)| Constant {
+                            specifier: specifier.clone(),
+                            export: export.clone(),
+                            path: named.path.clone(),
+                        },
+                    )
+                }
+                _ => None,
+            };
+        Some(GuardLiteral::Named {
+            pieces,
+            written: self.reader.text(expr.span()),
+            constant,
+        })
+    }
+
+    /// The literal one operand states.
+    fn guard_literal(&self, expr: &Expr) -> Option<GuardLiteral> {
+        match self.plain_literal(expr) {
+            Some(text) => Some(GuardLiteral::Text(text)),
+            None => self.named_literal(expr),
+        }
+    }
+
+    /// Which operand of a comparison is its literal, and the other, the
+    /// value compared. Text wins over a constant; of two texts, the one
+    /// route path does; two of a kind compare no value.
+    fn comparison_sides<'e>(
+        &self,
+        left: &'e Expr,
+        right: &'e Expr,
+    ) -> Option<(GuardLiteral, &'e Expr)> {
+        match (self.plain_literal(left), self.plain_literal(right)) {
+            (Some(text), None) => Some((GuardLiteral::Text(text), right)),
+            (None, Some(text)) => Some((GuardLiteral::Text(text), left)),
+            (Some(l), Some(r)) => match (is_producer_route_path(&l), is_producer_route_path(&r)) {
+                (true, false) => Some((GuardLiteral::Text(l), right)),
+                (false, true) => Some((GuardLiteral::Text(r), left)),
+                _ => None,
+            },
+            (None, None) => match (self.named_literal(left), self.named_literal(right)) {
+                (Some(named), None) => Some((named, right)),
+                (None, Some(named)) => Some((named, left)),
+                _ => None,
+            },
+        }
     }
 
     fn record_guard(
         &mut self,
-        literal: String,
+        literal: GuardLiteral,
         position: GuardPosition,
         subject: &Expr,
         span: Span,
         negated: bool,
         branch: Option<GuardBranch>,
     ) {
+        // `typeof x === "string"` compares a type tag the language names,
+        // never a value the code was handed.
+        if matches!(unwrap_expression(subject), Expr::Unary(unary) if unary.op == UnaryOp::TypeOf) {
+            return;
+        }
         let branch = branch.unwrap_or(match &self.guard.test {
             Some(test) => GuardBranch::Span(test.branch.0, test.branch.1),
             None if self.guard.in_return => GuardBranch::Returned,
@@ -1068,21 +1226,16 @@ impl CallWalker<'_, '_, '_> {
         self.ir.guards.push(guard);
     }
 
-    /// `pathname === "/items"`: either operand a route literal, the other the
-    /// value compared.
+    /// `pathname === "/items"`, `msg.type === "READY"`: either operand a
+    /// literal, the other the value compared.
     pub(super) fn read_comparison(&mut self, bin: &BinExpr) {
         let negated = match bin.op {
             BinaryOp::EqEq | BinaryOp::EqEqEq => false,
             BinaryOp::NotEq | BinaryOp::NotEqEq => true,
             _ => return,
         };
-        let (literal, subject) = match (
-            self.route_literal(&bin.left),
-            self.route_literal(&bin.right),
-        ) {
-            (Some(literal), None) => (literal, &*bin.right),
-            (None, Some(literal)) => (literal, &*bin.left),
-            _ => return,
+        let Some((literal, subject)) = self.comparison_sides(&bin.left, &bin.right) else {
+            return;
         };
         self.record_guard(
             literal,
@@ -1108,7 +1261,7 @@ impl CallWalker<'_, '_, '_> {
         let Some(first) = call.args.first().filter(|arg| arg.spread.is_none()) else {
             return;
         };
-        if let Some(literal) = self.route_literal(&first.expr) {
+        if let Some(literal) = self.guard_literal(&first.expr) {
             self.record_guard(
                 literal,
                 GuardPosition::StartsWith,
@@ -1127,7 +1280,7 @@ impl CallWalker<'_, '_, '_> {
             let Some(test) = &case.test else {
                 continue;
             };
-            let Some(literal) = self.route_literal(test) else {
+            let Some(literal) = self.guard_literal(test) else {
                 continue;
             };
             let branch = switch.cases[index..]
@@ -1150,7 +1303,7 @@ impl CallWalker<'_, '_, '_> {
     }
 
     /// `ROUTES[pathname]`, where `ROUTES` is a module-scope object literal:
-    /// one guard per route-shaped key.
+    /// one guard per key.
     pub(super) fn read_table_key(&mut self, member: &MemberExpr) {
         let MemberProp::Computed(computed) = &member.prop else {
             return;
@@ -1174,14 +1327,9 @@ impl CallWalker<'_, '_, '_> {
         let Some(entries) = self.scope.module.guards.tables.get(table.sym.as_ref()) else {
             return;
         };
-        let routes: Vec<TableEntry> = entries
-            .iter()
-            .filter(|entry| is_producer_route_path(&entry.key))
-            .cloned()
-            .collect();
-        for entry in routes {
+        for entry in entries.clone() {
             self.record_guard(
-                entry.key,
+                GuardLiteral::Text(entry.key),
                 GuardPosition::TableKey,
                 &computed.expr,
                 member.span,
@@ -1250,7 +1398,8 @@ pub enum Hop {
     },
     /// Into the call the function is handed to: the callee as written, the
     /// argument it is passed in and the keys down to it, the parameter the
-    /// chain was following, and the accesses from that parameter.
+    /// chain was following, the accesses from that parameter, and the text
+    /// of the call's other arguments.
     HandedTo {
         file: String,
         line: u32,
@@ -1259,9 +1408,33 @@ pub enum Hop {
         path: Vec<String>,
         param: usize,
         steps: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        args: Vec<HopArg>,
     },
     /// Out to an enclosing function, whose parameter it is.
     Enclosed { file: String, line: u32 },
+}
+
+/// The text a call states at one of its arguments, read as the value flow
+/// reads names ([`LinkedNames`]): `child.on("message", <fn>)` states
+/// `"message"` at argument 0.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HopArg {
+    pub arg: usize,
+    pub text: String,
+}
+
+/// The call a function is handed to, where a chain that stops inside that
+/// function took no hop out of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Within {
+    pub file: String,
+    pub line: u32,
+    pub callee: String,
+    pub arg: usize,
+    pub path: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<HopArg>,
 }
 
 /// Where a chain ends.
@@ -1299,6 +1472,10 @@ pub enum ChainEnd {
         reason: HoleReason,
         file: String,
         line: u32,
+        /// The source text the chain stopped at, when one expression is
+        /// where it stopped.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
 }
 
@@ -1322,17 +1499,27 @@ pub enum Branch {
     },
 }
 
-/// One route literal's chain to one end: the object a later step hands the
-/// model that classifies it, whichever model that is.
+/// One literal's chain to one end: the object a later step hands the model
+/// that classifies it, whichever model that is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GuardChain {
+    /// The text compared with, or the source text of a constant this pass
+    /// cannot read.
     pub literal: String,
+    pub shape: GuardShape,
+    /// The import an unread constant comes through.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constant: Option<Constant>,
     pub position: GuardPosition,
     pub negated: bool,
     pub site: ChainSite,
     pub subject: String,
     pub conjoined: Vec<Conjoined>,
     pub hops: Vec<Hop>,
+    /// For a chain that stops at a hole with no hop, the calls the function
+    /// it stops in is handed to.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub within: Vec<Within>,
     pub end: ChainEnd,
     pub branch: Vec<Branch>,
 }
@@ -1363,6 +1550,9 @@ struct Trace {
 struct Chains<'a> {
     inputs: &'a RequestSummaryInputs,
     root: &'a Path,
+    /// What each constant a guard or a call argument names reads as, with
+    /// every module's uses of it known.
+    names: LinkedNames<'a>,
     nodes: Vec<Node<'a>>,
     /// (file, span start, span end) of each call -> (node, call index).
     calls: HashMap<(&'a Path, u32, u32), (usize, usize)>,
@@ -1405,6 +1595,7 @@ impl<'a> Chains<'a> {
         let mut chains = Self {
             inputs,
             root,
+            names: LinkedNames::link(&inputs.files, &inputs.bindings),
             nodes: Vec::new(),
             calls: HashMap::new(),
             callers: HashMap::new(),
@@ -1505,7 +1696,102 @@ impl<'a> Chains<'a> {
             reason,
             file: self.rel(self.nodes[node].file),
             line: self.line_of(node),
+            text: None,
         }
+    }
+
+    /// The literal a guard compares with, its shape, and the import an
+    /// unread constant comes through. `None` for a builder's call that
+    /// reads as no text: what a call returns is no constant, so neither side
+    /// is known to be the literal.
+    fn literal(
+        &self,
+        node: usize,
+        literal: &GuardLiteral,
+    ) -> Option<(String, GuardShape, Option<Constant>)> {
+        let shape = |text: &str| {
+            if is_producer_route_path(text) {
+                GuardShape::Path
+            } else {
+                GuardShape::Name
+            }
+        };
+        match literal {
+            GuardLiteral::Text(text) => Some((text.clone(), shape(text), None)),
+            GuardLiteral::Named {
+                pieces,
+                written,
+                constant,
+            } => match self.names.text(self.nodes[node].file, pieces) {
+                Some(text) => {
+                    let shape = shape(&text);
+                    Some((text, shape, None))
+                }
+                None if calls_a_builder(pieces) => None,
+                None => Some((written.clone(), GuardShape::Unresolved, constant.clone())),
+            },
+        }
+    }
+
+    /// The text `call`, written in `file`, states at each argument other
+    /// than `arg`.
+    fn other_args(&self, file: &Path, call: &CallIr, arg: usize) -> Vec<HopArg> {
+        let Some(site_args) = &call.site_args else {
+            return Vec::new();
+        };
+        site_args
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != arg)
+            .filter_map(|(index, site_arg)| {
+                let text = match (&site_arg.text, &site_arg.holes) {
+                    (Some(text), _) => text.clone(),
+                    (None, Some(pieces)) => self.names.text(file, pieces)?,
+                    (None, None) => return None,
+                };
+                Some(HopArg { arg: index, text })
+            })
+            .collect()
+    }
+
+    /// Each call `node` is handed to: by its name, or written in one of the
+    /// call's arguments.
+    fn handed_at(&self, node: usize) -> Vec<HandedAt> {
+        let current = &self.nodes[node];
+        let mut handed: Vec<HandedAt> = Vec::new();
+        if let Some(key) = &current.key
+            && let Some(calls) = self.handed.get(&(current.file, key.clone()))
+        {
+            handed.extend(calls.iter().cloned());
+        }
+        if let Some(written_in) = &current.ir.written_in
+            && let Some(&(n, c)) =
+                self.calls
+                    .get(&(current.file, written_in.site.lo, written_in.site.hi))
+        {
+            handed.push((n, c, written_in.arg, written_in.path.clone()));
+        }
+        handed
+    }
+
+    /// The calls `node` is handed to, as a chain that stops inside it with
+    /// no hop states them.
+    fn within(&self, node: usize) -> Vec<Within> {
+        self.handed_at(node)
+            .into_iter()
+            .map(|(caller, call_index, arg, path)| {
+                let file = self.nodes[caller].file;
+                let call = &self.nodes[caller].ir.calls[call_index];
+                Within {
+                    file: self.rel(file),
+                    line: call.site.line,
+                    callee: call.callee_text.clone(),
+                    arg,
+                    path,
+                    args: self.other_args(file, call, arg),
+                }
+            })
+            .collect()
     }
 
     /// The calls written in `node` between `lo` and `hi`, in source order.
@@ -1534,6 +1820,9 @@ impl<'a> Chains<'a> {
     }
 
     fn of_guard(&self, node: usize, guard: &GuardIr) -> Vec<GuardChain> {
+        let Some((literal, shape, constant)) = self.literal(node, &guard.literal) else {
+            return Vec::new();
+        };
         let returns = &self.nodes[node].ir.returns_tests;
         let is_predicate = !returns.is_empty() && returns.iter().all(|test| *test);
         let branch = match &guard.branch {
@@ -1558,7 +1847,14 @@ impl<'a> Chains<'a> {
         ends.found
             .into_iter()
             .map(|(trace, end)| GuardChain {
-                literal: guard.literal.clone(),
+                literal: literal.clone(),
+                shape,
+                constant: constant.clone(),
+                within: if trace.hops.is_empty() && matches!(end, ChainEnd::Hole { .. }) {
+                    self.within(node)
+                } else {
+                    Vec::new()
+                },
                 position: guard.position,
                 negated: trace.negated,
                 site: ChainSite {
@@ -1614,7 +1910,12 @@ impl<'a> Chains<'a> {
                 ends.push(trace, end);
             }
             Root::Hole(reason) => {
-                let end = self.hole(reason, node);
+                let end = ChainEnd::Hole {
+                    reason,
+                    file: self.rel(self.nodes[node].file),
+                    line: self.line_of(node),
+                    text: trace.subject.text.clone(),
+                };
                 ends.push(trace, end);
             }
             Root::Outer(depth, index, name) => {
@@ -1666,6 +1967,7 @@ impl<'a> Chains<'a> {
                         reason: HoleReason::OutsideService,
                         file: self.rel(file),
                         line: 0,
+                        text: None,
                     };
                     ends.push(trace.clone(), end);
                     continue;
@@ -1700,6 +2002,7 @@ impl<'a> Chains<'a> {
                             reason: HoleReason::CallerArgMissing,
                             file: self.rel(file),
                             line: call.site.line,
+                            text: None,
                         };
                         ends.push(next, end);
                     }
@@ -1708,19 +2011,7 @@ impl<'a> Chains<'a> {
             return;
         }
         // Handed to a call: by name, or written in one of its arguments.
-        let mut handed: Vec<HandedAt> = Vec::new();
-        if let Some(key) = &current.key
-            && let Some(calls) = self.handed.get(&(current.file, key.clone()))
-        {
-            handed.extend(calls.iter().cloned());
-        }
-        if let Some(written_in) = &current.ir.written_in
-            && let Some(&(n, c)) =
-                self.calls
-                    .get(&(current.file, written_in.site.lo, written_in.site.hi))
-        {
-            handed.push((n, c, written_in.arg, written_in.path.clone()));
-        }
+        let handed = self.handed_at(node);
         if !handed.is_empty() {
             for (caller, call_index, arg, path) in handed {
                 self.handed_to(caller, call_index, arg, path, index, trace.clone(), ends);
@@ -1762,11 +2053,13 @@ impl<'a> Chains<'a> {
             path,
             param,
             steps: trace.subject.rendered_steps(),
+            args: self.other_args(file, call, arg),
         });
-        let at_call = |reason| ChainEnd::Hole {
+        let at_call = |reason, text: Option<String>| ChainEnd::Hole {
             reason,
             file: self.rel(file),
             line: call.site.line,
+            text,
         };
         if self
             .inputs
@@ -1774,11 +2067,11 @@ impl<'a> Chains<'a> {
             .target_at(file, call.site.lo, call.site.hi)
             .is_some()
         {
-            ends.push(trace, at_call(HoleReason::CallbackIntoOwnFunction));
+            ends.push(trace, at_call(HoleReason::CallbackIntoOwnFunction, None));
             return;
         }
         let Some(callee) = call.callee_subject.clone() else {
-            ends.push(trace, at_call(HoleReason::CalleeUnread));
+            ends.push(trace, at_call(HoleReason::CalleeUnread, None));
             return;
         };
         let steps = callee.rendered_steps();
@@ -1804,7 +2097,11 @@ impl<'a> Chains<'a> {
                 };
                 ends.push(trace, end);
             }
-            _ => ends.push(trace, at_call(HoleReason::CalleeUnread)),
+            // The callee's own hole names where reading it stopped.
+            _ => {
+                let text = callee.text.clone();
+                ends.push(trace, at_call(HoleReason::CalleeUnread, text));
+            }
         }
     }
 }
@@ -1844,6 +2141,7 @@ impl Ends {
                 reason: HoleReason::FanOutCap,
                 file: String::new(),
                 line: 0,
+                text: None,
             },
         };
         self.found.push((trace, end));
@@ -1860,12 +2158,35 @@ mod tests {
             .join(path)
     }
 
+    /// Which chains a key holds.
+    #[derive(Clone, Copy)]
+    enum Keyed {
+        /// Every chain.
+        All,
+        /// The route-path chains, with their shape left out: the keys
+        /// written for slice B, before any other literal was read.
+        Paths,
+    }
+
     /// The chains discovery reads in the fixture at `dir`, against the key
     /// written for it by hand.
-    fn assert_chains(dir: &str, key: &str) {
+    fn assert_chains(dir: &str, key: &str, keyed: Keyed) {
         let root = fixture(dir);
         let inputs = crate::engine::discover_request_inputs(&root);
-        let chains = serde_json::to_value(guard_chains(&inputs, &root)).expect("chains serialise");
+        let chains: Vec<serde_json::Value> = guard_chains(&inputs, &root)
+            .into_iter()
+            .filter(|chain| matches!(keyed, Keyed::All) || chain.shape == GuardShape::Path)
+            .map(|chain| {
+                let mut value = serde_json::to_value(chain).expect("chains serialise");
+                if matches!(keyed, Keyed::Paths)
+                    && let Some(object) = value.as_object_mut()
+                {
+                    object.remove("shape");
+                }
+                value
+            })
+            .collect();
+        let chains = serde_json::Value::Array(chains);
         let key_path = fixture(&format!("receive-guards/{key}.guards.json"));
         let expected: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&key_path).expect("the key is readable"))
@@ -1880,27 +2201,74 @@ mod tests {
 
     #[test]
     fn a_platform_worker_states_each_route_up_to_its_exported_handler() {
-        assert_chains("hand-dispatch-worker", "hand-dispatch-worker");
+        assert_chains("hand-dispatch-worker", "hand-dispatch-worker", Keyed::Paths);
     }
 
     #[test]
     fn every_export_form_of_a_worker_reaches_its_handler_or_its_in_repo_caller() {
-        assert_chains("receive-guards/worker-variants", "worker-variants");
+        assert_chains(
+            "receive-guards/worker-variants",
+            "worker-variants",
+            Keyed::Paths,
+        );
     }
 
     #[test]
     fn a_node_server_handler_ends_at_the_package_export_it_is_handed_to() {
-        assert_chains("receive-guards/node-server", "node-server");
+        assert_chains("receive-guards/node-server", "node-server", Keyed::Paths);
     }
 
     #[test]
     fn a_dev_server_middleware_ends_at_the_config_export_through_its_plugin_hook() {
-        assert_chains("receive-guards/dev-middleware", "dev-middleware");
+        assert_chains(
+            "receive-guards/dev-middleware",
+            "dev-middleware",
+            Keyed::Paths,
+        );
     }
 
     #[test]
     fn a_predicate_in_another_file_composes_through_its_callers() {
-        assert_chains("receive-guards/predicate-elsewhere", "predicate-elsewhere");
+        assert_chains(
+            "receive-guards/predicate-elsewhere",
+            "predicate-elsewhere",
+            Keyed::Paths,
+        );
+    }
+
+    /// A message listener's switch states each message name; the
+    /// registration's own name rides on the hop, or, where the chain stops
+    /// inside the listener, on `within`. A constant read through an import
+    /// states its text, and one from a package states where it comes from.
+    #[test]
+    fn a_message_switch_states_each_name_up_to_the_listener_it_is_handed_to() {
+        assert_chains(
+            "receive-guards/message-switch",
+            "message-switch",
+            Keyed::All,
+        );
+    }
+
+    /// A route compared with an imported constant states the constant's
+    /// text through a re-export; one from a package is kept as written.
+    #[test]
+    fn a_route_compared_with_an_imported_constant_states_its_text() {
+        assert_chains(
+            "receive-guards/constant-routes",
+            "constant-routes",
+            Keyed::All,
+        );
+    }
+
+    /// A handler table indexed with a message field states each of its
+    /// keys, route-shaped or not.
+    #[test]
+    fn a_handler_table_states_every_key() {
+        assert_chains(
+            "receive-guards/handler-tables",
+            "handler-tables",
+            Keyed::All,
+        );
     }
 
     /// The chains of one service written from `files` (path, source), each
@@ -2088,10 +2456,186 @@ export function register(ready: boolean): void {
         );
     }
 
+    /// Of a comparison's two operands, written text is the literal over a
+    /// value read through an import, and of two texts the route path is: the
+    /// other side is the value compared, as before names were read.
+    #[test]
+    fn text_is_the_literal_side_over_an_imported_value() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{ "name": "probe", "dependencies": { "invented-config": "1.0.0" } }"#,
+        )
+        .expect("the manifest is writable");
+        std::fs::create_dir_all(dir.path().join("src")).expect("the tree");
+        std::fs::write(
+            dir.path().join("src/mode.ts"),
+            r#"import { config } from "invented-config";
+import { HOME } from "invented-config";
+
+export function mode(): string {
+  if (config.mode === "dev") {
+    return "dev";
+  }
+  if (HOME === "/home") {
+    return "home";
+  }
+  return "prod";
+}
+"#,
+        )
+        .expect("the source is writable");
+        let inputs = crate::engine::discover_request_inputs(dir.path());
+        let chains = guard_chains(&inputs, dir.path());
+        let read: Vec<(&str, GuardShape, &str, serde_json::Value)> = chains
+            .iter()
+            .map(|chain| {
+                (
+                    chain.literal.as_str(),
+                    chain.shape,
+                    chain.subject.as_str(),
+                    serde_json::to_value(&chain.end).expect("ends serialise"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                (
+                    "dev",
+                    GuardShape::Name,
+                    "config.mode",
+                    serde_json::json!({
+                        "kind": "external_import", "specifier": "invented-config",
+                        "export": "config", "steps": ["mode"]
+                    })
+                ),
+                (
+                    "/home",
+                    GuardShape::Path,
+                    "HOME",
+                    serde_json::json!({
+                        "kind": "external_import", "specifier": "invented-config",
+                        "export": "HOME", "steps": []
+                    })
+                ),
+            ]
+        );
+    }
+
+    /// A builder called with text states the text it returns; a call that
+    /// reads as no text, or one handed a parameter, is no constant, so the
+    /// comparison states no guard.
+    #[test]
+    fn only_a_builder_that_reads_as_text_is_a_constant() {
+        let chains = chains_in(&[
+            (
+                "src/topics.ts",
+                r#"export function topicFor(name: string): string {
+  return `orders.${name}`;
+}
+"#,
+            ),
+            (
+                "src/route.ts",
+                r#"import { topicFor } from "./topics";
+import { lookup } from "./lookup";
+
+export function route(event: { topic: string }, kind: string): boolean {
+  if (event.topic === topicFor("created")) {
+    return true;
+  }
+  if (event.topic === lookup("updated")) {
+    return true;
+  }
+  return event.topic === topicFor(kind);
+}
+"#,
+            ),
+            (
+                "src/lookup.ts",
+                r#"export function lookup(name: string): string {
+  return name.length > 3 ? name : "short";
+}
+"#,
+            ),
+        ]);
+        let literals: Vec<&str> = chains
+            .iter()
+            .map(|(literal, _, _)| literal.as_str())
+            .collect();
+        assert_eq!(literals, vec!["orders.created"], "{chains:#?}");
+    }
+
+    /// A `typeof` test compares a type tag, not a value the code was handed,
+    /// so it states no guard; the name compared beside it does.
+    #[test]
+    fn a_typeof_test_states_no_guard() {
+        let chains = chains_in(&[(
+            "src/check.ts",
+            r#"export function check(value: unknown, message: { type: string }): boolean {
+  if (typeof value === "string") {
+    return true;
+  }
+  switch (typeof value) {
+    case "number":
+      return true;
+  }
+  return message.type === "ready";
+}
+"#,
+        )]);
+        let literals: Vec<&str> = chains
+            .iter()
+            .map(|(literal, _, _)| literal.as_str())
+            .collect();
+        assert_eq!(literals, vec!["ready"], "{chains:#?}");
+    }
+
+    /// A hole states the text it stopped at: a field of `this`, not
+    /// `this`, and what a call returns.
+    #[test]
+    fn a_hole_states_the_text_it_stopped_at() {
+        let chains = chains_in(&[(
+            "src/feed.ts",
+            r#"import { EventEmitter } from "node:events";
+
+function connect(): EventEmitter {
+  return new EventEmitter();
+}
+
+export class Feed {
+  private events = new EventEmitter();
+
+  listen(): void {
+    this.events.on("item", (item: { kind: string }) => {
+      if (item.kind === "added") {
+        console.log(item);
+      }
+    });
+    const socket = connect();
+    socket.on("frame", (frame: { op: string }) => {
+      if (frame.op === "ping") {
+        console.log(frame);
+      }
+    });
+  }
+}
+"#,
+        )]);
+        for (literal, text) in [("added", "this.events"), ("ping", "connect()")] {
+            let end = end_of(&chains, literal);
+            assert_eq!(end["kind"], "hole", "{literal}: {end}");
+            assert_eq!(end["reason"], "callee_unread", "{literal}: {end}");
+            assert_eq!(end["text"], text, "{literal}: {end}");
+        }
+    }
+
     /// A measurement, not a check: every chain the guards state over each
-    /// root, read as one service with the default config, with the route
-    /// literals in comparison positions the pass read no guard for. Offline
-    /// and model-free.
+    /// root, read as one service with the default config, with the literals
+    /// in comparison positions the pass read no guard for. Counts are by
+    /// shape, by end, by hole reason and by the text a hole stops at, table
+    /// keys apart. Offline and model-free.
     ///
     /// `CARRICK_GUARD_CENSUS=<root>[:<root>…] CARRICK_GUARD_CENSUS_OUT=<file>
     /// cargo test --lib request_summary::guards::tests::census -- --ignored --nocapture`
@@ -2112,7 +2656,8 @@ export function register(ready: boolean): void {
             let inputs = crate::engine::discover_request_inputs(root);
             let chains = guard_chains(&inputs, root);
 
-            // The denominator: every route literal in a comparison position.
+            // The denominators: every literal in a comparison position, and
+            // the route-shaped ones among them.
             let mut denominator: Vec<(String, u32, String, &'static str)> = Vec::new();
             let mut files: Vec<&PathBuf> = inputs.files.keys().collect();
             files.sort();
@@ -2125,7 +2670,7 @@ export function register(ready: boolean): void {
                 else {
                     continue;
                 };
-                for found in crate::compared_route_literals::compared_route_literals(&module) {
+                for found in crate::compared_route_literals::compared_literals(&module, &|_| true) {
                     let line = source_map.lookup_char_pos(found.span.lo).line as u32;
                     let position = match found.position {
                         crate::compared_route_literals::ComparisonPosition::Equality => "equality",
@@ -2158,51 +2703,113 @@ export function register(ready: boolean): void {
                     !read.contains(&(file.clone(), *line, value.clone()))
                 })
                 .collect();
+            let routes = denominator
+                .iter()
+                .filter(|(_, _, value, _)| is_producer_route_path(value))
+                .count();
+            let routes_unread = unread
+                .iter()
+                .filter(|(_, _, value, _)| is_producer_route_path(value))
+                .count();
 
-            let mut by_end: BTreeMap<&'static str, usize> = BTreeMap::new();
-            let mut holes: BTreeMap<String, usize> = BTreeMap::new();
+            // Each count is kept twice: table keys apart from the rest,
+            // since one table multiplies by its callers.
+            #[derive(Default, Debug)]
+            struct Counts {
+                guards: HashSet<(String, u32, String)>,
+                chains: usize,
+                shapes: BTreeMap<String, usize>,
+                ends: BTreeMap<&'static str, usize>,
+                holes: BTreeMap<String, usize>,
+                hole_texts: BTreeMap<&'static str, usize>,
+                within: usize,
+                hop_args: usize,
+            }
+            let name = |value: serde_json::Value| value.as_str().unwrap_or_default().to_string();
+            let text_kind = |text: &str| {
+                if text.starts_with("this.") {
+                    "this_field"
+                } else if text.starts_with("new ") {
+                    "construction"
+                } else if text.starts_with("await ") {
+                    "await"
+                } else if text.ends_with(')') {
+                    "call_result"
+                } else if text.ends_with(']') {
+                    "computed_member"
+                } else if text
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                {
+                    "binding"
+                } else {
+                    "other"
+                }
+            };
+            let (mut rest, mut tables) = (Counts::default(), Counts::default());
             for chain in &chains {
+                let counts = if chain.position == GuardPosition::TableKey {
+                    &mut tables
+                } else {
+                    &mut rest
+                };
+                counts.guards.insert((
+                    chain.site.file.clone(),
+                    chain.site.line,
+                    chain.literal.clone(),
+                ));
+                counts.chains += 1;
+                *counts
+                    .shapes
+                    .entry(name(serde_json::json!(chain.shape)))
+                    .or_default() += 1;
                 let kind = match &chain.end {
                     ChainEnd::EntryPoint { .. } => "entry_point",
                     ChainEnd::Literal { .. } => "literal",
                     ChainEnd::Env { .. } => "env",
                     ChainEnd::Global { .. } => "global",
                     ChainEnd::ExternalImport { .. } => "external_import",
-                    ChainEnd::Hole { reason, .. } => {
-                        let reason = serde_json::to_value(reason)
-                            .ok()
-                            .and_then(|v| v.as_str().map(str::to_string))
-                            .unwrap_or_default();
-                        *holes.entry(reason).or_default() += 1;
+                    ChainEnd::Hole { reason, text, .. } => {
+                        *counts
+                            .holes
+                            .entry(name(serde_json::json!(reason)))
+                            .or_default() += 1;
+                        let kind = text.as_deref().map_or("none", text_kind);
+                        *counts.hole_texts.entry(kind).or_default() += 1;
                         "hole"
                     }
                 };
-                *by_end.entry(kind).or_default() += 1;
+                *counts.ends.entry(kind).or_default() += 1;
+                counts.within += usize::from(!chain.within.is_empty());
+                counts.hop_args += usize::from(
+                    chain
+                        .hops
+                        .iter()
+                        .any(|hop| matches!(hop, Hop::HandedTo { args, .. } if !args.is_empty())),
+                );
             }
-            let guards: HashSet<(String, u32, String)> = read.clone();
-            let table_keys = chains
-                .iter()
-                .filter(|chain| chain.position == GuardPosition::TableKey)
-                .map(|chain| {
-                    (
-                        chain.site.file.clone(),
-                        chain.site.line,
-                        chain.literal.clone(),
-                    )
-                })
-                .collect::<HashSet<_>>()
-                .len();
             println!(
-                "census {}: {} denominator literal(s), {} guard(s) read ({} table key(s)), {} chain(s), {} unread",
+                "census {}: {} compared literal(s) ({} route), {} unread ({} route); starts: guard {}",
                 root.display(),
                 denominator.len(),
-                guards.len(),
-                table_keys,
+                routes,
+                unread.len(),
+                routes_unread,
                 chains.len(),
-                unread.len()
             );
-            println!("  ends: {by_end:?}");
-            println!("  holes: {holes:?}");
+            for (label, counts) in [("guards", &rest), ("table keys", &tables)] {
+                println!(
+                    "  {label}: {} read, {} chain(s), {} with within, {} with hop args",
+                    counts.guards.len(),
+                    counts.chains,
+                    counts.within,
+                    counts.hop_args
+                );
+                println!("    shapes: {:?}", counts.shapes);
+                println!("    ends: {:?}", counts.ends);
+                println!("    holes: {:?}", counts.holes);
+                println!("    hole texts: {:?}", counts.hole_texts);
+            }
             if let Some(out) = out.as_mut() {
                 for chain in &chains {
                     let line = serde_json::json!({ "root": root, "chain": chain });
