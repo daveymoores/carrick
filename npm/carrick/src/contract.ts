@@ -34,6 +34,8 @@ export type Boundary = {
   model_rows_joined?: number;
   model_contradictions_discarded?: number;
   model_endpoints_discarded_in_claimed_modules?: number;
+  /** Model endpoints whose echoed id names no listed site and whose file states no such route. */
+  model_endpoints_dropped_unanchored?: Counted;
   routes_without_response_type?: Counted;
   calls_without_expected_type?: Counted;
   types_degraded?: { stage?: string; detail?: string };

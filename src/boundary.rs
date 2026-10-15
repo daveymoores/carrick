@@ -91,10 +91,12 @@ pub struct ServiceBoundary {
     /// Files the analyzer was asked about and never answered for. Their rows
     /// are whatever the deterministic layer stated and nothing more.
     pub files_lost: Counted,
-    /// Candidates carrying a route-shaped literal and a readable verb that
-    /// neither layer produced a row for. A bare `x.verb("/lit", arg)` states no
-    /// producer/consumer role, so the scanner counts the gap rather than
-    /// guessing at it (the 2026-09-05 ruling).
+    /// Offered HTTP candidates carrying a route-shaped literal (a readable
+    /// verb is not required) that no layer produced a row for and no mount
+    /// answers. A bare `x.verb("/lit", arg)` states no producer/consumer role,
+    /// so the scanner counts the gap rather than guessing at it (the
+    /// 2026-09-05 ruling; widened beyond verb calls in carrick#2382, so the
+    /// number rises at that release without any row being lost).
     pub unemitted_literal_candidates: usize,
     /// Where those sites are, `file:line`, up to [`MAX_REASONS`] of them. The
     /// count above stays a count and keeps its type — the cloud's MCP server
@@ -147,6 +149,13 @@ pub struct ServiceBoundary {
     /// different thing about the same row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_endpoints_discarded_in_claimed_modules: Option<usize>,
+    /// Model endpoint rows dropped because the id they echoed names no site
+    /// the scanner listed and nothing in the file states the route
+    /// (carrick#2382). Not part of the claimed-module count: a row is in one
+    /// or the other. The reasons are `file:line METHOD path`. `None` on a blob
+    /// from a scanner that did not count it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_endpoints_dropped_unanchored: Option<Counted>,
     /// Indexed routes the index can serve no response shape for, so nothing on
     /// the producer side of a compatibility check. Routes counted in
     /// `routes_without_body` are not in this count.
@@ -229,6 +238,11 @@ impl ServiceBoundary {
             .map(|site| site.replace(&prefix, ""))
             .collect();
         sites.truncate(MAX_REASONS);
+        let dropped_unanchored = stats
+            .model_endpoints_dropped_unanchored_sites
+            .iter()
+            .map(|site| site.replace(&prefix, ""))
+            .collect();
         Self {
             candidates_withheld_changed_files: None,
             commit_hash: data.commit_hash.clone(),
@@ -248,6 +262,10 @@ impl ServiceBoundary {
             model_endpoints_discarded_in_claimed_modules: Some(
                 stats.model_endpoints_discarded_in_claimed_modules,
             ),
+            model_endpoints_dropped_unanchored: Some(Counted::new(
+                stats.model_endpoints_dropped_unanchored,
+                dropped_unanchored,
+            )),
             routes_without_response_type,
             routes_without_body: Some(routes_without_body),
             calls_without_expected_type: operations_without_a_type(data, ManifestRole::Consumer),
@@ -328,7 +346,7 @@ impl ServiceBoundary {
         );
         if self.unemitted_literal_candidates > 0 {
             out.push(format!(
-                "  {} bare route-literal call site(s) left unclassified{}",
+                "  {} route-literal call site(s) left unclassified{}",
                 self.unemitted_literal_candidates,
                 first_site(
                     &self.unemitted_literal_sites,
@@ -347,6 +365,15 @@ impl ServiceBoundary {
         {
             out.push(format!(
                 "  {discarded} model endpoint(s) dropped in modules a routing convention claims"
+            ));
+        }
+        if let Some(dropped) = &self.model_endpoints_dropped_unanchored
+            && !dropped.is_zero()
+        {
+            out.push(format!(
+                "  {} model endpoint(s) dropped: nothing in their file registers them{}",
+                dropped.total,
+                first_reason(dropped)
             ));
         }
         // One reason, once. `types_degraded` names the stage and the error;
@@ -953,6 +980,10 @@ mod tests {
             errors: vec![format!(
                 "Failed to analyze {repo_path}/src/dead.ts: gateway timeout"
             )],
+            model_endpoints_dropped_unanchored: 1,
+            model_endpoints_dropped_unanchored_sites: vec![format!(
+                "{repo_path}/src/worker.ts:14 GET /metrics"
+            )],
             ..Default::default()
         };
 
@@ -960,6 +991,14 @@ mod tests {
         assert_eq!(
             boundary.files_lost.reasons,
             vec!["Failed to analyze src/dead.ts: gateway timeout".to_string()]
+        );
+        // carrick#2382: the dropped rows are named relative to the repo.
+        assert_eq!(
+            boundary.model_endpoints_dropped_unanchored,
+            Some(Counted::new(
+                1,
+                vec!["src/worker.ts:14 GET /metrics".to_string()]
+            ))
         );
     }
 
@@ -1179,9 +1218,56 @@ mod tests {
         let lines = boundary.lines("gateway");
         assert!(
             lines.iter().any(|line| line
-                .contains("2 bare route-literal call site(s) left unclassified")
+                .contains("2 route-literal call site(s) left unclassified")
                 && line.contains("e.g. apps/gateway/main.ts:11")),
             "{lines:?}"
+        );
+    }
+
+    /// carrick#2382: a model endpoint dropped for an id that names no listed
+    /// site is counted and named, and a blob from a scanner that did not count
+    /// it reads as `None`, not as zero.
+    #[test]
+    fn a_dropped_model_endpoint_is_printed_and_an_old_blob_reads_as_not_counted() {
+        let mut boundary = ServiceBoundary {
+            commit_hash: "0123456".to_string(),
+            model_endpoints_dropped_unanchored: Some(Counted::new(
+                2,
+                vec!["src/worker.ts:14 GET /metrics".to_string()],
+            )),
+            ..Default::default()
+        };
+        let lines = boundary.lines("worker");
+        assert!(
+            lines.contains(
+                &"  2 model endpoint(s) dropped: nothing in their file registers them (e.g. src/worker.ts:14 GET /metrics)"
+                    .to_string()
+            ),
+            "{lines:?}"
+        );
+        let json = serde_json::to_string(&boundary).unwrap();
+        assert!(
+            json.contains("\"model_endpoints_dropped_unanchored\":{\"total\":2,"),
+            "{json}"
+        );
+
+        boundary.model_endpoints_dropped_unanchored = Some(Counted::default());
+        assert_eq!(
+            boundary.lines("worker").len(),
+            1,
+            "a counted zero prints nothing"
+        );
+
+        let mut old: serde_json::Value = serde_json::to_value(&boundary).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("model_endpoints_dropped_unanchored");
+        let parsed: ServiceBoundary = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.model_endpoints_dropped_unanchored, None);
+        assert!(
+            !serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("model_endpoints_dropped_unanchored")
         );
     }
 
