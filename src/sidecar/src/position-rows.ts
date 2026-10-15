@@ -33,6 +33,7 @@ import * as zlib from 'node:zlib';
 import { ts } from 'ts-morph';
 import { WriteGuard, installedPackageDirectory } from './capture/index.js';
 import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
+import { typeToStringAsDeclared } from './print-type.js';
 import type { ProjectLoader } from './project-loader.js';
 import type { PositionRowsCounts } from './types.js';
 
@@ -297,7 +298,12 @@ class PathNames {
     return name;
   }
 
-  /** `import("/abs/path")` in a printed type, written with the declaring file's name instead. */
+  /**
+   * `import("/abs/path")` in a printed type, written with the declaring
+   * file's name instead. The print names a module by the file that declares
+   * it (`typeToStringAsDeclared`, carrick#2019), so one type reads the same
+   * from every file.
+   */
   scrubType(text: string): string {
     if (!text.includes('import("')) return text;
     return text.replace(/import\("([^"]+)"\)/g, (whole, specifier: string) => {
@@ -345,7 +351,7 @@ class PositionWalker {
       if (type.flags & ts.TypeFlags.Any) {
         flags |= (type as { intrinsicName?: string }).intrinsicName === 'error' ? FLAG_ERROR_TYPE : FLAG_ANY;
       }
-      const typeText = this.paths.scrubType(this.checker.typeToString(type, typed));
+      const typeText = this.paths.scrubType(typeToStringAsDeclared(this.checker, type, typed));
       if (!symbol) return [kind, start, end, null, null, null, null, typeText, flags];
       const declaration = attributedDeclaration(() => this.program, symbol.declarations ?? []);
       if (!declaration) return [kind, start, end, ts.symbolName(symbol), null, null, null, typeText, flags];
