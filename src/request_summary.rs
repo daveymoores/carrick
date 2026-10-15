@@ -181,6 +181,19 @@ mod library_sites;
 mod alternatives;
 use alternatives::{Alternation, Alternatives};
 
+// What each function compares a request value against, and where that value
+// comes from (carrick#2386): the receive side of the same IR. Only tests and
+// the offline census read it so far, so the binary sees it as unused.
+#[allow(dead_code)]
+mod guards;
+use guards::{GuardIr, Subject, Tested, WrittenIn};
+
+#[allow(unused_imports)]
+pub use guards::{
+    Branch, ChainEnd, ChainSite, Conjoined, GuardChain, GuardPosition, HoleReason, Hop,
+    guard_chains,
+};
+
 #[allow(unused_imports)]
 pub use library_sites::{
     Contest, Holder, LibrarySite, LibrarySites, MakerForm, MemberUse, MemberWire, On, Selector,
@@ -718,6 +731,21 @@ struct CallIr {
     /// props fill in of the component's requests, and nothing else
     /// ([`Composer::compose`]).
     jsx: bool,
+    /// Each argument as a guard reads where its value comes from
+    /// (carrick#2386): `None` for a function written in place, and for
+    /// every position from a spread on.
+    arg_subjects: Vec<Option<Subject>>,
+    /// The callee, read the same way: the parameter, import or global a
+    /// function handed to this call is handed to.
+    callee_subject: Option<Subject>,
+    /// The callee as written.
+    callee_text: String,
+    /// The call is what an `if`, a ternary or a `&&` tests: the branch its
+    /// result guards.
+    tested: Option<Tested>,
+    /// Each name of a function this module declares that an argument hands
+    /// on, by position, with the keys down to it inside the argument.
+    handed: Vec<(usize, Vec<String>, String)>,
 }
 
 /// One function body, reduced to what a request summary reads.
@@ -776,6 +804,19 @@ struct FnIr {
     /// and, for a class member, the class's: a parameter typed through one is
     /// typed by whatever the caller passes.
     type_params: HashSet<String>,
+    /// Where the function node is written: the key that names a member of an
+    /// exported object, whose function is read as a detached one
+    /// (carrick#2386).
+    site: Option<Site>,
+    /// What the body compares a request value against (carrick#2386).
+    guards: Vec<GuardIr>,
+    /// For a function written as a call's argument, or inside one: the call,
+    /// the argument and the keys down to it.
+    written_in: Option<WrittenIn>,
+    /// Whether each `return` (an arrow's expression body included) hands
+    /// back a test: a comparison, a negation, a logical expression, a call
+    /// or a boolean.
+    returns_tests: Vec<bool>,
 }
 
 /// What one `return` hands back, read for whether a call of the function is
@@ -1008,6 +1049,10 @@ pub struct FileIr {
     /// Where this file starts in the discovery source map
     /// ([`Self::swc_start`]).
     source_start: u32,
+    /// Each definition the extractor keyed in this file, with where its
+    /// function node starts and whether the module exports it
+    /// ([`Self::place_definitions`], carrick#2386).
+    definitions: HashMap<String, (Option<u32>, bool)>,
 }
 
 /// A getter of a lazily built client as the module that declares it uses its
@@ -1114,6 +1159,7 @@ pub fn extract_file_ir(
                 .filter(|name| declared.declares_name(name))
                 .collect()
         },
+        guards: guards::ModuleGuards::default(),
     };
     module_scope.receivers = import_receivers(&imports)
         .into_iter()
@@ -1153,6 +1199,7 @@ pub fn extract_file_ir(
         source_map,
         builder_depth: std::cell::Cell::new(0),
     };
+    module_scope.guards = guards::ModuleGuards::of(module, &imports, definition_keys, &reader);
 
     // Module constants first, in source order, so a later one can read an
     // earlier one (`const BASE = ...; const USERS = `${BASE}/users``).
@@ -1483,6 +1530,8 @@ struct ModuleScope {
     /// declaration or an import. `new Map()` there builds the file's own
     /// `Map`, which is no language collection (carrick#2281).
     own_collections: HashSet<&'static str>,
+    /// What a guard reads a name through at module scope (carrick#2386).
+    guards: guards::ModuleGuards,
 }
 
 impl ModuleScope {
@@ -2660,6 +2709,9 @@ struct Captured {
     receivers: HashMap<BindingKey, ClientRef>,
     /// [`Scope::fetches`].
     fetches: HashSet<BindingKey>,
+    /// [`Scope::subjects`], each parameter of the enclosing functions read
+    /// as an enclosing one ([`Subject::enclosed`]).
+    subjects: HashMap<BindingKey, Subject>,
 }
 
 /// One module-scope binding an import introduces.
@@ -3129,6 +3181,14 @@ struct Scope<'a> {
     /// The names the function assigns again, anywhere in it: a test that
     /// reads one is not the same test twice (carrick#2051).
     reassigned: HashSet<String>,
+    /// Where each local the body declares, and each the enclosing functions
+    /// hold, comes from, as a guard reads it (carrick#2386). The send side
+    /// never reads it.
+    subjects: HashMap<BindingKey, Subject>,
+    /// The names the function writes a member of (`url.pathname = …`),
+    /// anywhere in it: a guard reads no such binding as what it was declared
+    /// with (carrick#2386). The send side never reads it.
+    written_through: HashSet<String>,
     fields: Option<&'a ClassFields>,
     module: &'a ModuleScope,
 }
@@ -3149,6 +3209,8 @@ impl<'a> Scope<'a> {
             param_verbs: HashMap::new(),
             alts: HashMap::new(),
             reassigned: HashSet::new(),
+            written_through: HashSet::new(),
+            subjects: HashMap::new(),
             fields: None,
             module,
         }
@@ -3176,12 +3238,13 @@ impl<'a> Scope<'a> {
         module: &ModuleScope,
         type_params: &HashSet<String>,
     ) where
-        N: VisitWith<Declarations> + VisitWith<Reassigned>,
+        N: VisitWith<Declarations> + VisitWith<Reassigned> + VisitWith<guards::WrittenThrough>,
     {
         let declared = Declarations::of(function);
         let mut reassigned = Reassigned::default();
         function.visit_with(&mut reassigned);
         self.reassigned = reassigned.names.clone();
+        self.written_through = guards::WrittenThrough::of(function);
         let settled = |binding: &BindingKey| {
             declared.binding_count(binding) == 1 && !reassigned.names.contains(&binding.0)
         };
@@ -3589,6 +3652,8 @@ impl Reader<'_> {
             param_verbs: HashMap::new(),
             alts: HashMap::new(),
             reassigned: HashSet::new(),
+            written_through: HashSet::new(),
+            subjects: captured.subjects.clone(),
             fields,
             module,
         };
@@ -3605,6 +3670,7 @@ impl Reader<'_> {
                 self.source_map,
             ),
             type_params: type_param_names(function.type_params.as_deref()),
+            site: Some(self.site(function.span)),
             ..FnIr::default()
         };
         match &function.body {
@@ -3640,6 +3706,8 @@ impl Reader<'_> {
             param_verbs: HashMap::new(),
             alts: HashMap::new(),
             reassigned: HashSet::new(),
+            written_through: HashSet::new(),
+            subjects: captured.subjects.clone(),
             fields,
             module,
         };
@@ -3652,6 +3720,7 @@ impl Reader<'_> {
         let mut ir = FnIr {
             params: ParamDecl::all(&arrow.params, Some(&*arrow.body), self.source_map),
             type_params: type_param_names(arrow.type_params.as_deref()),
+            site: Some(self.site(arrow.span)),
             ..FnIr::default()
         };
         match &*arrow.body {
@@ -3662,7 +3731,8 @@ impl Reader<'_> {
                 let returned = self.returned_instances(expr, &scope);
                 ir.returns.push((expr.span().lo.0, returned));
                 ir.body_returns.push(body_return(expr, &scope.bodies));
-                self.walk(expr, &scope, &mut ir);
+                ir.returns_tests.push(guards::is_test(expr));
+                self.walk_returned(expr, &scope, &mut ir);
             }
         }
         ir.settle_returned(arrow.is_async, arrow.is_generator);
@@ -3694,6 +3764,15 @@ impl Reader<'_> {
                     if let Some(init) = &declarator.init {
                         self.walk(init, scope, ir);
                     }
+                    // Where the binding's value comes from, for a guard that
+                    // reads it (carrick#2386).
+                    self.bind_subjects(
+                        &declarator.name,
+                        declarator.init.as_deref(),
+                        scope,
+                        &reassigned,
+                        &declared,
+                    );
                     // A `let` set again on every path to one of a few makers'
                     // instances, read where it is returned (carrick#1689).
                     // One never set again is a local receiver, below. Its
@@ -3812,8 +3891,22 @@ impl Reader<'_> {
             scope,
             ir,
             waited: HashSet::new(),
+            guard: guards::WalkState::default(),
         };
         node.visit_with(&mut walker);
+    }
+
+    /// [`Self::walk`] over what a function returns: an arrow's expression
+    /// body, read as a `return` of it (carrick#2386).
+    fn walk_returned(&self, expr: &Expr, scope: &Scope<'_>, ir: &mut FnIr) {
+        let mut walker = CallWalker {
+            reader: self,
+            scope,
+            ir,
+            waited: HashSet::new(),
+            guard: guards::WalkState::returned(),
+        };
+        expr.visit_with(&mut walker);
     }
 
     /// The value of an expression, as far as the source states it.
@@ -4857,6 +4950,9 @@ struct CallWalker<'r, 's, 'i> {
     /// The calls (span start, span end) whose result the source waits on,
     /// recorded before the call itself is visited ([`CallIr::waited`]).
     waited: HashSet<(u32, u32)>,
+    /// The test being read and where functions written in an argument sit,
+    /// for the guards (carrick#2386).
+    guard: guards::WalkState,
 }
 
 impl CallWalker<'_, '_, '_> {
@@ -4909,31 +5005,44 @@ impl Visit for CallWalker<'_, '_, '_> {
         if matches!(call.callee, Callee::Import(_)) {
             self.ir.unfollowed = true;
         }
+        // `pathname.startsWith("/users")`: a guard (carrick#2386).
+        self.read_starts_with(call);
+        let call_site = self.reader.site(call.span);
+        let callee_text = match &call.callee {
+            Callee::Expr(callee) => self.reader.text(callee.span()),
+            _ => String::new(),
+        };
         let mut args: Vec<Value> = Vec::with_capacity(call.args.len());
-        for arg in &call.args {
+        for (index, arg) in call.args.iter().enumerate() {
+            let written_in = WrittenIn::argument(call_site, &callee_text, index);
             let value = match &*arg.expr {
                 Expr::Arrow(arrow) => {
-                    let nested = self.reader.arrow(
+                    let mut nested = self.reader.arrow(
                         arrow,
                         self.scope.fields,
                         self.scope.module,
                         &self.captured(),
                     );
+                    nested.written_in = Some(written_in);
                     self.ir.nested.push(nested);
                     Value::Callback(self.ir.nested.len() - 1)
                 }
                 Expr::Fn(fn_expr) => {
                     // A `function` expression binds its own `this`.
-                    let nested = self.reader.function(
+                    let mut nested = self.reader.function(
                         &fn_expr.function,
                         None,
                         self.scope.module,
                         &self.captured(),
                     );
+                    nested.written_in = Some(written_in);
                     self.ir.nested.push(nested);
                     Value::Callback(self.ir.nested.len() - 1)
                 }
                 expr => {
+                    // A function written inside the argument (`{ plugins:
+                    // [{ configureServer() {} }] }`) sits at a key path in it.
+                    self.guard.place_functions_in(expr, &written_in);
                     expr.visit_with(self);
                     self.reader.eval(expr, self.scope)
                 }
@@ -5001,8 +5110,15 @@ impl Visit for CallWalker<'_, '_, '_> {
                 .map(|arg| library_sites::site_arg(&arg.expr, self.scope))
                 .collect()
         });
+        let bound = &self.guard.bound;
+        let arg_subjects = self.reader.arg_subjects(call, self.scope, bound);
+        let callee_subject = match &call.callee {
+            Callee::Expr(callee) => Some(self.reader.subject(callee, self.scope, bound)),
+            _ => None,
+        };
+        let handed = self.reader.handed(call, self.scope, bound);
         self.ir.calls.push(CallIr {
-            site: self.reader.site(call.span),
+            site: call_site,
             callee,
             args,
             request,
@@ -5013,6 +5129,11 @@ impl Visit for CallWalker<'_, '_, '_> {
             site_args,
             name_line,
             jsx: false,
+            arg_subjects,
+            callee_subject,
+            callee_text,
+            tested: self.guard.tested(call.span),
+            handed,
         });
     }
 
@@ -5069,6 +5190,11 @@ impl Visit for CallWalker<'_, '_, '_> {
                 site_args: None,
                 name_line: self.reader.line(element.span),
                 jsx: true,
+                arg_subjects: Vec::new(),
+                callee_subject: None,
+                callee_text: String::new(),
+                tested: None,
+                handed: Vec::new(),
             });
         }
         element.visit_children_with(self);
@@ -5078,19 +5204,21 @@ impl Visit for CallWalker<'_, '_, '_> {
     // state rows where they are written, and what it sends is not this
     // body's.
     fn visit_function(&mut self, function: &Function) {
-        let detached = self
-            .reader
-            .function(function, None, self.scope.module, &self.captured());
+        let mut detached =
+            self.reader
+                .function(function, None, self.scope.module, &self.captured());
+        detached.written_in = self.guard.placed(function.span);
         self.ir.detached.push(detached);
     }
 
     fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
-        let detached = self.reader.arrow(
+        let mut detached = self.reader.arrow(
             arrow,
             self.scope.fields,
             self.scope.module,
             &self.captured(),
         );
+        detached.written_in = self.guard.placed(arrow.span);
         self.ir.detached.push(detached);
     }
 
@@ -5154,7 +5282,74 @@ impl Visit for CallWalker<'_, '_, '_> {
             .push(ret.arg.as_deref().map_or(BodyReturn::Other, |arg| {
                 body_return(arg, &self.scope.bodies)
             }));
+        // A predicate's guard is read where it is returned (carrick#2386).
+        self.ir
+            .returns_tests
+            .push(ret.arg.as_deref().is_some_and(guards::is_test));
+        let in_return = std::mem::replace(&mut self.guard.in_return, true);
         ret.visit_children_with(self);
+        self.guard.in_return = in_return;
+    }
+
+    // The guards (carrick#2386): each records what it reads, then visits the
+    // node exactly as the default walk does.
+    fn visit_if_stmt(&mut self, stmt: &IfStmt) {
+        let test = self
+            .guard
+            .enter_test(&stmt.test, stmt.cons.span(), self.reader);
+        stmt.test.visit_with(self);
+        self.guard.leave_test(test);
+        stmt.cons.visit_with(self);
+        stmt.alt.visit_with(self);
+    }
+
+    fn visit_cond_expr(&mut self, cond: &CondExpr) {
+        let test = self
+            .guard
+            .enter_test(&cond.test, cond.cons.span(), self.reader);
+        cond.test.visit_with(self);
+        self.guard.leave_test(test);
+        cond.cons.visit_with(self);
+        cond.alt.visit_with(self);
+    }
+
+    fn visit_bin_expr(&mut self, bin: &BinExpr) {
+        self.read_comparison(bin);
+        if bin.op == BinaryOp::LogicalAnd && !self.guard.testing() {
+            // `pathname === "/x" && handle()`: the right side is the branch.
+            let test = self
+                .guard
+                .enter_test(&bin.left, bin.right.span(), self.reader);
+            bin.left.visit_with(self);
+            self.guard.leave_test(test);
+            bin.right.visit_with(self);
+        } else {
+            bin.visit_children_with(self);
+        }
+    }
+
+    fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
+        let negated = self.guard.negated;
+        if unary.op == UnaryOp::Bang {
+            self.guard.negated = !negated;
+        }
+        unary.visit_children_with(self);
+        self.guard.negated = negated;
+    }
+
+    fn visit_switch_stmt(&mut self, switch: &SwitchStmt) {
+        self.read_switch(switch);
+        switch.visit_children_with(self);
+    }
+
+    fn visit_member_expr(&mut self, member: &MemberExpr) {
+        self.read_table_key(member);
+        member.visit_children_with(self);
+    }
+
+    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
+        declarator.visit_children_with(self);
+        self.bind_block(declarator);
     }
 
     // `this.queue = new Queue("emails")`: a maker write, as the message-role
@@ -5242,6 +5437,7 @@ impl CallWalker<'_, '_, '_> {
                 .collect(),
             receivers: self.scope.local_receivers.clone(),
             fetches: self.scope.fetches.clone(),
+            subjects: guards::captured_subjects(self.scope, &self.guard.bound),
         }
     }
 }

@@ -7613,8 +7613,11 @@ fn discover_files_and_symbols(
                 .keys()
                 .cloned()
                 .collect();
-            let request_ir =
+            let mut request_ir =
                 crate::request_summary::extract_file_ir(&module, &cm, &definition_keys);
+            // Which functions the module offers, keyed as the extractor keys
+            // them, for where a guard's chain ends (carrick#2386).
+            request_ir.place_definitions(&func_extractor.function_definitions);
 
             let canonical = file_path
                 .canonicalize()

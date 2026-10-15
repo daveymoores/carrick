@@ -1,0 +1,116 @@
+[
+  {
+    "literal": "/admin",
+    "position": "starts_with",
+    "negated": true,
+    "site": {
+      "file": "src/lib/admin.ts",
+      "line": 2
+    },
+    "subject": "url.pathname",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "call",
+        "file": "src/worker.ts",
+        "line": 19,
+        "callee": "isAdminRoute",
+        "arg": 0
+      }
+    ],
+    "end": {
+      "kind": "entry_point",
+      "file": "src/worker.ts",
+      "line": 17,
+      "function": "default.fetch",
+      "param": 0,
+      "steps": [
+        "url",
+        "URL",
+        "pathname"
+      ]
+    },
+    "branch": []
+  },
+  {
+    "literal": "/media",
+    "position": "equality",
+    "negated": false,
+    "site": {
+      "file": "src/media.ts",
+      "line": 1
+    },
+    "subject": "url.pathname",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "call",
+        "file": "src/worker.ts",
+        "line": 22,
+        "callee": "isMediaRoute",
+        "arg": 0
+      }
+    ],
+    "end": {
+      "kind": "entry_point",
+      "file": "src/worker.ts",
+      "line": 17,
+      "function": "default.fetch",
+      "param": 0,
+      "steps": [
+        "url",
+        "URL",
+        "pathname"
+      ]
+    },
+    "branch": []
+  },
+  {
+    "literal": "/users",
+    "position": "starts_with",
+    "negated": false,
+    "site": {
+      "file": "src/routes.ts",
+      "line": 2
+    },
+    "subject": "url.pathname",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "call",
+        "file": "src/worker.ts",
+        "line": 6,
+        "callee": "isUsersRoute",
+        "arg": 0
+      },
+      {
+        "kind": "call",
+        "file": "src/worker.ts",
+        "line": 25,
+        "callee": "answer",
+        "arg": 1
+      }
+    ],
+    "end": {
+      "kind": "entry_point",
+      "file": "src/worker.ts",
+      "line": 17,
+      "function": "default.fetch",
+      "param": 0,
+      "steps": [
+        "url",
+        "URL",
+        "pathname"
+      ]
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "handleUsers",
+        "file": "src/worker.ts",
+        "line": 7,
+        "target": "src/worker.ts:handleUsers"
+      }
+    ]
+  }
+]

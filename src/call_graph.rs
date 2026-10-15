@@ -660,6 +660,18 @@ impl CallSiteTargets {
             .map(|(_, target, _)| target)
     }
 
+    /// Every resolved call site: the file it is written in, its span start
+    /// and end in the discovery source map, and the definition (file as
+    /// walked, definition key) it reaches. Inverted, it names each
+    /// definition's in-repo callers (carrick#2386).
+    pub fn every_site(&self) -> impl Iterator<Item = (&Path, u32, u32, &(PathBuf, String))> {
+        self.by_file.iter().flat_map(|(file, sites)| {
+            sites
+                .iter()
+                .map(move |(lo, (hi, target, _))| (file.as_path(), *lo, *hi, target))
+        })
+    }
+
     /// The definition the call spanning exactly `span_lo..span_hi` reaches
     /// (carrick#1562): never the call before it in a chain.
     pub fn target_at(&self, file: &Path, span_lo: u32, span_hi: u32) -> Option<&(PathBuf, String)> {

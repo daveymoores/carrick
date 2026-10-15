@@ -1,0 +1,8 @@
+{
+  "name": "dev-middleware",
+  "private": true,
+  "version": "0.0.0",
+  "devDependencies": {
+    "@invented/devserver": "1.0.0"
+  }
+}
