@@ -258,6 +258,74 @@ pub struct FactoryTables {
     /// Module-scope `const` -> the factory call that initialises it, for a
     /// binding the module states no class for by annotation or `new`.
     pub bindings: HashMap<String, FactoryCall>,
+    /// Module-scope type alias of a function type -> the class a call of a
+    /// value of that type returns (carrick#1561). Always
+    /// [`StatedReturn::Class`]: a type states no body to follow.
+    pub aliases: HashMap<String, StatedReturn>,
+}
+
+/// What a binding's declared type says a call of it returns, when the binding
+/// is a function value rather than a function declaration: a parameter or a
+/// local whose annotation is a function type (carrick#1561).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalledType {
+    /// `make: (id: string) => ApiClient`: the class the inline function type
+    /// names, written in the binding's own module.
+    Returns { name: String, promised: bool },
+    /// `make: MakeClient`: the type the annotation names, which states a
+    /// return only if it is an alias of a function type
+    /// ([`FactoryTables::aliases`]).
+    Alias(String),
+}
+
+/// A binding initialised by calling a function VALUE whose declared type is a
+/// function type: `const client = make("p1")` where `make: MakeClient`
+/// (carrick#1561). The value called is handed in, so its name says nothing;
+/// its type is the statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedCall {
+    pub called: CalledType,
+    /// Whether the call's value is awaited before it is bound.
+    pub awaited: bool,
+}
+
+/// What a binding's type annotation says a call of the binding returns:
+/// an inline function type that names one class (or `Promise` of one), or a
+/// plain type reference whose declaration may be such an alias. Anything else
+/// states nothing, under the same rules as a function's return annotation.
+pub fn called_type(type_ann: &TsTypeAnn) -> Option<CalledType> {
+    match unparenthesized(&type_ann.type_ann) {
+        TsType::TsTypeRef(reference) => match &reference.type_name {
+            TsEntityName::Ident(ident) => Some(CalledType::Alias(ident.sym.to_string())),
+            TsEntityName::TsQualifiedName(_) => None,
+        },
+        ty => match function_type_return(ty, None)? {
+            StatedReturn::Class { name, promised } => Some(CalledType::Returns { name, promised }),
+            StatedReturn::Call { .. } => None,
+        },
+    }
+}
+
+fn unparenthesized(ty: &TsType) -> &TsType {
+    match ty {
+        TsType::TsParenthesizedType(paren) => unparenthesized(&paren.type_ann),
+        ty => ty,
+    }
+}
+
+/// The class a function type states its call returns. `outer` is the type
+/// parameters of the alias the function type is declared by, which name no
+/// class either.
+fn function_type_return(ty: &TsType, outer: Option<&TsTypeParamDecl>) -> Option<StatedReturn> {
+    let TsType::TsFnOrConstructorType(TsFnOrConstructorType::TsFnType(function)) =
+        unparenthesized(ty)
+    else {
+        return None;
+    };
+    annotated_return(
+        &function.type_ann,
+        &[outer, function.type_params.as_deref()],
+    )
 }
 
 /// Read a module's top level for [`FactoryTables`].
@@ -279,6 +347,7 @@ pub struct FactoryTables {
 pub fn factory_tables(module: &Module) -> FactoryTables {
     let mut returns: HashMap<String, Option<StatedReturn>> = HashMap::new();
     let mut bindings: HashMap<String, Option<FactoryCall>> = HashMap::new();
+    let mut aliases: HashMap<String, Option<StatedReturn>> = HashMap::new();
     fn record<T: PartialEq>(
         table: &mut HashMap<String, Option<T>>,
         name: String,
@@ -301,6 +370,11 @@ pub fn factory_tables(module: &Module) -> FactoryTables {
             _ => continue,
         };
         match decl {
+            Decl::TsTypeAlias(alias) => record(
+                &mut aliases,
+                alias.id.sym.to_string(),
+                function_type_return(&alias.type_ann, alias.type_params.as_deref()),
+            ),
             Decl::Fn(function) => record(
                 &mut returns,
                 function.ident.sym.to_string(),
@@ -349,6 +423,10 @@ pub fn factory_tables(module: &Module) -> FactoryTables {
             .into_iter()
             .filter_map(|(name, stated)| stated.map(|stated| (name, stated)))
             .collect(),
+        aliases: aliases
+            .into_iter()
+            .filter_map(|(name, stated)| stated.map(|stated| (name, stated)))
+            .collect(),
     }
 }
 
@@ -393,37 +471,7 @@ fn stated_return(
     returned: Option<&Expr>,
 ) -> Option<StatedReturn> {
     if let Some(annotation) = annotation {
-        let TsType::TsTypeRef(reference) = &*annotation.type_ann else {
-            return None;
-        };
-        let TsEntityName::Ident(head) = &reference.type_name else {
-            return None;
-        };
-        let (named, promised) = match reference.type_params.as_deref() {
-            None => (head, false),
-            // `Promise<C>`. Any other generic head names the class its head
-            // does, as a binding's annotation is read.
-            Some(arguments) if &*head.sym == "Promise" => match arguments.params.as_slice() {
-                [argument] => match &**argument {
-                    TsType::TsTypeRef(inner) => match &inner.type_name {
-                        TsEntityName::Ident(inner) => (inner, true),
-                        TsEntityName::TsQualifiedName(_) => return None,
-                    },
-                    _ => return None,
-                },
-                _ => return None,
-            },
-            Some(_) => (head, false),
-        };
-        let own_parameter = type_params
-            .is_some_and(|declared| declared.params.iter().any(|p| p.name.sym == named.sym));
-        if own_parameter || &*named.sym == "Promise" {
-            return None;
-        }
-        return Some(StatedReturn::Class {
-            name: named.sym.to_string(),
-            promised,
-        });
+        return annotated_return(annotation, &[type_params]);
     }
     let returned = returned?;
     if let Some(class) = constructed_type_ident(returned) {
@@ -435,6 +483,47 @@ fn stated_return(
     factory_call(returned).map(|(callee, _)| StatedReturn::Call {
         callee: callee.sym.to_string(),
         promised: is_async,
+    })
+}
+
+/// The class a return annotation names: one type, or `Promise` of one. A
+/// union, a qualified name or a type parameter `own` declares states nothing.
+fn annotated_return(
+    annotation: &TsTypeAnn,
+    own: &[Option<&TsTypeParamDecl>],
+) -> Option<StatedReturn> {
+    let TsType::TsTypeRef(reference) = &*annotation.type_ann else {
+        return None;
+    };
+    let TsEntityName::Ident(head) = &reference.type_name else {
+        return None;
+    };
+    let (named, promised) = match reference.type_params.as_deref() {
+        None => (head, false),
+        // `Promise<C>`. Any other generic head names the class its head
+        // does, as a binding's annotation is read.
+        Some(arguments) if &*head.sym == "Promise" => match arguments.params.as_slice() {
+            [argument] => match &**argument {
+                TsType::TsTypeRef(inner) => match &inner.type_name {
+                    TsEntityName::Ident(inner) => (inner, true),
+                    TsEntityName::TsQualifiedName(_) => return None,
+                },
+                _ => return None,
+            },
+            _ => return None,
+        },
+        Some(_) => (head, false),
+    };
+    let own_parameter = own
+        .iter()
+        .flatten()
+        .any(|declared| declared.params.iter().any(|p| p.name.sym == named.sym));
+    if own_parameter || &*named.sym == "Promise" {
+        return None;
+    }
+    Some(StatedReturn::Class {
+        name: named.sym.to_string(),
+        promised,
     })
 }
 
@@ -603,6 +692,77 @@ mod tests {
             tables.returns.get("makeClient"),
             Some(&class("ApiClient", false))
         );
+    }
+
+    /// A type alias of a function type states the class a call of a value of
+    /// that type returns, by the rules a return annotation is read by
+    /// (carrick#1561).
+    #[test]
+    fn a_function_type_alias_states_the_class_its_call_returns() {
+        let tables = factories(
+            r#"
+            export type MakeClient = (projectId: string) => ApiClient;
+            type OpenClient = () => Promise<ApiClient>;
+            type Wrapped = (() => ApiClient);
+            type Either = () => ApiClient | BatchClient;
+            type Qualified = () => core.ApiClient;
+            type Own<T> = () => T;
+            type Inner = <T>() => T;
+            type Shape = { (projectId: string): ApiClient };
+            type NotAFunction = ApiClient;
+            "#,
+        );
+        assert_eq!(
+            tables.aliases.get("MakeClient"),
+            Some(&class("ApiClient", false))
+        );
+        assert_eq!(
+            tables.aliases.get("OpenClient"),
+            Some(&class("ApiClient", true))
+        );
+        assert_eq!(
+            tables.aliases.get("Wrapped"),
+            Some(&class("ApiClient", false))
+        );
+        assert_eq!(tables.aliases.len(), 3, "{:?}", tables.aliases);
+        assert!(tables.returns.is_empty(), "{:?}", tables.returns);
+    }
+
+    fn annotation(source: &str) -> Option<CalledType> {
+        let (_, module) =
+            parse_standalone_module(Path::new("annotation.ts"), source).expect("parses");
+        let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = &module.body[0] else {
+            panic!("one declaration");
+        };
+        let Pat::Ident(ident) = &var.decls[0].name else {
+            panic!("an identifier binding");
+        };
+        called_type(ident.type_ann.as_deref().expect("annotated"))
+    }
+
+    #[test]
+    fn a_function_typed_binding_states_what_its_call_returns() {
+        assert_eq!(
+            annotation("let make: (id: string) => ApiClient;"),
+            Some(CalledType::Returns {
+                name: "ApiClient".to_string(),
+                promised: false
+            })
+        );
+        assert_eq!(
+            annotation("let make: () => Promise<ApiClient>;"),
+            Some(CalledType::Returns {
+                name: "ApiClient".to_string(),
+                promised: true
+            })
+        );
+        assert_eq!(
+            annotation("let make: MakeClient;"),
+            Some(CalledType::Alias("MakeClient".to_string()))
+        );
+        assert_eq!(annotation("let make: () => ApiClient | BatchClient;"), None);
+        assert_eq!(annotation("let make: <T>() => T;"), None);
+        assert_eq!(annotation("let make: core.MakeClient;"), None);
     }
 
     #[test]

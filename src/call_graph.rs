@@ -72,7 +72,8 @@ use crate::agents::file_orchestrator::FileOrchestrator;
 use crate::import_bindings::{BindingResolver, DEFAULT_EXPORT, Lookup, ResolvedBinding};
 use crate::parser::parse_file;
 use crate::receiver_type::{
-    FactoryCall, FactoryTables, ReceiverTypes, StatedReturn, factory_tables, module_scope_types,
+    CalledType, FactoryCall, FactoryTables, ReceiverTypes, StatedReturn, TypedCall, factory_tables,
+    module_scope_types,
 };
 use crate::visitor::{
     CalleeRef, CalleeShape, FunctionCallRef, FunctionDefinition, FunctionDefinitionExtractor,
@@ -1055,8 +1056,14 @@ impl<'a> CallResolver<'a> {
         {
             return Some(target);
         }
-        let factory = callee.receiver.factory.as_ref()?;
-        self.resolve_factory_member(&ModuleRef::Indexed(index), factory, &callee.name)
+        let module = ModuleRef::Indexed(index);
+        if let Some(factory) = callee.receiver.factory.as_ref()
+            && let Some(target) = self.resolve_factory_member(&module, factory, &callee.name)
+        {
+            return Some(target);
+        }
+        let typed = callee.receiver.typed_factory.as_ref()?;
+        self.resolve_typed_call_member(&module, typed, &callee.name)
     }
 
     /// `client.foo(...)` where `const client = createClient()`: the member of
@@ -1083,10 +1090,45 @@ impl<'a> CallResolver<'a> {
         if promised && !factory.awaited {
             return None;
         }
-        if let Some(target) = self.definition_in(&module, member_keys(&class, member)) {
+        self.resolve_named_class_member(&module, &class, member)
+    }
+
+    /// `client.foo(...)` where `const client = make()` and `make` is a value
+    /// declared as a function type: inline (`make: () => Client`) or by an
+    /// alias (`make: MakeClient`, `type MakeClient = () => Client`)
+    /// (carrick#1561).
+    ///
+    /// An inline type writes the class name in the receiver's own module; an
+    /// alias writes it in the alias's module ([`Self::alias_class`]). The
+    /// same rules as [`Self::resolve_factory_member`] from there on.
+    fn resolve_typed_call_member(
+        &mut self,
+        module: &ModuleRef<'a>,
+        typed: &TypedCall,
+        member: &str,
+    ) -> Option<Target> {
+        let (module, class, promised) = match &typed.called {
+            CalledType::Returns { name, promised } => (module.clone(), name.clone(), *promised),
+            CalledType::Alias(alias) => self.alias_class(module, alias)?,
+        };
+        if promised && !typed.awaited {
+            return None;
+        }
+        self.resolve_named_class_member(&module, &class, member)
+    }
+
+    /// `member` of the class `class` names in `module`: one the module
+    /// declares, or the one its import names.
+    fn resolve_named_class_member(
+        &mut self,
+        module: &ModuleRef<'a>,
+        class: &str,
+        member: &str,
+    ) -> Option<Target> {
+        if let Some(target) = self.definition_in(module, member_keys(class, member)) {
             return Some(target);
         }
-        let symbol = self.import_in(&module, &class)?;
+        let symbol = self.import_in(module, class)?;
         let binding = self.resolve_import(&module.importer(), &symbol)?;
         let declaring_class = binding
             .local_name
@@ -1140,15 +1182,51 @@ impl<'a> CallResolver<'a> {
         }
     }
 
+    /// The class a call of a value typed by the alias `alias`, as `module`
+    /// names it, returns: the module that declares the alias, the class name
+    /// and whether the caller receives a promise of it. An imported alias is
+    /// followed through the TYPE exports, where `export type` declares it,
+    /// and read under the name it was imported by.
+    fn alias_class(
+        &mut self,
+        module: &ModuleRef<'a>,
+        alias: &str,
+    ) -> Option<(ModuleRef<'a>, String, bool)> {
+        let (module, stated) = match self.alias_return(module, alias) {
+            Some(stated) => (module.clone(), stated),
+            None => {
+                let symbol = self.import_in(module, alias)?;
+                if !matches!(symbol.kind, SymbolKind::Named) {
+                    return None;
+                }
+                let file = self.bindings.resolve_type(
+                    &module.importer(),
+                    &symbol.source,
+                    &symbol.imported_name,
+                )?;
+                let module = self.module_ref(file);
+                let stated = self.alias_return(&module, &symbol.imported_name)?;
+                (module, stated)
+            }
+        };
+        match stated {
+            StatedReturn::Class { name, promised } => Some((module, name, promised)),
+            StatedReturn::Call { .. } => None,
+        }
+    }
+
     fn stated_return(&mut self, module: &ModuleRef<'a>, function: &str) -> Option<StatedReturn> {
+        self.factories_in(module)?.returns.get(function).cloned()
+    }
+
+    fn alias_return(&mut self, module: &ModuleRef<'a>, alias: &str) -> Option<StatedReturn> {
+        self.factories_in(module)?.aliases.get(alias).cloned()
+    }
+
+    fn factories_in<'m>(&'m mut self, module: &'m ModuleRef<'a>) -> Option<&'m FactoryTables> {
         match module {
-            ModuleRef::Indexed(index) => index.factories.returns.get(function).cloned(),
-            ModuleRef::External(file) => self
-                .external_module(file)?
-                .factories
-                .returns
-                .get(function)
-                .cloned(),
+            ModuleRef::Indexed(index) => Some(&index.factories),
+            ModuleRef::External(file) => Some(&self.external_module(file)?.factories),
         }
     }
 
@@ -3284,6 +3362,57 @@ mod tests {
         let files = callee_files(&defs, "readShared");
         assert_eq!(callee_names(&defs, "readShared"), ["Client.get"]);
         assert!(files[0].ends_with("src/mail/client.ts"), "{files:?}");
+        drop(dir);
+    }
+
+    /// A receiver bound by calling a function VALUE resolves by the value's
+    /// declared type (carrick#1561): an inline function type, an alias
+    /// imported type-only from another module, and a local annotated with
+    /// one. A type that returns a union names no one class, and a value
+    /// handed in with no type states nothing.
+    #[test]
+    fn a_receiver_returned_by_a_function_typed_value_resolves_to_the_class_its_type_states() {
+        let (dir, defs) = scan(&[
+            (
+                "src/store.ts",
+                "export class Store {\n  load(key: string) {\n    return key;\n  }\n}\n\
+                 export class Cache {\n  load(key: string) {\n    return key;\n  }\n}\n",
+            ),
+            (
+                "src/types.ts",
+                "import type { Store, Cache } from \"./store\";\n\
+                 export type OpenStore = (name: string) => Promise<Store>;\n\
+                 export type OpenEither = (name: string) => Store | Cache;\n",
+            ),
+            (
+                "src/jobs.ts",
+                "import type { Store } from \"./store\";\n\
+                 import type { OpenStore, OpenEither } from \"./types\";\n\
+                 export function inline(open: (name: string) => Store) {\n  \
+                 const store = open(\"a\");\n  return store.load(\"k\");\n}\n\
+                 export async function aliased(open: OpenStore) {\n  \
+                 const store = await open(\"a\");\n  return store.load(\"k\");\n}\n\
+                 export function unawaited(open: OpenStore) {\n  \
+                 const store = open(\"a\");\n  return store.load(\"k\");\n}\n\
+                 export async function bound(pick: () => OpenStore) {\n  \
+                 const open: OpenStore = pick();\n  \
+                 const store = await open(\"a\");\n  return store.load(\"k\");\n}\n\
+                 export function union(open: OpenEither) {\n  \
+                 const store = open(\"a\");\n  return store.load(\"k\");\n}\n\
+                 export function untyped(open) {\n  \
+                 const store = open(\"a\");\n  return store.load(\"k\");\n}\n",
+            ),
+        ]);
+
+        for function in ["inline", "aliased", "bound"] {
+            assert_eq!(callee_names(&defs, function), ["Store.load"], "{function}");
+            let files = callee_files(&defs, function);
+            assert!(files[0].ends_with("src/store.ts"), "{function}: {files:?}");
+        }
+        // A promise of the class is not the class until it is awaited.
+        assert!(callee_names(&defs, "unawaited").is_empty());
+        assert!(callee_names(&defs, "union").is_empty());
+        assert!(callee_names(&defs, "untyped").is_empty());
         drop(dir);
     }
 
