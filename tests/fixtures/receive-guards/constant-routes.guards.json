@@ -1,0 +1,93 @@
+[
+  {
+    "literal": "/health",
+    "shape": "path",
+    "position": "equality",
+    "negated": false,
+    "site": {
+      "file": "src/server.ts",
+      "line": 7
+    },
+    "subject": "url.pathname",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/server.ts",
+        "line": 5,
+        "callee": "createServer",
+        "arg": 0,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    ],
+    "end": {
+      "kind": "external_import",
+      "specifier": "node:http",
+      "export": "createServer",
+      "steps": []
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "end",
+        "file": "src/server.ts",
+        "line": 8,
+        "target": null
+      }
+    ]
+  },
+  {
+    "literal": "METRICS_ROUTE",
+    "shape": "unresolved",
+    "constant": {
+      "specifier": "invented-routes",
+      "export": "METRICS_ROUTE",
+      "path": []
+    },
+    "position": "equality",
+    "negated": false,
+    "site": {
+      "file": "src/server.ts",
+      "line": 11
+    },
+    "subject": "url.pathname",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/server.ts",
+        "line": 5,
+        "callee": "createServer",
+        "arg": 0,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    ],
+    "end": {
+      "kind": "external_import",
+      "specifier": "node:http",
+      "export": "createServer",
+      "steps": []
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "end",
+        "file": "src/server.ts",
+        "line": 12,
+        "target": null
+      }
+    ]
+  }
+]

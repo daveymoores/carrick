@@ -308,6 +308,67 @@ mod tests {
         assert!(read("function f() { const P = '/a'; return x === P; }").is_empty());
     }
 
+    /// What the reader finds in every source file of the receive-guard
+    /// fixtures, as (file, line, value, position): the output the file
+    /// orchestrator reads, held fixed while the guard pass widens
+    /// (carrick#2386 slice B2).
+    #[test]
+    fn the_receive_guard_fixtures_read_as_they_did_before_the_widening() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let files = [
+            "hand-dispatch-worker/src/worker.ts",
+            "receive-guards/dev-middleware/src/devserver.ts",
+            "receive-guards/node-server/src/server.ts",
+            "receive-guards/predicate-elsewhere/src/lib/admin.ts",
+            "receive-guards/predicate-elsewhere/src/media.ts",
+            "receive-guards/predicate-elsewhere/src/routes.ts",
+            "receive-guards/predicate-elsewhere/src/worker.ts",
+            "receive-guards/worker-variants/src/bound.ts",
+            "receive-guards/worker-variants/src/satisfied.ts",
+            "receive-guards/worker-variants/src/smoke.ts",
+            "receive-guards/message-switch/src/parent.ts",
+            "receive-guards/message-switch/src/wire.ts",
+            "receive-guards/message-switch/src/worker.ts",
+            "receive-guards/constant-routes/src/routes/index.ts",
+            "receive-guards/constant-routes/src/routes/paths.ts",
+            "receive-guards/constant-routes/src/router.ts",
+            "receive-guards/constant-routes/src/server.ts",
+            "receive-guards/handler-tables/src/dispatch.ts",
+        ];
+        let mut found = Vec::new();
+        for file in files {
+            let path = fixtures.join(file);
+            let source = std::fs::read_to_string(&path).expect("the fixture is readable");
+            let (source_map, module) = crate::swc_scanner::parse_standalone_module(&path, &source)
+                .expect("the fixture parses");
+            for literal in compared_route_literals(&module) {
+                found.push(format!(
+                    "{file}:{} {} {:?}",
+                    source_map.lookup_char_pos(literal.span.lo).line,
+                    literal.value,
+                    literal.position
+                ));
+            }
+        }
+        let expected = [
+            "hand-dispatch-worker/src/worker.ts:23 /items Equality",
+            "hand-dispatch-worker/src/worker.ts:27 /items Equality",
+            "hand-dispatch-worker/src/worker.ts:34 /items/ StartsWith",
+            "hand-dispatch-worker/src/worker.ts:42 /health Case",
+            "receive-guards/dev-middleware/src/devserver.ts:9 /api/status Equality",
+            "receive-guards/node-server/src/server.ts:17 /health Case",
+            "receive-guards/node-server/src/server.ts:20 /ready Case",
+            "receive-guards/node-server/src/server.ts:21 /live Case",
+            "receive-guards/node-server/src/server.ts:36 /version Equality",
+            "receive-guards/predicate-elsewhere/src/lib/admin.ts:2 /admin StartsWith",
+            "receive-guards/predicate-elsewhere/src/media.ts:1 /media Equality",
+            "receive-guards/predicate-elsewhere/src/routes.ts:2 /users StartsWith",
+            "receive-guards/worker-variants/src/bound.ts:6 /items Equality",
+            "receive-guards/worker-variants/src/satisfied.ts:6 /status Equality",
+        ];
+        assert_eq!(found, expected, "{found:#?}");
+    }
+
     #[test]
     fn other_positions_and_shapes_are_not_read() {
         for source in [

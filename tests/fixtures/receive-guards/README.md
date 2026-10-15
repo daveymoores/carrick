@@ -21,4 +21,22 @@ same name here.
   import, a `.js` specifier and a tsconfig alias, one of them negated, one
   through two calls.
 
+Slice B2 (carrick#2386) widens the guards to every string literal and to
+constants read through imports. Each chain then states a `shape`: `path` for a
+route-shaped literal, `name` for any other, and `unresolved` for a constant the
+value flow cannot read. The five keys above hold only the `path` chains, and
+their tests compare only those, with `shape` left out. The keys below hold every
+chain.
+
+- `message-switch/`: a child process's `message` listener that switches on a
+  message field, one reached through a parse call, and a worker that compares
+  with a constant object imported from a sibling file and with one from a
+  package.
+- `constant-routes/`: a `node:http` server that compares the path with a
+  constant imported through a re-export and with one from a package, and a
+  route registered under an imported constant with spread handlers, which
+  states no guard.
+- `handler-tables/`: a module-scope handler table with name keys, indexed
+  with a message field.
+
 Lines are 1-based. Files are relative to the fixture root.
