@@ -137,6 +137,23 @@ pub(crate) fn utf16_offset(content: &str, byte_offset: usize) -> u32 {
     u32::try_from(units).unwrap_or(u32::MAX)
 }
 
+/// The ts-morph position of an SWC span into `content`: file-relative, and
+/// counted in UTF-16 code units rather than bytes (carrick#805, carrick#806).
+///
+/// `span` is an SWC position: a UTF-8 byte offset counted from
+/// [`crate::swc_scanner::SWC_SPAN_BASE`] into a file parsed on its own. Every
+/// span the sidecar is sent passes through here: the receiver-type request,
+/// the type layer's span locator (which the capture anchors are built from in
+/// turn), and the key a site looks its compiler row up by (carrick#2405).
+/// The conversion sits at the request and not at the candidate, because the
+/// byte span is what joins a pass's answers back to its candidate.
+pub fn sidecar_position(content: &str, span: u32) -> u32 {
+    utf16_offset(
+        content,
+        span.saturating_sub(crate::swc_scanner::SWC_SPAN_BASE) as usize,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

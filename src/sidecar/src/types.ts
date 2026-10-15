@@ -312,6 +312,23 @@ export interface AddProgramFilesRequest extends BaseRequest {
 }
 
 /**
+ * Write one row for each call, member access, comparison and identifier in
+ * each of a service's source files to a gzip JSON-lines file (carrick#2405).
+ * Record-only: nothing in a scan reads the file yet.
+ */
+export interface PositionRowsRequest extends BaseRequest {
+  action: 'position_rows';
+  /** Absolute paths of the service's source files, in the order written. */
+  files: string[];
+  /** The scanned repo's root: every path in the file is relative to it. */
+  scan_root: string;
+  /** Where the rows file goes. Written beside it under a temporary name, then renamed. */
+  out_path: string;
+  /** The service the rows are for, written in the header. */
+  service: string;
+}
+
+/**
  * Request to resolve type definitions from a v2 capture stub package.
  * Returns both the original declaration and the compiler-expanded form for
  * each surface alias (design doc: `resolve_per_endpoint_definitions` is
@@ -586,7 +603,8 @@ export type SidecarRequest =
   | HealthRequest
   | ShutdownRequest
   | ListProgramFilesRequest
-  | AddProgramFilesRequest;
+  | AddProgramFilesRequest
+  | PositionRowsRequest;
 
 /**
  * Request for a specific symbol to be bundled
@@ -794,6 +812,30 @@ export interface ShutdownResponse extends BaseResponse {
   status: 'success';
 }
 
+/** Response for position_rows: what was written, counted. */
+export interface PositionRowsResponse extends BaseResponse {
+  result?: PositionRowsCounts;
+  errors?: string[];
+}
+
+export interface PositionRowsCounts {
+  /** Source files in the request, each one line of the file. */
+  files: number;
+  rows: number;
+  /** Rows whose position resolved to a symbol. */
+  resolved: number;
+  /** Rows whose type is `any` (flag 1). */
+  any: number;
+  /** Rows whose type is the compiler's error type (flag 2). */
+  error_type: number;
+  /** The rows file's size on disk, compressed. */
+  bytes: number;
+  /** Time spent building programs and reading files into them. */
+  load_ms: number;
+  /** Time spent walking the files and writing the rows. */
+  walk_ms: number;
+}
+
 /**
  * Response for list_program_files action
  */
@@ -983,6 +1025,7 @@ export type SidecarResponse =
   | ShutdownResponse
   | ListProgramFilesResponse
   | AddProgramFilesResponse
+  | PositionRowsResponse
   | ErrorResponse;
 
 /**

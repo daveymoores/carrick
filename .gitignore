@@ -52,6 +52,11 @@ target/
 !tests/fixtures/inline-handler-response/node_modules/@fixture-http/runtime/
 !tests/fixtures/inline-handler-response/node_modules/@fixture-http/runtime/package.json
 !tests/fixtures/inline-handler-response/node_modules/@fixture-http/runtime/index.d.ts
+!tests/fixtures/position-rows/repo/node_modules/
+!tests/fixtures/position-rows/repo/node_modules/@fixture/
+!tests/fixtures/position-rows/repo/node_modules/@fixture/kit/
+!tests/fixtures/position-rows/repo/node_modules/@fixture/kit/package.json
+!tests/fixtures/position-rows/repo/node_modules/@fixture/kit/index.d.ts
 **/ts_check/output
 mcp-server/dist
 mcp-server/dist-lambda

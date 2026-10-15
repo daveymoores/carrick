@@ -28,6 +28,7 @@ pub(crate) use aws_storage::{
 };
 mod local_dir_storage;
 mod tee_storage;
+pub(crate) use local_dir_storage::blob_stem;
 pub use local_dir_storage::{CACHE_DIR_ENV, ISOLATE_ENV, LocalDirStorage, PEERS_ENV};
 pub use tee_storage::{LAPTOP_SCAN_ENV, TeeStorage, laptop_scan_requested};
 

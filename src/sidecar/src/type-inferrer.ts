@@ -61,6 +61,7 @@ import { externalImportsOf, isExternalOrigin } from './origin.js';
 import { reachedOnlyOnFailure } from './failure-path.js';
 import { readResponseModes, type JoinedBody, type ResponseModes } from './response-modes.js';
 import { functionAtLine } from './function-line-index.js';
+import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
 import { endLineOf, startLineOf } from './line-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import {
@@ -7057,71 +7058,19 @@ export class TypeInferrer {
    * The npm package name that declares a type. `undefined` when the type has
    * no declaration to read (a top type, a primitive, an anonymous object
    * literal) or when nothing owns its declaration but the workspace itself.
-   *
-   * The module graph is asked first, where there is one, because it is the
-   * only thing that can answer for a project whose resolution does not go
-   * through `node_modules`. Deno resolves an npm dependency's types straight
-   * out of its own cache
-   * (`$DENO_DIR/npm/<registry-host>/<name>/<version>/…`), a path with no
-   * `node_modules` segment anywhere in it, so the scan below found no package
-   * for ANY dependency-declared type on such a repo and every receiver the
-   * compiler had typed correctly went unclassified (carrick#1260). It runs
-   * first rather than second because a mixed checkout has both, and the graph
-   * is what actually resolved the module.
-   *
-   * The path scan is the Node answer: the LAST `node_modules` segment wins,
-   * which is what a nested or content-addressed store
-   * (`node_modules/.store/pkg@1.0.0/node_modules/pkg`) requires. Scoped names
-   * keep both segments.
+   * The declaration is the attributed one (carrick#2031), and the package is
+   * named by the module graph first, then by the path (`installedPackageOf`).
    */
   private declaringPackageOf(type: Type): string | undefined {
     const symbol = type.getSymbol() ?? type.getAliasSymbol();
-    const declaration = this.attributedDeclaration(symbol?.getDeclarations() ?? []);
+    const declaration = attributedDeclaration(
+      () => this.project.getProgram().compilerObject,
+      (symbol?.getDeclarations() ?? []).map((node) => node.compilerNode)
+    );
     if (!declaration) {
       return undefined;
     }
-    const filePath = declaration.getSourceFile().getFilePath().replace(/\\/g, '/');
-    const named = this.packageOf?.(filePath);
-    if (named) {
-      return named;
-    }
-    const marker = '/node_modules/';
-    const index = filePath.lastIndexOf(marker);
-    if (index < 0) {
-      return undefined;
-    }
-    const rest = filePath.slice(index + marker.length).split('/');
-    if (rest.length === 0 || rest[0].length === 0) {
-      return undefined;
-    }
-    if (rest[0].startsWith('@')) {
-      return rest.length > 1 ? `${rest[0]}/${rest[1]}` : undefined;
-    }
-    return rest[0];
-  }
-
-  /**
-   * The declaration a symbol is attributed to (carrick#2031). One declaration
-   * is itself. Where several files merge one symbol (a global interface the
-   * compiler's library declares and a typings package augments), their order
-   * is the order the checker merged them in, and on TypeScript 6 that changes
-   * once the program is rebuilt, so the first one is not an answer. The
-   * compiler's default library wins where it declares the symbol; otherwise,
-   * and among the library's own files, the declaring file whose path sorts
-   * first, then the earliest declaration in it.
-   */
-  private attributedDeclaration(declarations: Node[]): Node | undefined {
-    if (declarations.length <= 1) return declarations[0];
-    const program = this.project.getProgram().compilerObject;
-    const fromLibrary = declarations.filter((declaration) =>
-      program.isSourceFileDefaultLibrary(declaration.getSourceFile().compilerNode)
-    );
-    const candidates = fromLibrary.length > 0 ? fromLibrary : declarations;
-    return [...candidates].sort((a, b) => {
-      const pathA = a.getSourceFile().getFilePath();
-      const pathB = b.getSourceFile().getFilePath();
-      return pathA < pathB ? -1 : pathA > pathB ? 1 : a.getStart() - b.getStart();
-    })[0];
+    return installedPackageOf(declaration.getSourceFile().fileName, this.packageOf);
   }
 
   /**

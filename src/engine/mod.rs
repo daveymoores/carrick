@@ -2441,6 +2441,14 @@ impl ServiceScan {
             );
         }
 
+        // The compiler's rows for every position of the service's files
+        // (carrick#2405), when asked for, in a process of their own that
+        // starts after the analysis sidecar is gone. Record-only: a walk that
+        // fails loses its rows and says so here, and nothing else.
+        if let Some(recipe) = &self.sidecar {
+            record_position_rows(recipe, &self.repo_path, service, &data);
+        }
+
         let owed = durability::OwedWork {
             deferred: analysis.deferred,
             losses: crate::scan_health::service_losses(service.service_name.as_deref()),
@@ -6758,6 +6766,46 @@ fn service_sidecar_root(repo_path: &str, service: &Config) -> std::path::PathBuf
     match &service.directory {
         Some(dir) => canonical.join(dir),
         None => canonical,
+    }
+}
+
+/// Write the service's per-position compiler rows beside its blob when the
+/// run asks for them (`CARRICK_POSITION_ROWS=1` with a local store,
+/// carrick#2405). The files are the ones discovery walks; every path is sent
+/// under the repo's canonical root, as the service's sidecar root is. Off,
+/// this spawns nothing and writes nothing.
+fn record_position_rows(
+    recipe: &crate::services::type_sidecar::SidecarRecipe,
+    repo_path: &str,
+    service: &Config,
+    data: &CloudRepoData,
+) {
+    let Some(out) =
+        crate::position_rows::destination(&data.repo_name, data.service_name.as_deref())
+    else {
+        return;
+    };
+    let scan_root =
+        std::fs::canonicalize(repo_path).unwrap_or_else(|_| std::path::PathBuf::from(repo_path));
+    let mut files: Vec<std::path::PathBuf> =
+        walk_service(repo_path, service, &service_ignore_patterns(service))
+            .files
+            .iter()
+            .map(|file| scan_root.join(file.strip_prefix(repo_path).unwrap_or(file)))
+            .collect();
+    files.sort();
+    let service_root = service_sidecar_root(repo_path, service);
+    let label = service.service_name.as_deref().unwrap_or("(root)");
+    let walk = crate::position_rows::ServiceWalk {
+        service_root: &service_root,
+        tsconfig: service.tsconfig.as_deref(),
+        scan_root: &scan_root,
+        files: &files,
+        out: &out,
+        service: label,
+    };
+    if let Err(error) = crate::position_rows::record_service_rows(recipe, &walk) {
+        debug!("Position rows for service {label} were not written: {error}");
     }
 }
 

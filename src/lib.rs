@@ -63,6 +63,7 @@ pub mod packages;
 pub mod panic_report;
 pub mod parser;
 pub mod phase_timing;
+pub mod position_rows;
 pub mod pr_baseline;
 pub mod pr_context;
 pub mod pr_functions;

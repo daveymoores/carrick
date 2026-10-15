@@ -440,6 +440,21 @@ export class ProjectLoader {
   }
 
   /**
+   * Drop the program behind a key from `projectKeyFor`, so the memory it
+   * holds can go before the next one is built. The next `getProjectFor` on
+   * the key builds it again. For a walk that reads one owner's program at a
+   * time and never comes back to it (carrick#2405); the actions that keep
+   * their programs for the life of the process never call it.
+   */
+  releaseProjectFor(key: string): void {
+    if (key === '') {
+      this.project = null;
+    } else {
+      this.ownerProjects.delete(key);
+    }
+  }
+
+  /**
    * Get the ts-morph Project, building it on first call.
    *
    * @returns The Project instance

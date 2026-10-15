@@ -4286,8 +4286,8 @@ impl FileOrchestrator {
                         file_path: file_path.to_string(),
                         line_number,
                         infer_kind,
-                        span_start: Some(Self::sidecar_position(source, start)),
-                        span_end: Some(Self::sidecar_position(source, end)),
+                        span_start: Some(crate::utils::sidecar_position(source, start)),
+                        span_end: Some(crate::utils::sidecar_position(source, end)),
                         expression_text: None,
                         expression_line: None,
                         alias: Some(alias),
@@ -5594,8 +5594,8 @@ impl FileOrchestrator {
             requests.push(InferRequestItem {
                 file_path: file.clone(),
                 line_number: declared.line,
-                span_start: Some(Self::sidecar_position(content, declared.lo)),
-                span_end: Some(Self::sidecar_position(content, declared.hi)),
+                span_start: Some(crate::utils::sidecar_position(content, declared.lo)),
+                span_end: Some(crate::utils::sidecar_position(content, declared.hi)),
                 expression_text: None,
                 expression_line: None,
                 infer_kind: InferKind::Expression,
@@ -5714,8 +5714,8 @@ impl FileOrchestrator {
                         Some(content) => {
                             spanned += 1;
                             (
-                                Some(Self::sidecar_position(content, lo)),
-                                Some(Self::sidecar_position(content, hi)),
+                                Some(crate::utils::sidecar_position(content, lo)),
+                                Some(crate::utils::sidecar_position(content, hi)),
                             )
                         }
                         // Unreachable while the source that produced the
@@ -5849,8 +5849,8 @@ impl FileOrchestrator {
         Some((
             declaring_file.clone(),
             line,
-            Self::sidecar_position(content, lo),
-            Self::sidecar_position(content, hi),
+            crate::utils::sidecar_position(content, lo),
+            crate::utils::sidecar_position(content, hi),
         ))
     }
 
@@ -8037,21 +8037,6 @@ impl FileOrchestrator {
         }
     }
 
-    /// The ts-morph position of an SWC span into `content`: file-relative, and
-    /// counted in UTF-16 code units rather than bytes (carrick#805, carrick#806).
-    /// Every span the sidecar is sent passes through here — the receiver-type
-    /// request below, and the type layer's span locator in
-    /// [`collect_type_requests`](Self::collect_type_requests), which the capture
-    /// anchors are built from in turn. See
-    /// [`resolve_receiver_roles`](Self::resolve_receiver_roles) for why the
-    /// conversion sits at the request and not at the candidate.
-    fn sidecar_position(content: &str, span: u32) -> u32 {
-        crate::utils::utf16_offset(
-            content,
-            span.saturating_sub(crate::swc_scanner::SWC_SPAN_BASE) as usize,
-        )
-    }
-
     /// Ask the type sidecar what the receiver of every bare
     /// `x.verb("/lit", arg)` site is, and map the answers onto roles
     /// (carrick#695).
@@ -8122,8 +8107,11 @@ impl FileOrchestrator {
                 requests.push(InferRequestItem {
                     file_path: path_str.to_string(),
                     line_number: u32::try_from(candidate.line_number).unwrap_or(1).max(1),
-                    span_start: Some(Self::sidecar_position(content, candidate.span_start)),
-                    span_end: Some(Self::sidecar_position(content, candidate.span_end)),
+                    span_start: Some(crate::utils::sidecar_position(
+                        content,
+                        candidate.span_start,
+                    )),
+                    span_end: Some(crate::utils::sidecar_position(content, candidate.span_end)),
                     expression_text: None,
                     expression_line: None,
                     infer_kind: InferKind::ReceiverType,
