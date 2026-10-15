@@ -130,8 +130,8 @@ fn contradiction(line: i64, extra: &str) -> String {
 }
 
 /// The same row with the client name the model reports changed. The client is
-/// a field determinism does not state, so it is the one to watch surviving the
-/// join intact.
+/// the callee the scanner read, so the model's name must not survive the join
+/// (carrick#2387).
 fn contradiction_naming(line: i64, client: &str) -> String {
     contradiction(line, "").replace(
         r#""pattern_matched":"fetch""#,
@@ -594,8 +594,8 @@ fn a_contradicting_model_loses_the_method_and_the_target() {
     assert_eq!(quote["method"], "POST");
     assert_eq!(quote["target_url"], "${process.env.GATEWAY_URL}/v1/quote");
     assert_eq!(
-        quote["handler"], "gatewayClient",
-        "the model still contributes what determinism does not state"
+        quote["handler"], "fetch",
+        "the row displays the callee the scanner read, never the model's client name (carrick#2387)"
     );
 
     for call in &calls {
@@ -630,8 +630,8 @@ fn a_contradicting_model_loses_to_the_env_base_and_its_path() {
         "${process.env.USER_SERVICE_URL}/api/users/${userId}"
     );
     assert_eq!(
-        enrich["handler"], "userClient",
-        "the model still contributes what determinism does not state"
+        enrich["handler"], "get",
+        "the row displays the callee the scanner read, never the model's client name (carrick#2387)"
     );
 
     let rename = row_at(&calls, "src/orders.ts", 14);

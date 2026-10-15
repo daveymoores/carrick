@@ -97,7 +97,7 @@
       "protocol": "http",
       "method": "GET",
       "path": "/api/orders",
-      "handler": "fetch(",
+      "handler": "fetch",
       "request_type": null,
       "response_type": null,
       "target_url": "https://orders.internal/api/orders?user=${userId}",
