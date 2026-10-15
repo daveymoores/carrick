@@ -14,6 +14,7 @@ pub mod change_scope;
 pub mod client_semantics;
 pub mod cloud_storage;
 pub mod commonjs;
+pub mod compared_route_literals;
 pub mod config;
 pub mod console;
 pub mod consumer_row_fold;
