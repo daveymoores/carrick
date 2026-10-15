@@ -745,7 +745,7 @@ impl Reader<'_> {
 
     /// Each name of a function the module declares that an argument hands
     /// on, before any spread: the argument itself, or a value inside an
-    /// object or array it writes (`{ skip: isHealthPath }`), with the keys
+    /// object or array it writes (`{ skip: skipHealth }`), with the keys
     /// down to it.
     pub(super) fn handed(
         &self,
@@ -1322,8 +1322,8 @@ pub enum Branch {
     },
 }
 
-/// One route literal's chain to one end: the object the paid step hands a
-/// model, whichever answers it.
+/// One route literal's chain to one end: the object a later step hands the
+/// model that classifies it, whichever model that is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GuardChain {
     pub literal: String,
