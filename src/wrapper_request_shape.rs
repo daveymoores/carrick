@@ -279,6 +279,11 @@ pub(crate) fn request_options_argument(call: &CallExpr) -> Option<(usize, &Objec
 /// request whose verb it cannot state. An argument the source does not spell
 /// out (a binding, a member, a template with an interpolation) is not decided
 /// here: a wrapper's `client.get(path)` forwards its caller's route.
+///
+/// Only [`call_request_verb`] applies it. [`call_request_shape`] feeds the
+/// per-file propagation (carrick-cloud#386), which skips a module whose shape
+/// is unreadable instead of letting it disagree, so an `Unreadable` there would
+/// move rows that module used to hold back.
 fn names_no_route(call: &CallExpr) -> bool {
     let Some(first) = call.args.first() else {
         return true;
@@ -309,9 +314,6 @@ pub fn call_request_shape(call: &CallExpr, callee_property: Option<&str>) -> Req
     // contribute nothing.
     if verb.is_none() && options.is_none() {
         return RequestShapeSignal::NotARequest;
-    }
-    if verb.is_some() && options.is_none() && names_no_route(call) {
-        return RequestShapeSignal::Unreadable;
     }
 
     // The method: an explicit literal in the options bag wins over the verb the
