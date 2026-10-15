@@ -328,6 +328,8 @@ fn test_processing_stats_tracking() {
         model_contradictions_discarded: 0,
         model_methods_supplied: 0,
         model_endpoints_discarded_in_claimed_modules: 0,
+        model_endpoints_dropped_unanchored: 0,
+        model_endpoints_dropped_unanchored_sites: Vec::new(),
         model_only_rows: 0,
         unemitted_literal_candidates: 0,
         unemitted_literal_sites: Vec::new(),

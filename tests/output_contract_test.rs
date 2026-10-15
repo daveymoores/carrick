@@ -397,6 +397,11 @@ fn the_boundary_block_states_counts_totals_and_the_commit() {
         json["model_endpoints_discarded_in_claimed_modules"], 0,
         "a counted thing is stated, even at zero: {json:#?}"
     );
+    // carrick#2382: the same for the rows dropped for an id that names no site.
+    assert_eq!(
+        json["model_endpoints_dropped_unanchored"]["total"], 0,
+        "a counted thing is stated, even at zero: {json:#?}"
+    );
 
     // The SDK half is a cross-repo fact, folded in after the join.
     assert_eq!(json["sdk_unresolved"]["total"], 0);

@@ -592,14 +592,24 @@ pub struct ProcessingStats {
     /// kind: not a path argument, not a decorator, not the filename. Each one
     /// is logged with its method, path and file.
     pub model_endpoints_discarded_in_claimed_modules: usize,
+    /// Model endpoint rows dropped because the `candidate_id` they echoed
+    /// names no site the scanner listed and nothing deterministic states the
+    /// route (carrick#2382). Not part of the claimed-module count above: a
+    /// row is in one or the other. A route the model states from a
+    /// hand-written dispatch, with an id it made up, leaves the index here.
+    pub model_endpoints_dropped_unanchored: usize,
+    /// Where those rows were, `file:line METHOD path`, in the order they
+    /// were dropped, so the count can be reconciled against the file.
+    pub model_endpoints_dropped_unanchored_sites: Vec<String>,
     /// Model rows kept as rows of their own: the only record of a shape no
     /// deterministic source reads.
     pub model_only_rows: usize,
-    /// Candidates that carry a route-shaped literal argument and a readable
-    /// verb, and that neither the deterministic layer nor the model produced a
-    /// row for. A bare `x.verb("/lit", arg)` states no producer/consumer role,
-    /// so emitting it would need a classification rule the scanner does not
-    /// have; this counts the gap rather than guessing at it.
+    /// Offered HTTP candidates that carry a route-shaped literal (a request
+    /// verb is not required) and that neither the deterministic layer nor the
+    /// model produced a row for, or a mount on the same line. A bare
+    /// `x.verb("/lit", arg)` states no producer/consumer role, so emitting it
+    /// would need a classification rule the scanner does not have; this counts
+    /// the gap rather than guessing at it.
     pub unemitted_literal_candidates: usize,
     /// Where those sites are, `file:line`, in the order they were counted. A
     /// count of something nobody can point at is a number to argue with, not a
@@ -3763,6 +3773,10 @@ impl FileOrchestrator {
         debug!(
             "  - Model endpoints discarded in convention-claimed modules: {}",
             stats.model_endpoints_discarded_in_claimed_modules
+        );
+        debug!(
+            "  - Model endpoints dropped, their id names no listed site: {}",
+            stats.model_endpoints_dropped_unanchored
         );
         debug!("  - Model-only rows: {}", stats.model_only_rows);
         debug!(
@@ -8269,6 +8283,11 @@ impl FileOrchestrator {
                                 "{} {} (candidate_id '{}')",
                                 endpoint.method, endpoint.path, endpoint.candidate_id
                             ));
+                            stats.model_endpoints_dropped_unanchored += 1;
+                            stats.model_endpoints_dropped_unanchored_sites.push(format!(
+                                "{file_path}:{} {} {}",
+                                endpoint.line_number, endpoint.method, endpoint.path
+                            ));
                             continue;
                         }
                     }
@@ -8629,10 +8648,16 @@ impl FileOrchestrator {
             .values()
             .filter(|candidate| candidate.protocol == Protocol::Http)
             .filter(|candidate| {
-                matches!(candidate.request_shape, RequestShapeSignal::Known(_))
-                    && Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
-                        .is_some_and(|literal| Self::is_route_shaped(&literal))
+                Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
+                    .is_some_and(|literal| Self::is_route_shaped(&literal))
                     && !Self::row_at_span(result, candidate.span_start)
+                    // A mount (`app.use("/api", router)`) the model answered
+                    // has no span; its line is the only thing it shares with
+                    // the candidate.
+                    && !result
+                        .mounts
+                        .iter()
+                        .any(|mount| mount.line_number == candidate.line_number as i32)
             })
             .collect();
         // `candidate_map` is a HashMap, so the sites are ordered here rather
@@ -19251,17 +19276,64 @@ export { routes };
         };
         let mut candidate_map = HashMap::new();
         candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
-        let (result, _) = emit_and_join(result, &candidate_map, "src/app.ts");
+        let (result, stats) = emit_and_join(result, &candidate_map, "src/app.ts");
         assert_eq!(result.endpoints.len(), 1);
         assert_eq!(result.endpoints[0].path, "/known");
+        // carrick#2382: the drop is counted and named, not only logged.
+        assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
+        assert_eq!(
+            stats.model_endpoints_dropped_unanchored_sites,
+            vec!["src/app.ts:12 GET /invented".to_string()]
+        );
 
         // Route 2: force-analyzed, no candidates offered at all.
         let forced = FileAnalysisResult {
             endpoints: vec![endpoint_with_candidate("/a", "c1")],
             ..Default::default()
         };
-        let (forced, _) = emit_and_join(forced, &HashMap::new(), "src/forced.ts");
+        let (forced, stats) = emit_and_join(forced, &HashMap::new(), "src/forced.ts");
         assert!(forced.endpoints.is_empty());
+        assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
+    }
+
+    /// carrick#2382: a candidate that holds a route literal and states no
+    /// readable verb (a redirect, a bare call) is a gap the same as a verb
+    /// call is. A mount the model answered on its line is not a gap.
+    #[test]
+    fn a_route_literal_candidate_without_a_readable_verb_is_counted_unless_a_mount_answers_it() {
+        use crate::wrapper_request_shape::RequestShapeSignal;
+        for shape in [
+            RequestShapeSignal::NotARequest,
+            RequestShapeSignal::Unreadable,
+        ] {
+            let mut candidate = candidate_with_snippet("c1", Some("\"/login\""));
+            candidate.request_shape = shape;
+            let candidates = HashMap::from([("c1".to_string(), candidate)]);
+            let (_, stats) = emit_and_join(FileAnalysisResult::default(), &candidates, "src/a.ts");
+            assert_eq!(stats.unemitted_literal_candidates, 1);
+            assert_eq!(
+                stats.unemitted_literal_sites,
+                vec!["src/a.ts:12".to_string()]
+            );
+        }
+
+        let candidates = HashMap::from([(
+            "c1".to_string(),
+            candidate_with_snippet("c1", Some("\"/api\"")),
+        )]);
+        let mounted = FileAnalysisResult {
+            mounts: vec![crate::agents::file_analyzer_agent::MountResult {
+                line_number: 12,
+                parent_node: "app".to_string(),
+                child_node: "router".to_string(),
+                mount_path: "/api".to_string(),
+                import_source: None,
+                pattern_matched: "app.use".to_string(),
+            }],
+            ..Default::default()
+        };
+        let (_, stats) = emit_and_join(mounted, &candidates, "src/a.ts");
+        assert_eq!(stats.unemitted_literal_candidates, 0);
     }
 
     fn request_spec_candidate(id: &str, method: &str, url: &str) -> CandidateTarget {
