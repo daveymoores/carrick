@@ -31,23 +31,13 @@
     ],
     "chains": [
       {
-        "hops": [
-          {
-            "kind": "handed_to",
-            "file": "src/server.ts",
-            "line": 5,
-            "callee": "createServer",
-            "arg": 0,
-            "path": [],
-            "param": 1,
-            "steps": ["end"]
-          }
-        ],
+        "hops": [],
         "end": {
-          "kind": "external_import",
-          "specifier": "node:http",
-          "export": "createServer",
-          "steps": []
+          "kind": "hole",
+          "reason": "callee_unread",
+          "file": "src/server.ts",
+          "line": 8,
+          "text": "res"
         }
       }
     ]
@@ -62,23 +52,13 @@
     ],
     "chains": [
       {
-        "hops": [
-          {
-            "kind": "handed_to",
-            "file": "src/server.ts",
-            "line": 5,
-            "callee": "createServer",
-            "arg": 0,
-            "path": [],
-            "param": 1,
-            "steps": ["end"]
-          }
-        ],
+        "hops": [],
         "end": {
-          "kind": "external_import",
-          "specifier": "node:http",
-          "export": "createServer",
-          "steps": []
+          "kind": "hole",
+          "reason": "callee_unread",
+          "file": "src/server.ts",
+          "line": 12,
+          "text": "res"
         }
       }
     ]
