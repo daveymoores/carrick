@@ -1,0 +1,75 @@
+[
+  {
+    "literal": "/items",
+    "position": "equality",
+    "negated": false,
+    "site": {
+      "file": "src/bound.ts",
+      "line": 6
+    },
+    "subject": "path",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "call",
+        "file": "src/smoke.ts",
+        "line": 4,
+        "callee": "fetch",
+        "arg": 0
+      }
+    ],
+    "end": {
+      "kind": "literal",
+      "text": "http://localhost/items",
+      "steps": [
+        "new Request",
+        "url",
+        "URL",
+        "pathname",
+        "toLowerCase()"
+      ]
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "json",
+        "file": "src/bound.ts",
+        "line": 7,
+        "target": null
+      }
+    ]
+  },
+  {
+    "literal": "/status",
+    "position": "equality",
+    "negated": false,
+    "site": {
+      "file": "src/satisfied.ts",
+      "line": 6
+    },
+    "subject": "url.pathname",
+    "conjoined": [],
+    "hops": [],
+    "end": {
+      "kind": "entry_point",
+      "file": "src/satisfied.ts",
+      "line": 4,
+      "function": "default.fetch",
+      "param": 0,
+      "steps": [
+        "url",
+        "URL",
+        "pathname"
+      ]
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "json",
+        "file": "src/satisfied.ts",
+        "line": 7,
+        "target": null
+      }
+    ]
+  }
+]

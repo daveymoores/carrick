@@ -1,0 +1,198 @@
+[
+  {
+    "literal": "/items",
+    "position": "equality",
+    "negated": false,
+    "site": {
+      "file": "src/worker.ts",
+      "line": 23
+    },
+    "subject": "pathname",
+    "conjoined": [
+      {
+        "text": "request.method === \"GET\"",
+        "line": 23
+      }
+    ],
+    "hops": [],
+    "end": {
+      "kind": "entry_point",
+      "file": "src/worker.ts",
+      "line": 20,
+      "function": "default.fetch",
+      "param": 0,
+      "steps": [
+        "url",
+        "URL",
+        "pathname"
+      ]
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "json",
+        "file": "src/worker.ts",
+        "line": 24,
+        "target": "src/worker.ts:json"
+      },
+      {
+        "kind": "call",
+        "callee": "values",
+        "file": "src/worker.ts",
+        "line": 24,
+        "target": null
+      }
+    ]
+  },
+  {
+    "literal": "/items",
+    "position": "equality",
+    "negated": false,
+    "site": {
+      "file": "src/worker.ts",
+      "line": 27
+    },
+    "subject": "pathname",
+    "conjoined": [
+      {
+        "text": "request.method === \"POST\"",
+        "line": 27
+      }
+    ],
+    "hops": [],
+    "end": {
+      "kind": "entry_point",
+      "file": "src/worker.ts",
+      "line": 20,
+      "function": "default.fetch",
+      "param": 0,
+      "steps": [
+        "url",
+        "URL",
+        "pathname"
+      ]
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "json",
+        "file": "src/worker.ts",
+        "line": 28,
+        "target": null
+      },
+      {
+        "kind": "call",
+        "callee": "set",
+        "file": "src/worker.ts",
+        "line": 29,
+        "target": null
+      },
+      {
+        "kind": "call",
+        "callee": "audit",
+        "file": "src/worker.ts",
+        "line": 30,
+        "target": "src/worker.ts:audit"
+      },
+      {
+        "kind": "call",
+        "callee": "json",
+        "file": "src/worker.ts",
+        "line": 31,
+        "target": "src/worker.ts:json"
+      }
+    ]
+  },
+  {
+    "literal": "/items/",
+    "position": "starts_with",
+    "negated": false,
+    "site": {
+      "file": "src/worker.ts",
+      "line": 34
+    },
+    "subject": "pathname",
+    "conjoined": [
+      {
+        "text": "request.method === \"DELETE\"",
+        "line": 34
+      }
+    ],
+    "hops": [],
+    "end": {
+      "kind": "entry_point",
+      "file": "src/worker.ts",
+      "line": 20,
+      "function": "default.fetch",
+      "param": 0,
+      "steps": [
+        "url",
+        "URL",
+        "pathname"
+      ]
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "slice",
+        "file": "src/worker.ts",
+        "line": 35,
+        "target": null
+      },
+      {
+        "kind": "call",
+        "callee": "delete",
+        "file": "src/worker.ts",
+        "line": 36,
+        "target": null
+      },
+      {
+        "kind": "call",
+        "callee": "audit",
+        "file": "src/worker.ts",
+        "line": 37,
+        "target": "src/worker.ts:audit"
+      },
+      {
+        "kind": "call",
+        "callee": "json",
+        "file": "src/worker.ts",
+        "line": 38,
+        "target": "src/worker.ts:json"
+      }
+    ]
+  },
+  {
+    "literal": "/health",
+    "position": "case",
+    "negated": false,
+    "site": {
+      "file": "src/worker.ts",
+      "line": 42
+    },
+    "subject": "pathname",
+    "conjoined": [],
+    "hops": [],
+    "end": {
+      "kind": "entry_point",
+      "file": "src/worker.ts",
+      "line": 20,
+      "function": "default.fetch",
+      "param": 0,
+      "steps": [
+        "url",
+        "URL",
+        "pathname"
+      ]
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "json",
+        "file": "src/worker.ts",
+        "line": 43,
+        "target": "src/worker.ts:json"
+      }
+    ]
+  }
+]

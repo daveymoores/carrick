@@ -1,0 +1,66 @@
+[
+  {
+    "literal": "/api/status",
+    "position": "equality",
+    "negated": false,
+    "site": {
+      "file": "src/devserver.ts",
+      "line": 9
+    },
+    "subject": "req.url",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/devserver.ts",
+        "line": 8,
+        "callee": "server.middlewares.use",
+        "arg": 0,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "url"
+        ]
+      },
+      {
+        "kind": "handed_to",
+        "file": "src/devserver.ts",
+        "line": 3,
+        "callee": "defineConfig",
+        "arg": 0,
+        "path": [
+          "plugins",
+          "0",
+          "configureServer"
+        ],
+        "param": 0,
+        "steps": [
+          "middlewares",
+          "use"
+        ]
+      }
+    ],
+    "end": {
+      "kind": "external_import",
+      "specifier": "@invented/devserver",
+      "export": "defineConfig",
+      "steps": []
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "end",
+        "file": "src/devserver.ts",
+        "line": 10,
+        "target": null
+      },
+      {
+        "kind": "call",
+        "callee": "stringify",
+        "file": "src/devserver.ts",
+        "line": 10,
+        "target": null
+      }
+    ]
+  }
+]
