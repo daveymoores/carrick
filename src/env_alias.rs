@@ -560,7 +560,7 @@ pub(crate) fn env_read_name(expr: &Expr) -> Option<String> {
 
 /// If `member` is `process.env.NAME` or `import.meta.env.NAME` (dotted or
 /// with a string-literal index), return `NAME`.
-fn env_member_name(member: &MemberExpr) -> Option<String> {
+pub(crate) fn env_member_name(member: &MemberExpr) -> Option<String> {
     // The object must be exactly `process.env` or `import.meta.env`.
     let Expr::Member(obj) = &*member.obj else {
         return None;
@@ -586,7 +586,7 @@ fn env_member_name(member: &MemberExpr) -> Option<String> {
 
 /// If `call` is `Deno.env.get("NAME")` with a single string-literal argument,
 /// return `NAME`.
-fn env_get_call_name(call: &CallExpr) -> Option<String> {
+pub(crate) fn env_get_call_name(call: &CallExpr) -> Option<String> {
     let Callee::Expr(callee) = &call.callee else {
         return None;
     };
