@@ -264,11 +264,11 @@ pub(super) enum TextPiece {
 pub(super) struct NamedRef {
     /// The file's own name for the binding: a module-scope `const` or
     /// function of the file, or an import binding.
-    binding: String,
+    pub(super) binding: String,
     /// The entries walked into it (`["users", "byId"]`).
-    path: Vec<String>,
+    pub(super) path: Vec<String>,
     /// The builder's arguments, each as text pieces, when it is called.
-    args: Option<Vec<Vec<TextPiece>>>,
+    pub(super) args: Option<Vec<Vec<TextPiece>>>,
 }
 
 /// What a module-scope binding holds, as a name reads it (carrick#1562): a
@@ -1578,6 +1578,13 @@ impl<'a> LinkedNames<'a> {
             push_pieces(&mut out, read);
         }
         Some(out)
+    }
+
+    /// `pieces`, read in `file`, as one text: `None` unless every named
+    /// piece reads as text ([`Self::resolve`]). What a guard compares a
+    /// value against, when it names a constant (carrick#2386).
+    pub(super) fn text(&self, file: &Path, pieces: &[TextPiece]) -> Option<String> {
+        split_text(self.resolve(file, pieces, 0)).0
     }
 
     /// `arg`, read in `file`, with every named piece read

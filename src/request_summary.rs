@@ -190,8 +190,8 @@ use guards::{GuardIr, Subject, Tested, WrittenIn};
 
 #[allow(unused_imports)]
 pub use guards::{
-    Branch, ChainEnd, ChainSite, Conjoined, GuardChain, GuardPosition, HoleReason, Hop,
-    guard_chains,
+    Branch, ChainEnd, ChainSite, Conjoined, Constant, GuardChain, GuardPosition, GuardShape,
+    HoleReason, Hop, HopArg, Within, guard_chains,
 };
 
 #[allow(unused_imports)]

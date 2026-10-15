@@ -28,6 +28,11 @@
 //! no listed site on it (`RouteLiteralWitness` in
 //! `src/agents/file_orchestrator.rs`), and a candidate pass for hand-written
 //! dispatch can raise sites from the same positions (carrick#2386).
+//!
+//! [`compared_literals`] reads the same positions for any literal a caller
+//! keeps: the offline guard census counts every string a module compares
+//! (carrick#2386 slice B2), and [`compared_route_literals`] is its
+//! route-shaped case.
 
 use std::collections::HashMap;
 
@@ -53,11 +58,11 @@ pub enum ComparisonPosition {
     StartsWith,
 }
 
-/// One route-path literal in a comparison position.
+/// One literal in a comparison position.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ComparedRouteLiteral {
-    /// The literal's value, already shown to pass
-    /// [`is_producer_route_path`].
+pub struct ComparedLiteral {
+    /// The literal's value, already kept by the caller's test
+    /// ([`is_producer_route_path`] for [`compared_route_literals`]).
     pub value: String,
     pub position: ComparisonPosition,
     /// The comparison the literal stands in: the binary expression, the
@@ -68,19 +73,26 @@ pub struct ComparedRouteLiteral {
 
 /// Every route-path literal `module` compares a value against, in source
 /// order. See the module documentation for the positions read.
-pub fn compared_route_literals(module: &Module) -> Vec<ComparedRouteLiteral> {
-    let constants = top_level_route_constants(module);
+pub fn compared_route_literals(module: &Module) -> Vec<ComparedLiteral> {
+    compared_literals(module, &is_producer_route_path)
+}
+
+/// Every literal `module` compares a value against that `keep` keeps, in
+/// source order, read in the positions [`compared_route_literals`] reads.
+pub fn compared_literals(module: &Module, keep: &dyn Fn(&str) -> bool) -> Vec<ComparedLiteral> {
+    let constants = top_level_constants(module);
     let mut reader = ComparisonReader {
         constants,
+        keep,
         found: Vec::new(),
     };
     module.visit_with(&mut reader);
     reader.found
 }
 
-/// Top-level `const NAME = "<route literal>"` bindings whose name is
-/// declared exactly once in the file.
-fn top_level_route_constants(module: &Module) -> HashMap<String, String> {
+/// Top-level `const NAME = "<literal>"` bindings whose name is declared
+/// exactly once in the file.
+fn top_level_constants(module: &Module) -> HashMap<String, String> {
     let mut declarations = DeclarationCounter::default();
     module.visit_with(&mut declarations);
     let mut constants = HashMap::new();
@@ -104,19 +116,13 @@ fn top_level_route_constants(module: &Module) -> HashMap<String, String> {
             if declarations.counts.get(&name).copied() != Some(1) {
                 continue;
             }
-            let Some(value) = declarator.init.as_deref().and_then(route_literal) else {
+            let Some(value) = declarator.init.as_deref().and_then(literal_string) else {
                 continue;
             };
             constants.insert(name, value);
         }
     }
     constants
-}
-
-/// A string literal (or a template literal with no interpolation) whose value
-/// is route-shaped.
-fn route_literal(expr: &Expr) -> Option<String> {
-    literal_string(expr).filter(|value| is_producer_route_path(value))
 }
 
 /// How many times each name is declared anywhere in the file: variables,
@@ -169,26 +175,28 @@ impl Visit for DeclarationCounter {
 }
 
 /// The second pass: the comparisons.
-struct ComparisonReader {
+struct ComparisonReader<'k> {
     constants: HashMap<String, String>,
-    found: Vec<ComparedRouteLiteral>,
+    keep: &'k dyn Fn(&str) -> bool,
+    found: Vec<ComparedLiteral>,
 }
 
-impl ComparisonReader {
-    /// The route literal an operand denotes: the literal itself, or the
+impl ComparisonReader<'_> {
+    /// The kept literal an operand denotes: the literal itself, or the
     /// top-level constant a bare identifier names.
     fn operand(&self, expr: &Expr) -> Option<String> {
-        if let Some(value) = route_literal(expr) {
-            return Some(value);
-        }
-        match unwrap_expr(expr) {
-            Expr::Ident(ident) => self.constants.get(ident.sym.as_ref()).cloned(),
-            _ => None,
-        }
+        let value = match literal_string(expr) {
+            Some(value) => value,
+            None => match unwrap_expr(expr) {
+                Expr::Ident(ident) => self.constants.get(ident.sym.as_ref()).cloned()?,
+                _ => return None,
+            },
+        };
+        (self.keep)(&value).then_some(value)
     }
 
     fn push(&mut self, value: String, position: ComparisonPosition, span: Span) {
-        self.found.push(ComparedRouteLiteral {
+        self.found.push(ComparedLiteral {
             value,
             position,
             span,
@@ -196,7 +204,7 @@ impl ComparisonReader {
     }
 }
 
-impl Visit for ComparisonReader {
+impl Visit for ComparisonReader<'_> {
     fn visit_bin_expr(&mut self, bin: &BinExpr) {
         bin.visit_children_with(self);
         if !matches!(
@@ -306,6 +314,97 @@ mod tests {
         assert!(read("const P = '/a';\nfunction f(P) { return x === P; }").is_empty());
         assert!(read("let P = '/a';\nif (x === P) {}").is_empty());
         assert!(read("function f() { const P = '/a'; return x === P; }").is_empty());
+    }
+
+    /// What the reader finds in every source file of the receive-guard
+    /// fixtures, as (file, line, value, position): the output the file
+    /// orchestrator reads, held fixed while the guard pass widens
+    /// (carrick#2386 slice B2).
+    #[test]
+    fn the_receive_guard_fixtures_read_as_they_did_before_the_widening() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let files = [
+            "hand-dispatch-worker/src/worker.ts",
+            "receive-guards/dev-middleware/src/devserver.ts",
+            "receive-guards/node-server/src/server.ts",
+            "receive-guards/predicate-elsewhere/src/lib/admin.ts",
+            "receive-guards/predicate-elsewhere/src/media.ts",
+            "receive-guards/predicate-elsewhere/src/routes.ts",
+            "receive-guards/predicate-elsewhere/src/worker.ts",
+            "receive-guards/worker-variants/src/bound.ts",
+            "receive-guards/worker-variants/src/satisfied.ts",
+            "receive-guards/worker-variants/src/smoke.ts",
+            "receive-guards/message-switch/src/parent.ts",
+            "receive-guards/message-switch/src/wire.ts",
+            "receive-guards/message-switch/src/worker.ts",
+            "receive-guards/constant-routes/src/routes/index.ts",
+            "receive-guards/constant-routes/src/routes/paths.ts",
+            "receive-guards/constant-routes/src/router.ts",
+            "receive-guards/constant-routes/src/server.ts",
+            "receive-guards/handler-tables/src/dispatch.ts",
+        ];
+        let mut found = Vec::new();
+        for file in files {
+            let path = fixtures.join(file);
+            let source = std::fs::read_to_string(&path).expect("the fixture is readable");
+            let (source_map, module) = crate::swc_scanner::parse_standalone_module(&path, &source)
+                .expect("the fixture parses");
+            for literal in compared_route_literals(&module) {
+                found.push(format!(
+                    "{file}:{} {} {:?}",
+                    source_map.lookup_char_pos(literal.span.lo).line,
+                    literal.value,
+                    literal.position
+                ));
+            }
+        }
+        let expected = [
+            "hand-dispatch-worker/src/worker.ts:23 /items Equality",
+            "hand-dispatch-worker/src/worker.ts:27 /items Equality",
+            "hand-dispatch-worker/src/worker.ts:34 /items/ StartsWith",
+            "hand-dispatch-worker/src/worker.ts:42 /health Case",
+            "receive-guards/dev-middleware/src/devserver.ts:9 /api/status Equality",
+            "receive-guards/node-server/src/server.ts:17 /health Case",
+            "receive-guards/node-server/src/server.ts:20 /ready Case",
+            "receive-guards/node-server/src/server.ts:21 /live Case",
+            "receive-guards/node-server/src/server.ts:36 /version Equality",
+            "receive-guards/predicate-elsewhere/src/lib/admin.ts:2 /admin StartsWith",
+            "receive-guards/predicate-elsewhere/src/media.ts:1 /media Equality",
+            "receive-guards/predicate-elsewhere/src/routes.ts:2 /users StartsWith",
+            "receive-guards/worker-variants/src/bound.ts:6 /items Equality",
+            "receive-guards/worker-variants/src/satisfied.ts:6 /status Equality",
+        ];
+        assert_eq!(found, expected, "{found:#?}");
+    }
+
+    /// With every literal kept, a name is read in the same positions, by
+    /// itself or through a top-level constant, and a route is still read.
+    #[test]
+    fn every_literal_is_read_when_the_caller_keeps_it() {
+        let (_, module) = crate::swc_scanner::parse_standalone_module(
+            Path::new("src/worker.ts"),
+            "const DONE = 'done';\nif (m.type === 'READY') {}\nswitch (m.type) { case DONE: break; }\nif (p.startsWith('/a')) {}",
+        )
+        .expect("the source parses");
+        let read: Vec<(String, ComparisonPosition)> = compared_literals(&module, &|_| true)
+            .into_iter()
+            .map(|found| (found.value, found.position))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                ("READY".to_string(), ComparisonPosition::Equality),
+                ("done".to_string(), ComparisonPosition::Case),
+                ("/a".to_string(), ComparisonPosition::StartsWith),
+            ]
+        );
+        assert_eq!(
+            compared_route_literals(&module)
+                .into_iter()
+                .map(|found| found.value)
+                .collect::<Vec<_>>(),
+            vec!["/a".to_string()]
+        );
     }
 
     #[test]

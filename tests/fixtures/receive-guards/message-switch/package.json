@@ -1,0 +1,8 @@
+{
+  "name": "message-switch",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "invented-protocol": "1.0.0"
+  }
+}
