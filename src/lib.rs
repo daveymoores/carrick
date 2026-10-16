@@ -97,5 +97,4 @@ pub mod workspace_resolver;
 pub mod wrapper_call_join;
 pub mod wrapper_call_method;
 pub mod wrapper_call_route;
-pub mod wrapper_dispatch;
 pub mod wrapper_request_shape;

@@ -29,7 +29,6 @@ use crate::{
     cloud_storage::{ManifestRole, ManifestTypeKind},
     compared_route_literals::{ComparisonPosition, compared_route_literals},
     config::Config,
-    dispatch::Dispatch,
     engine::type_compat_v2::{ReceiverRole, classify_receiver},
     env_alias::{
         EnvAliasExtractor, EnvAliasMap, EnvFallbackMap, EnvSchemaIndex, LiteralBaseMap,
@@ -68,7 +67,6 @@ use crate::{
     url_normalizer::UrlNormalizer,
     visitor::{ImportSymbolExtractor, ImportedSymbol, SymbolKind, TypeSymbolExtractor},
     workspace_resolver::{Resolution, WorkspaceIndex},
-    wrapper_dispatch::{DispatchMemberIndex, collect_dispatch_members},
     wrapper_request_shape::{self, RequestShapeSignal, WrapperRequestShape},
 };
 use futures::stream::StreamExt;
@@ -524,11 +522,8 @@ pub struct ProcessingStats {
     /// Summary rows whose dispatch value was settled from their own body
     /// under the field the request line's row names (carrick#1555).
     pub summary_dispatch_settled: usize,
-    /// Model rows whose dispatch value no literal in their file witnesses and
-    /// that a wrapper's value replaced (carrick#2201).
-    pub dispatch_carried_over_guess: usize,
-    /// Model rows whose unwitnessed dispatch value was cleared because no
-    /// wrapper's value reached them (carrick#2201).
+    /// Model rows whose dispatch value no literal in their file witnesses,
+    /// cleared (carrick#2201).
     pub dispatch_guesses_cleared: usize,
     /// Pub/sub operations asserted deterministically from the AST and merged in
     /// because the file-analyzer's extraction omitted them (carrick#387). The
@@ -717,10 +712,6 @@ struct FileSymbols {
     /// The file's own request members, read for the files that import it
     /// (carrick#588).
     request_members: RequestMemberIndex,
-    /// Which member of this file reaches which single request (carrick#872),
-    /// read for the files that import it AND for its own same-file wrapper
-    /// sites. Says only a line, never a target.
-    dispatch_members: DispatchMemberIndex,
     /// Which import each local binding's value traces back to (carrick#666).
     /// Constrains the package-surface member join below.
     receiver_origins: ReceiverOrigins,
@@ -738,33 +729,6 @@ struct FileSymbols {
 struct MemberHome {
     path_str: String,
     request_line: u32,
-}
-
-/// Where the wrapper one call site delegates to writes its single request
-/// (carrick#872).
-///
-/// The site's own file states no dispatch value — the literal is in the
-/// wrapper — so the row emitted here is joined, once every file's rows are in,
-/// to whatever the model stated at `request_line` of `module`.
-#[derive(Debug, Clone)]
-struct DispatchSite {
-    /// The member name the site called. Provenance, for the debug line.
-    name: String,
-    /// Canonical path of the module that declares the member.
-    module: PathBuf,
-    /// 1-based line of the member's sole request, inside that module.
-    request_line: u32,
-}
-
-/// What [`FileOrchestrator::carry_wrapper_dispatch`] wrote.
-#[derive(Debug, Default)]
-struct CarriedDispatch {
-    /// Rows that took a wrapper's value.
-    carried: usize,
-    /// Of those, rows whose own value no literal in their file witnessed.
-    over_guess: usize,
-    /// (`file_results` key, site span) of every row that took a value.
-    sites: HashSet<(String, u32)>,
 }
 
 /// The literal witnesses of every file holding a row with a dispatch value,
@@ -1985,10 +1949,6 @@ impl FileOrchestrator {
             /// This file's OWN request members, keyed by name (carrick#588).
             /// Read for the files that import it, never for itself.
             request_members: RequestMemberIndex,
-            /// This file's OWN members that reach exactly one request, keyed
-            /// by name (carrick#872). Read for the files that import it, and
-            /// for its own same-file wrapper sites.
-            dispatch_members: DispatchMemberIndex,
             /// Which import each local binding's value traces back to
             /// (carrick#666), read at the package-surface member join.
             receiver_origins: ReceiverOrigins,
@@ -2004,12 +1964,6 @@ impl FileOrchestrator {
             /// stamped onto the rows that member DID produce, so a consumer
             /// listing can state what the join could not follow.
             unresolved_member_sites: Vec<(u32, String)>,
-            /// Call sites in this file that reach a wrapper whose body issues
-            /// one request, keyed by the site's call-expression start offset
-            /// (carrick#872). Read once every file's rows are in, to carry the
-            /// dispatch value the wrapper's own request states onto the row
-            /// emitted here.
-            dispatch_sites: HashMap<u32, DispatchSite>,
             /// What the deterministic layer states about this file, computed
             /// once every cross-file input it reads is in and before the model
             /// is called. These become the file's rows; the model's answer is
@@ -2075,7 +2029,6 @@ impl FileOrchestrator {
             stats: &mut ProcessingStats,
             member_deficits: &mut HashMap<String, u32>,
             resolved_member_rows: &mut HashMap<String, HashMap<u32, String>>,
-            dispatch_sites: &mut HashMap<String, HashMap<u32, DispatchSite>>,
             unread_prefixes: &mut Vec<crate::registration_scope::UnreadPrefix>,
             unstated_registrations: &mut Vec<crate::registration_scope::UnstatedRegistrations>,
         ) {
@@ -2218,12 +2171,6 @@ impl FileOrchestrator {
                         .collect(),
                 );
             }
-            // carrick#872: which wrapper each site in this file delegates to.
-            // Read once every file's rows are in — the value is in the
-            // WRAPPER's file, whose rows may not exist yet.
-            if !pf.dispatch_sites.is_empty() {
-                dispatch_sites.insert(pf.path_str.clone(), std::mem::take(&mut pf.dispatch_sites));
-            }
         }
 
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
@@ -2253,10 +2200,6 @@ impl FileOrchestrator {
         // can be stamped on exactly those rows.
         let mut member_deficits: HashMap<String, u32> = HashMap::new();
         let mut resolved_member_rows: HashMap<String, HashMap<u32, String>> = HashMap::new();
-        // carrick#872, filled per file and read once every file is in: which
-        // spans in which file reach a wrapper whose body issues one request,
-        // and where that request is written.
-        let mut dispatch_sites: HashMap<String, HashMap<u32, DispatchSite>> = HashMap::new();
         // What the repo's validation schemas declare about the environment
         // (carrick#649), folded across every parseable file. Repo-wide because
         // an environment variable is process-global and the file declaring the
@@ -2683,12 +2626,10 @@ impl FileOrchestrator {
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
                 local_wrapper_calls: scan_result.local_wrapper_calls,
                 request_members: symbols.request_members,
-                dispatch_members: symbols.dispatch_members,
                 receiver_origins: symbols.receiver_origins,
                 registration_sites: symbols.registration_sites,
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
-                dispatch_sites: HashMap::new(),
                 resolved: Vec::new(),
                 silent_sites: BTreeSet::new(),
             });
@@ -2762,15 +2703,9 @@ impl FileOrchestrator {
         // it. Seeded from the files already parsed for their symbol tables, so
         // the on-demand parse only runs for a module no analyzed file was.
         let mut member_cache: HashMap<PathBuf, RequestMemberIndex> = HashMap::new();
-        // The same modules read for a different question (carrick#872): which
-        // member reaches which single request. Filled at exactly the same
-        // points as `member_cache`, off the same parse, so the two never
-        // disagree about which modules were read.
-        let mut dispatch_cache: HashMap<PathBuf, DispatchMemberIndex> = HashMap::new();
         for pf in &pending {
             if let Ok(canonical) = Path::new(&pf.path_str).canonicalize() {
-                member_cache.insert(canonical.clone(), pf.request_members.clone());
-                dispatch_cache.insert(canonical, pf.dispatch_members.clone());
+                member_cache.insert(canonical, pf.request_members.clone());
             }
         }
 
@@ -2906,35 +2841,21 @@ impl FileOrchestrator {
                         }
                     }
                     let mut rings: Vec<Vec<(PathBuf, RequestMemberIndex)>> = Vec::new();
-                    // The dispatch index of the same modules, in the same ring
-                    // order, so the two joins answer from the same evidence.
-                    let mut dispatch_rings: Vec<Vec<(PathBuf, DispatchMemberIndex)>> = Vec::new();
                     for ring in [&nearest, &further] {
                         let mut indexes: Vec<(PathBuf, RequestMemberIndex)> = Vec::new();
-                        let mut dispatch_indexes: Vec<(PathBuf, DispatchMemberIndex)> = Vec::new();
                         for path in ring {
                             if !member_cache.contains_key(path) {
-                                let module = parse_file(path, &cm, &handler);
-                                let index = module
+                                let index = parse_file(path, &cm, &handler)
                                     .as_ref()
                                     .map(|module| collect_request_members(module, &cm))
                                     .unwrap_or_default();
-                                let dispatch = module
-                                    .as_ref()
-                                    .map(|module| collect_dispatch_members(module, &cm))
-                                    .unwrap_or_default();
                                 member_cache.insert(path.clone(), index);
-                                dispatch_cache.insert(path.clone(), dispatch);
                             }
                             if let Some(index) = member_cache.get(path) {
                                 indexes.push((path.clone(), index.clone()));
                             }
-                            if let Some(index) = dispatch_cache.get(path) {
-                                dispatch_indexes.push((path.clone(), index.clone()));
-                            }
                         }
                         rings.push(indexes);
-                        dispatch_rings.push(dispatch_indexes);
                     }
                     // The join's outcome, and the sites it declined
                     // (carrick#656) — both come back from the walk, because
@@ -2957,18 +2878,6 @@ impl FileOrchestrator {
                         pf.unresolved_member_sites.retain(|(site, _)| *site != span);
                         pf.resolved_members.insert(span, member);
                     }
-
-                    // Which wrapper each site delegates to, for the dispatch
-                    // carry (carrick#872). Same rings, same receiver rule, a
-                    // different index: a member the request-member join drops
-                    // for stating no route-shaped URL of its own still states
-                    // a line, and that line is where the model wrote the
-                    // dispatch value.
-                    pf.dispatch_sites = Self::resolve_dispatch_sites(
-                        &pf.candidate_map,
-                        dispatch_rings,
-                        &import_owners,
-                    );
 
                     // The same join across a workspace package boundary
                     // (carrick#666). Kept separate from the rings above rather
@@ -3152,39 +3061,13 @@ impl FileOrchestrator {
                 // A rescued file raised no candidate of its own, so it is not
                 // read as anybody's wrapper and nothing joins onto it either.
                 request_members: RequestMemberIndex::default(),
-                dispatch_members: DispatchMemberIndex::default(),
                 receiver_origins: ReceiverOrigins::default(),
                 registration_sites: symbols.registration_sites,
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
-                dispatch_sites: HashMap::new(),
                 resolved: Vec::new(),
                 silent_sites: BTreeSet::new(),
             });
-        }
-
-        // The same-file half of the dispatch carry (carrick#872). A site that
-        // delegates to a wrapper declared in its OWN file raises no candidate
-        // at all — that is why `local_http_wrapper` exists — so the ring join
-        // above never sees it. Its wrapper is in this file's own index, and
-        // the value the wrapper writes is in this file's own extracted rows.
-        for pf in &mut pending {
-            let Ok(canonical) = Path::new(&pf.path_str).canonicalize() else {
-                continue;
-            };
-            for call in &pf.local_wrapper_calls {
-                let Some(member) = pf.dispatch_members.get(&call.wrapper_name) else {
-                    continue;
-                };
-                pf.dispatch_sites.insert(
-                    call.span_start,
-                    DispatchSite {
-                        name: call.wrapper_name.clone(),
-                        module: canonical.clone(),
-                        request_line: member.request_line,
-                    },
-                );
-            }
         }
 
         // Where every request member the scan read is declared (carrick#656).
@@ -3194,9 +3077,8 @@ impl FileOrchestrator {
         // on demand for the consumers that import it, never on its own
         // `PendingFile`.
         // Every file this scan will have rows for, by canonical path. Read by
-        // the member homes below and by the dispatch carry (carrick#872),
-        // which both have to turn a module path into the `file_results` key
-        // its rows are stored under.
+        // the member homes below, which have to turn a module path into the
+        // `file_results` key its rows are stored under.
         let analysed: HashMap<PathBuf, String> = pending
             .iter()
             .filter_map(|pf| {
@@ -3710,7 +3592,6 @@ impl FileOrchestrator {
                         &mut stats,
                         &mut member_deficits,
                         &mut resolved_member_rows,
-                        &mut dispatch_sites,
                         &mut unread_prefixes,
                         &mut unstated_registrations,
                     );
@@ -3792,7 +3673,6 @@ impl FileOrchestrator {
                         &mut stats,
                         &mut member_deficits,
                         &mut resolved_member_rows,
-                        &mut dispatch_sites,
                         &mut unread_prefixes,
                         &mut unstated_registrations,
                     );
@@ -3947,26 +3827,11 @@ impl FileOrchestrator {
             debug!("  - Rows stating unfollowed member call sites: {stamped}");
         }
 
-        // PHASE 5b (carrick#872): carry the value a wrapper writes for a
-        // dispatching route onto the rows emitted at the sites that call it.
-        // Cross-file for the same reason as the pass above: the literal is in
-        // the wrapper's file and the row is in the consumer's, so neither
-        // file's own pass can see both. A model row's value stands only where
-        // its own file writes it (carrick#2201).
+        // PHASE 5b: settle the dispatch values summary rows send from their
+        // own bodies (carrick#1555), then clear every model value its own file
+        // does not write (carrick#2201).
         let witnesses = DispatchWitnesses::of(&file_results);
-        let carry = Self::settle_wrapper_dispatch(
-            &mut file_results,
-            &dispatch_sites,
-            &analysed,
-            &witnesses,
-            &mut stats,
-        );
-        if carry.carried > 0 {
-            debug!(
-                "  - Rows carrying a wrapper's dispatch value: {} ({} over an unwitnessed value)",
-                carry.carried, carry.over_guess
-            );
-        }
+        Self::settle_dispatch_values(&mut file_results, &witnesses, &mut stats);
         if stats.dispatch_guesses_cleared > 0 {
             debug!(
                 "  - Model dispatch values with no witness in their file, cleared: {}",
@@ -6268,11 +6133,6 @@ impl FileOrchestrator {
         // requests go through a helper raises no HTTP candidate of its own, so
         // the wrapper map's candidate gate is the wrong filter for this.
         let request_members = collect_request_members(&module, cm);
-        // The same parse again (carrick#872): which member reaches which
-        // single request, for the dispatch carry. A separate index from the
-        // one above because it answers a different question and drops far
-        // less — see `crate::wrapper_dispatch`.
-        let dispatch_members = collect_dispatch_members(&module, cm);
         // Same parse again: the origins are read off the declarators the
         // extractors above already walked.
         let receiver_origins = collect_receiver_origins(&module);
@@ -6290,7 +6150,6 @@ impl FileOrchestrator {
             env_fallbacks: bindings.env_fallbacks,
             literal_bases: bindings.literal_bases,
             request_members,
-            dispatch_members,
             receiver_origins,
             registration_sites,
         }
@@ -9861,79 +9720,6 @@ impl FileOrchestrator {
         resolved
     }
 
-    /// Join each candidate's callee name onto the wrapper whose body issues
-    /// the request it reaches (carrick#872).
-    ///
-    /// The same rings, the same nearest-ring-decides rule and the same
-    /// receiver constraint as [`Self::resolve_imported_members`], over
-    /// [`crate::wrapper_dispatch`]'s index instead of the request members. The
-    /// two indexes answer different questions, so a site can resolve here and
-    /// not there: a client whose URL is an opaque field states no route for the
-    /// request-member join to assert, and still states the line its request is
-    /// written on.
-    ///
-    /// Nothing is counted or reported for a site that does not resolve. This
-    /// join adds no row and changes no target: all it can do is carry a value
-    /// the model already stated one file away, so a miss leaves the site
-    /// exactly where it is.
-    ///
-    /// The rings stop where the request-member rings stop: at the repo's
-    /// relative import graph. A client another WORKSPACE PACKAGE publishes is
-    /// imported by package name, which names no module here, so a site that
-    /// reaches its wrapper through a published surface carries nothing yet —
-    /// the half `resolve_package_surface_members` answers for targets has no
-    /// counterpart here.
-    fn resolve_dispatch_sites(
-        candidate_map: &HashMap<String, CandidateTarget>,
-        rings: Vec<Vec<(PathBuf, DispatchMemberIndex)>>,
-        import_owners: &HashMap<String, Option<PathBuf>>,
-    ) -> HashMap<u32, DispatchSite> {
-        let rings: Vec<_> = rings
-            .into_iter()
-            .map(fold_indexes_with_conflicts)
-            .filter(|(members, conflicting)| !members.is_empty() || !conflicting.is_empty())
-            .collect();
-        if rings.is_empty() {
-            return HashMap::new();
-        }
-        let mut resolved: HashMap<u32, DispatchSite> = HashMap::new();
-        for candidate in candidate_map.values() {
-            let name = Self::member_call_name(candidate);
-            let mut owned = None;
-            for (members, conflicting) in &rings {
-                if conflicting.contains(name) {
-                    break;
-                }
-                if let Some(member) = members.get(name) {
-                    owned = Some(member);
-                    break;
-                }
-            }
-            let Some(owned) = owned else {
-                continue;
-            };
-            // A receiver that is itself imported must have been imported from
-            // the member's own module; a parameter, a local or a `this` chain
-            // carries no such constraint. Identical to the request-member join,
-            // for the same reason: `list` and `get` are what every client calls
-            // its methods.
-            if let Some(receiver_source) = import_owners.get(&candidate.callee_object)
-                && receiver_source.as_ref() != Some(&owned.module)
-            {
-                continue;
-            }
-            resolved.insert(
-                candidate.span_start,
-                DispatchSite {
-                    name: name.to_string(),
-                    module: owned.module.clone(),
-                    request_line: owned.member.request_line,
-                },
-            );
-        }
-        resolved
-    }
-
     /// The member name a candidate call site names: its callee property
     /// (`client.createArtifactUrl`), or its callee object when the call is a
     /// bare identifier. The same name the join keys on, written once so the
@@ -10071,152 +9857,25 @@ impl FileOrchestrator {
         stamped
     }
 
-    /// Carry the dispatch value a wrapper's own request states onto the rows
-    /// emitted at the sites that call it (carrick#872).
-    ///
-    /// The value is read from the wrapper's own rows at the line
-    /// [`crate::wrapper_dispatch`] said the wrapper's single request sits on:
-    /// a request-summary row's, whose value its own body writes, in
-    /// preference to the model's, and the model's only where the wrapper's
-    /// file witnesses it. Rows there stating two different values carry
-    /// nothing, and so does a wrapper with no value at all, which is the right
-    /// answer for a wrapper that takes its action as a parameter and for a
-    /// plain route alike.
-    ///
-    /// Read every value BEFORE writing any of them, so a row stamped by this
-    /// pass can never be read as another site's wrapper. Stamps `dispatch` and
-    /// nothing else: no target, no method, no key. A site row whose value its
-    /// own file witnesses keeps it: a literal at the site is a stronger
-    /// statement than one a delegation away. A value nothing in the site's
-    /// file writes is the model's guess (carrick#2201), and the wrapper's
-    /// value replaces it.
-    fn carry_wrapper_dispatch(
-        file_results: &mut HashMap<String, FileAnalysisResult>,
-        sites: &HashMap<String, HashMap<u32, DispatchSite>>,
-        analysed: &HashMap<PathBuf, String>,
-        witnesses: &DispatchWitnesses,
-    ) -> CarriedDispatch {
-        // (consumer file, site span, the wrapper's value, the member's name).
-        // Sorted, because the debug line this writes is read against a scan
-        // that must not reorder itself between runs.
-        let mut stamps: Vec<(&String, u32, Dispatch, &String)> = Vec::new();
-        let mut consumers: Vec<(&String, &HashMap<u32, DispatchSite>)> = sites.iter().collect();
-        consumers.sort_by_key(|(path, _)| *path);
-        for (path, spans) in consumers {
-            let mut ordered: Vec<(&u32, &DispatchSite)> = spans.iter().collect();
-            ordered.sort_by_key(|(span, _)| **span);
-            for (span, site) in ordered {
-                let Some(home_path) = analysed.get(&site.module) else {
-                    continue;
-                };
-                let Some(home) = file_results.get(home_path) else {
-                    continue;
-                };
-                let Ok(line) = i32::try_from(site.request_line) else {
-                    continue;
-                };
-                // The wrapper's own rows for that request. A file whose model
-                // answer never came, or whose request line nothing states a
-                // value for, carries nothing.
-                let at_line: Vec<&DataCallResult> = home
-                    .data_calls
-                    .iter()
-                    .filter(|call| {
-                        (call.line_number == line || call.call_expression_line == Some(line))
-                            && call.dispatch.as_ref().is_some_and(|dispatch| {
-                                call.resolution_source == Some(ResolutionSource::RequestSummary)
-                                    || witnesses.witnessed(home_path, &dispatch.value)
-                            })
-                    })
-                    .collect();
-                let summarised = at_line
-                    .iter()
-                    .any(|call| call.resolution_source == Some(ResolutionSource::RequestSummary));
-                let mut values: Vec<&Dispatch> = Vec::new();
-                for value in at_line
-                    .iter()
-                    .filter(|call| {
-                        !summarised
-                            || call.resolution_source == Some(ResolutionSource::RequestSummary)
-                    })
-                    .filter_map(|call| call.dispatch.as_ref())
-                {
-                    if !values.contains(&value) {
-                        values.push(value);
-                    }
-                }
-                let [dispatch] = values.as_slice() else {
-                    continue;
-                };
-                stamps.push((path, *span, (*dispatch).clone(), &site.name));
-            }
-        }
-
-        let stamps: Vec<(String, u32, Dispatch, String)> = stamps
-            .into_iter()
-            .map(|(path, span, dispatch, name)| (path.clone(), span, dispatch, name.clone()))
-            .collect();
-        let mut carry = CarriedDispatch::default();
-        for (path, span, dispatch, name) in stamps {
-            let Some(result) = file_results.get_mut(&path) else {
-                continue;
-            };
-            for data_call in &mut result.data_calls {
-                // A row the summaries state carries only the value its own
-                // body writes (carrick#1564 review, finding 9); a wrapper's
-                // model value is not that.
-                if data_call.call_expression_span_start != Some(span)
-                    || data_call.resolution_source == Some(ResolutionSource::RequestSummary)
-                {
-                    continue;
-                }
-                let guessed = match &data_call.dispatch {
-                    Some(stated) if witnesses.witnessed(&path, &stated.value) => continue,
-                    Some(_) => true,
-                    None => false,
-                };
-                debug!(
-                    "Carrying dispatch {}={} from {} onto {}:{}",
-                    dispatch.field, dispatch.value, name, path, data_call.line_number
-                );
-                data_call.dispatch = Some(dispatch.clone());
-                carry.carried += 1;
-                if guessed {
-                    carry.over_guess += 1;
-                }
-                carry.sites.insert((path.clone(), span));
-            }
-        }
-        carry
-    }
-
     /// PHASE 5b's dispatch values, in the order they depend on each other
     /// (carrick#2201):
     ///
     /// 1. The summary rows settle: the value a call through a declaration
     ///    sends, from its own body, under the field the request line's row
-    ///    names (carrick#1555). A wrapper's request row is often one of them,
-    ///    so this runs first, or the carry finds no value at its line.
-    /// 2. The carry stamps the wrapper's value onto the sites that call it
-    ///    (carrick#872), over a site value its file does not witness.
-    /// 3. Every model value still unwitnessed is cleared.
-    fn settle_wrapper_dispatch(
+    ///    names (carrick#1555). A site that reaches a wrapper is one of them,
+    ///    so the wrapper's value reaches the site here.
+    /// 2. Every model value still unwitnessed is cleared.
+    fn settle_dispatch_values(
         file_results: &mut HashMap<String, FileAnalysisResult>,
-        sites: &HashMap<String, HashMap<u32, DispatchSite>>,
-        analysed: &HashMap<PathBuf, String>,
         witnesses: &DispatchWitnesses,
         stats: &mut ProcessingStats,
-    ) -> CarriedDispatch {
+    ) {
         stats.summary_dispatch_settled = Self::settle_reached_dispatch(file_results);
-        let carry = Self::carry_wrapper_dispatch(file_results, sites, analysed, witnesses);
-        stats.dispatch_carried_over_guess = carry.over_guess;
-        stats.dispatch_guesses_cleared =
-            Self::clear_unwitnessed_dispatch(file_results, witnesses, &carry.sites);
-        carry
+        stats.dispatch_guesses_cleared = Self::clear_unwitnessed_dispatch(file_results, witnesses);
     }
 
     /// Clear the dispatch value on every model row whose file does not
-    /// witness it and that the carry did not replace (carrick#2201).
+    /// witness it (carrick#2201).
     ///
     /// The model reads a dispatch value off a call, and where the call is a
     /// client method it makes one up from the method's name. A value the
@@ -10228,7 +9887,6 @@ impl FileOrchestrator {
     fn clear_unwitnessed_dispatch(
         file_results: &mut HashMap<String, FileAnalysisResult>,
         witnesses: &DispatchWitnesses,
-        carried: &HashSet<(String, u32)>,
     ) -> usize {
         let mut cleared = 0;
         for (path, result) in file_results.iter_mut() {
@@ -10239,11 +9897,7 @@ impl FileOrchestrator {
                 let Some(dispatch) = &call.dispatch else {
                     continue;
                 };
-                if call
-                    .call_expression_span_start
-                    .is_some_and(|span| carried.contains(&(path.clone(), span)))
-                    || witnesses.witnessed(path, &dispatch.value)
-                {
+                if witnesses.witnessed(path, &dispatch.value) {
                     continue;
                 }
                 debug!(
@@ -11954,7 +11608,7 @@ impl FileOrchestrator {
 mod tests {
     use super::*;
     use crate::agents::file_analyzer_agent::{DataCallResult, EndpointResult, MountResult};
-    use crate::dispatch::DispatchLocation;
+    use crate::dispatch::{Dispatch, DispatchLocation};
 
     /// carrick#1294: a named GraphQL resolver is followed to the module that
     /// declares it, and the span sent for it is measured in THAT module's
@@ -20830,8 +20484,8 @@ export { routes };
         );
     }
 
-    /// The literal witnesses each named file states, for the dispatch carry
-    /// and clear (carrick#2201).
+    /// The literal witnesses each named file states, for the dispatch clear
+    /// (carrick#2201).
     fn witnesses(files: &[(&str, &[&str])]) -> DispatchWitnesses {
         DispatchWitnesses(
             files
@@ -20857,30 +20511,6 @@ export { routes };
         })
     }
 
-    /// `consumer.ts` calls the wrapper at span 100, whose single request is
-    /// line 19 of `client.ts`.
-    fn carry_into_consumer(
-        file_results: &mut HashMap<String, FileAnalysisResult>,
-        witnesses: &DispatchWitnesses,
-    ) -> CarriedDispatch {
-        FileOrchestrator::carry_wrapper_dispatch(
-            file_results,
-            &HashMap::from([(
-                "consumer.ts".to_string(),
-                HashMap::from([(
-                    100,
-                    DispatchSite {
-                        name: "searchByIntent".to_string(),
-                        module: PathBuf::from("/repo/client.ts"),
-                        request_line: 19,
-                    },
-                )]),
-            )]),
-            &HashMap::from([(PathBuf::from("/repo/client.ts"), "client.ts".to_string())]),
-            witnesses,
-        )
-    }
-
     /// A wrapper file whose request line holds `rows`, and a consumer whose
     /// site row states `site`.
     fn wrapper_and_site(
@@ -20902,162 +20532,11 @@ export { routes };
         ])
     }
 
-    fn wrapper_row(value: &str, source: ResolutionSource) -> DataCallResult {
-        let mut row = call_with_span(19, "${this.gatewayUrl}", Some(400));
-        row.dispatch = action(value);
-        row.resolution_source = Some(source);
-        row
-    }
-
     fn site_value(file_results: &HashMap<String, FileAnalysisResult>) -> Option<&str> {
         file_results["consumer.ts"].data_calls[0]
             .dispatch
             .as_ref()
             .map(|d| d.value.as_str())
-    }
-
-    /// carrick#872: the value the wrapper's own request states reaches the row
-    /// at the site that calls the wrapper, and nothing else on that row moves.
-    #[test]
-    fn carry_wrapper_dispatch_stamps_the_site_row_from_the_wrapper_s_row() {
-        let mut file_results = wrapper_and_site(
-            vec![wrapper_row("search-by-intent", ResolutionSource::Model)],
-            None,
-        );
-
-        let carry = carry_into_consumer(
-            &mut file_results,
-            &witnesses(&[("client.ts", &["search-by-intent"]), ("consumer.ts", &[])]),
-        );
-
-        assert_eq!((carry.carried, carry.over_guess), (1, 0));
-        assert_eq!(site_value(&file_results), Some("search-by-intent"));
-        assert_eq!(
-            file_results["consumer.ts"].data_calls[0].target, "/rpc/gateway",
-            "the carry states a value, never a target"
-        );
-    }
-
-    /// A wrapper whose own request states no value — a plain route, or one
-    /// whose action is a parameter — carries nothing, and the site is left
-    /// exactly where it was.
-    #[test]
-    fn carry_wrapper_dispatch_carries_nothing_from_a_wrapper_with_no_value() {
-        let mut row = call_with_span(19, "${this.gatewayUrl}", Some(400));
-        row.resolution_source = Some(ResolutionSource::Model);
-        let mut file_results = wrapper_and_site(vec![row], None);
-
-        let carry = carry_into_consumer(&mut file_results, &witnesses(&[]));
-
-        assert_eq!(carry.carried, 0);
-        assert_eq!(site_value(&file_results), None);
-    }
-
-    /// A row the request summaries state carries only the value its own body
-    /// writes, so a wrapper's model value is never carried onto it, even where
-    /// it states none (carrick#1564 review, finding 9).
-    #[test]
-    fn carry_wrapper_dispatch_leaves_a_row_the_source_states() {
-        let mut file_results = wrapper_and_site(
-            vec![wrapper_row("findSimilar", ResolutionSource::Model)],
-            None,
-        );
-        file_results.get_mut("consumer.ts").unwrap().data_calls[0].resolution_source =
-            Some(ResolutionSource::RequestSummary);
-
-        let carry = carry_into_consumer(
-            &mut file_results,
-            &witnesses(&[("client.ts", &["findSimilar"])]),
-        );
-
-        assert_eq!(carry.carried, 0);
-        assert_eq!(site_value(&file_results), None);
-    }
-
-    /// A site whose own file writes its value keeps it: a literal at the site
-    /// is a stronger statement than one a delegation away.
-    #[test]
-    fn carry_wrapper_dispatch_keeps_a_witnessed_site_value() {
-        let mut file_results = wrapper_and_site(
-            vec![wrapper_row("search-by-intent", ResolutionSource::Model)],
-            action("list-external-calls"),
-        );
-
-        let carry = carry_into_consumer(
-            &mut file_results,
-            &witnesses(&[
-                ("client.ts", &["search-by-intent"]),
-                ("consumer.ts", &["list-external-calls"]),
-            ]),
-        );
-
-        assert_eq!(carry.carried, 0);
-        assert_eq!(site_value(&file_results), Some("list-external-calls"));
-    }
-
-    /// carrick#2201: a site value no literal in the site's file writes is the
-    /// model's guess from the method name, and the wrapper's value replaces it.
-    #[test]
-    fn carry_wrapper_dispatch_replaces_an_unwitnessed_site_value() {
-        let mut file_results = wrapper_and_site(
-            vec![wrapper_row("search-by-intent", ResolutionSource::Model)],
-            action("searchByIntent"),
-        );
-
-        let carry = carry_into_consumer(
-            &mut file_results,
-            &witnesses(&[("client.ts", &["search-by-intent"]), ("consumer.ts", &[])]),
-        );
-
-        assert_eq!((carry.carried, carry.over_guess), (1, 1));
-        assert_eq!(site_value(&file_results), Some("search-by-intent"));
-        assert!(
-            carry.sites.contains(&("consumer.ts".to_string(), 100)),
-            "the clear must not undo the carried value"
-        );
-    }
-
-    /// carrick#2201: at the wrapper's request line, the request summary's
-    /// value (its own body's) is carried in preference to the model's.
-    #[test]
-    fn carry_wrapper_dispatch_prefers_the_request_summary_row() {
-        let mut file_results = wrapper_and_site(
-            vec![
-                wrapper_row("get-everything", ResolutionSource::Model),
-                wrapper_row("get-cross-repo-data", ResolutionSource::RequestSummary),
-            ],
-            None,
-        );
-
-        let carry = carry_into_consumer(
-            &mut file_results,
-            &witnesses(&[("client.ts", &["get-everything", "get-cross-repo-data"])]),
-        );
-
-        assert_eq!(carry.carried, 1);
-        assert_eq!(site_value(&file_results), Some("get-cross-repo-data"));
-    }
-
-    /// carrick#2201: rows at the wrapper's request line that state two
-    /// different values leave the wrapper's value unknown, so nothing is
-    /// carried.
-    #[test]
-    fn carry_wrapper_dispatch_carries_nothing_from_two_values() {
-        let mut file_results = wrapper_and_site(
-            vec![
-                wrapper_row("refresh-index", ResolutionSource::Model),
-                wrapper_row("refresh-cache", ResolutionSource::Model),
-            ],
-            None,
-        );
-
-        let carry = carry_into_consumer(
-            &mut file_results,
-            &witnesses(&[("client.ts", &["refresh-index", "refresh-cache"])]),
-        );
-
-        assert_eq!(carry.carried, 0);
-        assert_eq!(site_value(&file_results), None);
     }
 
     /// One model row at span 100 of `consumer.ts` stating `value`, cleared
@@ -21072,7 +20551,6 @@ export { routes };
         let cleared = FileOrchestrator::clear_unwitnessed_dispatch(
             &mut file_results,
             &witnesses(&[("consumer.ts", literals)]),
-            &HashSet::new(),
         );
         let after = file_results["consumer.ts"].data_calls[0]
             .dispatch
@@ -21081,7 +20559,7 @@ export { routes };
         (cleared, after)
     }
 
-    /// carrick#2201: an unwitnessed model value no wrapper reaches is cleared.
+    /// carrick#2201: an unwitnessed model value is cleared.
     #[test]
     fn clear_unwitnessed_dispatch_clears_a_value_the_file_never_writes() {
         assert_eq!(
@@ -21099,12 +20577,11 @@ export { routes };
         );
     }
 
-    /// carrick#2201: the wrapper's request row is a request summary, which
-    /// holds its body's value only once the summary rows settle. Settling runs
-    /// before the carry, so the site's guess is replaced by that value rather
-    /// than cleared.
+    /// carrick#2201: a request summary row holds its body's value once the
+    /// summary rows settle, under the field a row for the same route names;
+    /// the model's guess at a site whose file writes no value is then cleared.
     #[test]
-    fn settle_wrapper_dispatch_carries_a_value_the_summary_settles() {
+    fn settle_dispatch_values_settles_a_summary_value_and_clears_a_guess() {
         let mut request = call_with_span(19, "${config.apiEndpoint}/rpc/gateway", Some(400));
         request.method = Some("POST".to_string());
         request.resolution_source = Some(ResolutionSource::RequestSummary);
@@ -21115,33 +20592,26 @@ export { routes };
             Some("POST".to_string());
 
         let mut stats = ProcessingStats::default();
-        let carry = FileOrchestrator::settle_wrapper_dispatch(
+        FileOrchestrator::settle_dispatch_values(
             &mut file_results,
-            &HashMap::from([(
-                "consumer.ts".to_string(),
-                HashMap::from([(
-                    100,
-                    DispatchSite {
-                        name: "getAllRepoData".to_string(),
-                        module: PathBuf::from("/repo/client.ts"),
-                        request_line: 19,
-                    },
-                )]),
-            )]),
-            &HashMap::from([(PathBuf::from("/repo/client.ts"), "client.ts".to_string())]),
             &witnesses(&[("consumer.ts", &[])]),
             &mut stats,
         );
 
-        assert_eq!((carry.carried, carry.over_guess), (1, 1));
-        assert_eq!(site_value(&file_results), Some("get-cross-repo-data"));
+        assert_eq!(
+            file_results["client.ts"].data_calls[0]
+                .dispatch
+                .as_ref()
+                .map(|d| d.value.as_str()),
+            Some("get-cross-repo-data")
+        );
+        assert_eq!(site_value(&file_results), None);
         assert_eq!(
             (
                 stats.summary_dispatch_settled,
-                stats.dispatch_carried_over_guess,
                 stats.dispatch_guesses_cleared
             ),
-            (1, 1, 0)
+            (1, 1)
         );
     }
 
