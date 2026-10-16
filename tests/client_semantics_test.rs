@@ -618,6 +618,87 @@ async fn the_third_reviews_sites_read_nothing_the_file_can_change() {
     assert_eq!(stated(20), [("GET".to_string(), "/api/p6".to_string())]);
 }
 
+/// carrick#2451: the rows of `src/o<N>-*.ts`, read with the semantics and
+/// without them.
+async fn options_constant_rows() -> (Vec<DataFetchingCall>, Vec<DataFetchingCall>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::Vendored);
+    mock_env(&cassette);
+    let sidecar = real_sidecar(&repo);
+    let without = rows_without_semantics(&repo, &cassette, &sidecar).await;
+    let rows = rows(&scan(&StubStorage::default(), &repo, Some(&sidecar)).await);
+    (rows, without)
+}
+
+/// A site that reads as it does without the semantics: the same rendered
+/// row, read through no claim.
+fn assert_reads_as_without(rows: &[DataFetchingCall], without: &[DataFetchingCall], file: &str) {
+    let line = if file.contains("o4-") { 6 } else { 8 };
+    assert_eq!(
+        rendered(rows_at(rows, file, line)),
+        rendered(rows_at(without, file, line)),
+        "{file}:{line} reads as it does without the semantics"
+    );
+    assert!(
+        rows_at(rows, file, line)
+            .iter()
+            .all(|row| row.library_semantics.is_empty()),
+        "{file}:{line} is read through no claim: {rows:#?}"
+    );
+}
+
+/// carrick#2451: factory options held in a constant the file declares once
+/// and hands to that one call state the base.
+#[tokio::test]
+#[serial]
+async fn options_held_in_a_constant_state_the_base() {
+    let (rows, _) = options_constant_rows().await;
+    let get = ids(HTTP, &["factory:create", "verb:get"]);
+    let get: Vec<&str> = get.iter().map(String::as_str).collect();
+    assert_library_row(
+        &rows,
+        "src/o1-options-const.ts",
+        6,
+        "GET",
+        "/o1/users",
+        &get,
+    );
+}
+
+/// carrick#2451: a constant the file writes through reads as it did.
+#[tokio::test]
+#[serial]
+async fn options_the_file_writes_read_no_base() {
+    let (rows, without) = options_constant_rows().await;
+    assert_reads_as_without(&rows, &without, "src/o2-options-written.ts");
+}
+
+/// carrick#2451: a constant also handed to another call reads as it did.
+#[tokio::test]
+#[serial]
+async fn options_handed_to_another_call_read_no_base() {
+    let (rows, without) = options_constant_rows().await;
+    assert_reads_as_without(&rows, &without, "src/o3-options-passed.ts");
+}
+
+/// carrick#2451: a constant and the factory call inside one function state
+/// the base.
+#[tokio::test]
+#[serial]
+async fn options_held_in_a_local_constant_state_the_base() {
+    let (rows, _) = options_constant_rows().await;
+    let get = ids(HTTP, &["factory:create", "verb:get"]);
+    let get: Vec<&str> = get.iter().map(String::as_str).collect();
+    assert_library_row(
+        &rows,
+        "src/o4-options-local.ts",
+        6,
+        "GET",
+        "/o4/users",
+        &get,
+    );
+}
+
 /// carrick#1568: an instance one module builds and exports states the joined
 /// row, with the claims it was read through, at each call in the modules
 /// that import it: directly, renamed through a barrel, and as an anonymous
