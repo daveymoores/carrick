@@ -16,7 +16,11 @@ function sql(strings: TemplateStringsArray, ...values: unknown[]): string {
   return strings.join('?') + values.length;
 }
 
-class LimitedCounter extends Counter {
+interface Countable {
+  increment(by: number): number;
+}
+
+class LimitedCounter extends Counter implements Countable {
   override increment(by: number): number {
     const next = super.increment(by);
     return next > LIMIT ? LIMIT : next;

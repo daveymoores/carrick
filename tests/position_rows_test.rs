@@ -181,6 +181,10 @@ impl Visit for SwcPositions {
     // expression in a type position is a row, so the walk stops at types.
     fn visit_ts_type(&mut self, _: &swc_ecma_ast::TsType) {}
     fn visit_ts_interface_decl(&mut self, _: &swc_ecma_ast::TsInterfaceDecl) {}
+    // Pinned: `implements X` is an `Expr` in SWC and a type position in
+    // TypeScript (`isPartOfTypeNode`); a class's `extends` is an expression
+    // on both sides.
+    fn visit_ts_expr_with_type_args(&mut self, _: &swc_ecma_ast::TsExprWithTypeArgs) {}
     fn visit_expr(&mut self, node: &Expr) {
         if let Expr::Ident(ident) = node {
             self.add(Kind::Ident, ident.span());
@@ -646,6 +650,7 @@ fn census() {
         let rows = read_rows(raw.as_bytes()).expect("the rows file reads");
         let mut swc: HashMap<Kind, (usize, usize)> = HashMap::new();
         let mut held: HashMap<Kind, [usize; 4]> = HashMap::new();
+        let mut misses_shown: HashMap<Kind, usize> = HashMap::new();
         let mut stale = 0usize;
         let mut unparsed = 0usize;
         let mut total_rows = 0usize;
@@ -684,7 +689,22 @@ fn census() {
             for position in positions {
                 let counts = swc.entry(position.0).or_default();
                 counts.0 += 1;
-                counts.1 += usize::from(keys.contains(&position));
+                let found = keys.contains(&position);
+                counts.1 += usize::from(found);
+                if !found && misses_shown.get(&position.0).copied().unwrap_or(0) < 5 {
+                    *misses_shown.entry(position.0).or_default() += 1;
+                    let text = String::from_utf8_lossy(&source);
+                    let snippet: String = text
+                        .encode_utf16()
+                        .skip(position.1 as usize)
+                        .take((position.2 - position.1).min(60) as usize)
+                        .map(|unit| char::from_u32(u32::from(unit)).unwrap_or('?'))
+                        .collect();
+                    println!(
+                        "    miss {:?} {}:{}-{} {:?}",
+                        position.0, line.f, position.1, position.2, snippet
+                    );
+                }
             }
         }
         let pct = |part: usize, whole: usize| {

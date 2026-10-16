@@ -328,9 +328,10 @@ class PathNames {
 
   /**
    * `import("/abs/path")` in a printed type, written with the declaring
-   * file's name instead. The print names a module by the file that declares
-   * it (`typeToStringAsDeclared`, carrick#2019), so one type reads the same
-   * from every file.
+   * file's name instead. The print has no enclosing node, so it names every
+   * module by the file that declares it and one type reads the same from
+   * every file; it also skips the accessibility search an enclosing node
+   * costs (40% of the walk on a 600-file service).
    */
   scrubType(text: string): string {
     if (!text.includes('import("')) return text;
@@ -379,7 +380,7 @@ class PositionWalker {
       if (type.flags & ts.TypeFlags.Any) {
         flags |= (type as { intrinsicName?: string }).intrinsicName === 'error' ? FLAG_ERROR_TYPE : FLAG_ANY;
       }
-      const typeText = this.paths.scrubType(typeToStringAsDeclared(this.checker, type, typed));
+      const typeText = this.paths.scrubType(typeToStringAsDeclared(this.checker, type, undefined));
       if (!symbol) return [kind, start, end, null, null, null, null, typeText, flags];
       const declaration = attributedDeclaration(() => this.program, symbol.declarations ?? []);
       if (!declaration) return [kind, start, end, ts.symbolName(symbol), null, null, null, typeText, flags];
