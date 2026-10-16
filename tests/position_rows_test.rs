@@ -448,11 +448,19 @@ const readline = require('readline');
 const {{ spawn }} = require('child_process');
 const notes = {notes:?};
 fs.appendFileSync(path.join(notes, 'starts'), process.pid + '\n');
+// Each start, with the earlier processes still alive at it.
+const events = path.join(notes, 'events');
+const earlier = fs.existsSync(events)
+  ? fs.readFileSync(events, 'utf8').split('\n').filter((l) => l.startsWith('start ')).map((l) => Number(l.split(' ')[1]))
+  : [];
+const alive = earlier.filter((pid) => {{ try {{ process.kill(pid, 0); return true; }} catch {{ return false; }} }});
+fs.appendFileSync(events, `start ${{process.pid}} ${{alive.join(',')}}\n`);
 const child = spawn(process.execPath, [{real:?}], {{ stdio: ['pipe', 'inherit', 'inherit'] }});
 child.on('exit', (code) => process.exit(code ?? 1));
 readline.createInterface({{ input: process.stdin, terminal: false }}).on('line', (line) => {{
   const request = JSON.parse(line);
   fs.appendFileSync(path.join(notes, 'actions'), request.action + '\n');
+  fs.appendFileSync(events, `action ${{process.pid}} ${{request.action}} ${{request.out_path ?? request.outPath ?? ''}}\n`);
   if (request.action === 'position_rows' && {die_on_walk}) {{
     fs.writeSync(2, 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n');
     child.kill('SIGKILL');
@@ -476,15 +484,32 @@ struct Scan {
     positions: Option<PathBuf>,
     starts: usize,
     actions: Vec<String>,
+    /// `start <pid> <earlier pids alive>` and `action <pid> <action> <out>`
+    /// lines, in order.
+    events: Vec<String>,
 }
 
-fn scan(repo: &Path, rows_on: bool, die_on_walk: bool, store: &Path) -> Scan {
+/// One scan of `repo`. With no `store` the blobs go to the mock store and
+/// none is read back; `tmp`, when given, is the scan's `TMPDIR`.
+fn scan(
+    repo: &Path,
+    rows_on: bool,
+    die_on_walk: bool,
+    store: Option<&Path>,
+    tmp: Option<&Path>,
+) -> Scan {
     let notes = tempfile::tempdir().expect("notes dir");
     let shim = shim(notes.path(), die_on_walk);
     let cache = tempfile::tempdir().expect("cache dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    match store {
+        Some(store) => cmd.env("CARRICK_LOCAL_STORAGE_DIR", store),
+        None => cmd.env_remove("CARRICK_LOCAL_STORAGE_DIR"),
+    };
+    if let Some(tmp) = tmp {
+        cmd.env("TMPDIR", tmp);
+    }
     cmd.arg(repo)
-        .env("CARRICK_LOCAL_STORAGE_DIR", store)
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
         .env("CARRICK_CACHE_DIR", cache.path())
         .env("CARRICK_MOCK_ALL", "1")
@@ -519,7 +544,10 @@ fn scan(repo: &Path, rows_on: bool, die_on_walk: bool, store: &Path) -> Scan {
         String::from_utf8_lossy(&output.stderr)
     );
     let mut blobs = BTreeMap::new();
-    for entry in fs::read_dir(store).expect("read the store") {
+    for entry in store
+        .into_iter()
+        .flat_map(|store| fs::read_dir(store).expect("read the store"))
+    {
         let path = entry.expect("dir entry").path();
         if path.extension().is_some_and(|ext| ext == "json") {
             let mut blob: serde_json::Value =
@@ -535,14 +563,87 @@ fn scan(repo: &Path, rows_on: bool, die_on_walk: bool, store: &Path) -> Scan {
             );
         }
     }
-    let positions = store.join("positions");
+    let positions = store.map(|store| store.join("positions"));
     let read = |name: &str| fs::read_to_string(notes.path().join(name)).unwrap_or_default();
     Scan {
         blobs,
-        positions: positions.exists().then_some(positions),
+        positions: positions.filter(|positions| positions.exists()),
         starts: read("starts").lines().count(),
         actions: read("actions").lines().map(str::to_string).collect(),
+        events: read("events").lines().map(str::to_string).collect(),
     }
+}
+
+/// carrick#2413: the walk runs first, in a process of its own that has
+/// exited before the next process (the service's analysis sidecar) starts.
+/// Returns the out path the walk was asked to write.
+fn assert_walk_first(events: &[String]) -> PathBuf {
+    let walk: Vec<&str> = events
+        .iter()
+        .map(|line| line.split(' ').collect::<Vec<_>>())
+        .find(|parts| parts.len() == 4 && parts[0] == "action" && parts[2] == "position_rows")
+        .expect("the walk was asked");
+    let (pid, out) = (walk[1], walk[3]);
+    let starts: Vec<Vec<&str>> = events
+        .iter()
+        .filter(|line| line.starts_with("start "))
+        .map(|line| line.split(' ').collect())
+        .collect();
+    let walk_start = starts
+        .iter()
+        .position(|start| start[1] == pid)
+        .expect("the walk's process started");
+    // The analysis sidecar is the process after the walk's: before
+    // carrick#2413 the walk was the scan's last process.
+    let next = starts
+        .get(walk_start + 1)
+        .unwrap_or_else(|| panic!("no process started after the walk: {events:?}"));
+    assert!(
+        !next
+            .get(2)
+            .is_some_and(|alive| alive.split(',').any(|alive| alive == pid)),
+        "the walk's process was alive when the analysis sidecar started: {events:?}"
+    );
+    PathBuf::from(out)
+}
+
+/// carrick#2413: with no local store (the Action, the cloud runner) the flag
+/// still walks, into a directory of the run's own under the OS temp dir,
+/// outside the repo, and the rows file and the directory are gone when the
+/// scan ends.
+#[test]
+fn without_a_store_the_walk_writes_to_the_temp_dir_and_cleans_up() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let (_dir, repo) = materialise();
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_root = fs::canonicalize(tmp.path()).unwrap();
+    let on = scan(&repo, true, false, None, Some(&tmp_root));
+    // `TMPDIR` is canonical, so the path the scan sends is under it as
+    // written.
+    let out = assert_walk_first(&on.events);
+    assert!(
+        out.starts_with(&tmp_root),
+        "the rows went outside the temp dir: {}",
+        out.display()
+    );
+    assert!(
+        !out.starts_with(&repo),
+        "the rows went inside the repo: {}",
+        out.display()
+    );
+    let left: Vec<_> = fs::read_dir(&tmp_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().starts_with("carrick-positions-"))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the run's rows directory outlived it: {left:?}"
+    );
 }
 
 /// Off means off; on writes the rows and the same blob; a walk that dies of
@@ -557,7 +658,7 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
     let (_dir, repo) = materialise();
 
     let off_store = tempfile::tempdir().unwrap();
-    let off = scan(&repo, false, false, off_store.path());
+    let off = scan(&repo, false, false, Some(off_store.path()), None);
     assert!(
         off.positions.is_none(),
         "a scan without the flag wrote rows"
@@ -569,7 +670,7 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
     assert!(!off.blobs.is_empty(), "the scan stored no blob");
 
     let on_store = tempfile::tempdir().unwrap();
-    let on = scan(&repo, true, false, on_store.path());
+    let on = scan(&repo, true, false, Some(on_store.path()), None);
     let rows_file = on
         .positions
         .as_ref()
@@ -585,10 +686,11 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
         off.starts + 1,
         "the walk is one process of its own"
     );
+    assert_walk_first(&on.events);
     assert_eq!(on.blobs, off.blobs, "writing rows moved the blob");
 
     let died_store = tempfile::tempdir().unwrap();
-    let died = scan(&repo, true, true, died_store.path());
+    let died = scan(&repo, true, true, Some(died_store.path()), None);
     assert!(
         died.actions.iter().any(|action| action == "position_rows"),
         "the walk was not asked"

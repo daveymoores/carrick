@@ -186,6 +186,19 @@ pub fn parse_file(
     source_map: &Lrc<SourceMap>,
     handler: &Handler,
 ) -> Option<Module> {
+    let file_content = read_source(file_path)?;
+    parse_source(
+        file_path,
+        FileName::Real(file_path.to_path_buf()),
+        file_content,
+        source_map,
+        handler,
+    )
+}
+
+/// The text [`parse_file`] parses `file_path` from, as read from disk (a BOM
+/// included), or `None` for a file that is not script or cannot be read.
+pub fn read_source(file_path: &Path) -> Option<String> {
     // A data module an import or `require` reaches (`./ranges.json`,
     // `../package.json`) is not script: handing it to the ES parser fails on
     // its first key and prints a parse-error block for a file no pass reads
@@ -194,21 +207,13 @@ pub fn parse_file(
     if !crate::file_finder::has_source_extension(file_path) {
         return None;
     }
-    // Read file content
-    let file_content = match fs::read_to_string(file_path) {
-        Ok(content) => content,
+    match fs::read_to_string(file_path) {
+        Ok(content) => Some(content),
         Err(e) => {
             warn!("Error reading file {}: {}", file_path.display(), e);
-            return None;
+            None
         }
-    };
-    parse_source(
-        file_path,
-        FileName::Real(file_path.to_path_buf()),
-        file_content,
-        source_map,
-        handler,
-    )
+    }
 }
 
 /// [`parse_file`] over text already in hand: a copy of `file_path` that is

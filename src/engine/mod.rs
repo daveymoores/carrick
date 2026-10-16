@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use swc_common::{
-    SourceMap,
+    FileName, SourceMap,
     errors::{ColorConfig, Handler},
     sync::Lrc,
 };
@@ -2353,6 +2353,14 @@ impl ServiceScan {
         let packages = load_packages_for_service(&self.repo_path, service)?;
         let packages_took = service_started.elapsed();
 
+        // The compiler's rows for every position of the service's files
+        // (carrick#2405), when asked for, read once before discovery
+        // (carrick#2413). Walked in a process of their own that has exited
+        // before the analysis sidecar below starts, so the two programs
+        // never share a heap. Outside the local and model split: the walk
+        // is neither the analysis nor its wait.
+        let positions = walk_position_rows(self.sidecar.as_ref(), &self.repo_path, service);
+
         // A sidecar process of the service's own, scoped to its directory and
         // tsconfig, at the full heap cap. It is dropped, and its process
         // stopped, when this analysis ends.
@@ -2376,6 +2384,7 @@ impl ServiceScan {
                 &self.workspace,
                 &self.run_intents,
                 &self.graphql_schemas,
+                positions,
             )))
             .await;
         let analysis = analysis?;
@@ -2439,14 +2448,6 @@ impl ServiceScan {
                     .unwrap_or(0),
                 data.type_manifest.as_ref().map(|v| v.len()).unwrap_or(0)
             );
-        }
-
-        // The compiler's rows for every position of the service's files
-        // (carrick#2405), when asked for, in a process of their own that
-        // starts after the analysis sidecar is gone. Record-only: a walk that
-        // fails loses its rows and says so here, and nothing else.
-        if let Some(recipe) = &self.sidecar {
-            record_position_rows(recipe, &self.repo_path, service, &data);
         }
 
         let owed = durability::OwedWork {
@@ -3504,6 +3505,7 @@ async fn analyze_current_repo_incremental(
     workspace: &crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
     graphql_schemas: &crate::graphql::SchemaCatalogue,
+    positions: Option<crate::position_rows::PositionIndex>,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
@@ -3521,7 +3523,7 @@ async fn analyze_current_repo_incremental(
         function_definitions,
         repo_name,
         request_inputs,
-    } = discover_files_and_symbols(repo_path, config, cm.clone())?;
+    } = discover_with_positions(repo_path, config, cm.clone(), positions)?;
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
     // 3. Check if we can use incremental mode. The cache version is the whole
@@ -6769,24 +6771,32 @@ fn service_sidecar_root(repo_path: &str, service: &Config) -> std::path::PathBuf
     }
 }
 
-/// Write the service's per-position compiler rows beside its blob when the
-/// run asks for them (`CARRICK_POSITION_ROWS=1` with a local store,
-/// carrick#2405). The files are the ones discovery walks; every path is sent
-/// under the repo's canonical root, as the service's sidecar root is. Off,
-/// this spawns nothing and writes nothing.
-fn record_position_rows(
-    recipe: &crate::services::type_sidecar::SidecarRecipe,
+/// Walk the service's per-position compiler rows and read them, when the run
+/// asks for them (`CARRICK_POSITION_ROWS=1`, carrick#2405, carrick#2413):
+/// written beside its blob with a local store, under the OS temp dir
+/// otherwise, and named by the stem the blob will carry. The files are the
+/// ones discovery walks; every path is sent under the repo's canonical root,
+/// as the service's sidecar root is.
+///
+/// Off, this spawns nothing, writes nothing and is `None`. On, it is an
+/// index whatever happened: a run with no sidecar, or a walk that failed,
+/// gives one with no rows, every lookup in which is a hole. A walk that
+/// fails says so in the run log, and nothing else.
+fn walk_position_rows(
+    recipe: Option<&crate::services::type_sidecar::SidecarRecipe>,
     repo_path: &str,
     service: &Config,
-    data: &CloudRepoData,
-) {
-    let Some(out) =
-        crate::position_rows::destination(&data.repo_name, data.service_name.as_deref())
-    else {
-        return;
+) -> Option<crate::position_rows::PositionIndex> {
+    let canonical = canonical_repo_path(repo_path);
+    let out = crate::position_rows::destination(
+        &get_repository_name(&canonical),
+        service.service_name.as_deref(),
+    )?;
+    let scan_root = PathBuf::from(&canonical);
+    let label = service.service_name.as_deref().unwrap_or("(root)");
+    let Some(recipe) = recipe else {
+        return Some(crate::position_rows::PositionIndex::missing(&scan_root));
     };
-    let scan_root =
-        std::fs::canonicalize(repo_path).unwrap_or_else(|_| std::path::PathBuf::from(repo_path));
     let mut files: Vec<std::path::PathBuf> =
         walk_service(repo_path, service, &service_ignore_patterns(service))
             .files
@@ -6795,18 +6805,20 @@ fn record_position_rows(
             .collect();
     files.sort();
     let service_root = service_sidecar_root(repo_path, service);
-    let label = service.service_name.as_deref().unwrap_or("(root)");
     let walk = crate::position_rows::ServiceWalk {
         service_root: &service_root,
         tsconfig: service.tsconfig.as_deref(),
         scan_root: &scan_root,
         files: &files,
-        out: &out,
+        out: out.path(),
         service: label,
     };
     if let Err(error) = crate::position_rows::record_service_rows(recipe, &walk) {
         debug!("Position rows for service {label} were not written: {error}");
+        return Some(crate::position_rows::PositionIndex::missing(&scan_root));
     }
+    // Read once; a temporary rows file goes when `out` is dropped here.
+    Some(crate::position_rows::load_index(&out, &scan_root, label))
 }
 
 /// A sidecar process of the service's own, scoped to its directory and
@@ -7513,7 +7525,7 @@ fn sample_file_imports(
 /// detection is asked with, read before the scan reaches the service so the
 /// ask can be made ahead of it (carrick#1895).
 ///
-/// The same walk and the same parse as [`discover_files_and_symbols`], over
+/// The same walk and the same parse as [`discover_with_positions`], over
 /// the canonical `repo_path`, so the sample is the one discovery will read
 /// (`the_sample_read_ahead_is_the_one_discovery_reads`). Each file is parsed
 /// a second time when the scan reaches it; what this keeps is the sample, not
@@ -7540,10 +7552,24 @@ fn read_import_sample(
     Some(sample)
 }
 
+#[cfg(test)]
 fn discover_files_and_symbols(
     repo_path: &str,
     service: &Config,
     cm: Lrc<SourceMap>,
+) -> FileDiscoveryResult {
+    discover_with_positions(repo_path, service, cm, None)
+}
+
+/// Discover the service's files and symbols, binding each file's compiler
+/// rows, when the run walked them, to the text discovery parses it from
+/// (carrick#2413): the one read of the file, so the rows' hash is checked
+/// against the bytes every span is counted in.
+fn discover_with_positions(
+    repo_path: &str,
+    service: &Config,
+    cm: Lrc<SourceMap>,
+    mut positions: Option<crate::position_rows::PositionIndex>,
 ) -> FileDiscoveryResult {
     crate::scan_stage::enter(crate::scan_stage::Stage::Discovery);
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
@@ -7640,7 +7666,20 @@ fn discover_files_and_symbols(
     let mut wanted_from: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     for file_path in &files {
-        if let Some(module) = parse_file(file_path, &cm, &handler) {
+        let parsed = match positions.as_mut() {
+            Some(index) => crate::parser::read_source(file_path).and_then(|text| {
+                index.bind(file_path, &text);
+                crate::parser::parse_source(
+                    file_path,
+                    FileName::Real(file_path.clone()),
+                    text,
+                    &cm,
+                    &handler,
+                )
+            }),
+            None => parse_file(file_path, &cm, &handler),
+        };
+        if let Some(module) = parsed {
             // Extract import symbols
             let file_imports = sample_file_imports(&mut all_import_facts, &module);
 
@@ -7691,6 +7730,12 @@ fn discover_files_and_symbols(
             );
             per_file_definitions.push((file_path.clone(), func_extractor.function_definitions));
         }
+    }
+    if let Some(index) = &positions {
+        debug!(
+            "Position rows bound to discovery's reads: {:?}",
+            index.file_states()
+        );
     }
 
     // One row per definition, with same-named definitions in different files
@@ -7747,6 +7792,7 @@ fn discover_files_and_symbols(
         files: request_irs,
         sites: resolution.sites,
         bindings: resolution.bindings,
+        positions,
     };
 
     debug!(
@@ -7774,6 +7820,26 @@ pub(crate) fn discover_request_inputs(root: &Path) -> crate::request_summary::Re
     discover_files_and_symbols(&root.to_string_lossy(), &Config::default(), cm)
         .expect("discovery reads the service")
         .request_inputs
+}
+
+/// What discovery hands the request summaries for one service of the repo
+/// at `repo`, with `positions` bound as a scan binds them: for the census of
+/// the compiler rows' lookups (carrick#2413).
+#[cfg(test)]
+pub(crate) fn discover_service_inputs(
+    repo: &Path,
+    service: &Config,
+    positions: crate::position_rows::PositionIndex,
+) -> crate::request_summary::RequestSummaryInputs {
+    let cm: Lrc<SourceMap> = Default::default();
+    discover_with_positions(
+        &canonical_repo_path(&repo.to_string_lossy()),
+        service,
+        cm,
+        Some(positions),
+    )
+    .expect("discovery reads the service")
+    .request_inputs
 }
 
 /// The service's request summaries (carrick#1555), composed with the library

@@ -188,6 +188,11 @@ use alternatives::{Alternation, Alternatives};
 mod guards;
 use guards::{GuardIr, Subject, Tested, WrittenIn};
 
+// What the compiler's per-position rows say at each lookup the summaries
+// make by name today (carrick#2413): an offline census.
+#[cfg(test)]
+mod rows_census;
+
 #[allow(unused_imports)]
 pub use guards::{
     Branch, CallChain, CallFunction, CallName, CallStart, ChainEnd, ChainSite, Conjoined, Constant,
@@ -1114,6 +1119,38 @@ pub struct FileIr {
     /// function node starts and whether the module exports it
     /// ([`Self::place_definitions`], carrick#2386).
     definitions: HashMap<String, (Option<u32>, bool)>,
+    /// Each expression-position use of an import binding the file uses, by
+    /// name, as its span (discovery numbering): where a compiler row says
+    /// which declaration the use reaches (carrick#2413). Name-keyed as
+    /// [`Self::imported`] is, so a name declared again below lands here too,
+    /// and its uses then name more than one declaration.
+    import_uses: HashMap<String, Vec<(u32, u32)>>,
+}
+
+/// Every expression-position identifier among `names`, by name, with its
+/// span: the positions a compiler row is written at. Type positions hold
+/// none.
+struct ExpressionIdents<'a> {
+    names: &'a HashMap<String, BindingUse>,
+    spans: HashMap<String, Vec<(u32, u32)>>,
+}
+
+impl Visit for ExpressionIdents<'_> {
+    fn visit_ts_type(&mut self, _: &TsType) {}
+    fn visit_ts_interface_body(&mut self, _: &TsInterfaceBody) {}
+    fn visit_ts_expr_with_type_args(&mut self, _: &TsExprWithTypeArgs) {}
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        if let Expr::Ident(ident) = expr
+            && self.names.contains_key(ident.sym.as_ref())
+        {
+            self.spans
+                .entry(ident.sym.to_string())
+                .or_default()
+                .push((ident.span.lo.0, ident.span.hi.0));
+        }
+        expr.visit_children_with(self);
+    }
 }
 
 /// A getter of a lazily built client as the module that declares it uses its
@@ -1148,6 +1185,21 @@ impl FileIr {
                 BTreeSet::new()
             },
         }
+    }
+
+    /// Each import binding the file uses, with the span of every
+    /// expression-position use of it in SWC numbering ([`Self::swc_start`]):
+    /// where a compiler row names the declaration it reaches (carrick#2413).
+    pub fn import_uses(&self) -> impl Iterator<Item = (&str, Vec<(u32, u32)>)> + '_ {
+        self.import_uses.iter().map(|(name, spans)| {
+            (
+                name.as_str(),
+                spans
+                    .iter()
+                    .map(|(lo, hi)| (self.swc_start(*lo), self.swc_start(*hi)))
+                    .collect(),
+            )
+        })
     }
 
     /// Whether this module holds a client another module may import. Only
@@ -1246,7 +1298,14 @@ pub fn extract_file_ir(
     let value_specifiers = value_specifiers(module, |name| {
         module_scope.uses.contains_key(name) || jsx.contains(name)
     });
+    let mut idents = ExpressionIdents {
+        names: &imported,
+        spans: HashMap::new(),
+    };
+    module.visit_with(&mut idents);
+    let import_uses = idents.spans;
     let mut file = FileIr {
+        import_uses,
         imported,
         value_specifiers,
         loads: module_loads(module, &bound_requires),
@@ -6271,6 +6330,10 @@ pub struct RequestSummaryInputs {
     pub files: HashMap<PathBuf, FileIr>,
     pub sites: CallSiteTargets,
     pub bindings: ImportedBindings,
+    /// The compiler's rows for the service's positions, bound to the bytes
+    /// discovery parsed, when the run walks them (`CARRICK_POSITION_ROWS=1`,
+    /// carrick#2413); `None` otherwise. Nothing reads a row yet.
+    pub positions: Option<crate::position_rows::PositionIndex>,
 }
 
 /// How many modules re-exporting a binding they import are followed to the
