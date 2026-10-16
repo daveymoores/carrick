@@ -22,8 +22,12 @@
 use std::process::Command;
 
 fn calls() -> Vec<serde_json::Value> {
+    calls_in("url-bases-through-bindings")
+}
+
+fn calls_in(fixture: &str) -> Vec<serde_json::Value> {
     let repo = env!("CARGO_MANIFEST_DIR");
-    let fixture = format!("{repo}/tests/fixtures/url-bases-through-bindings");
+    let fixture = format!("{repo}/tests/fixtures/{fixture}");
     let mock_dir = format!("{fixture}/__llm__/");
 
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
@@ -143,4 +147,50 @@ fn an_imported_string_const_base_is_an_external_host() {
         charge["base"].is_null(),
         "a literal origin is not an env-var base: {charge:#?}"
     );
+}
+
+/// carrick#2406: the base of a row the request summaries state is read
+/// from where its base piece ends, not from the target's spelling. Each row
+/// here is stated at a call in `src/use.ts` or `src/rewritten.ts` to a
+/// function another module declares. See
+/// `tests/fixtures/summary-bases/README.md`.
+#[test]
+fn a_summary_rows_base_is_read_from_its_end() {
+    let calls = calls_in("summary-bases");
+    let base = |file: &str, line: i64| {
+        let call = call_at(&calls, file, line);
+        assert_eq!(call["resolution_source"], "request_summary", "{call:#?}");
+        (
+            call["base"]["kind"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            call["base"]["env_var"].as_str().map(str::to_string),
+        )
+    };
+    let env = |name: &str| ("env".to_string(), Some(name.to_string()));
+    let injected = ("injected".to_string(), None);
+
+    // A class field built from an environment read, called through the
+    // exported instance.
+    assert_eq!(base("src/use.ts", 6), env("SVC_URL"));
+    // A field a constructor parameter fills, and a field written twice.
+    assert_eq!(base("src/use.ts", 7), injected);
+    assert_eq!(base("src/use.ts", 8), injected);
+    // An imported binding read in the module that imports it is injected
+    // where the stating file does not bind that name.
+    assert_eq!(base("src/use.ts", 9), injected);
+    // A SCREAMING_SNAKE name the file neither declares nor imports is a
+    // global, so injected. The removed guess read it as an env var.
+    assert_eq!(base("src/use.ts", 10), injected);
+    // The stating file imports the alias, so the pass after the summaries
+    // rewrote the slot to the variable behind it: the row keeps that
+    // reading of its target.
+    let rewritten = call_at(&calls, "src/rewritten.ts", 5);
+    assert_eq!(
+        rewritten["target_url"],
+        "${process.env.API_BASE_URL}/things"
+    );
+    assert_eq!(base("src/rewritten.ts", 5), env("API_BASE_URL"));
+    assert_eq!(rewritten["base"]["written"], "${process.env.API_BASE_URL}");
 }

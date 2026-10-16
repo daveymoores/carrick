@@ -186,13 +186,13 @@ use alternatives::{Alternation, Alternatives};
 // the offline census read it so far, so the binary sees it as unused.
 #[allow(dead_code)]
 mod guards;
-use guards::{GuardIr, Root, Subject, Tested, WrittenIn};
+use guards::{GuardIr, Subject, Tested, WrittenIn};
 
 #[allow(unused_imports)]
 pub use guards::{
     Branch, CallChain, CallFunction, CallName, CallStart, ChainEnd, ChainSite, Conjoined, Constant,
     GuardChain, GuardPosition, GuardShape, HoleReason, Hop, HopArg, LibraryReceiver, NameFrom,
-    NamedCall, Within, guard_chains, named_calls,
+    NamedCall, Root, Within, guard_chains, named_calls,
 };
 
 #[allow(unused_imports)]
@@ -4182,18 +4182,9 @@ impl Reader<'_> {
         {
             return value.clone();
         }
-        // An environment read is decided by its spelling alone, with no
-        // check that `process` is the global (carrick#2406).
-        let text = self.text(member.span);
-        let end = match crate::env_alias::env_member_name(member) {
-            Some(name) => Root::Env {
-                written: text.clone(),
-                name,
-                fallback: None,
-            },
-            None => self.member_end(member, scope),
-        };
-        Value::opaque(text, end)
+        // Where it comes from is the receive side's reading, environment
+        // reads included (carrick#2406).
+        Value::opaque(self.text(member.span), self.member_end(member, scope))
     }
 
     /// Whether `call` is a call of a query builder the enclosing class or
@@ -6129,6 +6120,12 @@ pub struct SummaryRow {
     /// caller reaches a request written elsewhere, and this is where
     /// ([`RequestSummaryIndex::withdraw_registrations`], carrick#2383).
     pub request_at: (PathBuf, u32),
+    /// Where the target's base comes from (carrick#2406): the end of its
+    /// first piece when that is a value the source names, `None` when the
+    /// target opens with text the source writes. The row's base is read
+    /// from this ([`crate::call_base::stated_base`]), not from its spelling.
+    /// Last, so it orders only rows that agree on everything above.
+    pub base_end: Option<Root>,
 }
 
 /// What the summaries are composed from, as discovery leaves it: every
@@ -6812,7 +6809,17 @@ pub fn summarize(
     for sites in index.rows.values_mut() {
         for rows in sites.values_mut() {
             rows.sort();
-            rows.dedup();
+            // One row per statement, whatever end its base was reached by:
+            // the end says what kind of base it is, not which row it is.
+            rows.dedup_by(|later, kept| {
+                SummaryRow {
+                    base_end: None,
+                    ..later.clone()
+                } == SummaryRow {
+                    base_end: None,
+                    ..kept.clone()
+                }
+            });
         }
     }
     index
@@ -7064,7 +7071,12 @@ fn row(
     if !base_reads_the_same_in(effect, file) {
         return None;
     }
-    let target = render_target(&join_base(&effect.base, &effect.url))?;
+    let joined = join_base(&effect.base, &effect.url);
+    let target = render_target(&joined)?;
+    let base_end = match joined.first() {
+        Some(Piece::Opaque { end, .. }) => Some(end.clone()),
+        _ => None,
+    };
     let body_literals = effect
         .body
         .iter()
@@ -7097,6 +7109,7 @@ fn row(
                     .map(|ir| ir.env_fallbacks.clone())
                     .unwrap_or_default()
             }),
+        base_end,
     })
 }
 
@@ -8382,10 +8395,11 @@ mod tests {
         }
     }
 
-    /// carrick#2406: the send side decides an environment read by its
-    /// spelling alone, so a file that imports its own `process` still reads
-    /// `process.env.API` as the variable. The receive side checks that
-    /// `process` is the global ([`guards`]'s tests).
+    /// carrick#2406: an environment read is decided by its spelling alone,
+    /// so a file that imports its own `process` still reads
+    /// `process.env.API` as the variable. The receive side reads it the same
+    /// way now (`guards`'s `an_environment_read_on_the_receive_side_names_
+    /// its_variable`); it used to require `process` to be the global.
     #[test]
     fn the_send_side_reads_an_environment_spelling_without_a_shadow_check() {
         let url = request_url(

@@ -25,7 +25,7 @@ use crate::{
         },
         framework_guidance_agent::ProtocolGuidance,
     },
-    call_base::resolve_call_base,
+    call_base::{resolve_call_base, stated_base, written_base},
     cloud_storage::{ManifestRole, ManifestTypeKind},
     compared_route_literals::{ComparisonPosition, compared_route_literals},
     config::Config,
@@ -2548,6 +2548,7 @@ impl FileOrchestrator {
                             // composed ([`LateSummaryFile`]).
                             &BTreeMap::new(),
                             &EnvSchemaIndex::default(),
+                            false,
                         ),
                         &mut stats.deterministic_rows_emitted,
                     );
@@ -3625,6 +3626,8 @@ impl FileOrchestrator {
                     &HashMap::new(),
                     summary_rows,
                     &env_schema,
+                    // Its rows skip the passes after the join.
+                    false,
                 ),
                 &mut stats.deterministic_rows_emitted,
             );
@@ -3653,6 +3656,7 @@ impl FileOrchestrator {
                 receiver_roles.get(&pf.path_str).unwrap_or(&empty_roles),
                 summaries.rows(file).unwrap_or(&no_summary_rows),
                 &env_schema,
+                true,
             );
         }
 
@@ -7222,9 +7226,15 @@ impl FileOrchestrator {
         // one request.
         summary_rows: &BTreeMap<u32, Vec<SummaryRow>>,
         // What the service's validation schemas declare about each env var,
-        // for a summary row whose base another module's scope describes.
+        // for a summary row's base.
         env_schema: &EnvSchemaIndex,
+        // Whether a summary row whose base this file's scope read states
+        // that base here (carrick#2406). Not for a file whose rows skip the
+        // passes after the join, which is where such a base was stated
+        // before ([`Self::stamp_call_bases`]).
+        own_summary_bases: bool,
     ) -> Vec<Resolved> {
+        let own_fallbacks = own_summary_bases.then_some(env_fallbacks);
         // Keyed by the span START, which is the join key: a chained call
         // (`client.cancelRun(id).catch(fn)`) raises a candidate per link and
         // every link shares the receiver's start offset, so the links are one
@@ -7283,13 +7293,15 @@ impl FileOrchestrator {
                 summary_own_sites.push((
                     *start,
                     rows.iter()
-                        .map(|row| Self::summary_resolved(row, candidate, env_schema))
+                        .map(|row| {
+                            Self::summary_resolved(row, candidate, own_fallbacks, env_schema)
+                        })
                         .collect(),
                 ));
                 continue;
             }
             for (index, row) in rows.iter().enumerate() {
-                let resolved = Self::summary_resolved(row, candidate, env_schema);
+                let resolved = Self::summary_resolved(row, candidate, own_fallbacks, env_schema);
                 if index == 0 {
                     claim(resolved);
                 } else {
@@ -7705,15 +7717,29 @@ impl FileOrchestrator {
     /// the model's answer joins onto it by the same id; otherwise keyed by the
     /// site's own span, exactly as a same-file wrapper site is.
     ///
-    /// A row whose base another module's scope read (carrick#1568) carries
-    /// that module's defaults, and its base is stated from them here, as
-    /// that module's own rows state it: [`Self::stamp_call_bases`] leaves a
-    /// stated base alone, so the file the row sits in never describes it.
+    /// Its base is read from where the base piece ends (carrick#2406), not
+    /// from the target's spelling. A row whose base another module's scope
+    /// read (carrick#1568) looks its defaults up in that module's
+    /// (`base_fallbacks`), as that module's own rows do, so the file the row
+    /// sits in never describes it. Any other row looks them up in this
+    /// file's (`own_fallbacks`), and has no base stated here when that is
+    /// `None`.
     fn summary_resolved(
         row: &SummaryRow,
         candidate: Option<&CandidateTarget>,
+        own_fallbacks: Option<&EnvFallbackMap>,
         env_schema: &EnvSchemaIndex,
     ) -> Resolved {
+        let scope_fallbacks: Option<EnvFallbackMap> = row
+            .base_fallbacks
+            .as_ref()
+            .map(|fallbacks| fallbacks.clone().into_iter().collect());
+        let base = scope_fallbacks
+            .as_ref()
+            .or(own_fallbacks)
+            .and_then(|fallbacks| {
+                stated_base(&row.target, row.base_end.as_ref(), fallbacks, env_schema)
+            });
         let line = i32::try_from(row.line).unwrap_or(i32::MAX);
         let candidate_id = candidate
             .map(|candidate| candidate.candidate_id.clone())
@@ -7742,14 +7768,7 @@ impl FileOrchestrator {
                 primary_type_symbol: None,
                 type_import_source: None,
                 loopback_default_url: None,
-                base: row.base_fallbacks.as_ref().and_then(|fallbacks| {
-                    resolve_call_base(
-                        &row.target,
-                        &EnvAliasMap::new(),
-                        &fallbacks.clone().into_iter().collect(),
-                        env_schema,
-                    )
-                }),
+                base,
                 consumers_not_resolved: None,
                 // Settled once the field the target dispatches on is known:
                 // at the join, from the model's reading of which field that
@@ -10361,9 +10380,13 @@ impl FileOrchestrator {
     /// `base` — the target, the method and the canonical key are untouched, so
     /// this cannot move a call into or out of an operation.
     ///
-    /// A row already carrying a base is left alone: nothing upstream sets one
-    /// today, and if something starts to, the pass that read the call site is
-    /// the better witness than this re-reading of its target.
+    /// A row the request summaries state carries the base they read from its
+    /// end ([`Self::summary_resolved`], carrick#2406), and it is read again
+    /// here only where a pass after the summaries rewrote the target's base
+    /// slot ([`Self::resolve_target_bases`]): the end describes the piece
+    /// the summary wrote, not the rewrite. Any other row already carrying a
+    /// base is left alone, because the pass that read the call site is the
+    /// better witness than this re-reading of its target.
     fn stamp_call_bases(
         result: &mut FileAnalysisResult,
         aliases: &EnvAliasMap,
@@ -10371,7 +10394,16 @@ impl FileOrchestrator {
         env_schema: &EnvSchemaIndex,
     ) {
         for data_call in &mut result.data_calls {
-            if data_call.base.is_some() {
+            if data_call.resolution_source == Some(ResolutionSource::RequestSummary) {
+                let stated = data_call.base.as_ref().map(|base| base.written.clone());
+                if stated == written_base(&data_call.target) {
+                    continue;
+                }
+                debug!(
+                    "A summary row's base slot was rewritten after the summaries: reading {} from its target",
+                    data_call.target
+                );
+            } else if data_call.base.is_some() {
                 continue;
             }
             data_call.base =
@@ -15753,11 +15785,13 @@ export * from "./aFetch.js";"#,
             library_semantics: Vec::new(),
             base_fallbacks: None,
             request_at: (std::path::PathBuf::from("src/availability.ts"), 40),
+            base_end: None,
         };
         for at_caller in [true, false] {
             let resolved = FileOrchestrator::summary_resolved(
                 &summary(at_caller),
                 None,
+                Some(&EnvFallbackMap::new()),
                 &EnvSchemaIndex::default(),
             );
             let ResolvedRow::Call(call) = resolved.row else {
@@ -18877,6 +18911,7 @@ export { routes };
             receiver_roles,
             &BTreeMap::new(),
             &EnvSchemaIndex::default(),
+            true,
         );
         let mut result = FileAnalysisResult::default();
         let overrules = FileOrchestrator::emit_resolved_rows(

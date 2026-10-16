@@ -97,6 +97,11 @@ pub enum HoleReason {
     UnreadExpression,
     /// A value imported from a module of this service.
     InRepoValueImport,
+    /// A value imported through a specifier no module the scan reads
+    /// resolves: an alias no config maps, a missing target, an undeclared
+    /// package ([`crate::call_graph::ImportedBinding::Unresolved`]). It may
+    /// be a module of this service or a package; which is not known.
+    UnresolvedImport,
     /// The function is handed to a function this repository defines.
     CallbackIntoOwnFunction,
     /// The function is handed to a call whose callee is none of a
@@ -789,16 +794,18 @@ impl Reader<'_> {
             return Subject::hole(HoleReason::UnreadExpression)
                 .stopped_at(|| self.text(member.span));
         }
-        let base = self.subject(&member.obj, scope, bound);
-        if matches!(base.root, Root::Global(_))
-            && let Some(name) = env_member_name(member)
-        {
+        // An environment read is decided by its spelling, as every other
+        // reader of one decides it ([`crate::env_alias::env_read_name`]),
+        // the send side included: `process` bound by an import of the
+        // runtime module or by the file is read the same (carrick#2406).
+        if let Some(name) = env_member_name(member) {
             return Subject::of(Root::Env {
                 written: self.text(member.span),
                 name,
                 fallback: None,
             });
         }
+        let base = self.subject(&member.obj, scope, bound);
         match &member.prop {
             MemberProp::Ident(prop) => base.then(Step::Key(prop.sym.to_string())),
             MemberProp::Computed(computed) => match literal_string(&computed.expr) {
@@ -860,8 +867,8 @@ impl Reader<'_> {
         self.ident_subject(ident, scope, &Bound::default()).end()
     }
 
-    /// Where a member the send side keeps opaque comes from (carrick#2406).
-    /// The caller decides an environment read first.
+    /// Where a member the send side keeps opaque comes from (carrick#2406),
+    /// an environment read included.
     pub(super) fn member_end(&self, member: &MemberExpr, scope: &Scope<'_>) -> Root {
         self.member_subject(member, scope, &Bound::default()).end()
     }
@@ -2083,6 +2090,20 @@ impl<'a> Chains<'a> {
     }
 
     /// Follow `trace`, whose subject is read in `node`, to its ends.
+    /// The hole a chain stops at on an import (carrick#2406): the in-repo
+    /// import hole for a module of this service, its own reason for a
+    /// specifier nothing resolves, and `None` for a package the manifests
+    /// declare, which is an external import.
+    fn import_hole(&self, file: &Path, local: &str) -> Option<HoleReason> {
+        use crate::call_graph::ImportedBinding;
+        match self.inputs.bindings.get(file, local)? {
+            ImportedBinding::Unresolved => Some(HoleReason::UnresolvedImport),
+            ImportedBinding::Binding { .. }
+            | ImportedBinding::Module(_)
+            | ImportedBinding::Unfollowable => Some(HoleReason::InRepoValueImport),
+        }
+    }
+
     fn follow(&self, node: usize, mut trace: Trace, ends: &mut Ends) {
         if ends.full() {
             ends.cap(self.hole(HoleReason::FanOutCap, node), trace);
@@ -2098,19 +2119,13 @@ impl<'a> Chains<'a> {
                 specifier,
                 export,
             } => {
-                let end = if self
-                    .inputs
-                    .bindings
-                    .get(self.nodes[node].file, &local)
-                    .is_some()
-                {
-                    self.hole(HoleReason::InRepoValueImport, node)
-                } else {
-                    ChainEnd::ExternalImport {
+                let end = match self.import_hole(self.nodes[node].file, &local) {
+                    Some(reason) => self.hole(reason, node),
+                    None => ChainEnd::ExternalImport {
                         specifier,
                         export,
                         steps,
-                    }
+                    },
                 };
                 ends.push(trace, end);
             }
@@ -2294,14 +2309,13 @@ impl<'a> Chains<'a> {
                 specifier,
                 export,
             } => {
-                let end = if self.inputs.bindings.get(file, local).is_some() {
-                    at_call(HoleReason::InRepoValueImport, Some(local.clone()))
-                } else {
-                    ChainEnd::ExternalImport {
+                let end = match self.import_hole(file, local) {
+                    Some(reason) => at_call(reason, Some(local.clone())),
+                    None => ChainEnd::ExternalImport {
                         specifier: specifier.clone(),
                         export: export.clone(),
                         steps,
-                    }
+                    },
                 };
                 ends.push(trace, end);
             }
@@ -2670,17 +2684,14 @@ impl<'a> Chains<'a> {
                 local,
                 specifier,
                 export,
-            } => {
-                if self.inputs.bindings.get(file, local).is_some() {
-                    at_call(HoleReason::InRepoValueImport, Some(local.clone()))
-                } else {
-                    ChainEnd::ExternalImport {
-                        specifier: specifier.clone(),
-                        export: export.clone(),
-                        steps,
-                    }
-                }
-            }
+            } => match self.import_hole(file, local) {
+                Some(reason) => at_call(reason, Some(local.clone())),
+                None => ChainEnd::ExternalImport {
+                    specifier: specifier.clone(),
+                    export: export.clone(),
+                    steps,
+                },
+            },
             Root::Global(name) => ChainEnd::Global {
                 name: name.clone(),
                 steps,
@@ -2922,8 +2933,9 @@ mod tests {
 
     /// carrick#2406: the receive side decides an environment read by the
     /// AST recogniser the send side uses, and names the variable rather
-    /// than its spelling. `member_subject` still checks that `process` is
-    /// the global, so a file that imports its own `process` reads none.
+    /// than its spelling. A file that binds its own `process` reads one too,
+    /// as the send side reads it (`the_send_side_reads_an_environment_
+    /// spelling_without_a_shadow_check`): the spelling decides on both.
     #[test]
     fn an_environment_read_on_the_receive_side_names_its_variable() {
         let chains = chains_in(&[
@@ -2988,10 +3000,13 @@ export function deno(): boolean {
         // and asserted reads and `Deno.env.get("API")` for the call; a
         // global `process` with steps `env`, `MY-VAR` for the index.
         assert_eq!(ready, ["API", "API", "API", "API", "MY-VAR"], "{chains:#?}");
+        // Old answer: the import's hole, because `member_subject` required
+        // `process` to be the global.
         let health = end_of(&chains, "/health");
-        assert_ne!(
-            health["kind"], "env",
-            "an imported `process` is no environment: {health}"
+        assert_eq!(
+            (&health["kind"], &health["name"]),
+            (&serde_json::json!("env"), &serde_json::json!("API")),
+            "an imported `process` reads as the send side reads it: {health}"
         );
     }
 
@@ -3023,6 +3038,48 @@ registry.add((path: string) => path === "/health");
                 "kind": "hole", "reason": "in_repo_value_import",
                 "file": "src/main.ts", "line": 3, "text": "registry"
             })
+        );
+    }
+
+    /// carrick#2406: an import whose specifier nothing the scan reads
+    /// resolves (an undeclared package, an alias no config maps) ends at a
+    /// hole of its own, on the hop and on `follow`, not at the in-repo
+    /// import hole: it may be a module of this service or a package. A
+    /// package the manifest declares is an external import.
+    #[test]
+    fn an_import_nothing_resolves_ends_at_the_unresolved_import_hole() {
+        let chains = chains_with(
+            r#"{ "name": "probe", "dependencies": { "invented-declared": "1.0.0" } }"#,
+            &[(
+                "src/main.ts",
+                r#"import { registry } from "invented-undeclared";
+import { registry as declared } from "invented-declared";
+import { mode } from "@/unmapped/mode";
+
+registry.add((path: string) => path === "/hop-undeclared");
+declared.add((path: string) => path === "/hop-declared");
+
+function check(path: string): boolean {
+  return path === "/follow-alias";
+}
+
+export function read(): boolean {
+  return check(mode);
+}
+"#,
+            )],
+        );
+        let reason = |literal: &str| end_of(&chains, literal)["reason"].clone();
+        assert_eq!(
+            reason("/hop-undeclared"),
+            "unresolved_import",
+            "{chains:#?}"
+        );
+        assert_eq!(reason("/follow-alias"), "unresolved_import", "{chains:#?}");
+        assert_eq!(
+            end_of(&chains, "/hop-declared")["kind"],
+            "external_import",
+            "{chains:#?}"
         );
     }
 
