@@ -5829,7 +5829,11 @@ mod tests {
         assert_eq!(name(13), None, "an object another module writes through");
         assert_eq!(name(14), None, "an object whose inner object is aliased");
         assert_eq!(name(15), None, "a builder handed a parameter");
-        assert_eq!(name(16), None, "a function that does more than return");
+        assert_eq!(
+            name(16).as_deref(),
+            Some("two.z"),
+            "a function that declares a constant before its return (carrick#2447)"
+        );
         assert_eq!(name(17).as_deref(), Some("users"));
         let filled = site(&sites, "src/caller.ts", 2, Some("publish"));
         assert_eq!(filled.literal(0, None), Some("svc.filled"));
