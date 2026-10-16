@@ -25,6 +25,8 @@ const KIT_DTS = `export interface Res {
   status(code: number): Res;
   json(body: unknown): Res;
   send(body?: unknown): Res;
+  set(fields: Record<string, string>): Res;
+  cookie(name: string, value: string, options?: { httpOnly?: boolean; maxAge?: number }): Res;
 }
 export interface Req { body: unknown }
 export declare class App {
@@ -39,6 +41,9 @@ interface Item { id: string; label: string }
 
 declare function save(body: unknown): Promise<{ ok: boolean; item: Item }>;
 declare const code: number;
+declare const token: string;
+declare const fresh: boolean;
+declare function loadUser(): Promise<{ ok: boolean; user: { name: string; email: string } }>;
 
 const app = new App();
 
@@ -88,6 +93,40 @@ app.get('/two-success', async (req, res) => {
     return;
   }
   res.json({ none: true });
+});
+
+app.get('/setter-then-return', async (req, res) => {
+  const loaded = await loadUser();
+  res.set({ 'Cache-Control': 'no-store' });
+  return res.json(loaded.user);
+});
+
+app.post('/cookie-then-return', async (req, res) => {
+  const loaded = await loadUser();
+  res.cookie('s', token, { httpOnly: true });
+  return res.json(loaded.user);
+});
+
+app.post('/conflict-then-setter', async (req, res) => {
+  const loaded = await loadUser();
+  if (!loaded.ok) {
+    res.status(409).json({ clash: true });
+    return;
+  }
+  res.set({ 'Cache-Control': 'no-store' });
+  res.json(loaded.user);
+});
+
+app.get('/guarded-setter', async (req, res) => {
+  const loaded = await loadUser();
+  if (!loaded.ok) {
+    res.status(404).json({ gone: true });
+    return;
+  }
+  if (fresh) {
+    res.set({ 'Cache-Control': 'no-store' });
+  }
+  res.json(loaded.user);
 });
 `;
 
@@ -215,5 +254,39 @@ describe('carrick#2427 a located error send is not the route response', () => {
     assert.ok(got);
     const text = collapse(got.type_string);
     assert.ok(/made/.test(text) && /none/.test(text) && !/bad/.test(text), text);
+  });
+
+  // A setter that returns the response (headers, cookies) is a call whose
+  // result is response machinery, but it sends no body: its object argument
+  // is never a success body, whichever send the locator names.
+  const userOnly = (text: string): boolean =>
+    /name/.test(text) && /email/.test(text) && !/Cache-Control|httpOnly|clash|gone/.test(text);
+
+  it('a setter before a returned send is not a body (located at the send)', async () => {
+    const got = await infer('SetterReturn', '/setter-then-return', 'loaded.user');
+    assert.ok(got);
+    const text = collapse(got.type_string);
+    assert.ok(userOnly(text), text);
+  });
+
+  it('a cookie setter before a returned send is not a body (located at the send)', async () => {
+    const got = await infer('CookieReturn', '/cookie-then-return', 'loaded.user');
+    assert.ok(got);
+    const text = collapse(got.type_string);
+    assert.ok(userOnly(text), text);
+  });
+
+  it('a setter statement after a located error is not a success body', async () => {
+    const got = await infer('ConflictSetter', '/conflict-then-setter', '{ clash: true }');
+    assert.ok(got);
+    const text = collapse(got.type_string);
+    assert.ok(userOnly(text), text);
+  });
+
+  it('a guarded setter does not end the handler, so it is not a success body', async () => {
+    const got = await infer('GuardedSetter', '/guarded-setter', '{ gone: true }');
+    assert.ok(got);
+    const text = collapse(got.type_string);
+    assert.ok(userOnly(text), text);
   });
 });
