@@ -444,7 +444,7 @@ fn the_reader_answers_each_lookup_or_says_why_not() {
             std::env::var("CI").is_err(),
             "node or the built sidecar is missing in CI"
         );
-        eprintln!("Skipping: node or the built sidecar is missing");
+        crate::errln!("Skipping: node or the built sidecar is missing");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -555,56 +555,57 @@ fn census() {
             panic!("<label>=<repo>=<positions dir>: {entry}");
         };
         let census = census_repo(Path::new(root), Path::new(positions));
-        println!(
+        crate::outln!(
             "== {label}: {} service(s), {} without rows {:?}",
             census.services,
             census.services_without_rows.len(),
             census.services_without_rows
         );
         let total: usize = census.rows.values().map(|c| c.rows).sum();
-        println!("  rows {total}");
+        crate::outln!("  rows {total}");
         for (kind, counts) in &census.rows {
-            println!(
+            crate::outln!(
                 "    {kind}: {} rows, any {:.1}%, error type {:.1}%",
                 counts.rows,
                 pct(counts.any, counts.rows),
                 pct(counts.error_type, counts.rows)
             );
         }
-        println!("  files {:?}", census.files);
+        crate::outln!("  files {:?}", census.files);
         for (name, tally) in [
             ("imports", &census.imports),
             ("calls", &census.calls),
             ("globals", &census.globals),
             ("packages", &census.packages),
         ] {
-            println!(
+            crate::outln!(
                 "  {name}: {} site(s), {} find a row ({:.1}%)",
                 tally.total(),
                 tally.found(),
                 pct(tally.found(), tally.total())
             );
             for (key, count) in &tally.0 {
-                println!("    {key}: {count}");
+                crate::outln!("    {key}: {count}");
             }
         }
-        println!(
+        crate::outln!(
             "  import bindings {}, whose uses disagree {}",
-            census.import_bindings, census.imports_disagreeing
+            census.import_bindings,
+            census.imports_disagreeing
         );
-        println!("  call line deltas {:?}", census.call_line_deltas.0);
-        println!(
+        crate::outln!("  call line deltas {:?}", census.call_line_deltas.0);
+        crate::outln!(
             "  error-type ident rows, top 3 services {:?}",
             top3(&census.error_idents_by_service)
         );
-        println!(
+        crate::outln!(
             "  unresolved-import use holes, top 3 services {:?}",
             top3(&census.unresolved_import_uses_by_service)
         );
         for (key, examples) in &census.examples {
-            println!("  e.g. {key}:");
+            crate::outln!("  e.g. {key}:");
             for example in examples {
-                println!("      {example}");
+                crate::outln!("      {example}");
             }
         }
         all.insert(label.to_string(), census);
