@@ -434,6 +434,28 @@ export interface BoundName {
   bound: 'maker' | 'scope';
 }
 
+/**
+ * The function or client a call runs (label structure v2, carrick#2434): a
+ * slot of the call itself, or, with `bound: 'maker'`, a slot of the call that
+ * made the receiver (a mutation object whose `mutate` runs the function its
+ * maker was given).
+ */
+export interface RunsSlot extends ClaimSlot {
+  bound?: 'maker';
+}
+
+/**
+ * What a receive op's handler is handed (label structure v2, carrick#2434):
+ * its parameter `param` is an instance of the package's export `export`, on
+ * `side` of the connection (a server's connection handler is given the
+ * server end of a socket).
+ */
+export interface Yields {
+  param: number;
+  export: string;
+  side: string;
+}
+
 /** The closed role list; the role alone picks the checks a claim needs. */
 export type LibraryRole =
   | 'http_client'
@@ -487,6 +509,8 @@ export type LibraryClaim =
       /** A definition's id or a queue's name: bound to every op that names `{ bound: 'maker' }`. */
       name?: ClaimSlot;
       handler?: ClaimSlot;
+      /** The function or client the maker runs (label v2). */
+      runs?: ClaimSlot;
       key_labels?: Record<string, KeyLabel>;
       name_scope?: NameScope;
       picker?: string;
@@ -526,6 +550,18 @@ export type LibraryClaim =
       method?: string;
       /** HTTP: where the method sits. */
       method_key?: ClaimSlot;
+      /**
+       * HTTP (label v2): the method sent when the call names none. Beside
+       * `method_key`, the default when that option is absent; alone, the one
+       * method the call sends whatever its member is called.
+       */
+      method_default?: string;
+      /** HTTP (label v2): where the base URL the path joins sits. */
+      base?: ClaimSlot;
+      /** Label v2: the function or client the op runs. */
+      runs?: RunsSlot;
+      /** Label v2, `receive` only: what the handler is handed. */
+      yields?: Yields;
     }
   | {
       /** A name the library emits itself, spelled in one of `member`'s parameters. */

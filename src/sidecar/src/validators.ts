@@ -398,6 +398,26 @@ const ClaimSlotSchema = z
 
 const BoundNameSchema = z.object({ bound: z.enum(['maker', 'scope']) }).strict();
 
+/**
+ * Label structure v2 (carrick#2434). The schema takes the shape only: which
+ * method word, side or export a field names is the verifier's per-check
+ * verdict, since one element this schema refuses fails the whole request.
+ */
+const RunsSlotSchema = z
+  .object({
+    arg: z.number().int().nonnegative(),
+    key: z.string().min(1).optional(),
+    bound: z.literal('maker').optional(),
+  })
+  .strict();
+const YieldsSchema = z
+  .object({
+    param: z.number().int().nonnegative(),
+    export: z.string().min(1),
+    side: z.string().min(1),
+  })
+  .strict();
+
 const ClaimOnSchema = z.enum(['export', 'instance', 'both']);
 const MemberPathSchema = z.array(z.string().min(1));
 const KeyLabelsSchema = z.record(z.string().min(1), z.enum(['name', 'not_name']));
@@ -422,6 +442,7 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       prefix: ClaimSlotSchema.optional(),
       name: ClaimSlotSchema.optional(),
       handler: ClaimSlotSchema.optional(),
+      runs: ClaimSlotSchema.optional(),
       key_labels: KeyLabelsSchema.optional(),
       name_scope: NameScopeSchema.optional(),
       picker: z.string().optional(),
@@ -458,6 +479,10 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       options: ClaimSlotSchema.optional(),
       method: z.string().min(1).optional(),
       method_key: ClaimSlotSchema.optional(),
+      method_default: z.string().min(1).optional(),
+      base: ClaimSlotSchema.optional(),
+      runs: RunsSlotSchema.optional(),
+      yields: YieldsSchema.optional(),
     })
     .strict(),
   z

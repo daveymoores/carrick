@@ -797,6 +797,38 @@ pub enum OpName {
     Slot(ClaimSlot),
 }
 
+/// Which call a `runs` slot reads (label structure v2, carrick#2434).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunsBound {
+    /// The call that made the receiver: a mutation object's `mutate` runs the
+    /// function its maker was given.
+    Maker,
+}
+
+/// The function or client a call runs (label structure v2, carrick#2434):
+/// argument `arg` (or its `key`) of the call itself, or, with `bound`, of the
+/// call that made the receiver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunsSlot {
+    pub arg: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<RunsBound>,
+}
+
+/// What a receive op's handler is handed (label structure v2, carrick#2434):
+/// its parameter `param` is an instance of the package's export `export`, on
+/// `side` of the connection. The verifier judges `side` (`client` or
+/// `server`); it is carried as the store wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Yields {
+    pub param: u32,
+    pub export: String,
+    pub side: String,
+}
+
 /// What an `op` claim does on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -878,6 +910,10 @@ pub enum LibraryClaim {
         name: Option<ClaimSlot>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         handler: Option<ClaimSlot>,
+        /// Label v2: the function or client the maker runs (a hook runs the
+        /// query function it is given).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runs: Option<ClaimSlot>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         key_labels: BTreeMap<String, KeyLabel>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -940,6 +976,21 @@ pub enum LibraryClaim {
         /// HTTP: where the method sits.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         method_key: Option<ClaimSlot>,
+        /// HTTP (label v2): the method sent when the call names none. Beside
+        /// `method_key`, the default when that option is absent; alone, the
+        /// one method the call sends whatever its member is called.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        method_default: Option<String>,
+        /// HTTP (label v2): where the base URL the path joins sits.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<ClaimSlot>,
+        /// Label v2: the function or client the op runs. Boxed, as is
+        /// `yields`, so an op stays near the size of the other claims.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runs: Option<Box<RunsSlot>>,
+        /// Label v2, `receive` only: what the handler is handed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        yields: Option<Box<Yields>>,
     },
     /// A name the library emits itself, spelled in one of `member`'s
     /// parameters.
@@ -4928,6 +4979,7 @@ mod tests {
                         prefix: Some(slot()),
                         name: Some(slot()),
                         handler: Some(slot()),
+                        runs: Some(slot()),
                         key_labels: key_labels(),
                         name_scope: Some(name_scope()),
                         picker: Some("model/q1".into()),
@@ -4958,6 +5010,18 @@ mod tests {
                         options: Some(slot()),
                         method: Some("POST".into()),
                         method_key: Some(slot()),
+                        method_default: Some("GET".into()),
+                        base: Some(slot()),
+                        runs: Some(Box::new(RunsSlot {
+                            arg: 0,
+                            key: Some("fn".into()),
+                            bound: Some(RunsBound::Maker),
+                        })),
+                        yields: Some(Box::new(Yields {
+                            param: 0,
+                            export: "Socket".into(),
+                            side: "server".into(),
+                        })),
                     }),
                     library(LibraryClaim::Op {
                         op: LibraryOp::Receive,
@@ -4977,6 +5041,10 @@ mod tests {
                         options: Some(slot()),
                         method: Some("POST".into()),
                         method_key: Some(slot()),
+                        method_default: None,
+                        base: None,
+                        runs: None,
+                        yields: None,
                     }),
                     library(LibraryClaim::Reserved {
                         member: "on".into(),
@@ -5361,6 +5429,7 @@ mod tests {
                         prefix: None,
                         name: Some(slot(0, Some("id"))),
                         handler: Some(slot(0, Some("run"))),
+                        runs: None,
                         key_labels: [
                             ("id".to_string(), KeyLabel::Name),
                             ("description".to_string(), KeyLabel::NotName),
@@ -5396,6 +5465,10 @@ mod tests {
                         options: None,
                         method: None,
                         method_key: None,
+                        method_default: None,
+                        base: None,
+                        runs: None,
+                        yields: None,
                     },
                 ),
                 check(
@@ -5421,6 +5494,10 @@ mod tests {
                         options: None,
                         method: None,
                         method_key: None,
+                        method_default: None,
+                        base: None,
+                        runs: None,
+                        yields: None,
                     },
                 ),
                 check(
@@ -5462,6 +5539,7 @@ mod tests {
                         prefix: None,
                         name: Some(slot(0, None)),
                         handler: Some(slot(1, None)),
+                        runs: None,
                         key_labels: BTreeMap::new(),
                         name_scope: None,
                         picker: None,
@@ -5487,6 +5565,10 @@ mod tests {
                         options: None,
                         method: None,
                         method_key: Some(slot(0, Some("method"))),
+                        method_default: None,
+                        base: None,
+                        runs: None,
+                        yields: None,
                     },
                 ),
             ],
@@ -5587,6 +5669,7 @@ mod tests {
                 prefix: None,
                 name: None,
                 handler: None,
+                runs: None,
                 key_labels: BTreeMap::new(),
                 name_scope: None,
                 picker: None,

@@ -39,7 +39,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::agent_service::AgentCallError;
-use crate::library_claims::{CallClaim, ExportClaims, Side};
+use crate::library_claims::{CallClaim, ExportClaims, Side, SideRule};
 use crate::services::type_sidecar::{LibraryClaim, LibraryRole};
 
 /// The roles this scanner reads rows for: the store spends nothing on others.
@@ -799,13 +799,32 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
             answer.dropped += 1;
             continue;
         };
+        // Label v2 (carrick#2434): the package's type-only packages. A name
+        // that is not a string says nothing and is skipped.
+        let type_packages: Vec<String> = entry
+            .get("type_packages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|name| {
+                name.as_str()
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+            .collect();
         for export in entry
             .get("exports")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            match parse_export(package, version, export, &mut answer.dropped) {
+            match parse_export(
+                package,
+                version,
+                &type_packages,
+                export,
+                &mut answer.dropped,
+            ) {
                 Some(claims) => answer.exports.push(claims),
                 None => answer.dropped += 1,
             }
@@ -819,6 +838,7 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
 fn parse_export(
     package: &str,
     version: &str,
+    type_packages: &[String],
     export: &Value,
     dropped: &mut usize,
 ) -> Option<ExportClaims> {
@@ -828,6 +848,16 @@ fn parse_export(
     let side: Option<Side> = match export.get("side") {
         None | Some(Value::Null) => None,
         Some(side) => Some(serde_json::from_value(side.clone()).ok()?),
+    };
+    // Label v2 (carrick#2434). A label is carried as written; a side rule
+    // this build has no word for drops the export, as an unknown role does.
+    let label = match export.get("label") {
+        None | Some(Value::Null) => None,
+        Some(label) => Some(label.as_str()?.to_string()),
+    };
+    let side_rule: Option<SideRule> = match export.get("side_rule") {
+        None | Some(Value::Null) => None,
+        Some(rule) => Some(serde_json::from_value(rule.clone()).ok()?),
     };
     let elements = |list: &str| -> Vec<Value> {
         export
@@ -871,7 +901,10 @@ fn parse_export(
         specifier,
         export: name,
         role,
+        label,
         side,
+        side_rule,
+        type_packages: type_packages.to_vec(),
         claims,
         calls,
         patterns,
@@ -954,6 +987,13 @@ pub(crate) mod store_bodies {
     /// (`JSON.stringify({ library_claims })`).
     pub const ANSWERED: &str = r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"answered","surface_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","exports":[{"specifier":"lib","export":"default","role":"broker","side":null,"classifier":"jev-test/q1","makes":[],"scopes":[],"ops":[{"op":"send","member":"publish","on":"export","name":{"arg":0},"payload":{"arg":1},"picker":"gemini-test/q1"}],"reserved":[],"calls":[],"patterns":[]}]}]}"#;
 
+    /// The store's 200 body under label structure v2 (carrick#2434), byte
+    /// for byte as carrick-cloud's `lambdas/library-claims/http.test.js`
+    /// case "label v2 rides on the wire" sends it: a `ver` row's
+    /// `type_packages`, a class row's `side_rule` on a picked role and its
+    /// `label` on a class-only role.
+    pub const ANSWERED_V2: &str = r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"answered","surface_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","type_packages":["@types/lib"],"exports":[{"specifier":"lib","export":"Server","role":"socket","side":null,"side_rule":"by_origin","classifier":"jev-test/q1","makes":[],"scopes":[],"ops":[{"op":"send","member":"publish","on":"export","name":{"arg":0},"payload":{"arg":1},"picker":"gemini-test/q1"}],"reserved":[],"calls":[],"patterns":[]},{"specifier":"lib","export":"request","role":"http_client","label":"request_runner","side":null,"classifier":"jev-test/q1","makes":[],"scopes":[],"ops":[],"reserved":[],"calls":[],"patterns":[]}]}]}"#;
+
     /// The same store's 200 body for a package it cannot answer yet: the
     /// case "with no lister pinned, every package is pending and no build
     /// starts".
@@ -962,7 +1002,9 @@ pub(crate) mod store_bodies {
 
 #[cfg(test)]
 mod tests {
-    use super::store_bodies::{ANSWERED as STORE_ANSWERED, PENDING as STORE_PENDING};
+    use super::store_bodies::{
+        ANSWERED as STORE_ANSWERED, ANSWERED_V2 as STORE_ANSWERED_V2, PENDING as STORE_PENDING,
+    };
     use super::*;
     use std::fs;
 
@@ -1828,6 +1870,119 @@ mod tests {
         // Two ops, one call and two exports.
         assert_eq!(answer.dropped, 5);
         assert_eq!(answer.skipped, 2);
+    }
+
+    /// Label structure v2 (carrick#2434): every field the rebuilt store
+    /// writes reads into the claims, and the checks the scanner sends carry
+    /// it on to the verifier.
+    #[test]
+    fn a_label_v2_answer_reads_every_field() {
+        let answer = parse_answer(
+            r#"{"library_claims":[{"package":"fixture-sockets","version":"2.0.0","status":"answered",
+                "type_packages":["@types/fixture-sockets","",7],"exports":[
+                {"specifier":"fixture-sockets","export":"SocketServer","role":"socket","label":"socket_server",
+                 "side":null,"side_rule":"by_origin",
+                 "makes":[{"form":"new","member":null,"runs":{"arg":0,"key":"handler"}}],
+                 "ops":[
+                    {"op":"receive","member":"on","of":"instance:new","handler":{"arg":1},
+                     "yields":{"param":0,"export":"Socket","side":"server"}},
+                    {"op":"request","member":"request","of":"instance:new","name":{"arg":0},
+                     "method_key":{"arg":1,"key":"method"},"method_default":"GET","base":{"arg":2}},
+                    {"op":"request","member":"mutate","of":"instance:new","runs":{"bound":"maker","arg":0}}
+                 ]}]}]}"#,
+        );
+        assert_eq!((answer.answered, answer.dropped), (1, 0));
+        let export = &answer.exports[0];
+        assert_eq!(export.label.as_deref(), Some("socket_server"));
+        assert_eq!(export.side_rule, Some(SideRule::ByOrigin));
+        assert_eq!(
+            export.type_packages,
+            vec!["@types/fixture-sockets".to_string()]
+        );
+        assert_eq!(export.claims.len(), 4);
+        let sent = serde_json::to_value(&export.claims).unwrap();
+        assert_eq!(
+            sent[0]["runs"],
+            serde_json::json!({ "arg": 0, "key": "handler" })
+        );
+        assert_eq!(
+            sent[1]["yields"],
+            serde_json::json!({ "param": 0, "export": "Socket", "side": "server" })
+        );
+        assert_eq!(sent[2]["method_default"], "GET");
+        assert_eq!(sent[2]["base"], serde_json::json!({ "arg": 2 }));
+        assert_eq!(
+            sent[3]["runs"],
+            serde_json::json!({ "bound": "maker", "arg": 0 })
+        );
+    }
+
+    #[test]
+    fn the_store_s_label_v2_body_reads_its_label_side_rule_and_type_packages() {
+        let answer = parse_answer(STORE_ANSWERED_V2);
+        assert_eq!((answer.answered, answer.dropped), (1, 0));
+        type Read<'a> = (&'a str, Option<&'a str>, Option<SideRule>, &'a [String]);
+        let read: Vec<Read> = answer
+            .exports
+            .iter()
+            .map(|export| {
+                (
+                    export.export.as_str(),
+                    export.label.as_deref(),
+                    export.side_rule,
+                    export.type_packages.as_slice(),
+                )
+            })
+            .collect();
+        let types = ["@types/lib".to_string()];
+        assert_eq!(
+            read,
+            vec![
+                ("Server", None, Some(SideRule::ByOrigin), &types[..]),
+                ("request", Some("request_runner"), None, &types[..]),
+            ]
+        );
+    }
+
+    /// A v2 field in a shape this build cannot read drops its element and
+    /// counts it; a side rule it has no word for drops the export.
+    #[test]
+    fn a_label_v2_field_out_of_shape_is_dropped_and_counted() {
+        let answer = parse_answer(
+            r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"answered","exports":[
+                {"specifier":"lib","export":"default","role":"http_client","label":"request_runner","ops":[
+                    {"op":"request","member":"get","on":"export","name":{"arg":0},"method":"GET"},
+                    {"op":"request","member":"get","on":"export","name":{"arg":0},"method_default":5},
+                    {"op":"request","member":"get","on":"export","runs":{"bound":"scope","arg":0}},
+                    {"op":"receive","member":"on","on":"export","yields":{"param":-1,"export":"S","side":"server"}}
+                ]},
+                {"specifier":"lib","export":"Socket","role":"socket","side_rule":"by_mood"},
+                {"specifier":"lib","export":"Labelled","role":"socket","label":7}
+            ]}]}"#,
+        );
+        assert_eq!(answer.exports.len(), 1);
+        assert_eq!(answer.exports[0].label.as_deref(), Some("request_runner"));
+        assert_eq!(answer.exports[0].claims.len(), 1);
+        // Three ops and two exports.
+        assert_eq!(answer.dropped, 5);
+    }
+
+    /// An answer in the shape before label v2 reads as it did, and its
+    /// claims go to the verifier byte for byte as before: no v2 key appears.
+    #[test]
+    fn an_answer_in_today_s_shape_reads_and_sends_unchanged() {
+        let answer = parse_answer(STORE_ANSWERED);
+        let export = &answer.exports[0];
+        assert_eq!((export.label.as_ref(), export.side_rule), (None, None));
+        assert!(export.type_packages.is_empty());
+        assert_eq!(
+            serde_json::to_string(&export.claims).unwrap(),
+            r#"[{"kind":"op","op":"send","member":"publish","on":"export","name":{"arg":0},"payload":{"arg":1},"picker":"gemini-test/q1"}]"#
+        );
+        let carried = serde_json::to_value(export).unwrap();
+        for key in ["label", "side_rule", "type_packages"] {
+            assert!(carried.get(key).is_none(), "{key} is written though absent");
+        }
     }
 
     #[test]
