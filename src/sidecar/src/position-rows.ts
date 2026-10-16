@@ -392,6 +392,9 @@ function toSlashes(p: string): string {
 }
 
 /** The rows of one program's files. */
+/** A module symbol's name when the compiler spells it as an absolute file name. */
+const QUOTED_ABSOLUTE_MODULE_NAME = /^"(?:\/|[A-Za-z]:[\\/])/;
+
 class PositionWalker {
   private readonly checker: ts.TypeChecker;
 
@@ -429,23 +432,28 @@ class PositionWalker {
       if (!symbol) return [kind, start, end, null, null, null, null, typeText, flags];
       const declaration = attributedDeclaration(() => this.program, symbol.declarations ?? []);
       if (!declaration) return [kind, start, end, ts.symbolName(symbol), null, null, null, typeText, flags];
-      // A file's own module symbol is named by the compiler as the quoted
-      // absolute file name (`"/<checkout>/pkg/index"`). Name it as `decl_file`
-      // names the file. A symbol that merely lives in a file (CommonJS
-      // `exports`) keeps its name.
+      // The compiler names a file's module symbol by the quoted absolute file
+      // name (`"/<checkout>/pkg/index"`), whatever declaration the row
+      // attributes it to. Name it as `decl_file` names a file. A symbol
+      // that merely lives in a file (CommonJS `exports`) keeps its name.
       const symbolName = ts.symbolName(symbol);
-      const isModule = declaration.kind === ts.SyntaxKind.SourceFile && symbolName.startsWith('"');
+      const isModule = QUOTED_ABSOLUTE_MODULE_NAME.test(symbolName);
       const declaringFile = declaration.getSourceFile();
-      const declFile = this.program.isSourceFileDefaultLibrary(declaringFile)
-        ? `lib:${path.basename(declaringFile.fileName)}`
-        : this.paths.declaringFile(declaringFile.fileName);
+      const nameOf = (file: ts.SourceFile): string | null =>
+        this.program.isSourceFileDefaultLibrary(file)
+          ? `lib:${path.basename(file.fileName)}`
+          : this.paths.declaringFile(file.fileName);
+      const declFile = nameOf(declaringFile);
       if (declFile === null) flags |= FLAG_DECLARATION_UNNAMED;
       const declLine =
         declaringFile.getLineAndCharacterOfPosition(declaration.getStart(declaringFile)).line + 1;
       const declPackage = this.paths.declaringPackage(declaringFile.fileName, (file) =>
         this.loader.packageOf(file)
       );
-      const name = isModule ? declFile : symbolName;
+      // The module's own file, not the declaration the row attributes: a
+      // module augmentation in another file can sort first.
+      const moduleFile = isModule ? (symbol.declarations ?? []).find(ts.isSourceFile) : undefined;
+      const name = isModule ? (moduleFile ? nameOf(moduleFile) : null) : symbolName;
       return [kind, start, end, name, declFile, declLine, declPackage, typeText, flags];
     } catch {
       return [kind, start, end, null, null, null, null, null, FLAG_CHECKER_THREW];

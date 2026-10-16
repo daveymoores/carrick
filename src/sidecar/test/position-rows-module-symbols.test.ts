@@ -21,6 +21,8 @@ const FILES: Record<string, string> = {
   'node_modules/dep/package.json': '{"name":"dep","version":"1.0.0","types":"index.d.ts"}',
   'node_modules/dep/index.d.ts': 'export declare function fetchIt(url: string): Promise<string>;\n',
   'src/mod.ts': 'export function inside(): number { return 1; }\n',
+  // Sorts before mod.ts, so the row attributes the namespace to this file.
+  'src/aug.ts': 'import "./mod";\ndeclare module "./mod" { export interface Extra { n: number } }\nexport {};\n',
   'src/barrel.ts': 'export * as modNs from "./mod";\n',
   'src/main.ts': [
     'import * as dep from "dep";',
@@ -98,7 +100,11 @@ describe('position_rows: module symbols carry no absolute path (carrick#2419)', 
     }
     const idents = one.rows.filter((r) => r[0] === 'ident' && (r[4] ?? '').length > 0);
     assert.ok(idents.some((r) => r[3] === 'node_modules/dep/index.d.ts' && r[4] === r[3]), 'the installed package namespace');
-    assert.ok(idents.some((r) => r[3] === 'src/mod.ts' && r[4] === r[3]), 'the repo module through the re-export');
+    assert.ok(idents.some((r) => r[3] === 'src/mod.ts'), 'the repo module through the re-export');
+    assert.ok(
+      idents.every((r) => r[3] !== 'src/aug.ts'),
+      'a module augmentation in another file does not rename the module'
+    );
   });
 
   it('writes byte-identical rows from two checkout paths', () => {
