@@ -1274,6 +1274,7 @@ pub fn extract_file_ir(
         imports: HashSet::new(),
         uses: uses.uses,
         object_consts: object_consts(module),
+        object_lits: HashMap::new(),
         subclass_fields: subclass_members(&classes, |class| &class.fields),
         subclass_methods: subclass_members(&classes, |class| &class.methods),
         class_this: library_sites::class_this(module),
@@ -1382,6 +1383,9 @@ pub fn extract_file_ir(
                             .builders
                             .insert((ident_key(&ident.id), path), builder);
                     }
+                    module_scope
+                        .object_lits
+                        .insert(ident_key(&ident.id), object.clone());
                 }
                 if !matches!(&**init, Expr::Arrow(_) | Expr::Fn(_)) {
                     let (value, client, text) = {
@@ -1647,6 +1651,10 @@ struct ModuleScope {
     uses: HashMap<String, BindingUse>,
     /// Names declared once in the file, by `const <name> = { … }`.
     object_consts: HashSet<String>,
+    /// The literal of each module-scope `const` object the file never writes
+    /// through, by binding: what a serialised name states
+    /// ([`library_sites::serialised_operand`], carrick#2453).
+    object_lits: HashMap<BindingKey, ObjectLit>,
     /// Class name -> the fields a class in this file that extends it
     /// declares or writes again.
     subclass_fields: HashMap<String, HashSet<String>>,
@@ -4446,11 +4454,8 @@ impl Reader<'_> {
             Expr::Object(obj) => Value::Obj(self.object(obj, scope)),
             Expr::Call(call) => {
                 // `JSON.stringify(body)` is the body it serialises.
-                if is_member_call(call, "JSON", "stringify")
-                    && let Some(arg) = call.args.first()
-                    && arg.spread.is_none()
-                {
-                    return self.eval(&arg.expr, scope);
+                if let Some(operand) = library_sites::serialised_operand(call) {
+                    return self.eval(operand, scope);
                 }
                 // `usersPath(id)`, `ENDPOINTS.users.byId(id)`: what the
                 // builder returns, with the call's arguments in its
