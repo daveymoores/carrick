@@ -16,7 +16,9 @@
 //!    rows file;
 //! 4. off means off: a scan without `CARRICK_POSITION_ROWS=1` asks no walk
 //!    and writes no `positions/` directory, and a scan with it writes the rows
-//!    and the same blob.
+//!    and the same blob;
+//! 5. every service's walk has exited before the first analysis sidecar
+//!    starts (carrick#2413 slice G1).
 //!
 //! The census at the end (`#[ignore]`) measures join coverage and what the
 //! rows hold on any repo with a rows file.
@@ -605,6 +607,111 @@ fn assert_walk_first(events: &[String]) -> PathBuf {
         "the walk's process was alive when the analysis sidecar started: {events:?}"
     );
     PathBuf::from(out)
+}
+
+/// A repo of two services, each a directory with its own manifest and one
+/// source file that calls the other.
+fn two_service_repo(root: &Path) -> PathBuf {
+    let repo = root.join("two");
+    let write = |relative: &str, contents: &str| {
+        let path = repo.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    };
+    write(
+        "carrick.json",
+        r#"{ "services": [
+  { "name": "orders", "directory": "services/orders" },
+  { "name": "billing", "directory": "services/billing" }
+] }"#,
+    );
+    write("package.json", r#"{ "name": "two", "private": true }"#);
+    for (service, other) in [("orders", "billing"), ("billing", "orders")] {
+        write(
+            &format!("services/{service}/package.json"),
+            &format!(r#"{{ "name": "{service}" }}"#),
+        );
+        write(
+            &format!("services/{service}/src/index.ts"),
+            &format!(
+                "export async function ask{other}(id: string): Promise<number> {{\n  \
+                 const response = await fetch(`http://{other}/items/${{id}}`);\n  \
+                 return response.status;\n}}\n"
+            ),
+        );
+    }
+    repo
+}
+
+/// carrick#2413 slice G1: every service's walk runs before the loop, so
+/// each walk's process has exited before the first analysis sidecar starts,
+/// and the blobs are the ones a scan without walks writes.
+#[test]
+fn every_walk_ends_before_the_first_analysis_sidecar_starts() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = two_service_repo(&fs::canonicalize(dir.path()).unwrap());
+
+    let off_store = tempfile::tempdir().unwrap();
+    let off = scan(&repo, false, false, Some(off_store.path()), None);
+    let on_store = tempfile::tempdir().unwrap();
+    let on = scan(&repo, true, false, Some(on_store.path()), None);
+
+    let split = |line: &String| line.split(' ').map(str::to_string).collect::<Vec<_>>();
+    let walks: BTreeSet<String> = on
+        .events
+        .iter()
+        .map(split)
+        .filter(|parts| parts.len() == 4 && parts[0] == "action" && parts[2] == "position_rows")
+        .map(|parts| parts[1].clone())
+        .collect();
+    assert_eq!(walks.len(), 2, "one walk a service: {:?}", on.events);
+    let starts: Vec<Vec<String>> = on
+        .events
+        .iter()
+        .filter(|line| line.starts_with("start "))
+        .map(split)
+        .collect();
+    let first_walk = starts
+        .iter()
+        .position(|start| walks.contains(&start[1]))
+        .expect("the walks' processes started");
+    // Every process after the first walk that is not a walk is an analysis
+    // sidecar; the run's own sidecar started before any walk.
+    let analyses: Vec<&Vec<String>> = starts[first_walk..]
+        .iter()
+        .filter(|start| !walks.contains(&start[1]))
+        .collect();
+    assert_eq!(
+        analyses.len(),
+        2,
+        "one analysis sidecar a service: {starts:?}"
+    );
+    let first_analysis = starts
+        .iter()
+        .position(|start| start == analyses[0])
+        .unwrap();
+    assert!(
+        starts[first_analysis..]
+            .iter()
+            .all(|start| !walks.contains(&start[1])),
+        "a walk started after the first analysis sidecar: {starts:?}"
+    );
+    for analysis in analyses {
+        let alive = analysis.get(2).map(String::as_str).unwrap_or("");
+        assert!(
+            !alive.split(',').any(|pid| walks.contains(pid)),
+            "a walk's process was alive when an analysis sidecar started: {starts:?}"
+        );
+    }
+    assert_eq!(off.blobs.len(), 2, "one blob a service");
+    assert_eq!(
+        on.blobs, off.blobs,
+        "walking ahead of the loop moved a blob"
+    );
 }
 
 /// carrick#2413: with no local store (the Action, the cloud runner) the flag

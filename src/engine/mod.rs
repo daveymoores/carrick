@@ -52,6 +52,7 @@ pub mod service_workers;
 pub mod setup_ahead;
 pub(crate) mod type_compat_v2;
 pub(crate) mod upload_boundary;
+mod walk_lane;
 
 /// Current cache format version.
 ///
@@ -1035,35 +1036,64 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .filter(|(_, at)| at.is_some())
         .map(|(service, _)| service.clone())
         .collect();
-    // Every service's detection and guidance, asked for from here on beside
-    // the loop below instead of one service at a time inside it
-    // (carrick#1895). Dropped with this function, which ends every ask.
-    let setups = setup_ahead::SetupsAhead::start(repo_path, &analysed, |service| {
-        if no_cache {
-            return None;
-        }
-        previous_generation(previous_generations, &repo_name, service)
-            .map(setup_ahead::StoredSetup::of)
-    });
-    let scan = std::sync::Arc::new(ServiceScan {
-        repo_path: repo_path.to_string(),
-        services: analysed.into(),
-        sidecar: sidecar.map(TypeSidecar::recipe),
-        run_intents,
-        graphql_schemas,
-        setups: std::sync::Arc::new(setups),
-        workspace: workspace_scan,
-    });
-    let upload_blocked = multi_service && !storage.supports_multi_service();
+    let recipe = sidecar.map(TypeSidecar::recipe);
     // Several services at once, each on a thread of its own and each started
     // in declared order (carrick#1066). A failure in one stops none of the
     // others, and each result is kept at its service's index. A carried
     // service is no job: it is never handed to a worker.
-    let width = service_workers::width(scan.services.len(), crate::analysis_channel::dispatching());
+    let width = service_workers::width(analysed.len(), crate::analysis_channel::dispatching());
     debug!(
         "Analysing services {} at a time: {}",
         width.count, width.why
     );
+    // The pass is timed from here: the walks are part of it, as they were
+    // when each ran inside the loop.
+    let pass_started = Instant::now();
+    // Every analysed service's compiler walk, when the run walks, in a lane
+    // of its own that ends before the loop starts (carrick#2413 slice G1).
+    let walking = walk_lane::requested();
+    let (walk_ends, walked) = if walking {
+        walk_lane::signals(analysed.len())
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let lane = walk_lane::walk_all(
+        recipe.clone(),
+        repo_path,
+        if walking { &analysed } else { &[] },
+        width.count,
+        walk_ends,
+    );
+    // Every service's detection and guidance, asked for from here on beside
+    // the loop below instead of one service at a time inside it
+    // (carrick#1895), each once its own walk has ended. Dropped with this
+    // function, which ends every ask.
+    let setups = setup_ahead::SetupsAhead::start(
+        repo_path,
+        &analysed,
+        |service| {
+            if no_cache {
+                return None;
+            }
+            previous_generation(previous_generations, &repo_name, service)
+                .map(setup_ahead::StoredSetup::of)
+        },
+        walked,
+    );
+    // The loop starts once every walk has ended: no walk process is alive
+    // beside an analysis sidecar.
+    let walks = lane.await;
+    let scan = std::sync::Arc::new(ServiceScan {
+        repo_path: repo_path.to_string(),
+        services: analysed.into(),
+        sidecar: recipe,
+        run_intents,
+        graphql_schemas,
+        setups: std::sync::Arc::new(setups),
+        workspace: workspace_scan,
+        walks: walking.then_some(walks),
+    });
+    let upload_blocked = multi_service && !storage.supports_multi_service();
     let jobs: Vec<ServiceJob> = services
         .iter()
         .zip(&scan_index)
@@ -1080,7 +1110,6 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             generation: PreviousGeneration::Stored,
         })
         .collect();
-    let pass_started = Instant::now();
     let outcomes = scan.analyze_all(jobs, width.count).await;
     crate::scan_timing::pass_ended(pass_started.elapsed().as_secs_f64());
     let mut runs: Vec<ServiceRun> = Vec::with_capacity(services.len());
@@ -2188,6 +2217,10 @@ struct ServiceScan {
     /// The repo-wide external-call pass, built by the first service to ask
     /// and read by the rest.
     workspace: std::sync::Arc<crate::external_call_candidates::WorkspaceScan>,
+    /// Each analysed service's walk, by its index, when the run walks
+    /// (carrick#2413): read by its analysis and by the owed-work retry, and
+    /// kept until the run ends.
+    walks: Option<Vec<walk_lane::Walked>>,
 }
 
 /// One service's analysis in this run, and what it still owes.
@@ -2354,12 +2387,16 @@ impl ServiceScan {
         let packages_took = service_started.elapsed();
 
         // The compiler's rows for every position of the service's files
-        // (carrick#2405), when asked for, read once before discovery
-        // (carrick#2413). Walked in a process of their own that has exited
-        // before the analysis sidecar below starts, so the two programs
-        // never share a heap. Outside the local and model split: the walk
-        // is neither the analysis nor its wait.
-        let positions = walk_position_rows(self.sidecar.as_ref(), &self.repo_path, service);
+        // (carrick#2405), when asked for, read before discovery
+        // (carrick#2413). Walked in the lane before the loop, in a process
+        // that exited before any analysis sidecar started, so the two
+        // programs never share a heap. Outside the local and model split:
+        // the walk is neither the analysis nor its wait.
+        let positions = self
+            .walks
+            .as_ref()
+            .and_then(|walks| walks.get(index))
+            .map(walk_lane::Walked::index);
 
         // A sidecar process of the service's own, scoped to its directory and
         // tsconfig, at the full heap cap. It is dropped, and its process
@@ -6769,56 +6806,6 @@ fn service_sidecar_root(repo_path: &str, service: &Config) -> std::path::PathBuf
         Some(dir) => canonical.join(dir),
         None => canonical,
     }
-}
-
-/// Walk the service's per-position compiler rows and read them, when the run
-/// asks for them (`CARRICK_POSITION_ROWS=1`, carrick#2405, carrick#2413):
-/// written beside its blob with a local store, under the OS temp dir
-/// otherwise, and named by the stem the blob will carry. The files are the
-/// ones discovery walks; every path is sent under the repo's canonical root,
-/// as the service's sidecar root is.
-///
-/// Off, this spawns nothing, writes nothing and is `None`. On, it is an
-/// index whatever happened: a run with no sidecar, or a walk that failed,
-/// gives one with no rows, every lookup in which is a hole. A walk that
-/// fails says so in the run log, and nothing else.
-fn walk_position_rows(
-    recipe: Option<&crate::services::type_sidecar::SidecarRecipe>,
-    repo_path: &str,
-    service: &Config,
-) -> Option<crate::position_rows::PositionIndex> {
-    let canonical = canonical_repo_path(repo_path);
-    let out = crate::position_rows::destination(
-        &get_repository_name(&canonical),
-        service.service_name.as_deref(),
-    )?;
-    let scan_root = PathBuf::from(&canonical);
-    let label = service.service_name.as_deref().unwrap_or("(root)");
-    let Some(recipe) = recipe else {
-        return Some(crate::position_rows::PositionIndex::missing(&scan_root));
-    };
-    let mut files: Vec<std::path::PathBuf> =
-        walk_service(repo_path, service, &service_ignore_patterns(service))
-            .files
-            .iter()
-            .map(|file| scan_root.join(file.strip_prefix(repo_path).unwrap_or(file)))
-            .collect();
-    files.sort();
-    let service_root = service_sidecar_root(repo_path, service);
-    let walk = crate::position_rows::ServiceWalk {
-        service_root: &service_root,
-        tsconfig: service.tsconfig.as_deref(),
-        scan_root: &scan_root,
-        files: &files,
-        out: out.path(),
-        service: label,
-    };
-    if let Err(error) = crate::position_rows::record_service_rows(recipe, &walk) {
-        debug!("Position rows for service {label} were not written: {error}");
-        return Some(crate::position_rows::PositionIndex::missing(&scan_root));
-    }
-    // Read once; a temporary rows file goes when `out` is dropped here.
-    Some(crate::position_rows::load_index(&out, &scan_root, label))
 }
 
 /// A sidecar process of the service's own, scoped to its directory and

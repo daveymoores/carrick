@@ -65,6 +65,7 @@ use tokio::sync::{Notify, Semaphore, oneshot};
 use tracing::{debug, info};
 
 use super::durability::ModelSetup;
+use super::walk_lane::WalkEnded;
 use super::{CACHE_VERSION, PreviousGeneration, SettledDetection, guidance_is_keyed};
 use crate::agents::framework_guidance_agent::ProtocolGuidance;
 use crate::cloud_storage::CloudRepoData;
@@ -556,6 +557,36 @@ struct AskAhead {
 struct ServiceAhead {
     config: Config,
     stored: Option<StoredSetup>,
+    /// Heard once the service's walk has ended, when the run walks
+    /// (carrick#2413 slice G1).
+    walked: Option<WalkEnded>,
+}
+
+/// Wait until the service's walk has ended, however it ended, when the run
+/// walks; at once when it does not.
+///
+/// A setup is planned once its own service's walk is over and no sooner, so
+/// the walks run before the loop and each setup is asked beside the walks
+/// still to come. Waiting for every walk instead would hold the first
+/// setup until the lane ends, and the loop with it.
+async fn once_walked(walked: Option<WalkEnded>) {
+    if let Some(walked) = walked {
+        let _ = walked.await;
+    }
+}
+
+/// Plan `service`'s setup once its own walk has ended ([`once_walked`]), then
+/// run `read` off the runtime's own threads: it walks and parses the
+/// service's files.
+async fn plan_after_walk<R>(mut service: ServiceAhead, read: R) -> Option<(String, AskAhead)>
+where
+    R: FnOnce(ServiceAhead) -> Option<(String, AskAhead)> + Send + 'static,
+{
+    once_walked(service.walked.take()).await;
+    tokio::task::spawn_blocking(move || read(service))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Run `read` with nothing it logs written anywhere.
@@ -622,12 +653,16 @@ pub(super) struct SetupsAhead {
 impl SetupsAhead {
     /// Start asking for the setups of `services`, in order. `stored` is the
     /// part of a service's previous generation its setup is decided on.
+    /// `walked` is heard as each service's walk ends, position for position,
+    /// and is empty when the run walks nothing: each setup is planned once
+    /// its own walk is over ([`once_walked`]).
     ///
     /// Asks nothing when the scan uses no model, or [`IN_FLIGHT_ENV`] is `0`.
     pub(super) fn start(
         repo_path: &str,
         services: &[Config],
         stored: impl Fn(&Config) -> Option<StoredSetup>,
+        walked: Vec<WalkEnded>,
     ) -> Self {
         let turns = AskTurns::default();
         let bound = match Bound::of_run() {
@@ -640,12 +675,14 @@ impl SetupsAhead {
                 };
             }
         };
+        let mut walked = walked.into_iter();
         let (queue, slots): (Vec<_>, Vec<_>) = services
             .iter()
             .map(|config| {
                 let (queued, slot) = queue_place(ServiceAhead {
                     config: config.clone(),
                     stored: stored(config),
+                    walked: walked.next(),
                 });
                 (queued, Some(slot))
             })
@@ -661,16 +698,9 @@ impl SetupsAhead {
                 || !crate::retry_budget::remaining().is_zero(),
                 move |service: ServiceAhead| {
                     let repo_path = repo_path.clone();
-                    async move {
-                        // The read walks and parses the service's files, so
-                        // it runs off the runtime's own threads.
-                        tokio::task::spawn_blocking(move || {
-                            quietly(|| read_ask(&repo_path, service))
-                        })
-                        .await
-                        .ok()
-                        .flatten()
-                    }
+                    plan_after_walk(service, move |service| {
+                        quietly(|| read_ask(&repo_path, service))
+                    })
                 },
                 move |ask: AskAhead| {
                     let turns = ask_turns.clone();
@@ -1396,7 +1426,51 @@ pub(crate) mod tests {
         ServiceAhead {
             config: Config::default(),
             stored,
+            walked: None,
         }
+    }
+
+    /// A setup is not read until its own service's walk has ended, however it
+    /// ended; a service with no walk to wait for is read at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_setup_waits_for_its_own_walk_before_its_plan_is_read() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        let mut waiting = ahead(None);
+        waiting.walked = Some(receiver);
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = ran.clone();
+        let planned = tokio::spawn(plan_after_walk(waiting, move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            None
+        }));
+        for _ in 0..5 {
+            sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "read ran before the walk ended"
+        );
+        drop(sender);
+        assert!(planned.await.unwrap().is_none());
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "read ran once the walk ended"
+        );
+
+        let seen = ran.clone();
+        let at_once = plan_after_walk(ahead(None), move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            None
+        })
+        .await;
+        assert!(at_once.is_none());
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            2,
+            "no walk to wait for: read at once"
+        );
     }
 
     /// What the loop reads for the service at `repo`: its manifests, their
@@ -1605,6 +1679,71 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// The compiler walks of [`LOGGED`]'s 43 services, in tenths of a second
+    /// and in the same order, as a $0 replay of its repository timed them
+    /// (carrick#2413 slice G scoping). Each pair is the whole walk, then the
+    /// walk up to the end of its imports pass, which a walk that hands its
+    /// list on before the write would give (slice G4). They sum to 134.5 s
+    /// and 113.4 s.
+    const WALKED: [(u64, u64); 43] = [
+        (21, 18),
+        (13, 12),
+        (20, 18),
+        (39, 22),
+        (13, 12),
+        (30, 19),
+        (14, 13),
+        (18, 16),
+        (23, 16),
+        (16, 14),
+        (15, 14),
+        (14, 13),
+        (20, 17),
+        (14, 13),
+        (16, 14),
+        (78, 71),
+        (15, 14),
+        (23, 22),
+        (74, 67),
+        (18, 16),
+        (23, 20),
+        (20, 18),
+        (17, 15),
+        (21, 19),
+        (18, 13),
+        (21, 16),
+        (18, 15),
+        (12, 12),
+        (18, 17),
+        (17, 13),
+        (21, 18),
+        (17, 15),
+        (20, 16),
+        (17, 14),
+        (135, 90),
+        (38, 25),
+        (15, 14),
+        (13, 13),
+        (17, 15),
+        (19, 14),
+        (71, 45),
+        (14, 13),
+        (269, 263),
+    ];
+
+    /// Where a replay runs each service's walk.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Walks {
+        /// None: the queue as carrick#1895 merged it.
+        None,
+        /// Inside the loop, before each service's analysis, with every setup
+        /// asked from the scan's start: the walk as slice A placed it.
+        InTheLoop,
+        /// In a lane, one at a time, before the loop; each setup planned once
+        /// its own walk ends ([`once_walked`]): slice G1.
+        InTheLane,
+    }
+
     /// What a replay of [`LOGGED`] came to.
     struct Replayed {
         /// How long the loop waited for each service's setup.
@@ -1614,6 +1753,11 @@ pub(crate) mod tests {
         /// When the last service's analysis ended.
         pass_took: Duration,
         drained: Drained,
+        /// When each service's walk ended, its setup's plan began, and the
+        /// loop reached the service, from the replay's start.
+        walk_ended: Vec<Duration>,
+        planned: Vec<Duration>,
+        reached: Vec<Duration>,
     }
 
     /// Replay [`LOGGED`] through the queue and a loop that analyses the
@@ -1623,6 +1767,19 @@ pub(crate) mod tests {
     /// the log: the first is answered by the model and the rest from what the
     /// cloud kept, whichever service comes to ask first.
     async fn replay(bound: Bound) -> Replayed {
+        replay_walked(bound, Walks::None).await
+    }
+
+    /// [`replay`] with [`WALKED`]'s walks run where `walks` says.
+    async fn replay_walked(bound: Bound, walks: Walks) -> Replayed {
+        let at = |times: &Arc<Mutex<Vec<Duration>>>, service: usize, began: Instant| {
+            times.lock().unwrap()[service] = began.elapsed();
+        };
+        let times = || Arc::new(Mutex::new(vec![Duration::ZERO; LOGGED.len()]));
+        let (walk_ended, planned) = (times(), times());
+        let (ends, walked) = super::super::walk_lane::signals(LOGGED.len());
+        let walked = Arc::new(Mutex::new(walked.into_iter().map(Some).collect::<Vec<_>>()));
+        let (lane_ended, lane_heard) = oneshot::channel::<()>();
         let turns = AskTurns::default();
         let mut logged_guidance: HashMap<usize, VecDeque<u64>> = HashMap::new();
         for (_, _, guidance, _, lists, _) in LOGGED {
@@ -1635,14 +1792,42 @@ pub(crate) mod tests {
         let (queue, slots) = places::<()>(LOGGED.len());
         let began = Instant::now();
 
+        // The lane: every walk one after another, each heard as it ends.
+        let lane_walk_ended = walk_ended.clone();
+        let lane = (walks == Walks::InTheLane).then(|| {
+            tokio::spawn(async move {
+                for (service, end) in ends.into_iter().enumerate() {
+                    sleep(tenths(WALKED[service].0)).await;
+                    at(&lane_walk_ended, service, began);
+                    drop(end);
+                }
+                drop(lane_ended);
+            })
+        });
+        // Without a lane no setup waits for a walk.
+        if walks != Walks::InTheLane {
+            walked
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .for_each(|walk| *walk = None);
+        }
+
+        let (queue_walked, queue_planned) = (walked.clone(), planned.clone());
         let queue = tokio::spawn(async move {
             let drained = drain(
                 queue,
                 bound,
                 || true,
-                |service: usize| async move {
-                    sleep(tenths(LOGGED[service].0)).await;
-                    Some((service.to_string(), service))
+                |service: usize| {
+                    let walk = queue_walked.lock().unwrap()[service].take();
+                    let planned = queue_planned.clone();
+                    async move {
+                        once_walked(walk).await;
+                        at(&planned, service, began);
+                        sleep(tenths(LOGGED[service].0)).await;
+                        Some((service.to_string(), service))
+                    }
                 },
                 move |service: usize| {
                     let (turns, logged_guidance) = (turns.clone(), logged_guidance.clone());
@@ -1669,8 +1854,16 @@ pub(crate) mod tests {
             (drained, began.elapsed())
         });
 
+        // The loop starts once the lane has ended.
+        let _ = lane_heard.await;
         let mut waited = Vec::new();
+        let mut reached = Vec::new();
         for (service, slot) in slots.into_iter().enumerate() {
+            reached.push(began.elapsed());
+            if walks == Walks::InTheLoop {
+                sleep(tenths(WALKED[service].0)).await;
+                at(&walk_ended, service, began);
+            }
             let (read, .., rest) = LOGGED[service];
             sleep(tenths(read)).await;
             let waiting = Instant::now();
@@ -1682,11 +1875,18 @@ pub(crate) mod tests {
         }
         let pass_took = began.elapsed();
         let (drained, queue_took) = queue.await.unwrap();
+        if let Some(lane) = lane {
+            lane.await.unwrap();
+        }
+        let times = |times: Arc<Mutex<Vec<Duration>>>| times.lock().unwrap().clone();
         Replayed {
             waited,
             queue_took,
             pass_took,
             drained,
+            walk_ended: times(walk_ended),
+            planned: times(planned),
+            reached,
         }
     }
 
@@ -1775,6 +1975,84 @@ pub(crate) mod tests {
         assert!(
             waited > replayed.waited[0],
             "and more than at four at a time"
+        );
+    }
+
+    /// carrick#2413 slice G1: the same first index with its compiler walks,
+    /// [`WALKED`]. Walked in a lane before the loop, each setup planned as
+    /// its own walk ends, the setups are all answered by the time the lane
+    /// ends: the loop waits for none of them, and the pass is no longer than
+    /// with each walk inside the loop.
+    #[tokio::test(start_paused = true)]
+    async fn walked_before_the_loop_the_setups_are_answered_while_the_walks_run() {
+        let whole: u64 = WALKED.iter().map(|(whole, _)| whole).sum();
+        let to_imports: u64 = WALKED.iter().map(|(_, imports)| imports).sum();
+        assert_eq!((whole, to_imports), (1_345, 1_134), "134.5 s and 113.4 s");
+
+        let no_walk = replay(bound(MAX_IN_FLIGHT)).await;
+        let in_the_loop = replay_walked(bound(MAX_IN_FLIGHT), Walks::InTheLoop).await;
+        let in_the_lane = replay_walked(bound(MAX_IN_FLIGHT), Walks::InTheLane).await;
+
+        assert_eq!(in_the_lane.drained.asked, 43);
+        assert_eq!(
+            in_the_lane.waited,
+            vec![Duration::ZERO; 43],
+            "the loop waited for a setup after the lane"
+        );
+        assert!(
+            in_the_lane.pass_took <= in_the_loop.pass_took,
+            "the lane's pass {:?} is longer than the walks in the loop {:?}",
+            in_the_lane.pass_took,
+            in_the_loop.pass_took
+        );
+        let waited = |replayed: &Replayed| replayed.waited.iter().sum::<Duration>();
+        eprintln!(
+            "replay with walks: no walk {:.1}s (loop waited {:.1}s); walks in the loop {:.1}s \
+             (waited {:.1}s); walks in a lane {:.1}s (waited {:.1}s); every setup answered \
+             after {:.1}s",
+            no_walk.pass_took.as_secs_f64(),
+            waited(&no_walk).as_secs_f64(),
+            in_the_loop.pass_took.as_secs_f64(),
+            waited(&in_the_loop).as_secs_f64(),
+            in_the_lane.pass_took.as_secs_f64(),
+            waited(&in_the_lane).as_secs_f64(),
+            in_the_lane.queue_took.as_secs_f64(),
+        );
+    }
+
+    /// A setup's plan begins once its own service's walk has ended, and
+    /// before the loop reaches the service: the first setup does not wait for
+    /// the other walks, and none waits for the loop.
+    #[tokio::test(start_paused = true)]
+    async fn a_setup_is_planned_once_its_own_walk_ends_and_before_the_loop_reaches_it() {
+        let replayed = replay_walked(bound(MAX_IN_FLIGHT), Walks::InTheLane).await;
+        let lane_ended = *replayed.walk_ended.last().unwrap();
+        assert_eq!(lane_ended, tenths(1_345));
+        for service in 0..LOGGED.len() {
+            let (ended, planned, reached) = (
+                replayed.walk_ended[service],
+                replayed.planned[service],
+                replayed.reached[service],
+            );
+            assert!(
+                ended <= planned,
+                "service {service} was planned at {planned:?}, before its walk ended at \
+                 {ended:?}"
+            );
+            assert!(
+                planned < reached,
+                "service {service} was planned at {planned:?}, once the loop had reached it \
+                 at {reached:?}"
+            );
+        }
+        assert_eq!(
+            replayed.planned[0],
+            tenths(WALKED[0].0),
+            "the first setup is planned as the first walk ends, not as the lane does"
+        );
+        assert!(
+            replayed.reached[0] >= lane_ended,
+            "the loop began in the lane"
         );
     }
 }
