@@ -186,13 +186,13 @@ use alternatives::{Alternation, Alternatives};
 // the offline census read it so far, so the binary sees it as unused.
 #[allow(dead_code)]
 mod guards;
-use guards::{GuardIr, Root, Subject, Tested, WrittenIn};
+use guards::{GuardIr, Subject, Tested, WrittenIn};
 
 #[allow(unused_imports)]
 pub use guards::{
     Branch, CallChain, CallFunction, CallName, CallStart, ChainEnd, ChainSite, Conjoined, Constant,
     GuardChain, GuardPosition, GuardShape, HoleReason, Hop, HopArg, LibraryReceiver, NameFrom,
-    NamedCall, Within, guard_chains, named_calls,
+    NamedCall, Root, Within, guard_chains, named_calls,
 };
 
 #[allow(unused_imports)]
@@ -4182,18 +4182,9 @@ impl Reader<'_> {
         {
             return value.clone();
         }
-        // An environment read is decided by its spelling alone, with no
-        // check that `process` is the global (carrick#2406).
-        let text = self.text(member.span);
-        let end = match crate::env_alias::env_member_name(member) {
-            Some(name) => Root::Env {
-                written: text.clone(),
-                name,
-                fallback: None,
-            },
-            None => self.member_end(member, scope),
-        };
-        Value::opaque(text, end)
+        // Where it comes from is the receive side's reading, environment
+        // reads included (carrick#2406).
+        Value::opaque(self.text(member.span), self.member_end(member, scope))
     }
 
     /// Whether `call` is a call of a query builder the enclosing class or
@@ -6129,6 +6120,12 @@ pub struct SummaryRow {
     /// caller reaches a request written elsewhere, and this is where
     /// ([`RequestSummaryIndex::withdraw_registrations`], carrick#2383).
     pub request_at: (PathBuf, u32),
+    /// Where the target's base comes from (carrick#2406): the end of its
+    /// first piece when that is a value the source names, `None` when the
+    /// target opens with text the source writes. The row's base is read
+    /// from this ([`crate::call_base::stated_base`]), not from its spelling.
+    /// Last, so it orders only rows that agree on everything above.
+    pub base_end: Option<Root>,
 }
 
 /// What the summaries are composed from, as discovery leaves it: every
@@ -6811,11 +6808,32 @@ pub fn summarize(
     }
     for sites in index.rows.values_mut() {
         for rows in sites.values_mut() {
-            rows.sort();
-            rows.dedup();
+            merge_rows(rows);
         }
     }
     index
+}
+
+/// One row per statement at a site, whatever end its base was reached by:
+/// the end says what kind of base it is, not which row it is (carrick#2406).
+/// Where the merged rows' ends disagree, no one of them is the base's, so
+/// the row keeps the hole an unread value ends at, which states the base
+/// as injected rather than as any one of the ends.
+fn merge_rows(rows: &mut Vec<SummaryRow>) {
+    rows.sort();
+    rows.dedup_by(|later, kept| {
+        let same = SummaryRow {
+            base_end: None,
+            ..later.clone()
+        } == SummaryRow {
+            base_end: None,
+            ..kept.clone()
+        };
+        if same && later.base_end != kept.base_end {
+            kept.base_end = Some(Root::Hole(HoleReason::UnreadExpression));
+        }
+        same
+    });
 }
 
 /// Whether a call of `callee`, written in `ir`, provably sends nothing
@@ -7064,7 +7082,12 @@ fn row(
     if !base_reads_the_same_in(effect, file) {
         return None;
     }
-    let target = render_target(&join_base(&effect.base, &effect.url))?;
+    let joined = join_base(&effect.base, &effect.url);
+    let target = render_target(&joined)?;
+    let base_end = match joined.first() {
+        Some(Piece::Opaque { end, .. }) => Some(end.clone()),
+        _ => None,
+    };
     let body_literals = effect
         .body
         .iter()
@@ -7097,6 +7120,7 @@ fn row(
                     .map(|ir| ir.env_fallbacks.clone())
                     .unwrap_or_default()
             }),
+        base_end,
     })
 }
 
@@ -8382,10 +8406,11 @@ mod tests {
         }
     }
 
-    /// carrick#2406: the send side decides an environment read by its
-    /// spelling alone, so a file that imports its own `process` still reads
-    /// `process.env.API` as the variable. The receive side checks that
-    /// `process` is the global ([`guards`]'s tests).
+    /// carrick#2406: an environment read is decided by its spelling alone,
+    /// so a file that imports its own `process` still reads
+    /// `process.env.API` as the variable. The receive side reads it the same
+    /// way now (`guards`'s `an_environment_read_on_the_receive_side_names_
+    /// its_variable`); it used to require `process` to be the global.
     #[test]
     fn the_send_side_reads_an_environment_spelling_without_a_shadow_check() {
         let url = request_url(
@@ -8400,6 +8425,50 @@ mod tests {
                 Some("${process.env.API}/users".to_string())
             )
         );
+    }
+
+    /// carrick#2406: two rows that state the same thing at a site merge into
+    /// one. Where their bases end apart (an environment read and a
+    /// parameter, or two variables), the merged row's base is no one of them:
+    /// it ends at a hole, which states it injected, not as the end that
+    /// sorts first.
+    #[test]
+    fn merged_rows_whose_base_ends_disagree_keep_no_one_end() {
+        let row = |end: Root| SummaryRow {
+            callee: "list".to_string(),
+            span_start: 10,
+            span_end: 20,
+            line: 2,
+            method: "GET".to_string(),
+            target: "${base}/users".to_string(),
+            body_literals: BTreeMap::new(),
+            reaches_request: None,
+            own_site: false,
+            at_caller: false,
+            call_body: None,
+            library_semantics: Vec::new(),
+            base_fallbacks: None,
+            request_at: (PathBuf::from("src/client.ts"), 40),
+            base_end: Some(end),
+        };
+        let a = env("process.env.A", "A", None);
+        let b = env("process.env.B", "B", None);
+        let param = Root::Param(0, "base".to_string());
+        let hole = Some(Root::Hole(HoleReason::UnreadExpression));
+        for ends in [
+            vec![a.clone(), param.clone()],
+            vec![a.clone(), b.clone()],
+            vec![param.clone(), a.clone(), a.clone()],
+        ] {
+            let mut rows: Vec<SummaryRow> = ends.into_iter().map(row).collect();
+            merge_rows(&mut rows);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].base_end, hole);
+        }
+        let mut agreeing = vec![row(a.clone()), row(a.clone())];
+        merge_rows(&mut agreeing);
+        assert_eq!(agreeing.len(), 1);
+        assert_eq!(agreeing[0].base_end, Some(a));
     }
 
     /// carrick#2406: where the AST recogniser and the text test it replaced

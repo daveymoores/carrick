@@ -18,6 +18,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::env_alias::{EnvAliasMap, EnvFallbackMap, EnvSchemaIndex, is_loopback_origin};
+use crate::request_summary::Root;
 
 /// What kind of thing supplies a call's base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,32 +93,87 @@ pub fn resolve_call_base(
     env_schema: &EnvSchemaIndex,
 ) -> Option<CallBaseResolution> {
     let trimmed = target.trim().trim_start_matches(['`', '"', '\'']);
-
     let Some(slot) = leading_interpolation(trimmed) else {
-        // No base slot at all. A path is a base-less call; anything else
-        // (an absolute URL, a bare identifier) is not this reading's business.
-        return trimmed.starts_with('/').then(|| CallBaseResolution {
-            written: String::new(),
-            kind: CallBaseKind::Relative,
-            env_var: None,
-            fallback: None,
-            fallback_is_loopback: false,
-            declared_optional: None,
-        });
+        return slotless_base(trimmed);
     };
+    match base_env_var(slot, aliases, env_fallbacks, env_schema) {
+        Some(env_var) => Some(env_base(slot, env_var, env_fallbacks, env_schema)),
+        None => Some(injected_base(slot)),
+    }
+}
 
-    let written = format!("${{{slot}}}");
-    let Some(env_var) = base_env_var(slot, aliases, env_fallbacks, env_schema) else {
-        return Some(CallBaseResolution {
-            written,
-            kind: CallBaseKind::Injected,
-            env_var: None,
-            fallback: None,
-            fallback_is_loopback: false,
-            declared_optional: None,
-        });
+/// The base of a row the request summaries state (carrick#2406), read from
+/// where its base piece ends rather than from the spelling of its target.
+///
+/// `end` is the end of the target's first piece when that piece is a value
+/// the source names (`None` when the target opens with text the source
+/// writes). An environment read is `env`; every other end (a parameter, a
+/// field, an import, a global, a hole) is `injected`, so no naming guess
+/// applies. `written` is the target's leading `${…}`, as
+/// [`resolve_call_base`] writes it, and the default beside an env read is
+/// looked up exactly as there.
+pub fn stated_base(
+    target: &str,
+    end: Option<&Root>,
+    env_fallbacks: &EnvFallbackMap,
+    env_schema: &EnvSchemaIndex,
+) -> Option<CallBaseResolution> {
+    let trimmed = target.trim().trim_start_matches(['`', '"', '\'']);
+    let Some(slot) = leading_interpolation(trimmed) else {
+        return slotless_base(trimmed);
     };
+    match end {
+        Some(Root::Env { name, .. }) => {
+            Some(env_base(slot, name.clone(), env_fallbacks, env_schema))
+        }
+        _ => Some(injected_base(slot)),
+    }
+}
 
+/// What [`CallBaseResolution::written`] is for `target`: its leading `${…}`,
+/// empty for a bare path, `None` for anything else. A pass that rewrites a
+/// target's base slot changes this.
+pub fn written_base(target: &str) -> Option<String> {
+    let trimmed = target.trim().trim_start_matches(['`', '"', '\'']);
+    match leading_interpolation(trimmed) {
+        Some(slot) => Some(format!("${{{slot}}}")),
+        None => trimmed.starts_with('/').then(String::new),
+    }
+}
+
+/// The base of a target with no base slot at all. A path is a base-less
+/// call; anything else (an absolute URL, a bare identifier) is not this
+/// reading's business.
+fn slotless_base(trimmed: &str) -> Option<CallBaseResolution> {
+    trimmed.starts_with('/').then(|| CallBaseResolution {
+        written: String::new(),
+        kind: CallBaseKind::Relative,
+        env_var: None,
+        fallback: None,
+        fallback_is_loopback: false,
+        declared_optional: None,
+    })
+}
+
+/// A base slot that reads no environment variable, reported as written.
+fn injected_base(slot: &str) -> CallBaseResolution {
+    CallBaseResolution {
+        written: format!("${{{slot}}}"),
+        kind: CallBaseKind::Injected,
+        env_var: None,
+        fallback: None,
+        fallback_is_loopback: false,
+        declared_optional: None,
+    }
+}
+
+/// A base slot that reads `env_var`, with what the source declares about it.
+fn env_base(
+    slot: &str,
+    env_var: String,
+    env_fallbacks: &EnvFallbackMap,
+    env_schema: &EnvSchemaIndex,
+) -> CallBaseResolution {
     // The `??`/`||` literal the binding was declared with, looked up under the
     // spelling at the call site and under the environment variable itself; the
     // schema's `.default("…")` is the same statement made in the other place
@@ -129,14 +185,14 @@ pub fn resolve_call_base(
         .cloned()
         .or_else(|| declaration.and_then(|d| d.default_literal.clone()));
 
-    Some(CallBaseResolution {
+    CallBaseResolution {
         fallback_is_loopback: fallback.as_deref().is_some_and(is_loopback_origin),
-        written,
+        written: format!("${{{slot}}}"),
         kind: CallBaseKind::Env,
         env_var: Some(env_var),
         fallback,
         declared_optional: declaration.map(|d| d.optional),
-    })
+    }
 }
 
 /// The text inside a target's LEADING `${…}` — its base slot. `None` when the
@@ -493,5 +549,106 @@ mod tests {
             None,
             "two different declarations arbitrate to nothing, not to one of them"
         );
+    }
+
+    fn env_end(written: &str, name: &str) -> Root {
+        Root::Env {
+            written: written.to_string(),
+            name: name.to_string(),
+            fallback: None,
+        }
+    }
+
+    /// carrick#2406: a stated row's base is the kind its end says, with
+    /// the default looked up as [`resolve_call_base`] looks it up: the
+    /// spelling at the call, then the variable, then the schema.
+    #[test]
+    fn a_stated_env_end_reads_its_default_as_the_target_reading_does() {
+        let (_, fallbacks, schema) =
+            bindings(r#"const url = process.env.KNOWLEDGE_URL ?? "http://localhost:3939";"#);
+        let end = env_end("process.env.KNOWLEDGE_URL", "KNOWLEDGE_URL");
+        let target = "${process.env.KNOWLEDGE_URL}/api/lookup";
+        let stated = stated_base(target, Some(&end), &fallbacks, &schema);
+        assert_eq!(
+            stated,
+            resolve_call_base(target, &EnvAliasMap::new(), &fallbacks, &schema)
+        );
+        let stated = stated.expect("an env end states a base");
+        assert_eq!(stated.kind, CallBaseKind::Env);
+        assert!(stated.fallback_is_loopback);
+    }
+
+    /// carrick#2406: the end decides, not the spelling. A string index
+    /// whose name is no identifier is an environment read to the end and
+    /// was injected to the target reading.
+    #[test]
+    fn a_stated_env_end_is_an_env_base_whatever_its_spelling() {
+        let target = "${process.env[\"MY-VAR\"]}/api/lookup";
+        let end = env_end("process.env[\"MY-VAR\"]", "MY-VAR");
+        let stated = stated_base(
+            target,
+            Some(&end),
+            &EnvFallbackMap::new(),
+            &EnvSchemaIndex::default(),
+        )
+        .expect("an env end states a base");
+        assert_eq!(stated.kind, CallBaseKind::Env);
+        assert_eq!(stated.env_var.as_deref(), Some("MY-VAR"));
+        assert_eq!(stated.written, "${process.env[\"MY-VAR\"]}");
+        // Old answer.
+        let read = base("", target).expect("a base slot resolves");
+        assert_eq!(read.kind, CallBaseKind::Injected);
+    }
+
+    /// carrick#2406: every end but an environment read is injected. The
+    /// removed guess: a lone SCREAMING_SNAKE global was an env var to the
+    /// target reading.
+    #[test]
+    fn a_stated_end_that_reads_no_environment_is_injected() {
+        let target = "${API_BASE}/api/lookup";
+        for end in [
+            Root::Global("API_BASE".to_string()),
+            Root::Param(0, "API_BASE".to_string()),
+            Root::Import {
+                local: "API_BASE".to_string(),
+                specifier: "./config".to_string(),
+                export: "API_BASE".to_string(),
+            },
+            Root::Hole(crate::request_summary::HoleReason::Reassigned),
+        ] {
+            let stated = stated_base(
+                target,
+                Some(&end),
+                &EnvFallbackMap::new(),
+                &EnvSchemaIndex::default(),
+            )
+            .expect("a base slot states a base");
+            assert_eq!(stated.kind, CallBaseKind::Injected, "{end:?}");
+            assert_eq!(stated.written, "${API_BASE}");
+            assert_eq!(stated.env_var, None);
+        }
+        let guessed = base("", target).expect("a base slot resolves");
+        assert_eq!(guessed.kind, CallBaseKind::Env, "the guess this removes");
+    }
+
+    /// carrick#2406: a target that opens with text states a relative base
+    /// or none, as the target reading does, and `written_base` is what both
+    /// readings write.
+    #[test]
+    fn a_stated_target_with_no_slot_reads_as_the_target_reading_does() {
+        let none = (&EnvFallbackMap::new(), &EnvSchemaIndex::default());
+        let relative = stated_base("/api/lookup", None, none.0, none.1).expect("relative");
+        assert_eq!(relative.kind, CallBaseKind::Relative);
+        assert_eq!(relative.written, "");
+        assert_eq!(
+            stated_base("https://api.example.com/v1", None, none.0, none.1),
+            None
+        );
+        assert_eq!(written_base("/api/lookup").as_deref(), Some(""));
+        assert_eq!(
+            written_base("${this.base}/v1").as_deref(),
+            Some("${this.base}")
+        );
+        assert_eq!(written_base("https://api.example.com/v1"), None);
     }
 }
