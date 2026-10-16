@@ -123,6 +123,24 @@ pub enum HoleReason {
     FanOutCap,
     /// The chain reaches a function it already passed through.
     Recursion,
+    /// No compiler row answers the position: the service has no rows file
+    /// (its walk failed, died or timed out), the file is not in it, or it
+    /// holds no row of the kind there (carrick#2413).
+    RowsMissing,
+    /// The file's bytes hash otherwise than the ones its rows were read
+    /// from.
+    RowsStale,
+    /// The walk read no rows for the file: no program holds it, or it could
+    /// not be read.
+    NotInProgram,
+    /// The type checker threw at the position.
+    CheckerThrew,
+    /// The compiler names no declaration for a name that is not an import,
+    /// or types it as the error type.
+    UnresolvedName,
+    /// A member or a call whose receiver the compiler types as `any`, with
+    /// no declaration.
+    UntypedReceiver,
 }
 
 /// Where a compared value comes from, before any access is applied to it.
