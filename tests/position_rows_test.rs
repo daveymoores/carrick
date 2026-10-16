@@ -194,22 +194,10 @@ impl Visit for SwcPositions {
 }
 
 /// Each SWC position of `file`, as the sidecar numbers it. Parsed on a source
-/// map of its own, as each file of a scan is.
-///
-/// Pinned (carrick#2407): SWC strips a leading BOM, and `sidecar_position`
-/// is handed the text as read, BOM included, so on main every position in a
-/// BOM file is two units short. `strip_bom` converts against the text SWC
-/// parsed, which is what the fix will do.
-fn swc_positions_with(file: &Path, strip_bom: bool) -> Vec<(Kind, u32, u32)> {
+/// map of its own, as each file of a scan is, and converted against the text
+/// as read, BOM included, as the scan converts it (carrick#2407).
+fn swc_positions(file: &Path) -> Vec<(Kind, u32, u32)> {
     let content = fs::read_to_string(file).expect("read source");
-    let numbered = if strip_bom {
-        content
-            .strip_prefix('\u{feff}')
-            .unwrap_or(&content)
-            .to_string()
-    } else {
-        content.clone()
-    };
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_emitter_writer(Box::new(std::io::sink()), None);
     let module = carrick::parser::parse_source(
@@ -228,15 +216,11 @@ fn swc_positions_with(file: &Path, strip_bom: bool) -> Vec<(Kind, u32, u32)> {
         .map(|(kind, lo, hi)| {
             (
                 kind,
-                sidecar_position(&numbered, lo),
-                sidecar_position(&numbered, hi),
+                sidecar_position(&content, lo),
+                sidecar_position(&content, hi),
             )
         })
         .collect()
-}
-
-fn swc_positions(file: &Path) -> Vec<(Kind, u32, u32)> {
-    swc_positions_with(file, true)
 }
 
 /// Every SWC position of every walked file finds a row of its kind, and every
@@ -296,20 +280,14 @@ fn every_swc_position_finds_its_row_and_every_hash_agrees() {
         joined > 50,
         "too few positions joined to prove anything: {joined}"
     );
-    // carrick#2407, pinned: the BOM file's positions as main converts them
-    // miss. When this fails, the defect is fixed: drop `strip_bom`.
+    // carrick#2407: a BOM file is walked and held to the same join.
     let bom = repo.join("apps/api/src/bom.ts");
-    let bom_line = &rows.files[files.iter().position(|f| *f == bom).expect("bom.ts walked")];
-    let bom_keys: BTreeSet<(Kind, u32, u32)> = bom_line
-        .r
-        .iter()
-        .map(|row| (row.kind(), row.start(), row.end()))
-        .collect();
+    assert!(files.contains(&bom), "bom.ts is walked");
     assert!(
-        swc_positions_with(&bom, false)
-            .iter()
-            .all(|position| !bom_keys.contains(position)),
-        "carrick#2407 is fixed: sidecar_position now reads a BOM file as SWC does"
+        fs::read(&bom)
+            .expect("read bom.ts")
+            .starts_with(b"\xEF\xBB\xBF"),
+        "bom.ts starts with a BOM"
     );
     assert!(
         misses.is_empty(),

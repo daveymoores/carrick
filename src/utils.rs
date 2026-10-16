@@ -147,9 +147,13 @@ pub(crate) fn utf16_offset(content: &str, byte_offset: usize) -> u32 {
 /// turn), and the key a site looks its compiler row up by (carrick#2405).
 /// The conversion sits at the request and not at the candidate, because the
 /// byte span is what joins a pass's answers back to its candidate.
+///
+/// `content` is the file as read from disk. A leading UTF-8 BOM is dropped
+/// before counting: SWC's source map strips it, so an SWC span counts from
+/// the character after it, and TypeScript drops it too (carrick#2407).
 pub fn sidecar_position(content: &str, span: u32) -> u32 {
     utf16_offset(
-        content,
+        content.strip_prefix('\u{feff}').unwrap_or(content),
         span.saturating_sub(crate::swc_scanner::SWC_SPAN_BASE) as usize,
     )
 }
@@ -228,5 +232,25 @@ mod tests {
         let content = "// 🚀\nx";
         let x = content.find('x').expect("the binding is in the source");
         assert_eq!(utf16_offset(content, x), 6);
+    }
+
+    /// SWC's source map drops a leading BOM, so its spans count from the
+    /// character after it, as TypeScript's positions do (carrick#2407). A
+    /// span converted against the file as read lands where the same span
+    /// lands in the file without the BOM; a file without one is unchanged.
+    #[test]
+    fn a_leading_bom_is_not_counted() {
+        use swc_common::{FileName, SourceMap, sync::Lrc};
+        let without = "const a = 1;\nfetch('/a');";
+        let with = format!("\u{feff}{without}");
+        let map: Lrc<SourceMap> = Default::default();
+        let file = map.new_source_file(Lrc::new(FileName::Anon), with.clone());
+        assert_eq!(&*file.src, without, "SWC parses the text without the BOM");
+        let call = file.start_pos.0 + without.find("fetch").expect("the call") as u32;
+        assert_eq!(file.start_pos.0, crate::swc_scanner::SWC_SPAN_BASE);
+
+        assert_eq!(sidecar_position(&with, call), 13);
+        assert_eq!(sidecar_position(without, call), 13);
+        assert_eq!(sidecar_position(&with, file.start_pos.0), 0);
     }
 }
