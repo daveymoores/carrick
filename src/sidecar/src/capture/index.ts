@@ -52,11 +52,12 @@ import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { DenoProject, findDenoConfig } from './deno-project.js';
 import { emitsAlike, ProjectGraph, type ServiceProject } from './project-references.js';
 import { redirectingCompilerHost, referenceRedirect, type ReferenceRedirect } from './reference-redirect.js';
+import { markUncarried } from './unresolved.js';
 import { findServiceTsconfig } from './service-config.js';
 import { placeEmittedTree, surfaceModuleInTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
 import { sidecarCompilerOptions } from './compiler-options.js';
-import { boundedCompilerHost, boundedSys, untrustedReadBound, type ReadBound } from './checkout.js';
+import { boundedCompilerHost, boundedSys, isInsideCheckout, untrustedReadBound, type ReadBound } from './checkout.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
@@ -316,6 +317,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     bound,
     augmentations,
     redirectFor,
+    readsReferences: graphForRedirect?.hasReferences ?? false,
   };
   try {
     resolved = ownerGroups && emitProject
@@ -878,6 +880,34 @@ interface AnalysisContext {
   augmentations: (parsed: ts.ParsedCommandLine) => readonly string[];
   /** How an owner's program reads the projects it references, if it references any. */
   redirectFor: (owner: ServiceProject) => ReferenceRedirect | undefined;
+  /** Whether the named config references other projects, so owners are read by references. */
+  readsReferences: boolean;
+}
+
+/**
+ * The files of an anchor program the surface emit cannot carry (carrick#2418):
+ * the sources of the projects its owner references, and a workspace package's
+ * source reached through a link (an external-library file inside the checkout
+ * under no `node_modules`). The anchor program types them; the emit, under
+ * the compiler's own resolution, reaches the first as unbuilt output and does
+ * not emit the second.
+ */
+function uncarriedFiles(
+  program: ts.Program,
+  redirect: ReferenceRedirect | undefined,
+  repoRoot: string
+): (fileName: string) => boolean {
+  return (fileName) => {
+    if (redirect?.referenceFor(fileName)) return true;
+    const sourceFile = program.getSourceFile(fileName);
+    const slashed = fileName.replace(/\\/g, '/');
+    return (
+      sourceFile !== undefined &&
+      program.isSourceFileFromExternalLibrary(sourceFile) &&
+      isInsideCheckout(slashed, repoRoot) &&
+      !slashed.includes('/node_modules/')
+    );
+  };
 }
 
 /**
@@ -947,6 +977,7 @@ function resolveAnchors(
       ? redirectingCompilerHost(programHost(options, deno, ctx.bound) ?? ts.createCompilerHost(options), options, redirect)
       : programHost(options, deno, ctx.bound);
     const program = ts.createProgram(rootNames, options, host);
+    if (owner && !deno && ctx.readsReferences) markUncarried(program, uncarriedFiles(program, redirect, ctx.repoRoot));
     // The checker binds every file of the program when it is first asked for,
     // which the first anchor would otherwise do: asked for here, so that the
     // report below says the program is whole before any anchor is read.

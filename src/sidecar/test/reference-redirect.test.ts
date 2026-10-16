@@ -318,10 +318,15 @@ describe('carrick#2418: referenced packages are typed from source, as an editor 
     );
   });
 
-  it('5. capture: a symbol anchor naming the referenced types reads no unresolved import', () => {
+  it('5. capture: a symbol anchor naming the referenced types never reads as declared', () => {
+    // The anchor program resolves Order; the surface emit, which keeps the
+    // compiler's own resolution, still reaches the unbuilt output, so the
+    // emitted text may hold `unknown` there. Its cause is that import, never
+    // an author's `unknown`: each position is either typed or labelled with it.
     const placed = records.get('Endpoint_placed_Response');
     assert.ok(placed, 'no record for the anchor');
-    assert.deepStrictEqual(unresolvedImports(placed), [], JSON.stringify(placed));
+    const declared = (placed.any_provenance ?? []).filter((p) => p.reason === 'declared');
+    assert.deepStrictEqual(declared, [], JSON.stringify(placed));
     // A member reached through the package's own paths alias.
     const priced = records.get('Endpoint_priced_Response');
     assert.ok(priced, 'no record for the priced anchor');
@@ -352,6 +357,8 @@ describe('carrick#2418: referenced packages are typed from source, as an editor 
     const shapes = program.getSourceFile(path.join(ws.repo, 'packages', 'shapes', 'src', 'index.ts'));
     assert.ok(shapes, 'the sibling source is in the program');
     assert.strictEqual(program.isSourceFileFromExternalLibrary(shapes), false);
+    // Reached through shapes' own paths alias: the import resolved under its options.
+    assert.ok(program.getSourceFile(path.join(ws.repo, 'packages', 'shapes', 'src', 'money.ts')));
   });
 
   it('7. nothing is written into the tree by infer, the walk or a capture', () => {

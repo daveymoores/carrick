@@ -38,10 +38,9 @@
  * Nothing here writes, and every read goes through the host it wraps.
  */
 
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 import ts from 'typescript';
-import { boundedSys, isInsideCheckout, untrustedReadBound } from './checkout.js';
+import { boundedSys, isInsideCheckout, realOf, untrustedReadBound } from './checkout.js';
 import { sidecarCompilerOptions } from './compiler-options.js';
 import { ProjectGraph, type ServiceProject } from './project-references.js';
 
@@ -74,24 +73,18 @@ export interface ReferenceRedirect {
 
 const DECLARATION = /\.d\.[cm]?ts$/;
 
-/** Real paths through the deepest existing ancestor, cached per directory. */
+/** `realOf`, cached per directory: the resolver asks about many files in few directories. */
 function realPaths(): (p: string) => string {
   const dirs = new Map<string, string>();
-  const realDir = (dir: string): string => {
-    let real = dirs.get(dir);
-    if (real !== undefined) return real;
-    try {
-      real = fs.realpathSync.native(dir);
-    } catch {
-      const parent = path.dirname(dir);
-      real = parent === dir ? dir : path.join(realDir(parent), path.basename(dir));
-    }
-    dirs.set(dir, real);
-    return real;
-  };
   return (p) => {
     const abs = path.resolve(p);
-    return path.join(realDir(path.dirname(abs)), path.basename(abs));
+    const dir = path.dirname(abs);
+    let real = dirs.get(dir);
+    if (real === undefined) {
+      real = realOf(dir);
+      dirs.set(dir, real);
+    }
+    return path.join(real, path.basename(abs));
   };
 }
 
