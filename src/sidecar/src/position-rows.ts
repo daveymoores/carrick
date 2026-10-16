@@ -36,6 +36,7 @@ import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { ts, type Project } from 'ts-morph';
 import { WriteGuard, installedPackageDirectory } from './capture/index.js';
+import { isDeclarationFileName } from './capture/specifiers.js';
 import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
 import { typeToStringAsDeclared } from './print-type.js';
 import type { ProjectLoader } from './project-loader.js';
@@ -91,9 +92,6 @@ const COMPARE_OPERATORS = new Set<ts.SyntaxKind>([
   ts.SyntaxKind.InstanceOfKeyword,
   ts.SyntaxKind.InKeyword,
 ]);
-
-/** A root file that only declares: `.d.ts`, `.d.mts` or `.d.cts`. */
-const DECLARATION_FILE = /\.d\.[cm]?ts$/;
 
 /** One line of the file per source file. */
 interface FileLine {
@@ -209,7 +207,7 @@ export function writePositionRows(options: PositionRowsOptions): PositionRowsCou
       const declarations = project
         .getProgram()
         .compilerObject.getRootFileNames()
-        .filter((name) => DECLARATION_FILE.test(name));
+        .filter(isDeclarationFileName);
       untaken.set(key, { indexes: missed, declarations });
     }
     // One owner's program at a time.
