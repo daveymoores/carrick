@@ -1,11 +1,12 @@
 //! Per-position compiler rows (carrick#2405, move 2 of the fact layer).
 //!
-//! Before a service's analysis starts its sidecar, a fresh record-only
-//! sidecar walks the service's source files and writes, for every call,
+//! Before the scan's analysis loop starts any sidecar, a fresh record-only
+//! sidecar walks each service's source files and writes, for every call,
 //! member access, comparison and expression identifier, what the compiler
 //! knows there: the symbol, the declaration's file and line, the declaring
 //! package and the type text. The walk is the sidecar's
-//! (`src/sidecar/src/position-rows.ts`). Its process exits before the
+//! (`src/sidecar/src/position-rows.ts`); the walks run in a lane of their own
+//! (`crate::engine::walk_lane`). Every walk process exits before the first
 //! analysis sidecar spawns, so the two programs never share a heap
 //! (carrick#2413).
 //!
@@ -15,11 +16,12 @@
 //! listings read top-level `*.json` only, so the subdirectory is never read
 //! as a blob. Without one (the Action, the cloud runner) it writes under a
 //! per-run directory in the OS temp dir, never inside the scanned tree, and
-//! the file is removed once it is read ([`Destination`]). A walk that dies or
+//! the file is removed when the run ends ([`Destination`]). A walk that dies or
 //! misses its deadline loses that service's rows and says so in the run log,
 //! and nothing else: it is never a scan-health entry, a finding or a stop.
 //!
-//! The rows are read once, before discovery, into a [`PositionIndex`] the
+//! The rows are read before each analysis pass's discovery (the loop, and
+//! the owed-work retry), into a [`PositionIndex`] the
 //! request summaries carry. Nothing reads a row yet (move 3 of the fact
 //! layer reads them slice by slice); a lookup that finds none is a hole with
 //! a reason ([`HoleReason`]), never a fallback.
@@ -211,7 +213,7 @@ pub fn content_hash(bytes: &[u8]) -> String {
 /// Beside the blobs when there is a local store, and kept there. Otherwise
 /// under a directory of this run's own in the OS temp dir: the file and, once
 /// empty, the directory are removed when this is dropped, which is when the
-/// service's rows have been read (carrick#2413).
+/// run ends (carrick#2413).
 #[derive(Debug)]
 pub struct Destination {
     path: PathBuf,
