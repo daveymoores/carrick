@@ -575,6 +575,20 @@ async fn once_walked(walked: Option<WalkEnded>) {
     }
 }
 
+/// Plan `service`'s setup once its own walk has ended ([`once_walked`]), then
+/// run `read` off the runtime's own threads: it walks and parses the
+/// service's files.
+async fn plan_after_walk<R>(mut service: ServiceAhead, read: R) -> Option<(String, AskAhead)>
+where
+    R: FnOnce(ServiceAhead) -> Option<(String, AskAhead)> + Send + 'static,
+{
+    once_walked(service.walked.take()).await;
+    tokio::task::spawn_blocking(move || read(service))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Run `read` with nothing it logs written anywhere.
 ///
 /// The queue reads a service's manifests and files before the loop does, with
@@ -682,19 +696,11 @@ impl SetupsAhead {
                 queue,
                 bound,
                 || !crate::retry_budget::remaining().is_zero(),
-                move |mut service: ServiceAhead| {
+                move |service: ServiceAhead| {
                     let repo_path = repo_path.clone();
-                    async move {
-                        once_walked(service.walked.take()).await;
-                        // The read walks and parses the service's files, so
-                        // it runs off the runtime's own threads.
-                        tokio::task::spawn_blocking(move || {
-                            quietly(|| read_ask(&repo_path, service))
-                        })
-                        .await
-                        .ok()
-                        .flatten()
-                    }
+                    plan_after_walk(service, move |service| {
+                        quietly(|| read_ask(&repo_path, service))
+                    })
                 },
                 move |ask: AskAhead| {
                     let turns = ask_turns.clone();
@@ -1422,6 +1428,49 @@ pub(crate) mod tests {
             stored,
             walked: None,
         }
+    }
+
+    /// A setup is not read until its own service's walk has ended, however it
+    /// ended; a service with no walk to wait for is read at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_setup_waits_for_its_own_walk_before_its_plan_is_read() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        let mut waiting = ahead(None);
+        waiting.walked = Some(receiver);
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = ran.clone();
+        let planned = tokio::spawn(plan_after_walk(waiting, move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            None
+        }));
+        for _ in 0..5 {
+            sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "read ran before the walk ended"
+        );
+        drop(sender);
+        assert!(planned.await.unwrap().is_none());
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "read ran once the walk ended"
+        );
+
+        let seen = ran.clone();
+        let at_once = plan_after_walk(ahead(None), move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            None
+        })
+        .await;
+        assert!(at_once.is_none());
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            2,
+            "no walk to wait for: read at once"
+        );
     }
 
     /// What the loop reads for the service at `repo`: its manifests, their
