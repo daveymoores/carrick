@@ -1921,7 +1921,8 @@ mod tests {
     fn the_store_s_label_v2_body_reads_its_label_side_rule_and_type_packages() {
         let answer = parse_answer(STORE_ANSWERED_V2);
         assert_eq!((answer.answered, answer.dropped), (1, 0));
-        let read: Vec<(&str, Option<&str>, Option<SideRule>, &[String])> = answer
+        type Read<'a> = (&'a str, Option<&'a str>, Option<SideRule>, &'a [String]);
+        let read: Vec<Read> = answer
             .exports
             .iter()
             .map(|export| {

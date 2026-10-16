@@ -984,12 +984,13 @@ pub enum LibraryClaim {
         /// HTTP (label v2): where the base URL the path joins sits.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base: Option<ClaimSlot>,
-        /// Label v2: the function or client the op runs.
+        /// Label v2: the function or client the op runs. Boxed, as is
+        /// `yields`, so an op stays near the size of the other claims.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        runs: Option<RunsSlot>,
+        runs: Option<Box<RunsSlot>>,
         /// Label v2, `receive` only: what the handler is handed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        yields: Option<Yields>,
+        yields: Option<Box<Yields>>,
     },
     /// A name the library emits itself, spelled in one of `member`'s
     /// parameters.
@@ -5011,16 +5012,16 @@ mod tests {
                         method_key: Some(slot()),
                         method_default: Some("GET".into()),
                         base: Some(slot()),
-                        runs: Some(RunsSlot {
+                        runs: Some(Box::new(RunsSlot {
                             arg: 0,
                             key: Some("fn".into()),
                             bound: Some(RunsBound::Maker),
-                        }),
-                        yields: Some(Yields {
+                        })),
+                        yields: Some(Box::new(Yields {
                             param: 0,
                             export: "Socket".into(),
                             side: "server".into(),
-                        }),
+                        })),
                     }),
                     library(LibraryClaim::Op {
                         op: LibraryOp::Receive,
