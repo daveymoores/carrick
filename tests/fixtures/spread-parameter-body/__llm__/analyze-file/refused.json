@@ -1,0 +1,58 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:7",
+      "line_number": 7,
+      "target": "${JOBS_URL}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(JOBS_URL, { method: \"POST\", ... })",
+      "call_expression_line": 7,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:15",
+      "line_number": 15,
+      "target": "${JOBS_URL}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(JOBS_URL, { method: \"POST\", ... })",
+      "call_expression_line": 15,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:24",
+      "line_number": 24,
+      "target": "${JOBS_URL}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(JOBS_URL, { method: \"POST\", ... })",
+      "call_expression_line": 24,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:34",
+      "line_number": 34,
+      "target": "${JOBS_URL}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(JOBS_URL, { method: \"POST\", ... })",
+      "call_expression_line": 34,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

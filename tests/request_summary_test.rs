@@ -171,17 +171,12 @@ fn an_invented_action_is_replaced_by_the_literal_the_body_writes() {
 
 /// Where the request line states no action, the row the source states
 /// carries none: the model's invented `findSimilar` is never kept on it
-/// (carrick#1564 review, finding 9). Production sends `find-similar`
-/// there, which the scanner does not state: a known gap.
+/// (carrick#1564 review, finding 9). The caller's own literal fills the
+/// spread the request line writes the action before, so the action the
+/// site sends is the source's (carrick#2411).
 #[test]
 fn a_fact_row_never_carries_the_models_action() {
-    assert_known_gap(
-        &calls(),
-        "tools/find-similar.ts",
-        4,
-        "find-similar",
-        "#1585: the request line writes the action before a typed spread",
-    );
+    assert_gateway_row(&calls(), "tools/find-similar.ts", 4, Some("find-similar"));
 }
 
 #[test]

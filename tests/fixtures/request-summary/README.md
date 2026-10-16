@@ -68,10 +68,11 @@ counted rather than hidden.
 | site | the scanner states | issue |
 |---|---|---|
 | `api-client.ts:103` | `POST /types/check-or-upload`, no action | #1585 |
-| `tools/find-similar.ts:4` | `POST …`, no action | #1585 |
 
 The body writes `action` and then spreads `params`. Only the declared type
 of `params` says the spread carries no `action`, and a type is not what the
 object holds at run time, so the scanner treats the spread as one that may
 overwrite the key. Whether to trust the declared type is the decision in
-#1585.
+#1585. At a caller that writes the object (`tools/find-similar.ts:4`), the
+object's own keys say what the spread puts in place, so the row states the
+action (#2411).

@@ -1334,6 +1334,7 @@ impl CallWalker<'_, '_, '_> {
             tested: None,
             handed: self.reader.handed(args, self.scope, bound),
             names: self.reader.arg_names(args, self.scope),
+            spread_args: Vec::new(),
         };
         self.ir.constructions.push(construction);
     }
