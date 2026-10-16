@@ -883,6 +883,8 @@ Response (counts only; the rows are in the file):
 
 The file is gzip JSON lines, written to `<out_path>.partial` and renamed into place, through the write guard: a directory inside the scanned trees is refused unless it is beneath `.carrick`. Line 1 is `{"v":1,"typescript":"<version>","service":"<name>","files":N}`. Then one line per file, in request order: `{"f":"<repo-relative path>","h":"<sha256 of the bytes on disk>","r":[row, ...]}`, or with `"skip":"unreadable"` or `"skip":"not_in_program"` and no rows.
 
+Each file is read in the program of the project that owns it, one owner at a time. A file that program does not take (JavaScript under a config without `allowJs`) is read after every owner, in the owner's `scripts` program: the same options with `allowJs` on, the owner's root declaration files and the files it did not take (carrick#2413). `not_in_program` is a file that program does not take either.
+
 Each row is `[kind, start, end, symbol, decl_file, decl_line, decl_package, type_text, flags]`, keyed by `(start, end, kind)`: TypeScript `getStart()`/`getEnd()` in UTF-16 code units.
 
 | kind | node | symbol of | type of |

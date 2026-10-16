@@ -87,6 +87,20 @@ const DEFAULT_COMPILER_OPTIONS: CompilerOptions = {
 };
 
 /**
+ * What a build makes (carrick#2413). `listed` is the project as its config
+ * lists it. `scripts` has the same options with JavaScript accepted and lists
+ * no file: it is for the files the listed program does not take (a `.js`,
+ * `.mjs` or `.cjs` file under a config without `allowJs`), which the caller
+ * adds.
+ */
+export type BuildKind = 'listed' | 'scripts';
+
+/** `options` as `kind` builds them. */
+function optionsFor<O extends CompilerOptions>(kind: BuildKind, options: O): O {
+  return kind === 'scripts' ? { ...options, allowJs: true } : options;
+}
+
+/**
  * Map string module values to ts-morph enum values
  */
 const MODULE_MAP: Record<string, number> = {
@@ -153,8 +167,11 @@ const TARGET_MAP: Record<string, number> = {
  */
 export class ProjectLoader {
   private project: Project | null = null;
-  /** Set by `load()`; builds the ts-morph project on first `getProject()`. */
-  private buildProject: (() => Project) | null = null;
+  /**
+   * Set by `load()`; builds the ts-morph project on first `getProject()`,
+   * and the default project's `scripts` program for `scriptProjectFor`.
+   */
+  private buildProject: ((kind: BuildKind) => Project) | null = null;
   /**
    * The Deno graph this project resolved through, when it did (carrick#1260).
    * It is the only thing that can name the package a resolved file belongs to,
@@ -228,13 +245,13 @@ export class ProjectLoader {
       if (this.tsconfigSnapshot) {
         const snapshot = this.tsconfigSnapshot;
         this.log('Project will load with tsconfig snapshot');
-        this.buildProject = () => {
+        this.buildProject = (kind) => {
           const project = new Project({
-              ...this.fileSystemOption(),
-            compilerOptions: sidecarCompilerOptions(this.snapshotToCompilerOptions(snapshot)),
+            ...this.fileSystemOption(),
+            compilerOptions: sidecarCompilerOptions(optionsFor(kind, this.snapshotToCompilerOptions(snapshot))),
             skipAddingFilesFromTsConfig: true,
           });
-          this.addDefaultSourceFiles(project);
+          if (kind === 'listed') this.addDefaultSourceFiles(project);
           return project;
         };
       }
@@ -245,7 +262,7 @@ export class ProjectLoader {
 
         if (denoConfig) {
           this.log(`Project will load with Deno config: ${denoConfig.configPath}`);
-          this.buildProject = () => {
+          this.buildProject = (kind) => {
             const deno = new DenoProject(denoConfig, this.repoRoot);
             this.denoProject = deno;
             // The graph's external-library verdicts, kept past the program
@@ -253,7 +270,7 @@ export class ProjectLoader {
             const imports = new ExternalImports();
             const project = new Project({
               ...this.fileSystemOption(),
-              compilerOptions: sidecarCompilerOptions(deno.parsed.options as CompilerOptions),
+              compilerOptions: sidecarCompilerOptions(optionsFor(kind, deno.parsed.options as CompilerOptions)),
               skipAddingFilesFromTsConfig: true,
               resolutionHost: imports.recording((host, getOptions) => ({
                 resolveModuleNames: (names, from) => names.map(name =>
@@ -264,24 +281,26 @@ export class ProjectLoader {
               })),
             });
             registerExternalImports(project, imports);
-            for (const file of deno.parsed.fileNames) project.addSourceFileAtPath(file);
-            for (const diagnostic of deno.diagnostics) this.logError(diagnostic);
+            if (kind === 'listed') {
+              for (const file of deno.parsed.fileNames) project.addSourceFileAtPath(file);
+              for (const diagnostic of deno.diagnostics) this.logError(diagnostic);
+            }
             return project;
           };
         } else if (tsconfigPath) {
           this.log(`Project will load with tsconfig: ${tsconfigPath}`);
           this.namedTsconfigPath = tsconfigPath;
-          this.buildProject = () => this.projectFromConfig(tsconfigPath);
+          this.buildProject = (kind) => this.projectFromConfig(tsconfigPath, kind);
         } else {
           this.log('No tsconfig.json found, using default compiler options');
-          this.buildProject = () => {
+          this.buildProject = (kind) => {
             const project = new Project({
               ...this.fileSystemOption(),
-              compilerOptions: sidecarCompilerOptions(DEFAULT_COMPILER_OPTIONS),
+              compilerOptions: sidecarCompilerOptions(optionsFor(kind, DEFAULT_COMPILER_OPTIONS)),
               skipAddingFilesFromTsConfig: true,
             });
             // Add source files from common locations
-            this.addDefaultSourceFiles(project);
+            if (kind === 'listed') this.addDefaultSourceFiles(project);
             return project;
           };
         }
@@ -385,15 +404,18 @@ export class ProjectLoader {
     return bound ? { fileSystem: boundedFileSystem(bound) } : {};
   }
 
-  /** A ts-morph project built from one tsconfig and the files it lists. */
-  private projectFromConfig(configPath: string): Project {
+  /**
+   * A ts-morph project built from one tsconfig: with the files it lists, or
+   * as its `scripts` program (`BuildKind`).
+   */
+  private projectFromConfig(configPath: string, kind: BuildKind = 'listed'): Project {
     const imports = new ExternalImports();
     const project = new Project({
       ...this.fileSystemOption(),
       tsConfigFilePath: configPath,
       // Over the tsconfig's own options: ts-morph lays these on top.
-      compilerOptions: sidecarCompilerOptions(getCompilerOptionsFromTsConfig(configPath).options),
-      skipAddingFilesFromTsConfig: false,
+      compilerOptions: sidecarCompilerOptions(optionsFor(kind, getCompilerOptionsFromTsConfig(configPath).options)),
+      skipAddingFilesFromTsConfig: kind === 'scripts',
       // Each import resolves in its file's own module format (carrick#1619),
       // and every external-library answer is kept past the program rebuilds
       // that drop it (carrick#1731).
@@ -440,6 +462,19 @@ export class ProjectLoader {
   }
 
   /**
+   * The `scripts` program (`BuildKind`) of the project behind a key from
+   * `projectKeyFor`: its options with JavaScript accepted, built by the same
+   * factory, and no file listed. Not kept; the caller drops it. For the walk's
+   * files that the owner's program does not take (carrick#2413).
+   */
+  scriptProjectFor(key: string): Project {
+    if (!this.initialized || !this.buildProject) {
+      throw new Error('Project not initialized. Call load() first and ensure it succeeds.');
+    }
+    return key === '' ? this.buildProject('scripts') : this.projectFromConfig(key, 'scripts');
+  }
+
+  /**
    * Drop the program behind a key from `projectKeyFor`, so the memory it
    * holds can go before the next one is built. The next `getProjectFor` on
    * the key builds it again. For a walk that reads one owner's program at a
@@ -468,7 +503,7 @@ export class ProjectLoader {
     }
     if (!this.project) {
       const startTime = performance.now();
-      this.project = this.buildProject();
+      this.project = this.buildProject('listed');
       const buildTimeMs = Math.round(performance.now() - startTime);
       this.log(
         `Project built in ${buildTimeMs}ms ` +
