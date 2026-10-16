@@ -7780,7 +7780,8 @@ fn discover_with_positions(
         sites: resolution.sites,
         bindings: resolution.bindings,
         positions,
-    };
+    }
+    .linked();
 
     debug!(
         "Extracted {} import facts and {} function definitions from {} files",
