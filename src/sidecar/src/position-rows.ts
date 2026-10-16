@@ -218,6 +218,13 @@ function fileLine(line: FileLine): string {
 class PathNames {
   private readonly roots: string[];
   private readonly packageNames = new Map<string, string | null>();
+  /**
+   * Answers by declaring file: a service's rows name a few thousand files
+   * hundreds of thousands of times, and the module graph's answer is a scan
+   * of its packages (on a Deno service it was 40% of the walk).
+   */
+  private readonly declaringFiles = new Map<string, string | null>();
+  private readonly declaringPackages = new Map<string, string | null>();
 
   constructor(scanRoot: string) {
     const resolved = path.resolve(scanRoot);
@@ -248,6 +255,15 @@ class PathNames {
 
   /** What a declaring file is written as, or `null` when nothing names it. */
   declaringFile(fileName: string): string | null {
+    let named = this.declaringFiles.get(fileName);
+    if (named === undefined) {
+      named = this.nameDeclaringFile(fileName);
+      this.declaringFiles.set(fileName, named);
+    }
+    return named;
+  }
+
+  private nameDeclaringFile(fileName: string): string | null {
     const inside = this.inside(fileName);
     if (inside) return toSlashes(inside.rel);
     const installed = installedPackageDirectory(this.roots[0], fileName);
@@ -263,6 +279,18 @@ class PathNames {
    * `name` of the nearest package.json at or above it, up to the root.
    */
   declaringPackage(
+    fileName: string,
+    packageOf: (filePath: string) => string | undefined
+  ): string | null {
+    let named = this.declaringPackages.get(fileName);
+    if (named === undefined) {
+      named = this.nameDeclaringPackage(fileName, packageOf);
+      this.declaringPackages.set(fileName, named);
+    }
+    return named;
+  }
+
+  private nameDeclaringPackage(
     fileName: string,
     packageOf: (filePath: string) => string | undefined
   ): string | null {
