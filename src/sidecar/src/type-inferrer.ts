@@ -2142,7 +2142,7 @@ export class TypeInferrer {
    *  - the row's line is neither a route registration nor a line inside the
    *    handler the located send sits in;
    *  - the located expression is neither a send nor the argument of one;
-   *  - that send is not one the handler returns;
+   *  - that send is neither one the handler returns nor a statement of it;
    *  - it is a success send and the only one that survives, so the join would
    *    be the located body anyway;
    *  - no joined body is the located one (a text body beside JSON ones).
@@ -2174,13 +2174,17 @@ export class TypeInferrer {
       return undefined;
     }
 
-    const branches = this.responseReturnedExpressions(func).flatMap((expression) =>
+    const returnedBranches = this.responseReturnedExpressions(func).flatMap((expression) =>
       this.expandResponseBranches(expression, 0)
     );
-    if (branches.length === 0) return undefined;
-    const serialisers = this.calleesProvenSerialiser(branches);
+    const serialisers = this.calleesProvenSerialiser(returnedBranches);
     const isSend = (candidate: Node): boolean =>
       this.isResponseSend(candidate, extractionConfig, serialisers);
+    // carrick#2427: a handler that sends through a parameter returns nothing,
+    // its sends are statements. They are this handler's responses as surely as
+    // a returned send is, and the error ones must not be the contract.
+    const branches = [...returnedBranches, ...this.responseSendStatements(func, isSend)];
+    if (branches.length === 0) return undefined;
 
     const peeled = this.peelTransparentExpression(located);
     const site = isSend(peeled) ? peeled : this.receivingCallOf(located, isSend);
@@ -2245,6 +2249,25 @@ export class TypeInferrer {
       return this.inferredFromRecoveredPayload(request, recovered);
     }
     return undefined;
+  }
+
+  /**
+   * The response sends `func` makes as statements (`res.status(409).json(e);`),
+   * for a handler that sends through a parameter and returns nothing. Only the
+   * outermost call of a statement is a send, only in `func`'s own scope, and
+   * only where `isSend` accepts it, so a logger call or an `await save()`
+   * statement is never one.
+   */
+  private responseSendStatements(func: FunctionLike, isSend: (candidate: Node) => boolean): Node[] {
+    const body = func.getBody();
+    if (!body || !Node.isBlock(body)) return [];
+    const sends: Node[] = [];
+    for (const statement of body.getDescendantsOfKind(SyntaxKind.ExpressionStatement)) {
+      if (this.findContainingFunctionForNode(statement) !== func) continue;
+      const expression = this.peelTransparentExpression(statement.getExpression());
+      if (isSend(expression)) sends.push(expression);
+    }
+    return sends;
   }
 
   /**
