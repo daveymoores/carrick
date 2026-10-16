@@ -449,7 +449,8 @@ fn copy_tree(from: &Path, to: &Path) {
 /// real sidecar: an imported constant and instance, a member call through a
 /// typed receiver, the global `fetch` and `URL`, a shadowed `URL`, a name
 /// nothing declares, a file edited after the walk and a `.mjs` file in a
-/// service whose tsconfig has no `allowJs`. Each lookup reads what the
+/// service whose tsconfig has no `allowJs`, which the walk reads in the
+/// config's `scripts` program (carrick#2413). Each lookup reads what the
 /// compiler says there, or a hole with its reason.
 #[test]
 fn the_reader_answers_each_lookup_or_says_why_not() {
@@ -507,19 +508,20 @@ fn the_reader_answers_each_lookup_or_says_why_not() {
     let census = census_repo(&repo, &positions);
     assert!(census.services_without_rows.is_empty());
     assert_eq!(census.files.get("stale"), Some(&1), "{:?}", census.files);
+    assert_eq!(census.files.get("fresh"), Some(&4), "{:?}", census.files);
     assert_eq!(
         census.files.get("not_in_program"),
-        Some(&1),
+        None,
         "{:?}",
         census.files
     );
     let count = |tally: &Tally, key: &str| tally.0.get(key).copied().unwrap_or(0);
-    // `BASE_PATH` twice and `items` once in main.ts reach client.ts, as
-    // the call graph says; the use in the edited file is stale and the one in
-    // the `.mjs` file has no rows.
+    // `BASE_PATH` twice and `items` once in main.ts, and once in the `.mjs`
+    // file, reach client.ts, as the call graph says; the use in the edited
+    // file is stale.
     assert_eq!(
         count(&census.imports, "binding/same_file"),
-        3,
+        4,
         "{:?}",
         census.imports
     );
@@ -531,7 +533,7 @@ fn the_reader_answers_each_lookup_or_says_why_not() {
     );
     assert_eq!(
         count(&census.imports, "binding/hole:not_in_program"),
-        1,
+        0,
         "{:?}",
         census.imports
     );

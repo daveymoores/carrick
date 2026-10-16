@@ -67,7 +67,7 @@ export { findServiceTsconfig } from './service-config.js';
 // installed declaring file the way the capture's resolution walk does.
 export { WriteGuard } from './guarded-fs.js';
 export { installedPackageDirectory } from './installed-package-directory.js';
-export { packageNameOf } from './specifiers.js';
+export { isDeclarationFileName, packageNameOf } from './specifiers.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar
 // reaches it only through this door (index.js).
 export { runCheck } from './check.js';

@@ -21,7 +21,11 @@
  *
  * Each file is read in the program of the project that owns it
  * (`ProjectLoader.projectKeyFor`, carrick#1604), one owner's program at a
- * time: a group's program is released before the next one is built.
+ * time: a group's program is released before the next one is built. A file
+ * the owner's program does not take (JavaScript under a config without
+ * `allowJs`) is read after every owner, in that owner's `scripts` program
+ * (`ProjectLoader.scriptProjectFor`, carrick#2413), with the owner's root
+ * declaration files beside it so that the globals they declare are declared.
  *
  * The file format is pinned on the scanner side by `src/position_rows.rs`.
  */
@@ -30,8 +34,8 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
-import { ts } from 'ts-morph';
-import { WriteGuard, installedPackageDirectory } from './capture/index.js';
+import { ts, type Project } from 'ts-morph';
+import { WriteGuard, installedPackageDirectory, isDeclarationFileName } from './capture/index.js';
 import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
 import { typeToStringAsDeclared } from './print-type.js';
 import type { ProjectLoader } from './project-loader.js';
@@ -129,20 +133,31 @@ export function writePositionRows(options: PositionRowsOptions): PositionRowsCou
     groups.set(key, [...(groups.get(key) ?? []), index]);
   });
 
-  for (const [key, indexes] of groups) {
+  // Files an owner's program did not take, by owner, with that program's
+  // root declaration files.
+  const untaken = new Map<string, { indexes: number[]; declarations: string[] }>();
+
+  /**
+   * Add each file of `indexes` to `project`, build its program once, and walk
+   * every file the program takes. Returns the files it did not take; every
+   * other file is settled, and reported to `onFile`.
+   */
+  const walkGroup = (project: Project, indexes: number[], hashes: Map<number, string>): number[] => {
     const loadStarted = performance.now();
-    const project = loader.getProjectFor(key);
-    const read = new Map<number, { hash: string; fileName: string | undefined }>();
+    const read = new Map<number, string | undefined>();
     for (const index of indexes) {
       const file = files[index];
-      let bytes: Buffer;
-      try {
-        bytes = fs.readFileSync(file);
-      } catch {
-        lines[index] = fileLine({ f: paths.relative(file), skip: 'unreadable', r: [] });
-        continue;
+      if (!hashes.has(index)) {
+        let bytes: Buffer;
+        try {
+          bytes = fs.readFileSync(file);
+        } catch {
+          lines[index] = fileLine({ f: paths.relative(file), skip: 'unreadable', r: [] });
+          options.onFile?.();
+          continue;
+        }
+        hashes.set(index, crypto.createHash('sha256').update(bytes).digest('hex'));
       }
-      const hash = crypto.createHash('sha256').update(bytes).digest('hex');
       // A file no program lists is added, as `infer` adds one.
       let sourceFile = project.getSourceFile(file);
       if (!sourceFile) {
@@ -152,7 +167,7 @@ export function writePositionRows(options: PositionRowsOptions): PositionRowsCou
           sourceFile = undefined;
         }
       }
-      read.set(index, { hash, fileName: sourceFile?.getFilePath() });
+      read.set(index, sourceFile?.getFilePath());
     }
     // Built once, after every file the group adds.
     const program = project.getProgram().compilerObject;
@@ -160,29 +175,59 @@ export function writePositionRows(options: PositionRowsOptions): PositionRowsCou
 
     const walkStarted = performance.now();
     const walker = new PositionWalker(program, paths, loader);
+    const missed: number[] = [];
     for (const index of indexes) {
-      const entry = read.get(index);
-      if (entry) {
-        const f = paths.relative(files[index]);
-        const sourceFile = entry.fileName ? program.getSourceFile(entry.fileName) : undefined;
-        if (!sourceFile) {
-          lines[index] = fileLine({ f, h: entry.hash, skip: 'not_in_program', r: [] });
-        } else {
-          const rows = walker.rowsOf(sourceFile);
-          for (const row of rows) {
-            counts.rows += 1;
-            if (row[3] !== null) counts.resolved += 1;
-            if (row[8] & FLAG_ANY) counts.any += 1;
-            if (row[8] & FLAG_ERROR_TYPE) counts.error_type += 1;
-          }
-          lines[index] = fileLine({ f, h: entry.hash, r: rows });
-        }
+      if (!read.has(index)) continue;
+      const fileName = read.get(index);
+      const sourceFile = fileName ? program.getSourceFile(fileName) : undefined;
+      if (!sourceFile) {
+        missed.push(index);
+        continue;
       }
+      const rows = walker.rowsOf(sourceFile);
+      for (const row of rows) {
+        counts.rows += 1;
+        if (row[3] !== null) counts.resolved += 1;
+        if (row[8] & FLAG_ANY) counts.any += 1;
+        if (row[8] & FLAG_ERROR_TYPE) counts.error_type += 1;
+      }
+      lines[index] = fileLine({ f: paths.relative(files[index]), h: hashes.get(index), r: rows });
       options.onFile?.();
     }
     counts.walk_ms += performance.now() - walkStarted;
+    return missed;
+  };
+
+  const hashes = new Map<number, string>();
+  for (const [key, indexes] of groups) {
+    const project = loader.getProjectFor(key);
+    const missed = walkGroup(project, indexes, hashes);
+    if (missed.length > 0) {
+      const declarations = project
+        .getProgram()
+        .compilerObject.getRootFileNames()
+        .filter(isDeclarationFileName);
+      untaken.set(key, { indexes: missed, declarations });
+    }
     // One owner's program at a time.
     loader.releaseProjectFor(key);
+  }
+
+  for (const [key, { indexes, declarations }] of untaken) {
+    const loadStarted = performance.now();
+    const project = loader.scriptProjectFor(key);
+    for (const declaration of declarations) {
+      try {
+        project.addSourceFileAtPath(declaration);
+      } catch {
+        // A declaration file that went away is not the walk's to report.
+      }
+    }
+    counts.load_ms += performance.now() - loadStarted;
+    for (const index of walkGroup(project, indexes, hashes)) {
+      lines[index] = fileLine({ f: paths.relative(files[index]), h: hashes.get(index), skip: 'not_in_program', r: [] });
+      options.onFile?.();
+    }
   }
 
   const writeStarted = performance.now();
