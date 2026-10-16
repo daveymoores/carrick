@@ -453,6 +453,25 @@ pub struct CaptureFidelity {
     pub usable_rate: f64,
 }
 
+/// What a `position_rows` walk wrote, counted (carrick#2405). For the run
+/// log: nothing in the scan reads the rows yet.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PositionRowsCounts {
+    /// Source files in the request, each one line of the rows file.
+    pub files: usize,
+    pub rows: usize,
+    /// Rows whose position resolved to a symbol.
+    pub resolved: usize,
+    /// Rows whose type is `any`.
+    pub any: usize,
+    /// Rows whose type is the compiler's error type.
+    pub error_type: usize,
+    /// The rows file's size on disk, compressed.
+    pub bytes: u64,
+    pub load_ms: u64,
+    pub walk_ms: u64,
+}
+
 /// Result of a `capture_v2` action (mirrors `CaptureStubResult`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CaptureV2Result {
@@ -1108,6 +1127,14 @@ enum SidecarRequest {
     },
     #[serde(rename = "list_program_files")]
     ListProgramFiles { request_id: String },
+    #[serde(rename = "position_rows")]
+    PositionRows {
+        request_id: String,
+        files: Vec<String>,
+        scan_root: String,
+        out_path: String,
+        service: String,
+    },
     #[serde(rename = "add_program_files")]
     AddProgramFiles {
         request_id: String,
@@ -1125,7 +1152,8 @@ impl SidecarRequest {
             SidecarRequest::Init { .. }
             | SidecarRequest::ListProgramFiles { .. }
             | SidecarRequest::Shutdown { .. } => 0,
-            SidecarRequest::AddProgramFiles { files, .. } => files.len(),
+            SidecarRequest::AddProgramFiles { files, .. }
+            | SidecarRequest::PositionRows { files, .. } => files.len(),
             SidecarRequest::Bundle { symbols, .. } => symbols.len(),
             SidecarRequest::Infer { requests, .. } => requests.len(),
             SidecarRequest::CaptureV2 { anchors, .. } => anchors.len(),
@@ -2160,6 +2188,11 @@ pub struct TypeSidecar {
     /// The highest peak, in bytes, of the processes a restart has replaced:
     /// see [`Self::peak_resident_bytes`].
     replaced_peak: AtomicU64,
+    /// A process whose work nothing in the scan reads (carrick#2405): its
+    /// death and its missed deadlines are logged at debug and nothing else.
+    /// Nothing is recorded for the run and nothing is restarted
+    /// ([`Self::record_only`]).
+    record_only: bool,
 }
 
 /// How a sidecar process that is gone came to an end, with what it left to
@@ -2199,8 +2232,31 @@ impl SidecarRecipe {
         repo_root: &Path,
         tsconfig_path: Option<&str>,
     ) -> Result<TypeSidecar, SidecarError> {
-        let sidecar =
+        self.spawn_ready(repo_root, tsconfig_path, false)
+    }
+
+    /// [`Self::spawn_scoped`], record-only from the start
+    /// ([`TypeSidecar::record_only`]): a death while it gets ready is not
+    /// recorded either (carrick#2405).
+    pub fn spawn_scoped_record_only(
+        &self,
+        repo_root: &Path,
+        tsconfig_path: Option<&str>,
+    ) -> Result<TypeSidecar, SidecarError> {
+        self.spawn_ready(repo_root, tsconfig_path, true)
+    }
+
+    fn spawn_ready(
+        &self,
+        repo_root: &Path,
+        tsconfig_path: Option<&str>,
+        record_only: bool,
+    ) -> Result<TypeSidecar, SidecarError> {
+        let mut sidecar =
             TypeSidecar::spawn(&self.sidecar_path)?.with_operation_timeout(self.operation_timeout);
+        if record_only {
+            sidecar = sidecar.record_only();
+        }
         if let Some(scan_root) = &self.scan_root {
             sidecar.set_scan_root(scan_root);
         }
@@ -2252,6 +2308,7 @@ impl TypeSidecar {
             evidence: Mutex::new(evidence),
             death_noted: AtomicBool::new(false),
             replaced_peak: AtomicU64::new(0),
+            record_only: false,
         })
     }
 
@@ -2323,6 +2380,14 @@ impl TypeSidecar {
             return;
         }
         let death = self.how_the_process_died();
+        if self.record_only {
+            debug!(
+                "[type_sidecar] A record-only sidecar process ended ({:?}; heap line: {}, OOM \
+                 kills rose: {}); nothing is recorded for the run",
+                death.end, death.heap_line, death.oom_kills_rose
+            );
+            return;
+        }
         match death.memory_death() {
             Some(kind) => {
                 let cap = heap_cap_mb();
@@ -2351,6 +2416,17 @@ impl TypeSidecar {
     /// happens when it passes cannot serve it.
     pub fn with_operation_timeout(mut self, timeout: Duration) -> Self {
         self.operation_timeout = timeout;
+        self
+    }
+
+    /// This process, record-only (carrick#2405): its work is something
+    /// nothing in the scan reads, so when it dies or misses a deadline that
+    /// is logged at debug and nothing else. No memory death, time limit or
+    /// service loss is recorded for the run, nothing is restarted, and
+    /// `CARRICK_FAIL_ON_TYPE_MEMORY` never sees it. Set before `init`, so
+    /// readiness is covered too.
+    pub fn record_only(mut self) -> Self {
+        self.record_only = true;
         self
     }
 
@@ -2703,6 +2779,16 @@ impl TypeSidecar {
     /// consumer each lost pair belongs to
     /// ([`crate::time_limits::from_check_outcomes`]).
     fn restarting_on_timeout<T>(&self, answer: Result<T, SidecarError>) -> Result<T, SidecarError> {
+        if matches!(answer, Err(SidecarError::Timeout)) && self.record_only {
+            // Nobody reads its answer, so nothing is counted and nothing is
+            // replaced: the process is stopped and the caller loses its work.
+            debug!(
+                "[type_sidecar] A record-only operation gave no answer or progress within {:?}",
+                self.operation_timeout
+            );
+            self.kill();
+            return answer;
+        }
         if matches!(answer, Err(SidecarError::Timeout)) {
             crate::scan_health::record_time_limit(
                 crate::time_limits::TimeLimit::SidecarDeadline,
@@ -3063,6 +3149,43 @@ impl TypeSidecar {
             return Err(SidecarError::CaptureFailed(result.errors.join("; ")));
         }
         Ok(result)
+    }
+
+    /// Write the compiler's rows for each call, member access, comparison
+    /// and identifier in `files` to `out_path` (carrick#2405). Asked of a
+    /// record-only process of its own ([`SidecarRecipe::spawn_scoped_record_only`]):
+    /// the walk releases each owner's program as it goes, so it inherits
+    /// nothing from the service's analysis.
+    pub fn position_rows(
+        &self,
+        files: &[PathBuf],
+        scan_root: &Path,
+        out_path: &Path,
+        service: &str,
+    ) -> Result<PositionRowsCounts, SidecarError> {
+        self.ensure_ready()?;
+        let request_id = self.next_request_id();
+        let request = SidecarRequest::PositionRows {
+            request_id: request_id.clone(),
+            files: files
+                .iter()
+                .map(|file| file.to_string_lossy().into_owned())
+                .collect(),
+            scan_root: scan_root.to_string_lossy().into_owned(),
+            out_path: out_path.to_string_lossy().into_owned(),
+            service: service.to_string(),
+        };
+        self.send_request(&request)?;
+        // The walk writes a progress frame as it finishes files, so the
+        // operation deadline is a silence, not a total.
+        let value = self.operation_result(&request_id)?;
+        if value.get("status").and_then(|s| s.as_str()) != Some("success") {
+            return Err(SidecarError::PositionRowsFailed(frame_errors(&value)));
+        }
+        serde_json::from_value(value.get("result").cloned().ok_or_else(|| {
+            SidecarError::PositionRowsFailed("no result in the answer".to_string())
+        })?)
+        .map_err(|e| SidecarError::DeserializationError(e.to_string()))
     }
 
     /// Run the v2 "tsc as the judge" check over assembled capture stubs.
@@ -3991,6 +4114,8 @@ pub enum SidecarError {
     CheckFailed(String),
     /// The sidecar could not list or add its program's files
     ProgramFilesFailed(String),
+    /// The sidecar answered a position-rows walk with an error (carrick#2405)
+    PositionRowsFailed(String),
     /// This process was signalled while the wait was on (carrick#1387).
     Interrupted(crate::shutdown::Interrupted),
 }
@@ -4040,7 +4165,8 @@ impl SidecarError {
             | SidecarError::ResolutionFailed(_)
             | SidecarError::CaptureFailed(_)
             | SidecarError::CheckFailed(_)
-            | SidecarError::ProgramFilesFailed(_) => false,
+            | SidecarError::ProgramFilesFailed(_)
+            | SidecarError::PositionRowsFailed(_) => false,
             SidecarError::SpawnFailed(_)
             | SidecarError::InitFailed(_)
             | SidecarError::NotReady(_)
@@ -4066,6 +4192,7 @@ impl std::fmt::Display for SidecarError {
             SidecarError::CaptureFailed(e) => write!(f, "v2 capture failed: {}", e),
             SidecarError::CheckFailed(e) => write!(f, "v2 check failed: {}", e),
             SidecarError::ProgramFilesFailed(e) => write!(f, "Program files request failed: {}", e),
+            SidecarError::PositionRowsFailed(e) => write!(f, "Position rows walk failed: {}", e),
             SidecarError::Interrupted(e) => write!(f, "{e}"),
         }
     }

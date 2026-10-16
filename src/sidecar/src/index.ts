@@ -35,6 +35,7 @@ import { LibraryClaimsVerifier, httpCheck } from './library-claims.js';
 import { PROGRESS_INTERVAL_MS, atMostEvery } from './progress.js';
 import { mergeInferTimings } from './infer-timing.js';
 import { addProgramFiles, listProgramFiles } from './program-files.js';
+import { writePositionRows } from './position-rows.js';
 import type {
   BundleResult,
   RetypeOutcome,
@@ -54,6 +55,7 @@ import type {
   ShutdownResponse,
   ListProgramFilesResponse,
   AddProgramFilesResponse,
+  PositionRowsResponse,
   ErrorResponse,
 } from './types.js';
 
@@ -684,6 +686,46 @@ function handleAddProgramFiles(
 }
 
 /**
+ * Handle the 'position_rows' action - write the compiler's rows for each
+ * call, member access, comparison and identifier of the given files
+ * (carrick#2405). Asked of a process of its own: it releases each owner's
+ * program once its files are walked, so nothing built before it is kept.
+ */
+function handlePositionRows(
+  request: SidecarRequest & { action: 'position_rows' }
+): PositionRowsResponse {
+  try {
+    const loader = initializedLoader();
+    // Built over programs the walk releases; nothing may read them after it.
+    components = new Map();
+    let done = 0;
+    const report = atMostEvery(PROGRESS_INTERVAL_MS, () =>
+      writeProgress(request.request_id, 'positions', `${done} of ${request.files.length}`)
+    );
+    const result = writePositionRows({
+      loader,
+      files: request.files,
+      scanRoot: request.scan_root,
+      outPath: request.out_path,
+      service: request.service,
+      onFile: () => {
+        done += 1;
+        report();
+      },
+    });
+    log(
+      `Position rows: ${result.rows} row(s) over ${result.files} file(s), ` +
+        `${result.bytes} byte(s), load ${result.load_ms}ms, walk ${result.walk_ms}ms`
+    );
+    return { request_id: request.request_id, status: 'success', result };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Position rows failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
  * Handle the 'health' action - report initialization status
  */
 function handleHealth(request: SidecarRequest & { action: 'health' }): HealthResponse {
@@ -745,6 +787,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleListProgramFiles(request);
     case 'add_program_files':
       return handleAddProgramFiles(request);
+    case 'position_rows':
+      return handlePositionRows(request);
     case 'health':
       return handleHealth(request);
     case 'shutdown':

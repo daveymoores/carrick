@@ -108,13 +108,14 @@ A client must skip progress frames rather than treat the first frame as the answ
 | `bundle`, `verify_library_claims` | One per program the request reads, when that program is ready. |
 | `capture_v2` | One as it reaches each stage, `phase` naming it: `program` (the program the anchors are read in is being built), `anchors` (they are being resolved; `message` is `<done> of <total>`, starting at `0`, then at most one every 1.5 s), `emit` (declarations), `self-check` (the stub). The last one written says how far a capture whose process died had got. |
 | `check_v2` | A keepalive every 1.5 s while it installs and checks; `phase` names the stage. |
+| `position_rows` | As `infer`, counting the files walked, with `phase` `positions`. |
 | every other action | None. |
 
 Frames are written by the work itself, between units, except for `check_v2`, whose work runs in child processes. A handler that stops finishing units stops writing them.
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `infer`, `retype_check`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files` and `add_program_files` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
+`init` resolves a project; `bundle`, `infer`, `retype_check`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files`, `add_program_files` and `position_rows` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
 
 `capture_v2`, `check_v2`, `resolve_definitions`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
@@ -134,6 +135,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `list_library_surface` | yes | List a package's declared surface the way the verifier reads it, with its full-surface hash |
 | `list_program_files` | yes | The files the program was built from, in order |
 | `add_program_files` | yes | Add files to the program in a given order |
+| `position_rows` | yes | Write the compiler's rows for every call, member access, comparison and identifier of a service's files (record-only) |
 | `resolve_definitions` | no | As-written and structural form of captured aliases |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
 | `health` | no | Readiness and init cost |
@@ -854,6 +856,43 @@ Response:
 To give a second process the first one's program, send the first one's `list_program_files` answer to the second one's `add_program_files` before the second one answers any other request. Both processes then build from the same roots in the same order, so they hold the same files in the same order. A process that has already added files keeps them where they are.
 
 Both actions read the default project, the one that types every file no referenced project owns. A file a referenced project owns (carrick#1604) is in that project's program from its tsconfig, so `add_program_files` skips it, and no request adds files to that program.
+
+#### `position_rows` - The compiler's rows for every position (carrick#2405)
+
+Record-only: nothing in a scan reads the rows yet. The scanner asks for them only with `CARRICK_POSITION_ROWS=1` and a local store (`CARRICK_LOCAL_STORAGE_DIR`), of a process of its own started after the service's analysis sidecar is gone. The walk reads each file in the program of the project that owns it, one owner's program at a time, releasing each before it builds the next. A file no program lists is added, as `infer` adds one.
+
+```json
+{
+  "request_id": "14",
+  "action": "position_rows",
+  "files": ["/repo/apps/api/src/a.ts", "/repo/apps/api/src/b.ts"],
+  "scan_root": "/repo",
+  "out_path": "/store/positions/repo__api.jsonl.gz",
+  "service": "api"
+}
+```
+
+Response (counts only; the rows are in the file):
+```json
+{
+  "request_id": "14",
+  "status": "success",
+  "result": { "files": 2, "rows": 380, "resolved": 361, "any": 4, "error_type": 2, "bytes": 2411, "load_ms": 980, "walk_ms": 120 }
+}
+```
+
+The file is gzip JSON lines, written to `<out_path>.partial` and renamed into place, through the write guard: a directory inside the scanned trees is refused unless it is beneath `.carrick`. Line 1 is `{"v":1,"typescript":"<version>","service":"<name>","files":N}`. Then one line per file, in request order: `{"f":"<repo-relative path>","h":"<sha256 of the bytes on disk>","r":[row, ...]}`, or with `"skip":"unreadable"` or `"skip":"not_in_program"` and no rows.
+
+Each row is `[kind, start, end, symbol, decl_file, decl_line, decl_package, type_text, flags]`, keyed by `(start, end, kind)`: TypeScript `getStart()`/`getEnd()` in UTF-16 code units.
+
+| kind | node | symbol of | type of |
+|---|---|---|---|
+| `call` | call, `new`, tagged template | the callee's name, through `( )`, `as`, `!`, `satisfies` | the call |
+| `member` | property or element access | the name or the argument | the access |
+| `compare` | `=== !== == != < > <= >= instanceof in` | the left operand | the left operand |
+| `ident` | an identifier in expression position, a shorthand property `{ a }` included | itself | itself |
+
+The symbol follows aliases to a target that has a declaration. The declaration is the one the inferrer attributes it to (carrick#2031). `decl_file` is repo-relative (`node_modules/...` included), `lib:<file>` for the compiler's default library (its line is in ts-morph's copy of the library), `pkg:<name>/<path>` for an installed package outside the repo root, or `null`. `decl_package` is the module graph's or the path's package, else the `name` of the nearest `package.json` up to the repo root. `type_text` is the compiler's print of the type at the node with no enclosing declaration (`typeToString(getTypeAtLocation(node))`, default truncation), through `print-type.ts`, so one type reads the same from every file; a declaring file's path in it is written as `decl_file` names it. Flags: 1 `any`, 2 the error type (never with 1), 4 the checker threw at the node, 8 the declaration is outside the checkout and unnamed. The scanner pins the format in `src/position_rows.rs`.
 
 #### `resolve_definitions` - Read aliases out of a capture stub
 

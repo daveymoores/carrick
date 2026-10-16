@@ -1,0 +1,5 @@
+{
+  "name": "position-rows-fixture",
+  "private": true,
+  "workspaces": ["packages/*", "apps/*"]
+}

@@ -97,12 +97,16 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           base === 'project-loader.ts' ||
           base === 'definition-resolver.ts' ||
           base === 'type-inferrer.ts' ||
-          base === 'bundler.ts'
+          base === 'bundler.ts' ||
+          base === 'declaration-attribution.ts' ||
+          base === 'position-rows.ts'
         ) {
           // Shared Deno resolution, the options every program carries
           // (`sidecarCompilerOptions`, carrick#2019), and the response-table
           // reading the inferrer and the v1 bundle share with the capture's
-          // symbol anchor (carrick#1841).
+          // symbol anchor (carrick#1841). The per-position rows write
+          // through the guard and name packages as the capture does
+          // (carrick#2405).
           assert.strictEqual(
             spec,
             './capture/index.js',

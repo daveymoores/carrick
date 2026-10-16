@@ -1,0 +1,2 @@
+# Bytes as written: one file has CRLF line endings, one a BOM (carrick#2405).
+* -text
