@@ -6808,21 +6808,32 @@ pub fn summarize(
     }
     for sites in index.rows.values_mut() {
         for rows in sites.values_mut() {
-            rows.sort();
-            // One row per statement, whatever end its base was reached by:
-            // the end says what kind of base it is, not which row it is.
-            rows.dedup_by(|later, kept| {
-                SummaryRow {
-                    base_end: None,
-                    ..later.clone()
-                } == SummaryRow {
-                    base_end: None,
-                    ..kept.clone()
-                }
-            });
+            merge_rows(rows);
         }
     }
     index
+}
+
+/// One row per statement at a site, whatever end its base was reached by:
+/// the end says what kind of base it is, not which row it is (carrick#2406).
+/// Where the merged rows' ends disagree, no one of them is the base's, so
+/// the row keeps the hole an unread value ends at, which states the base
+/// as injected rather than as any one of the ends.
+fn merge_rows(rows: &mut Vec<SummaryRow>) {
+    rows.sort();
+    rows.dedup_by(|later, kept| {
+        let same = SummaryRow {
+            base_end: None,
+            ..later.clone()
+        } == SummaryRow {
+            base_end: None,
+            ..kept.clone()
+        };
+        if same && later.base_end != kept.base_end {
+            kept.base_end = Some(Root::Hole(HoleReason::UnreadExpression));
+        }
+        same
+    });
 }
 
 /// Whether a call of `callee`, written in `ir`, provably sends nothing
@@ -8414,6 +8425,50 @@ mod tests {
                 Some("${process.env.API}/users".to_string())
             )
         );
+    }
+
+    /// carrick#2406: two rows that state the same thing at a site merge into
+    /// one. Where their bases end apart (an environment read and a
+    /// parameter, or two variables), the merged row's base is no one of them:
+    /// it ends at a hole, which states it injected, not as the end that
+    /// sorts first.
+    #[test]
+    fn merged_rows_whose_base_ends_disagree_keep_no_one_end() {
+        let row = |end: Root| SummaryRow {
+            callee: "list".to_string(),
+            span_start: 10,
+            span_end: 20,
+            line: 2,
+            method: "GET".to_string(),
+            target: "${base}/users".to_string(),
+            body_literals: BTreeMap::new(),
+            reaches_request: None,
+            own_site: false,
+            at_caller: false,
+            call_body: None,
+            library_semantics: Vec::new(),
+            base_fallbacks: None,
+            request_at: (PathBuf::from("src/client.ts"), 40),
+            base_end: Some(end),
+        };
+        let a = env("process.env.A", "A", None);
+        let b = env("process.env.B", "B", None);
+        let param = Root::Param(0, "base".to_string());
+        let hole = Some(Root::Hole(HoleReason::UnreadExpression));
+        for ends in [
+            vec![a.clone(), param.clone()],
+            vec![a.clone(), b.clone()],
+            vec![param.clone(), a.clone(), a.clone()],
+        ] {
+            let mut rows: Vec<SummaryRow> = ends.into_iter().map(row).collect();
+            merge_rows(&mut rows);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].base_end, hole);
+        }
+        let mut agreeing = vec![row(a.clone()), row(a.clone())];
+        merge_rows(&mut agreeing);
+        assert_eq!(agreeing.len(), 1);
+        assert_eq!(agreeing[0].base_end, Some(a));
     }
 
     /// carrick#2406: where the AST recogniser and the text test it replaced
