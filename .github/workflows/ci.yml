@@ -94,7 +94,7 @@ jobs:
           - shard: n5
             runner: nextest
             targets: >-
-              --test request_summary_test --test spread_parameter_body_test --test object_key_url_wrapper_test --test incremental_raw_cache_test --test socket_class_field_test --test alias_shaped_type_imports_test --test span_locator_units_test --test ask_in_parts_test --test dispatch_resume_test --test socket_extraction_test
+              --test request_summary_test --test spread_parameter_body_test --test object_key_url_wrapper_test --test incremental_raw_cache_test --test socket_class_field_test --test alias_shaped_type_imports_test --test span_locator_units_test --test ask_in_parts_test --test dispatch_resume_test --test socket_extraction_test --test class_client_construction_test
           - shard: n6
             runner: nextest
             targets: >-
