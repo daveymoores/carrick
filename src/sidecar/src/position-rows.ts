@@ -429,6 +429,12 @@ class PositionWalker {
       if (!symbol) return [kind, start, end, null, null, null, null, typeText, flags];
       const declaration = attributedDeclaration(() => this.program, symbol.declarations ?? []);
       if (!declaration) return [kind, start, end, ts.symbolName(symbol), null, null, null, typeText, flags];
+      // A file's own module symbol is named by the compiler as the quoted
+      // absolute file name (`"/<checkout>/pkg/index"`). Name it as `decl_file`
+      // names the file. A symbol that merely lives in a file (CommonJS
+      // `exports`) keeps its name.
+      const symbolName = ts.symbolName(symbol);
+      const isModule = declaration.kind === ts.SyntaxKind.SourceFile && symbolName.startsWith('"');
       const declaringFile = declaration.getSourceFile();
       const declFile = this.program.isSourceFileDefaultLibrary(declaringFile)
         ? `lib:${path.basename(declaringFile.fileName)}`
@@ -439,7 +445,8 @@ class PositionWalker {
       const declPackage = this.paths.declaringPackage(declaringFile.fileName, (file) =>
         this.loader.packageOf(file)
       );
-      return [kind, start, end, ts.symbolName(symbol), declFile, declLine, declPackage, typeText, flags];
+      const name = isModule ? declFile : symbolName;
+      return [kind, start, end, name, declFile, declLine, declPackage, typeText, flags];
     } catch {
       return [kind, start, end, null, null, null, null, null, FLAG_CHECKER_THREW];
     }
