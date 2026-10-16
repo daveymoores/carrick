@@ -268,7 +268,28 @@ fn census_repo(root: &Path, positions: &Path) -> RepoCensus {
             for (lo, hi, target, line) in inputs.sites.sites_in(file) {
                 let (lo, hi) = (ir.swc_start(lo), ir.swc_start(hi));
                 let key = match positions.declaration(file, lo, hi, Kind::Call, false) {
-                    Err(reason) => hole(reason),
+                    Err(reason) => {
+                        // A JSX element is a call site to the call graph and
+                        // no row kind to the walk.
+                        let mut key = hole(reason);
+                        if reason == HoleReason::RowsMissing
+                            && let Ok(text) = std::fs::read_to_string(file)
+                        {
+                            let body = text.strip_prefix('\u{feff}').unwrap_or(&text);
+                            let start = (lo - SWC_SPAN_BASE) as usize;
+                            let end = ((hi - SWC_SPAN_BASE) as usize).min(start + 60);
+                            let snippet = body.get(start..end).unwrap_or_default();
+                            if snippet.starts_with('<') {
+                                key.push_str("/jsx_element");
+                            } else {
+                                census.example(
+                                    "calls/rows_missing",
+                                    format!("{rel}:{lo}-{hi}: {snippet:?}"),
+                                );
+                            }
+                        }
+                        key
+                    }
                     Ok(row) => {
                         let target = relative(target);
                         if row.decl_file() == Some(target.as_str()) {
