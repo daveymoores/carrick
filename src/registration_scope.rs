@@ -1890,6 +1890,9 @@ impl CallbackTrace<'_> {
                 file_results,
                 &declaring,
                 &name,
+                // The hand-out's row mounts the function by this name, so
+                // its hand-ons hang from it.
+                &name,
                 registration.position,
                 depth,
                 &mut hand_ons,

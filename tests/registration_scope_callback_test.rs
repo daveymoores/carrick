@@ -119,15 +119,15 @@ fn all_rows(projection: &serde_json::Value) -> String {
 #[test]
 fn a_route_the_host_callback_registers_takes_the_scope_prefix_and_folds() {
     let projection = scan();
-    let all = all_rows(&projection);
-    let notes = rows_in(&projection, "packages/routes/src/notes.ts");
+    let all = all_rows(projection);
+    let notes = rows_in(projection, "packages/routes/src/notes.ts");
     assert_eq!(notes.len(), 1, "one row for the note route:\n{all}");
     assert_eq!(notes[0].0, "/api/v1/teams/:id/notes", "{all}");
     assert_eq!(
         notes[0].1, "descriptor_route",
         "the documentation row folds onto the handler row:\n{all}"
     );
-    let tags = rows_in(&projection, "packages/routes/src/tags.ts");
+    let tags = rows_in(projection, "packages/routes/src/tags.ts");
     assert_eq!(
         tags.iter()
             .map(|(path, _)| path.as_str())
@@ -135,7 +135,7 @@ fn a_route_the_host_callback_registers_takes_the_scope_prefix_and_folds() {
         vec!["/api/v1/teams/:id/tags"],
         "a second function reached from the same hand-out:\n{all}"
     );
-    let documented: Vec<String> = paths_in(&projection, "packages/routes/src/docs.ts");
+    let documented: Vec<String> = paths_in(projection, "packages/routes/src/docs.ts");
     assert_eq!(
         documented,
         vec!["/api/v1/teams/{id}/audit".to_string()],
@@ -147,10 +147,10 @@ fn a_route_the_host_callback_registers_takes_the_scope_prefix_and_folds() {
 fn the_scope_keeps_the_routes_the_model_stated() {
     let projection = scan();
     assert_eq!(
-        paths_in(&projection, "packages/routes/src/orders.ts"),
+        paths_in(projection, "packages/routes/src/orders.ts"),
         vec!["/api/v1/orders"],
         "{}",
-        all_rows(&projection)
+        all_rows(projection)
     );
 }
 
@@ -158,10 +158,10 @@ fn the_scope_keeps_the_routes_the_model_stated() {
 fn a_function_sharing_its_file_with_other_routes_is_not_mounted() {
     let projection = scan();
     assert_eq!(
-        paths_in(&projection, "packages/routes/src/shared.ts"),
+        paths_in(projection, "packages/routes/src/shared.ts"),
         vec!["/admin/keys", "/public/keys"],
         "{}",
-        all_rows(&projection)
+        all_rows(projection)
     );
 }
 
@@ -180,17 +180,17 @@ fn a_file_another_mount_already_resolves_to_keeps_that_mount() {
 fn a_hand_out_of_the_plugins_own_instance_is_not_followed() {
     let projection = scan();
     assert_eq!(
-        paths_in(&projection, "packages/routes/src/root-routes.ts"),
+        paths_in(projection, "packages/routes/src/root-routes.ts"),
         vec!["/teams/:id/root"],
         "{}",
-        all_rows(&projection)
+        all_rows(projection)
     );
 }
 
 #[test]
 fn a_callback_that_is_not_one_supplier_keeps_its_routes_paths() {
     let projection = scan();
-    let all = all_rows(&projection);
+    let all = all_rows(projection);
     for (file, path, why) in [
         (
             "twice-routes.ts",
@@ -214,7 +214,7 @@ fn a_callback_that_is_not_one_supplier_keeps_its_routes_paths() {
         ),
     ] {
         assert_eq!(
-            paths_in(&projection, &format!("packages/routes/src/{file}")),
+            paths_in(projection, &format!("packages/routes/src/{file}")),
             vec![path.to_string()],
             "{why}:\n{all}"
         );
@@ -225,9 +225,9 @@ fn a_callback_that_is_not_one_supplier_keeps_its_routes_paths() {
 fn the_host_packages_own_rows_do_not_move() {
     let projection = scan();
     assert_eq!(
-        paths_in(&projection, "packages/server/src/extra.ts"),
+        paths_in(projection, "packages/server/src/extra.ts"),
         vec!["/teams/:id/audit"],
         "{}",
-        all_rows(&projection)
+        all_rows(projection)
     );
 }
