@@ -1,0 +1,78 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "/v1/ops",
+      "method": "POST",
+      "pattern_matched": "sendOp(",
+      "call_expression_text": "sendOp(\"purge\", extra)",
+      "call_expression_line": 9,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "op",
+        "value": "invoke-sendOp"
+      }
+    },
+    {
+      "candidate_id": "@line:10",
+      "line_number": 10,
+      "target": "/v1/ops",
+      "method": "POST",
+      "pattern_matched": "sendOp(",
+      "call_expression_text": "sendOp(\"purge\", buildArgs())",
+      "call_expression_line": 10,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "op",
+        "value": "invoke-sendOp"
+      }
+    },
+    {
+      "candidate_id": "@line:11",
+      "line_number": 11,
+      "target": "/v1/ops",
+      "method": "POST",
+      "pattern_matched": "sendOp(",
+      "call_expression_text": "sendOp(...list)",
+      "call_expression_line": 11,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "op",
+        "value": "invoke-sendOp"
+      }
+    },
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "target": "/v1/ops",
+      "method": "POST",
+      "pattern_matched": "sendOp(",
+      "call_expression_text": "sendOp(\"purge\")",
+      "call_expression_line": 12,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "op",
+        "value": "invoke-sendOp"
+      }
+    }
+  ]
+}

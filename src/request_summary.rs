@@ -339,6 +339,12 @@ pub enum Value {
 pub struct ObjValue {
     pub fields: BTreeMap<String, Value>,
     pub open: bool,
+    /// A spread of the function's own parameter, and the keys written before
+    /// it (carrick#2411): what a caller's argument there puts in place is
+    /// read where the call is, so those keys stand unless it sets them.
+    /// `fields` and `open` read as if the spread could hold anything: only
+    /// the body a request sends reads this.
+    pub under_param: Option<(usize, BTreeMap<String, Value>)>,
 }
 
 impl ObjValue {
@@ -401,6 +407,8 @@ impl Value {
                     .map(|(key, value)| (key.clone(), value.enclosed()))
                     .collect(),
                 open: obj.open,
+                // A closure's object reads as it always did.
+                under_param: None,
             }),
             Value::Callback(index) => Value::Callback(*index),
         }
@@ -779,6 +787,22 @@ struct CallIr {
     /// (carrick#2386): what a call that names an operation names. Read by
     /// the chains alone.
     names: Vec<guards::ArgName>,
+    /// Each argument as a spread of the callee's parameter puts it in place
+    /// (carrick#2411): empty for an element.
+    spread_args: Vec<SpreadArg>,
+}
+
+/// What a call's argument puts in place of the callee's spread of that
+/// parameter in a body it sends ([`ObjValue::under_param`], carrick#2411).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpreadArg {
+    /// The caller's own parameter, by position: its callers fill the spread.
+    Param(usize),
+    /// The objects it may be, every key of each stated
+    /// ([`Reader::spread_branches`]).
+    Keys(Vec<ObjValue>),
+    /// Anything else, which may carry any key.
+    Unread,
 }
 
 /// One function body, reduced to what a request summary reads.
@@ -4047,6 +4071,7 @@ impl Reader<'_> {
                         return Value::Obj(ObjValue {
                             fields: BTreeMap::new(),
                             open: true,
+                            under_param: None,
                         });
                     }
                     return value.clone();
@@ -4285,14 +4310,26 @@ impl Reader<'_> {
     /// literal, or a condition choosing between them) overwrites exactly those
     /// keys; any other spread, and any computed key, may overwrite every one,
     /// and the object is open. A key written after a spread is known.
+    ///
+    /// One spread of the function's own parameter, in an object that is
+    /// closed up to it, is the caller's argument there (carrick#2411): the
+    /// keys before it are held ([`ObjValue::under_param`]) for a call to put
+    /// that argument in place. Any later entry but a plain key drops the hold.
     fn object(&self, obj: &ObjectLit, scope: &Scope<'_>) -> ObjValue {
         let mut value = ObjValue::default();
         for prop in &obj.props {
             let prop = match prop {
                 PropOrSpread::Spread(spread) => {
+                    // A held object is open, so a second spread takes no hold.
+                    value.under_param = None;
                     match self.spread_branches(&spread.expr, scope) {
                         Some(branches) => value.spread(&branches),
                         None => {
+                            if !value.open {
+                                value.under_param = self
+                                    .own_param(&spread.expr, scope)
+                                    .map(|index| (index, std::mem::take(&mut value.fields)));
+                            }
                             value.fields.clear();
                             value.open = true;
                         }
@@ -4309,6 +4346,7 @@ impl Reader<'_> {
                     None => {
                         value.fields.clear();
                         value.open = true;
+                        value.under_param = None;
                     }
                 },
                 Prop::Shorthand(ident) => {
@@ -4332,10 +4370,42 @@ impl Reader<'_> {
                         _ => {}
                     }
                     value.open = true;
+                    value.under_param = None;
                 }
             }
         }
         value
+    }
+
+    /// The position of the function's own parameter `expr` names, when its
+    /// keys are the ones the caller wrote ([`Scope::key_objects`]).
+    fn own_param(&self, expr: &Expr, scope: &Scope<'_>) -> Option<usize> {
+        match crate::graphql_document_sites::unwrap_expression(expr) {
+            Expr::Ident(ident) if scope.key_objects.contains(&ident_key(ident)) => {
+                scope.param_index(ident)
+            }
+            _ => None,
+        }
+    }
+
+    /// Each argument of a call as a spread of the callee's parameter reads it
+    /// (carrick#2411), by the rules [`Self::object`] reads that spread with.
+    fn spread_args(&self, args: &[ExprOrSpread], scope: &Scope<'_>) -> Vec<SpreadArg> {
+        let mut spread = false;
+        args.iter()
+            .map(|arg| {
+                spread |= arg.spread.is_some();
+                if spread {
+                    SpreadArg::Unread
+                } else if let Some(index) = self.own_param(&arg.expr, scope) {
+                    SpreadArg::Param(index)
+                } else if let Some(branches) = self.spread_branches(&arg.expr, scope) {
+                    SpreadArg::Keys(branches)
+                } else {
+                    SpreadArg::Unread
+                }
+            })
+            .collect()
     }
 
     /// The objects a spread may put in place, when the source states every
@@ -5202,6 +5272,7 @@ impl Visit for CallWalker<'_, '_, '_> {
         };
         let handed = self.reader.handed(&call.args, self.scope, bound);
         let names = self.reader.arg_names(&call.args, self.scope);
+        let spread_args = self.reader.spread_args(&call.args, self.scope);
         self.ir.calls.push(CallIr {
             site: call_site,
             callee,
@@ -5220,6 +5291,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             tested: self.guard.tested(call.span),
             handed,
             names,
+            spread_args,
         });
     }
 
@@ -5282,6 +5354,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 tested: None,
                 handed: Vec::new(),
                 names: Vec::new(),
+                spread_args: Vec::new(),
             });
         }
         element.visit_children_with(self);
@@ -5671,6 +5744,11 @@ struct Effect {
     /// The function's own parameter the body is, or the key of it that holds
     /// the body, when the caller writes it.
     body_param: Option<(usize, Option<String>)>,
+    /// The body spreads the function's own parameter at this position, and
+    /// these string keys are written before the spread
+    /// ([`ObjValue::under_param`], carrick#2411): a caller's argument there
+    /// is put in place before `body`'s keys, which are written after it.
+    body_under: Option<(usize, BTreeMap<String, Vec<Piece>>)>,
     /// A verb call: a request only when reached from another function.
     verb: bool,
     /// A library client's base, kept apart from `url` until the row is
@@ -5694,6 +5772,10 @@ impl Effect {
             BodyValue::Param(index) => (BTreeMap::new(), Some((*index, None))),
             BodyValue::ParamKey(index, key) => (BTreeMap::new(), Some((*index, Some(key.clone())))),
             BodyValue::Unstated => (BTreeMap::new(), None),
+        };
+        let body_under = match &shape.body {
+            BodyValue::Fields(obj) => held_strings(obj),
+            _ => None,
         };
         let readings = match &shape.alternation {
             Alternation::Single => vec![(shape.method.clone(), shape.url.clone())],
@@ -5719,6 +5801,7 @@ impl Effect {
                     url,
                     body: body.clone(),
                     body_param: body_param.clone(),
+                    body_under: body_under.clone(),
                     verb: shape.kind == RequestKind::Verb,
                     base: shape.base.clone(),
                     base_scope: shape.base_scope.clone(),
@@ -5851,6 +5934,8 @@ impl Effect {
                 .map(|(key, pieces)| (key.clone(), lift(pieces)))
                 .collect(),
             body_param: None,
+            // A closure's body reads as it always did.
+            body_under: None,
             verb: self.verb,
             base: lift(&self.base),
             base_scope: self.base_scope.clone(),
@@ -5875,8 +5960,10 @@ impl Effect {
             || self.base.iter().any(Piece::is_parameter)
     }
 
-    /// This effect as seen from a call passing `args`.
-    fn instantiate(&self, args: &[Value]) -> Effect {
+    /// This effect as seen from a call passing `args`, which `spread_args`
+    /// reads as a spread of the parameter at each position puts them in
+    /// place.
+    fn instantiate(&self, args: &[Value], spread_args: &[SpreadArg]) -> Effect {
         // What the caller wrote where the callee reads `name`, at `position`
         // of the URL. An opaque value standing for a path segment is a path
         // parameter, and keeps the name the callee gives it. Leading the URL
@@ -5979,30 +6066,61 @@ impl Effect {
             },
             other => other.clone(),
         };
-        let (body, body_param) = match &self.body_param {
+        let fill_keys = |keys: &BTreeMap<String, Vec<Piece>>| -> BTreeMap<String, Vec<Piece>> {
+            keys.iter()
+                .map(|(key, pieces)| (key.clone(), fill(pieces)))
+                .collect()
+        };
+        // The object the caller writes is the body: one that spreads the
+        // caller's own parameter holds its keys for the caller's callers
+        // (carrick#2411). They are the caller's already.
+        let (body, body_param, body_under) = match &self.body_param {
             Some((index, key)) => match (args.get(*index), key) {
-                (Some(Value::Obj(obj)), None) => (string_fields(obj), None),
+                (Some(Value::Obj(obj)), None) => (string_fields(obj), None, held_strings(obj)),
                 (Some(Value::Obj(obj)), Some(key)) => match obj.fields.get(key) {
-                    Some(Value::Obj(body)) => (string_fields(body), None),
+                    Some(Value::Obj(body)) => (string_fields(body), None, held_strings(body)),
                     Some(Value::Str(pieces)) => match pieces.as_slice() {
-                        [Piece::Param(outer, _)] => (BTreeMap::new(), Some((*outer, None))),
-                        _ => (BTreeMap::new(), None),
+                        [Piece::Param(outer, _)] => (BTreeMap::new(), Some((*outer, None)), None),
+                        _ => (BTreeMap::new(), None, None),
                     },
-                    _ => (BTreeMap::new(), None),
+                    _ => (BTreeMap::new(), None, None),
                 },
                 (Some(Value::Str(pieces)), key) => match pieces.as_slice() {
-                    [Piece::Param(outer, _)] => (BTreeMap::new(), Some((*outer, key.clone()))),
-                    _ => (BTreeMap::new(), None),
+                    [Piece::Param(outer, _)] => {
+                        (BTreeMap::new(), Some((*outer, key.clone())), None)
+                    }
+                    _ => (BTreeMap::new(), None, None),
                 },
-                _ => (BTreeMap::new(), None),
+                _ => (BTreeMap::new(), None, None),
             },
-            None => (
-                self.body
-                    .iter()
-                    .map(|(key, pieces)| (key.clone(), fill(pieces)))
-                    .collect(),
-                None,
-            ),
+            None => {
+                let after = fill_keys(&self.body);
+                match &self.body_under {
+                    // The caller's argument in place of the spread
+                    // (carrick#2411): the keys written before it stand unless
+                    // it sets them, and the ones written after it go on top.
+                    Some((index, held)) => match spread_args.get(*index) {
+                        Some(SpreadArg::Keys(branches)) => {
+                            let mut object = ObjValue {
+                                fields: fill_keys(held)
+                                    .into_iter()
+                                    .map(|(key, pieces)| (key, Value::Str(pieces)))
+                                    .collect(),
+                                ..ObjValue::default()
+                            };
+                            object.spread(branches);
+                            let mut body = string_fields(&object);
+                            body.extend(after);
+                            (body, None, None)
+                        }
+                        Some(SpreadArg::Param(outer)) => {
+                            (after, None, Some((*outer, fill_keys(held))))
+                        }
+                        Some(SpreadArg::Unread) | None => (after, None, None),
+                    },
+                    None => (after, None, None),
+                }
+            }
         };
         let mut instantiated = Effect {
             site: self.site.clone(),
@@ -6010,6 +6128,7 @@ impl Effect {
             url: fill(&self.url),
             body,
             body_param,
+            body_under,
             verb: self.verb,
             base: fill(&self.base),
             base_scope: self.base_scope.clone(),
@@ -6026,8 +6145,9 @@ impl Effect {
     /// This effect as a call at `site` in `file` sends it. Where the call
     /// fills the last hole the callee left open, the call is where the request
     /// is stated, and it is the request line everything further up reaches.
-    fn at_call(&self, args: &[Value], file: &Path, site: Site) -> Effect {
-        let mut instantiated = self.instantiate(args);
+    fn at_call(&self, call: &CallIr, file: &Path) -> Effect {
+        let site = call.site;
+        let mut instantiated = self.instantiate(&call.args, &call.spread_args);
         if self.has_params() && !instantiated.has_params() {
             instantiated.site = RequestSite {
                 file: file.to_path_buf(),
@@ -6041,19 +6161,32 @@ impl Effect {
     /// This effect with every parameter left unknown: a callback's requests,
     /// whose arguments the callee supplies.
     fn detached(&self) -> Effect {
-        self.instantiate(&[])
+        self.instantiate(&[], &[])
     }
 }
 
 /// An object literal's string-valued keys.
 fn string_fields(obj: &ObjValue) -> BTreeMap<String, Vec<Piece>> {
-    obj.fields
+    string_values(&obj.fields)
+}
+
+/// The string-valued keys of `fields`.
+fn string_values(fields: &BTreeMap<String, Value>) -> BTreeMap<String, Vec<Piece>> {
+    fields
         .iter()
         .filter_map(|(key, value)| match value {
             Value::Str(pieces) => Some((key.clone(), pieces.clone())),
             _ => None,
         })
         .collect()
+}
+
+/// The parameter an object literal spreads and the string-valued keys
+/// written before it ([`ObjValue::under_param`], carrick#2411).
+fn held_strings(obj: &ObjValue) -> Option<(usize, BTreeMap<String, Vec<Piece>>)> {
+    obj.under_param
+        .as_ref()
+        .map(|(index, held)| (*index, string_values(held)))
 }
 
 /// What a call to one function sends.
@@ -6581,7 +6714,7 @@ impl Composer<'_> {
                     for effect in callee.effects.iter().filter(|effect| effect.has_params()) {
                         summary
                             .effects
-                            .insert(ir.settle_forward(effect.at_call(&call.args, file, call.site)));
+                            .insert(ir.settle_forward(effect.at_call(call, file)));
                     }
                 }
                 Some((_, callee)) => {
@@ -6590,7 +6723,7 @@ impl Composer<'_> {
                     for effect in &callee.effects {
                         summary
                             .effects
-                            .insert(ir.settle_forward(effect.at_call(&call.args, file, call.site)));
+                            .insert(ir.settle_forward(effect.at_call(call, file)));
                     }
                     for (index, arg) in call.args.iter().enumerate() {
                         match arg {
@@ -6900,7 +7033,7 @@ fn emit(
                     if call.jsx && !effect.has_params() {
                         continue;
                     }
-                    let instantiated = effect.instantiate(&call.args);
+                    let instantiated = effect.instantiate(&call.args, &call.spread_args);
                     // What this call writes for a method that is a parameter
                     // (carrick#2049).
                     if matches!(effect.method, MethodValue::Param(_)) {
@@ -7570,6 +7703,7 @@ mod tests {
             url,
             body: BTreeMap::new(),
             body_param: None,
+            body_under: None,
             verb: false,
             base: Vec::new(),
             base_scope: None,
@@ -7584,6 +7718,7 @@ mod tests {
                 .map(|(key, pieces)| (key.to_string(), Value::Str(pieces.clone())))
                 .collect(),
             open,
+            under_param: None,
         })
     }
 
@@ -7707,11 +7842,11 @@ mod tests {
         let route = vec![opaque("process.env.API"), lit("/users")];
 
         // The key, written.
-        let filled = wrapper.instantiate(&[object(&[("url", route.clone())], false)]);
+        let filled = wrapper.instantiate(&[object(&[("url", route.clone())], false)], &[]);
         assert_eq!(filled.url, route);
         assert!(!filled.has_params());
         // Written after a spread: an open object still states the key.
-        let after_spread = wrapper.instantiate(&[object(&[("url", route.clone())], true)]);
+        let after_spread = wrapper.instantiate(&[object(&[("url", route.clone())], true)], &[]);
         assert_eq!(after_spread.url, route);
 
         // Missing, or overwritten by a spread or a computed key (which empty
@@ -7726,7 +7861,7 @@ mod tests {
             vec![],
         ] {
             assert_eq!(
-                wrapper.instantiate(&args).url,
+                wrapper.instantiate(&args, &[]).url,
                 vec![Piece::Unknown],
                 "{args:?}"
             );
@@ -7735,8 +7870,12 @@ mod tests {
         let nested = Value::Obj(ObjValue {
             fields: BTreeMap::from([("url".to_string(), object(&[], false))]),
             open: false,
+            under_param: None,
         });
-        assert_eq!(wrapper.instantiate(&[nested]).url, vec![Piece::Unknown]);
+        assert_eq!(
+            wrapper.instantiate(&[nested], &[]).url,
+            vec![Piece::Unknown]
+        );
     }
 
     /// carrick#1950: a caller that passes its own parameter on leaves the key
@@ -7744,18 +7883,23 @@ mod tests {
     #[test]
     fn a_key_passed_on_stays_open_for_the_next_caller() {
         let wrapper = effect(vec![keyed(0, "url")]);
-        let passed_on =
-            wrapper.instantiate(&[Value::Str(vec![Piece::Param(1, "options".to_string())])]);
+        let passed_on = wrapper.instantiate(
+            &[Value::Str(vec![Piece::Param(1, "options".to_string())])],
+            &[],
+        );
         assert_eq!(
             passed_on.url,
             vec![Piece::ParamKey(1, "url".to_string(), "url".to_string())]
         );
         assert!(passed_on.has_params());
         let route = vec![lit("/users")];
-        let filled = passed_on.instantiate(&[
-            Value::Str(vec![lit("first")]),
-            object(&[("url", route.clone())], false),
-        ]);
+        let filled = passed_on.instantiate(
+            &[
+                Value::Str(vec![lit("first")]),
+                object(&[("url", route.clone())], false),
+            ],
+            &[],
+        );
         assert_eq!(filled.url, route);
     }
 
@@ -7919,7 +8063,7 @@ mod tests {
         value.spread(&[
             ObjValue {
                 fields: BTreeMap::from([("limit".to_string(), Value::Str(vec![lit("1")]))]),
-                open: false,
+                ..ObjValue::default()
             },
             ObjValue::default(),
         ]);
@@ -7934,15 +8078,258 @@ mod tests {
         same.spread(&[
             ObjValue {
                 fields: BTreeMap::from([("op".to_string(), Value::Str(vec![lit("x")]))]),
-                open: false,
+                ..ObjValue::default()
             },
             ObjValue {
                 fields: BTreeMap::from([("op".to_string(), Value::Str(vec![lit("x")]))]),
-                open: false,
+                ..ObjValue::default()
             },
         ]);
         assert_eq!(same.fields.get("op"), Some(&Value::Str(vec![lit("x")])));
         assert!(!same.open, "every branch states the same value");
+    }
+
+    /// The file IR `source` reads as.
+    fn file_ir_of(source: &str) -> FileIr {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.ts");
+        std::fs::write(&path, source).expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            true,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
+        extract_file_ir(&module, &cm, &HashSet::new())
+    }
+
+    /// The body object the first request `function` makes in `source` sends.
+    fn request_body(source: &str, function: &str) -> ObjValue {
+        let file = file_ir_of(source);
+        let ir = &file.functions[function];
+        match ir.calls.iter().find_map(|call| call.request.as_ref()) {
+            Some(RequestShape {
+                body: BodyValue::Fields(obj),
+                ..
+            }) => obj.clone(),
+            other => panic!("{function} sends no object body: {other:?}"),
+        }
+    }
+
+    const SPREAD_WRAPPERS: &str = r#"
+const URL = "https://api.example.com/rpc";
+let counter = 0;
+export async function held(op: string, args: object) {
+  return fetch(URL, { method: "POST", body: JSON.stringify({ op, ...args, mode: "x" }) });
+}
+export async function twice(op: string, first: object, second: object) {
+  return fetch(URL, { method: "POST", body: JSON.stringify({ op, ...first, ...second }) });
+}
+export async function keyOf(op: string, options: { extra: object }) {
+  return fetch(URL, { method: "POST", body: JSON.stringify({ op, ...options.extra }) });
+}
+export async function reassigned(op: string, given: object) {
+  given = { ...given };
+  return fetch(URL, { method: "POST", body: JSON.stringify({ op, ...given }) });
+}
+export async function writtenThrough(op: string, stamped: { stamp?: number }) {
+  stamped.stamp = counter;
+  return fetch(URL, { method: "POST", body: JSON.stringify({ op, ...stamped }) });
+}
+export async function computed(op: string, keyed: object, name: string) {
+  return fetch(URL, { method: "POST", body: JSON.stringify({ op, ...keyed, [name]: "y" }) });
+}
+export async function opened(op: string, rest: object, late: object) {
+  return fetch(URL, { method: "POST", body: JSON.stringify({ ...rest.inner, op, ...late }) });
+}
+"#;
+
+    /// carrick#2411: a spread of the function's own parameter holds the keys
+    /// written before it; `fields` and `open` read as they always did.
+    #[test]
+    fn a_spread_of_its_own_parameter_holds_the_keys_before_it() {
+        let body = request_body(SPREAD_WRAPPERS, "held");
+        assert!(body.open);
+        assert_eq!(
+            body.fields,
+            BTreeMap::from([("mode".to_string(), Value::Str(vec![lit("x")]))])
+        );
+        assert_eq!(
+            body.under_param,
+            Some((
+                1,
+                BTreeMap::from([(
+                    "op".to_string(),
+                    Value::Str(vec![Piece::Param(0, "op".to_string())])
+                )])
+            ))
+        );
+    }
+
+    /// carrick#2411: a second parameter spread, a spread of a parameter's
+    /// key, a parameter assigned again or written through, a computed key
+    /// after the spread, and a spread into an object already open hold
+    /// nothing.
+    #[test]
+    fn a_spread_the_hold_cannot_prove_holds_nothing() {
+        for function in [
+            "twice",
+            "keyOf",
+            "reassigned",
+            "writtenThrough",
+            "computed",
+            "opened",
+        ] {
+            let body = request_body(SPREAD_WRAPPERS, function);
+            assert_eq!(body.under_param, None, "{function}: {body:?}");
+            assert!(body.open, "{function}");
+            assert!(!body.fields.contains_key("op"), "{function}: {body:?}");
+        }
+    }
+
+    /// carrick#2411: each argument as a spread of the callee's parameter
+    /// reads it: a literal's keys, the caller's own parameter, and nothing
+    /// for anything else or any position from a spread argument on.
+    #[test]
+    fn a_call_reads_each_argument_as_a_spread_puts_it_in_place() {
+        let source = r#"
+import { send } from "./send";
+export async function caller(op: string, passed: object, flag: boolean, list: unknown[]) {
+  const local = {};
+  await send("a", {}, flag ? { id: "1" } : {}, passed, local, build());
+  await send("a", ...list, {});
+}
+function build() { return {}; }
+"#;
+        let file = file_ir_of(source);
+        let calls: Vec<&CallIr> = file.functions["caller"]
+            .calls
+            .iter()
+            .filter(|call| call.callee == "send")
+            .collect();
+        let empty = ObjValue::default();
+        let id = ObjValue {
+            fields: BTreeMap::from([("id".to_string(), Value::Str(vec![lit("1")]))]),
+            ..ObjValue::default()
+        };
+        assert_eq!(
+            calls[0].spread_args,
+            vec![
+                SpreadArg::Unread,
+                SpreadArg::Keys(vec![empty.clone()]),
+                SpreadArg::Keys(vec![id, empty]),
+                SpreadArg::Param(1),
+                SpreadArg::Unread,
+                SpreadArg::Unread,
+            ]
+        );
+        assert_eq!(
+            calls[1].spread_args,
+            vec![SpreadArg::Unread, SpreadArg::Unread, SpreadArg::Unread]
+        );
+    }
+
+    /// `{ op, ...args, mode: "x" }`, sent by a function whose parameters are
+    /// `(op, args)`.
+    fn held_effect() -> Effect {
+        Effect {
+            body: BTreeMap::from([("mode".to_string(), vec![lit("x")])]),
+            body_under: Some((
+                1,
+                BTreeMap::from([("op".to_string(), vec![Piece::Param(0, "op".to_string())])]),
+            )),
+            ..effect(vec![lit("https://api.example.com/rpc")])
+        }
+    }
+
+    fn body_of_keys(pairs: &[(&str, &str)]) -> BTreeMap<String, Vec<Piece>> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), vec![lit(value)]))
+            .collect()
+    }
+
+    /// carrick#2411: a literal in place of the spread keeps the keys before
+    /// it unless it sets them, and the keys after it go on top.
+    #[test]
+    fn a_literal_argument_is_read_in_place_of_the_spread() {
+        let args = [
+            Value::Str(vec![lit("purge")]),
+            object(&[("id", vec![lit("7")])], false),
+        ];
+        let empty = ObjValue::default();
+        let id = ObjValue {
+            fields: BTreeMap::from([("id".to_string(), Value::Str(vec![lit("7")]))]),
+            ..ObjValue::default()
+        };
+        let filled =
+            held_effect().instantiate(&args, &[SpreadArg::Unread, SpreadArg::Keys(vec![id])]);
+        assert_eq!(
+            filled.body,
+            body_of_keys(&[("op", "purge"), ("id", "7"), ("mode", "x")])
+        );
+        assert_eq!(filled.body_under, None);
+
+        // The literal sets the held key: the runtime overwrite.
+        let evict = ObjValue {
+            fields: BTreeMap::from([
+                ("op".to_string(), Value::Str(vec![lit("evict")])),
+                ("mode".to_string(), Value::Str(vec![lit("ignored")])),
+            ]),
+            ..ObjValue::default()
+        };
+        let overwritten = held_effect().instantiate(
+            &args,
+            &[SpreadArg::Unread, SpreadArg::Keys(vec![evict, empty])],
+        );
+        assert_eq!(
+            overwritten.body,
+            body_of_keys(&[("mode", "x")]),
+            "a key only one branch sets is unknown, and one written after the spread stands"
+        );
+        let evict = ObjValue {
+            fields: BTreeMap::from([("op".to_string(), Value::Str(vec![lit("evict")]))]),
+            ..ObjValue::default()
+        };
+        let overwritten =
+            held_effect().instantiate(&args, &[SpreadArg::Unread, SpreadArg::Keys(vec![evict])]);
+        assert_eq!(
+            overwritten.body,
+            body_of_keys(&[("op", "evict"), ("mode", "x")])
+        );
+    }
+
+    /// carrick#2411: the caller's own parameter in place of the spread holds
+    /// the filled keys one function up; anything else drops them.
+    #[test]
+    fn a_parameter_argument_holds_the_keys_and_anything_else_drops_them() {
+        let args = [
+            Value::Str(vec![lit("purge")]),
+            Value::Str(vec![Piece::Param(2, "scope".to_string())]),
+        ];
+        let passed = held_effect().instantiate(&args, &[SpreadArg::Unread, SpreadArg::Param(2)]);
+        assert_eq!(passed.body, body_of_keys(&[("mode", "x")]));
+        assert_eq!(
+            passed.body_under,
+            Some((2, body_of_keys(&[("op", "purge")])))
+        );
+        assert!(!passed.has_params(), "a held body never moves a row");
+
+        for spread_args in [
+            vec![SpreadArg::Unread, SpreadArg::Unread],
+            vec![SpreadArg::Unread],
+            vec![],
+        ] {
+            let dropped = held_effect().instantiate(&args, &spread_args);
+            assert_eq!(
+                dropped.body,
+                body_of_keys(&[("mode", "x")]),
+                "{spread_args:?}"
+            );
+            assert_eq!(dropped.body_under, None, "{spread_args:?}");
+        }
     }
 
     #[test]
@@ -8394,7 +8781,7 @@ mod tests {
             ),
         ];
         for (arg, end) in cases {
-            let filled = segment.instantiate(&[Value::Str(arg)]);
+            let filled = segment.instantiate(&[Value::Str(arg)], &[]);
             assert_eq!(
                 filled.url.last(),
                 Some(&Piece::Opaque {
