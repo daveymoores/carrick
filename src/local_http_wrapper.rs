@@ -909,7 +909,7 @@ fn is_route_shaped(target: &str) -> bool {
 }
 
 /// The property a call was made through (`post` in `client.post(…)`).
-fn callee_property(call: &CallExpr) -> Option<String> {
+pub(crate) fn callee_property(call: &CallExpr) -> Option<String> {
     let Callee::Expr(callee) = &call.callee else {
         return None;
     };

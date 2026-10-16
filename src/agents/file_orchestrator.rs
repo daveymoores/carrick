@@ -18296,6 +18296,59 @@ export { routes };
         assert_eq!(stats.unemitted_literal_candidates, 0);
     }
 
+    /// carrick-cloud#2373: the sites of an unreadable same-module request
+    /// helper reach the model as candidates, so a site it leaves out is
+    /// counted and named instead of vanishing with every counter at 0.
+    #[test]
+    fn an_unanswered_site_of_a_request_helper_is_counted() {
+        let content = include_str!("../../tests/fixtures/unawaited-request-helper/client.ts");
+        let scanned = SwcScanner::new().scan_content(
+            std::path::Path::new("src/client.ts"),
+            content,
+            &[],
+            &[],
+        );
+        let candidates: HashMap<String, CandidateTarget> = scanned
+            .candidates
+            .into_iter()
+            .map(|candidate| (candidate.candidate_id.clone(), candidate))
+            .collect();
+        let line = |needle: &str| {
+            content
+                .lines()
+                .position(|l| l.contains(needle))
+                .map(|i| i + 1)
+                .expect("the fixture holds the site")
+        };
+
+        let (_, stats) = emit_and_join_with_receivers(
+            FileAnalysisResult::default(),
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/client.ts",
+            false,
+            &HashMap::new(),
+        );
+
+        let named = |needle: &str| format!("src/client.ts:{}", line(needle));
+        for needle in ["list: (o", "search: (q"] {
+            assert!(
+                stats.unemitted_literal_sites.contains(&named(needle)),
+                "`{needle}` must be counted: {:?}",
+                stats.unemitted_literal_sites
+            );
+        }
+        assert_eq!(
+            stats.unemitted_literal_candidates, 4,
+            "`list`, `search`, `create` and `track`'s fetch; `get` and `remove` write an interpolated template, which this count never read: {:?}",
+            stats.unemitted_literal_sites
+        );
+    }
+
     #[test]
     fn an_unclassified_receiver_leaves_the_site_exactly_as_it_was() {
         let candidates = bare_literal_map("thing", "/widgets");
