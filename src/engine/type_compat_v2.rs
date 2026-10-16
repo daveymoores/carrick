@@ -154,6 +154,14 @@ pub(crate) fn classify_receiver(
 /// a receiver typed from a `@types/*` package is matched against the list the
 /// detection actually produced. Nothing else is rewritten.
 fn normalize_declaring_package(package: &str) -> String {
+    types_package_runtime_name(package)
+}
+
+/// The package a DefinitelyTyped name types (`@types/hapi__hapi` ->
+/// `@hapi/hapi`); any other name is itself. The library store's
+/// `type_packages` widen this past the convention
+/// ([`crate::library_claims::runtime_package_of`]).
+pub(crate) fn types_package_runtime_name(package: &str) -> String {
     let Some(rest) = package.strip_prefix("@types/") else {
         return package.to_string();
     };
