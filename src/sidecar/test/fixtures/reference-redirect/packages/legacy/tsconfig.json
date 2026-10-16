@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "outDir": "dist",
+    "module": "commonjs",
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}

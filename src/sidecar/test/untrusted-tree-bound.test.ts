@@ -156,3 +156,88 @@ describe('carrick#2230: an untrusted scan reads inside the checkout only', () =>
     }
   });
 });
+
+// carrick#2418: a referenced project is read from source, but never one whose
+// real path is outside the checkout. Here the referenced package is a link
+// that leaves the checkout; under the switch its config, outputs and source
+// read as missing, so the reference stays unresolved.
+describe('carrick#2418: a referenced project outside the checkout is not read', () => {
+  const FAR_MARK = 'FAR_MARK_9f3c_outside_reference';
+  let base: string;
+  let service: string;
+  const saved = process.env[UNTRUSTED_TREE_ENV];
+
+  before(() => {
+    base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-2418-bound-')));
+    const outside = path.join(base, 'outside', 'linked');
+    const checkout = path.join(base, 'checkout');
+    const put = (abs: string, text: string): void => {
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, text);
+    };
+    put(path.join(outside, 'package.json'), JSON.stringify({ name: '@acme/linked', version: '1.0.0', types: 'dist/index.d.ts' }));
+    put(
+      path.join(outside, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { composite: true, rootDir: 'src', outDir: 'dist', strict: true }, include: ['src'] })
+    );
+    put(path.join(outside, 'src', 'index.ts'), `export interface Far { ${FAR_MARK}: string }\n`);
+    fs.mkdirSync(path.join(checkout, '.git'), { recursive: true });
+    fs.mkdirSync(path.join(checkout, 'packages'), { recursive: true });
+    fs.symlinkSync(outside, path.join(checkout, 'packages', 'linked'), 'dir');
+    fs.mkdirSync(path.join(checkout, 'node_modules', '@acme'), { recursive: true });
+    fs.symlinkSync(path.join('..', '..', 'packages', 'linked'), path.join(checkout, 'node_modules', '@acme', 'linked'), 'dir');
+    service = path.join(checkout, 'services', 'api');
+    put(path.join(service, 'package.json'), JSON.stringify({ name: 'api', version: '1.0.0', type: 'module' }));
+    put(
+      path.join(service, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: { module: 'nodenext', moduleResolution: 'nodenext', strict: true, skipLibCheck: true },
+        include: ['src'],
+        references: [{ path: '../../packages/linked' }],
+      })
+    );
+    put(
+      path.join(service, 'src', 'uses.ts'),
+      "import type { Far } from '@acme/linked';\nexport interface Holds { far: Far }\n"
+    );
+  });
+
+  after(() => {
+    if (saved === undefined) delete process.env[UNTRUSTED_TREE_ENV];
+    else process.env[UNTRUSTED_TREE_ENV] = saved;
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  const farText = (): { text: string; files: string[] } => {
+    const loader = new ProjectLoader({ repoRoot: service });
+    assert.ok(loader.load().success);
+    const project = loader.getProject();
+    const far = project
+      .getSourceFileOrThrow(path.join(service, 'src', 'uses.ts'))
+      .getInterfaceOrThrow('Holds')
+      .getPropertyOrThrow('far')
+      .getType();
+    return { text: far.getText() + ' ' + far.getProperties().map((p) => p.getName()).join(','), files: project.getSourceFiles().map((f) => f.getFullText()) };
+  };
+
+  it('1. switch unset: the linked reference is read from source (the known positive)', () => {
+    delete process.env[UNTRUSTED_TREE_ENV];
+    assert.match(farText().text, new RegExp(FAR_MARK));
+  });
+
+  it('2. switch set: nothing outside is read and the reference stays unresolved', () => {
+    process.env[UNTRUSTED_TREE_ENV] = '1';
+    const { text, files } = farText();
+    assert.ok(!text.includes(FAR_MARK), text);
+    assert.ok(!files.some((file) => file.includes(FAR_MARK)), 'a program file holds the outside source');
+    const result = captureStub({
+      repoRoot: service,
+      serviceName: 'api',
+      outDir: path.join(base, 'stub'),
+      anchors: [
+        { kind: 'symbol', alias: 'Endpoint_far_Response', symbol_name: 'Holds', source_file: 'src/uses.ts', anchor_origin: 'llm-symbol' },
+      ],
+    });
+    assert.ok(!(JSON.stringify(result) + walkText(path.join(base, 'stub'))).includes(FAR_MARK), 'the capture read outside');
+  });
+});

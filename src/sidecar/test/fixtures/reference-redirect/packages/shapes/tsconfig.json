@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "skipLibCheck": true,
+    "paths": { "@shapes-internal/*": ["./src/*"] }
+  },
+  "include": ["src"]
+}

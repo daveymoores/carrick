@@ -10,12 +10,15 @@
  *
  * TypeScript's editor answers "which project types this file" by searching
  * the named config, then its references depth-first in declared order, for
- * the first project whose file list includes the file. That project is the
- * file's owner here too, and a file is only ever typed under its owner's
- * options: the loader builds one program per owner it is asked about, and
- * the capture types each anchor in its owner's program. A file no reachable
- * project includes is owned by the named config, which is how it was typed
- * before references were read.
+ * the first project that lists the file and is not a project one of whose
+ * own references lists it too (tsserver's default-project rule, carrick#2418:
+ * a file a referenced project lists is that project's source, so a solution
+ * config whose default include lists every file owns none of them). That
+ * project is the file's owner here too, and a file is only ever typed under
+ * its owner's options: the loader builds one program per owner it is asked
+ * about, and the capture types each anchor in its owner's program. A file no
+ * reachable project owns is owned by the named config, which is how it was
+ * typed before references were read.
  */
 
 import * as path from 'node:path';
@@ -47,19 +50,25 @@ function parseConfig(
 
 const fileKey = (file: string): string => path.resolve(file);
 
+/** A project reached from the named config, with the files it lists. */
+interface Reached {
+  project: ServiceProject;
+  files: Set<string>;
+}
+
 /**
  * The projects a named config reaches and the owner of each file among them.
- * References are read only when a file the named config does not include is
- * asked about, so a service whose files the named config includes costs one
- * parse, as before.
+ * References are read on the first question about a file, and never for a
+ * named config that references nothing, which costs one parse, as before.
  */
 export class ProjectGraph {
   readonly named: ServiceProject;
   /** References that could not be read, one line each. */
   readonly diagnostics: string[] = [];
   private readonly extendedConfigCache = new Map<string, ts.ExtendedConfigCacheEntry>();
-  private walked: { project: ServiceProject; files: Set<string> }[] | undefined;
+  private walked: Reached[] | undefined;
   private readonly namedFiles: Set<string>;
+  private readonly closures = new Map<ServiceProject, Reached[]>();
 
   /** Throws when the named config cannot be read, as a bare parse would. */
   constructor(configPath: string) {
@@ -73,15 +82,50 @@ export class ProjectGraph {
   }
 
   /**
-   * The project that owns `file`: the first in search order whose file list
-   * includes it (the named config, then its references depth-first in
-   * declared order; a config reached twice is visited once). The named config
-   * when none does.
+   * The project that owns `file`: the first in search order (the named
+   * config, then its references depth-first in declared order; a config
+   * reached twice is visited once) that lists it while no project in its own
+   * reference closure lists it. The named config when none does.
    */
   ownerOf(file: string): ServiceProject {
+    if (!this.hasReferences) return this.named;
     const key = fileKey(file);
-    if (this.namedFiles.has(key) || !this.hasReferences) return this.named;
-    return this.projects().find((entry) => entry.files.has(key))?.project ?? this.named;
+    const owner = this.projects().find(
+      (entry) => entry.files.has(key) && !this.closure(entry.project).some((reached) => reached.files.has(key))
+    );
+    return owner?.project ?? this.named;
+  }
+
+  /**
+   * Every project `project` reaches through its references, transitively,
+   * depth-first in declared order, without itself. Only projects this graph
+   * reached from the named config are known, which is every one a project
+   * the graph holds can reach.
+   */
+  closureOf(project: ServiceProject): ServiceProject[] {
+    return this.hasReferences ? this.closure(project).map((reached) => reached.project) : [];
+  }
+
+  private closure(project: ServiceProject): Reached[] {
+    let found = this.closures.get(project);
+    if (found) return found;
+    const byPath = new Map(this.projects().map((entry) => [entry.project.configPath, entry]));
+    const seen = new Set<string>([project.configPath]);
+    found = [];
+    const visit = (from: ServiceProject): void => {
+      for (const reference of from.parsed.projectReferences ?? []) {
+        const referencePath = path.resolve(ts.resolveProjectReferencePath(reference));
+        if (seen.has(referencePath)) continue;
+        seen.add(referencePath);
+        const entry = byPath.get(referencePath);
+        if (!entry) continue;
+        found!.push(entry);
+        visit(entry.project);
+      }
+    };
+    visit(project);
+    this.closures.set(project, found);
+    return found;
   }
 
   /** Position in search order, 0 for the named config. */
@@ -91,10 +135,10 @@ export class ProjectGraph {
     return index === -1 ? Number.MAX_SAFE_INTEGER : index;
   }
 
-  private projects(): { project: ServiceProject; files: Set<string> }[] {
+  private projects(): Reached[] {
     if (this.walked) return this.walked;
     const visited = new Set<string>([this.named.configPath]);
-    const order: { project: ServiceProject; files: Set<string> }[] = [];
+    const order: Reached[] = [];
     const visit = (project: ServiceProject, files: Set<string>): void => {
       order.push({ project, files });
       for (const reference of project.parsed.projectReferences ?? []) {

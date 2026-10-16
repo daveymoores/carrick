@@ -61,7 +61,23 @@ function usagesOf(file: ts.SourceFile): Map<string, ts.StringLiteralLike[]> {
 /** Why a module name cannot be given one mode: see the header. */
 const UNPLACED = Symbol('unplaced');
 
-export const moduleFormatResolutionHost: ResolutionHostFactory = (host, getOptions) => {
+/**
+ * The editor's project-reference rule for the program's owner config
+ * (`ReferenceRedirect` in `capture/reference-redirect.ts`, carrick#2418),
+ * restated here because this module is outside the capture seam.
+ */
+export interface ResolutionRedirect {
+  referenceFor(containingFile: string): unknown;
+  resolutionHost<H extends { fileExists(fileName: string): boolean }>(host: H): H;
+  sourceAnswer<R extends { resolvedFileName: string } | undefined>(answer: R): R;
+}
+
+/**
+ * The resolution host factory, resolving through `redirect` when the owner
+ * config references other projects.
+ */
+export const moduleFormatResolutionHost = (redirect?: ResolutionRedirect): ResolutionHostFactory => (host, getOptions) => {
+  const resolutionHost = redirect ? redirect.resolutionHost(host) : host;
   let cache: ts.ModuleResolutionCache | undefined;
   let cacheOptions: ts.CompilerOptions | undefined;
   const cacheFor = (options: ts.CompilerOptions): ts.ModuleResolutionCache => {
@@ -106,15 +122,17 @@ export const moduleFormatResolutionHost: ResolutionHostFactory = (host, getOptio
       return moduleNames.map((name) => {
         const mode = modeOf(name);
         if (mode === UNPLACED) return undefined;
-        return ts.resolveModuleName(
+        const answer = ts.resolveModuleName(
           name,
           containingFile,
           compilerOptions,
-          host,
+          resolutionHost,
           resolutionCache,
-          redirectedReference,
+          redirectedReference ??
+            (redirect?.referenceFor(containingFile) as ts.ResolvedProjectReference | undefined),
           mode
         ).resolvedModule;
+        return redirect ? redirect.sourceAnswer(answer) : answer;
       });
     },
   };
