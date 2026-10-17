@@ -1928,16 +1928,23 @@ async fn a_whole_request_refused_for_size_is_asked_in_parts() {
     let fx = Fixture::of(&[(subject.clone(), shape.source.clone())], &subject);
     let whole = fx.whole_prompt().await;
     assert!(
-        (100_000..WHOLE_PROMPT_MAX_BYTES).contains(&whole.len()),
-        "a whole prompt between the stated limit and the line: {}",
+        whole.len() < WHOLE_PROMPT_MAX_BYTES,
+        "a whole prompt under the scanner's line: {}",
         whole.len()
     );
 
+    // Refused stating no limit, the file is cut into its windows.
+    agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 1, &too_large(json!({})));
+    let (windows, _) = fx.dumped_run().await;
+    let largest = windows.parts.values().map(String::len).max().unwrap();
+
+    // Refused stating half the largest window's prompt, no request is over it.
+    let stated = largest / 2;
     agent_service::inject_mock_envelope(
         ROUTE,
         &fx.whole_marker(),
         1,
-        &too_large(json!({ "max_prompt_bytes": 100_000, "user_message_bytes": whole.len() })),
+        &too_large(json!({ "max_prompt_bytes": stated, "user_message_bytes": whole.len() })),
     );
     let (dumps, sent) = fx.dumped_run().await;
     assert!(
@@ -1951,8 +1958,8 @@ async fn a_whole_request_refused_for_size_is_asked_in_parts() {
     );
     for (label, prompt) in &dumps.parts {
         assert!(
-            prompt.len() <= 100_000,
-            "part {label}: {} bytes",
+            prompt.len() <= stated,
+            "part {label}: {} bytes over the stated {stated}",
             prompt.len()
         );
     }
