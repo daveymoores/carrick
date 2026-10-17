@@ -1553,6 +1553,11 @@ impl FileIr {
     /// detached function (an exported object's member) and what makes a
     /// function an entry point (carrick#2386).
     pub fn place_definitions(&mut self, definitions: &HashMap<String, FunctionDefinition>) {
+        self.definition_lines = super::row_calls::definition_lines(
+            definitions
+                .iter()
+                .map(|(key, definition)| (key.as_str(), definition)),
+        );
         self.definitions = definitions
             .iter()
             .map(|(key, definition)| {
@@ -1866,12 +1871,34 @@ impl<'a> Chains<'a> {
                 }
             }
         }
-        for (file, lo, hi, target) in inputs.sites.every_site() {
-            chains
-                .callers
-                .entry(target.clone())
-                .or_default()
-                .push((file.to_path_buf(), lo, hi));
+        if inputs.row_calls.is_some() {
+            // With rows, each call and construction reaches what its row
+            // names (carrick#2413 slice D).
+            let mut every: Vec<(&'a Path, u32, u32)> = chains
+                .calls
+                .keys()
+                .chain(chains.constructions.keys())
+                .copied()
+                .collect();
+            every.sort();
+            every.dedup();
+            for (file, lo, hi) in every {
+                if let Some(target) = inputs.call_target(file, lo, hi) {
+                    chains
+                        .callers
+                        .entry(target)
+                        .or_default()
+                        .push((file.to_path_buf(), lo, hi));
+                }
+            }
+        } else {
+            for (file, lo, hi, target) in inputs.sites.every_site() {
+                chains.callers.entry(target.clone()).or_default().push((
+                    file.to_path_buf(),
+                    lo,
+                    hi,
+                ));
+            }
         }
         for callers in chains.callers.values_mut() {
             callers.sort();
@@ -2045,9 +2072,8 @@ impl<'a> Chains<'a> {
                 line: call.site.line,
                 target: self
                     .inputs
-                    .sites
-                    .target_at(node.file, call.site.lo, call.site.hi)
-                    .map(|(file, key)| format!("{}:{key}", self.rel(file))),
+                    .call_target(node.file, call.site.lo, call.site.hi)
+                    .map(|(file, key)| format!("{}:{key}", self.rel(&file))),
             })
             .collect()
     }
@@ -2301,14 +2327,17 @@ impl<'a> Chains<'a> {
             line: call.site.line,
             text,
         };
-        if self
-            .inputs
-            .sites
-            .target_at(file, call.site.lo, call.site.hi)
-            .is_some()
-        {
-            ends.push(trace, at_call(HoleReason::CallbackIntoOwnFunction, None));
-            return;
+        match self.inputs.reach(file, call.site.lo, call.site.hi) {
+            super::row_calls::Reach::Function(..) | super::row_calls::Reach::OutsideService(..) => {
+                ends.push(trace, at_call(HoleReason::CallbackIntoOwnFunction, None));
+                return;
+            }
+            // The rows cannot say whose the callee is (carrick#2413 slice D).
+            super::row_calls::Reach::Unknown(reason) => {
+                ends.push(trace, at_call(reason, None));
+                return;
+            }
+            super::row_calls::Reach::NoFunction => {}
         }
         let Some(callee) = call.callee_subject.clone() else {
             ends.push(trace, at_call(HoleReason::CalleeUnread, None));
@@ -2679,14 +2708,17 @@ impl<'a> Chains<'a> {
             line: call.site.line,
             text,
         };
-        if self
-            .inputs
-            .sites
-            .target_at(file, call.site.lo, call.site.hi)
-            .is_some()
-        {
-            ends.push(trace, at_call(HoleReason::OwnFunction, None));
-            return;
+        match self.inputs.reach(file, call.site.lo, call.site.hi) {
+            super::row_calls::Reach::Function(..) | super::row_calls::Reach::OutsideService(..) => {
+                ends.push(trace, at_call(HoleReason::OwnFunction, None));
+                return;
+            }
+            // The rows cannot say whose the callee is (carrick#2413 slice D).
+            super::row_calls::Reach::Unknown(reason) => {
+                ends.push(trace, at_call(reason, None));
+                return;
+            }
+            super::row_calls::Reach::NoFunction => {}
         }
         let Some(callee) = call.callee_subject.clone() else {
             ends.push(trace, at_call(HoleReason::CalleeUnread, None));

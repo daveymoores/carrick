@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "experimentalDecorators": true,
+    "baseUrl": ".",
+    "paths": {
+      "@calls/remote": ["../../packages/remote/src/index.ts"],
+      "http-kit": ["src/vendor/http-kit.ts"]
+    },
+    "lib": ["es2022", "dom"],
+    "types": []
+  },
+  "include": ["src/**/*"]
+}

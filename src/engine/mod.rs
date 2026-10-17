@@ -7781,6 +7781,7 @@ fn discover_with_positions(
         bindings: resolution.bindings,
         positions,
         links: None,
+        row_calls: None,
     }
     .linked();
     if let Some(links) = &request_inputs.links {
@@ -7788,6 +7789,13 @@ fn discover_with_positions(
             "Position rows for service {}: {}",
             service.service_name.as_deref().unwrap_or("(root)"),
             links.describe()
+        );
+    }
+    if let Some(row_calls) = &request_inputs.row_calls {
+        debug!(
+            "Position rows for service {}: {}",
+            service.service_name.as_deref().unwrap_or("(root)"),
+            row_calls.describe()
         );
     }
 

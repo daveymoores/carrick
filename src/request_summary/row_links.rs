@@ -206,111 +206,35 @@ impl RowLinks {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fixture_walk::Walked;
     use super::super::library_sites::{LibrarySite, MemberUse, MemberWire, library_sites};
     use super::*;
-    use crate::config::Config;
 
     /// Every use reads as a claimed maker or op.
     fn on_wire(_: &str, _: &MemberUse) -> MemberWire {
         MemberWire::OnWire
     }
 
-    fn copy_tree(from: &Path, to: &Path) {
-        std::fs::create_dir_all(to).unwrap();
-        for entry in std::fs::read_dir(from).unwrap() {
-            let entry = entry.unwrap();
-            let target = to.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_tree(&entry.path(), &target);
-            } else {
-                std::fs::copy(entry.path(), &target).unwrap();
-            }
-        }
-    }
-
-    /// The sidecar script, when node and the built sidecar are here. CI
-    /// builds it before the Rust tests, so a skip there would mean nothing.
-    fn sidecar() -> Option<PathBuf> {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
-        let node = std::process::Command::new("node")
-            .arg("--version")
-            .output()
-            .is_ok();
-        if script.exists() && node {
-            return Some(script);
-        }
-        assert!(
-            std::env::var("CI").is_err(),
-            "node or the built sidecar is missing in CI"
-        );
-        crate::errln!("Skipping: node or the built sidecar is missing");
-        None
-    }
-
     /// One service of `tests/fixtures/position-rows-names/`, with `edit`
     /// applied to its tree (paths under `services/names`; empty text removes the
     /// file), read by discovery with the rows the real sidecar walks
     /// (`with_rows`) or with none, as a run without `CARRICK_POSITION_ROWS`.
-    struct Walked {
-        _dir: tempfile::TempDir,
-        inputs: RequestSummaryInputs,
-    }
-
     fn walked(edit: &[(&str, &str)], with_rows: bool) -> Option<Walked> {
-        let script = sidecar()?;
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let dir = tempfile::tempdir().unwrap();
-        let repo = std::fs::canonicalize(dir.path()).unwrap().join("repo");
-        copy_tree(
-            &manifest.join("tests/fixtures/position-rows-names/repo"),
-            &repo,
-        );
-        let service_root = repo.join("services/names");
-        for (name, text) in edit {
-            let path = service_root.join(name);
-            if text.is_empty() {
-                std::fs::remove_file(&path).unwrap();
-            } else {
-                std::fs::write(&path, text).unwrap();
-            }
-        }
-        let service = Config::load_services(vec![repo.join("carrick.json")])
-            .unwrap()
-            .remove(0);
-        let positions = with_rows.then(|| {
-            let mut files =
-                crate::file_finder::walk_service(&repo.to_string_lossy(), &service, &[]).files;
-            files.sort();
-            // A directory beside the tree: the walk refuses to write into it.
-            let positions = dir.path().join("positions");
-            std::fs::create_dir_all(&positions).unwrap();
-            let out = positions.join("repo__names.jsonl.gz");
-            let sidecar = crate::services::TypeSidecar::spawn(&script).expect("spawn the sidecar");
-            sidecar.set_scan_root(&repo);
-            let recipe = sidecar.recipe();
-            drop(sidecar);
-            crate::position_rows::record_service_rows(
-                &recipe,
-                &crate::position_rows::ServiceWalk {
-                    service_root: &service_root,
-                    tsconfig: Some("tsconfig.json"),
-                    scan_root: &repo,
-                    files: &files,
-                    out: &out,
-                    service: "names",
-                },
-            )
-            .expect("the walk writes its rows");
-            PositionIndex::of(
-                &repo,
-                crate::position_rows::read_rows_file(&out).expect("the rows read"),
-            )
-        });
-        let inputs = crate::engine::discover_service_inputs(&repo, &service, positions);
-        Some(Walked { _dir: dir, inputs })
+        super::super::fixture_walk::walked(
+            "position-rows-names",
+            "services/names",
+            "names",
+            edit,
+            with_rows,
+        )
     }
 
-    impl Walked {
+    trait Reads {
+        fn sites(&self) -> Vec<LibrarySite>;
+        fn link(&self, file: &str, local: &str) -> Option<RowLink>;
+    }
+
+    impl Reads for Walked {
         fn sites(&self) -> Vec<LibrarySite> {
             library_sites(&self.inputs).sites
         }
