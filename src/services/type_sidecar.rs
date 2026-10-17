@@ -4807,7 +4807,7 @@ mod tests {
                 service_name: "web".into(),
                 alias: "B".into(),
             },
-            topic: None,
+            topic: (protocol == ProbeProtocol::Pubsub).then(|| "orders".to_string()),
         };
         vec![
             SidecarRequest::Init {
