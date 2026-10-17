@@ -876,8 +876,8 @@ mod tests {
         assert!(deferred.worth_retrying());
     }
 
-    const FINAL_ANSWER_FOR_ONE: &str = "The cloud's answer for 1 file(s) is final: a re-run gets \
-                                        the same until the file or Carrick changes.";
+    const FINAL_ANSWER_FOR_ONE: &str = "The answer for 1 file(s) is final: a re-run gives the \
+                                        same result until the file changes or Carrick is updated.";
 
     /// carrick#1897: the run's closing lines never advise a re-run for a file
     /// whose answer is final. A service that owes nothing else gets no such
