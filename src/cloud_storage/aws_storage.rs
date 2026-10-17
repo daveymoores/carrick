@@ -540,6 +540,10 @@ pub struct AwsStorage {
     /// uploads through [`CloudStorage::name_pending_on_final_write`] and sent
     /// only on the write marked final.
     pending_services: std::sync::Mutex<Vec<String>>,
+    /// The repo's full declared service set (carrick-cloud#909), noted once by
+    /// the engine through [`CloudStorage::note_declared_services`]. `None`
+    /// until a run that resolved its set from a clean tree notes it.
+    declared_services: std::sync::Mutex<Option<Vec<Option<String>>>>,
 }
 
 #[derive(Serialize)]
@@ -640,6 +644,15 @@ struct LambdaRequest {
     /// stamp the first index done on this very write. Omitted when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_services: Option<Vec<String>>,
+    /// The repo's full declared service set, on the two write actions
+    /// (carrick-cloud#909): every service the run's config resolution
+    /// produced, each as the `service_name` its own write sends, `null` where
+    /// it sends none. The cloud retires the repo's rows whose service is not
+    /// in it. Omitted when the run noted none, and on every other action, so
+    /// an older scanner's body is what it was and a cloud that does not read
+    /// it ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared_services: Option<Vec<Option<String>>>,
 }
 
 /// `start-scan`: the first thing a laptop run does, before a single model
@@ -1016,6 +1029,7 @@ impl AwsStorage {
             accepts_pending_services: std::sync::atomic::AtomicBool::new(false),
             accepts_analysis_job: std::sync::atomic::AtomicBool::new(false),
             pending_services: std::sync::Mutex::new(Vec::new()),
+            declared_services: std::sync::Mutex::new(None),
             force_reindex,
             authorized_repo: std::sync::OnceLock::new(),
             repo_full_name: std::sync::OnceLock::new(),
@@ -1089,6 +1103,27 @@ impl AwsStorage {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (!pending.is_empty()).then(|| pending.clone())
+    }
+
+    /// The declared service set to ride on a write action, if the run noted
+    /// one. Every write of the run carries the whole set, not the one
+    /// service it writes (carrick-cloud#909).
+    fn declared_services(&self) -> Option<Vec<Option<String>>> {
+        self.declared_services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// The set a `close-scan` may carry. Only the close of a run that wrote
+    /// nothing because no service changed states it: that run read the whole
+    /// config and the cloud's old row would otherwise wait for the next write.
+    /// A pull request run, a `--no-upload` run and a superseded resume do not
+    /// speak for what the repo's main declares, so they send none.
+    fn declared_services_on_close(&self, reason: &str) -> Option<Vec<Option<String>>> {
+        (reason == crate::change_scope::NO_CHANGE_REASON)
+            .then(|| self.declared_services())
+            .flatten()
     }
 
     /// A copy of `data` under the repository name this run was authorised to
@@ -1516,6 +1551,7 @@ impl AwsStorage {
             unanalysed_total: lost.total,
             scan_final: final_in_run.then_some(true),
             pending_services: self.pending_services_on(final_in_run),
+            declared_services: self.declared_services(),
         };
 
         let response: WriteActionResponse = self.call_lambda(&request).await?;
@@ -2020,6 +2056,7 @@ impl CloudStorage for AwsStorage {
             unanalysed_total: None,
             scan_final: None,
             pending_services: None,
+            declared_services: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&check_request).await?;
@@ -2059,6 +2096,7 @@ impl CloudStorage for AwsStorage {
                     unanalysed_total: lost.total,
                     scan_final: final_in_run.then_some(true),
                     pending_services: self.pending_services_on(final_in_run),
+                    declared_services: self.declared_services(),
                 };
 
                 let complete_response: WriteActionResponse =
@@ -2114,6 +2152,7 @@ impl CloudStorage for AwsStorage {
             unanalysed_total: None,
             scan_final: None,
             pending_services: None,
+            declared_services: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&request).await?;
@@ -2393,12 +2432,15 @@ impl CloudStorage for AwsStorage {
             action: &'a str,
             scan_id: &'a str,
             reason: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            declared_services: Option<Vec<Option<String>>>,
         }
 
         let request = CloseScanRequest {
             action: "close-scan",
             scan_id: &scan_id,
             reason,
+            declared_services: self.declared_services_on_close(reason),
         };
 
         self.post_run_marker(token, request.action, &request).await;
@@ -2535,6 +2577,7 @@ impl CloudStorage for AwsStorage {
             unanalysed_total: None,
             scan_final: None,
             pending_services: None,
+            declared_services: None,
         };
 
         match self.call_lambda::<LambdaResponse>(&request).await {
@@ -2571,6 +2614,13 @@ impl CloudStorage for AwsStorage {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = pending_services.to_vec();
         true
+    }
+
+    fn note_declared_services(&self, declared: &[Option<String>]) {
+        *self
+            .declared_services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(declared.to_vec());
     }
 
     fn supports_multi_service(&self) -> bool {
@@ -2770,6 +2820,7 @@ mod tests {
             unanalysed_total: None,
             scan_final: None,
             pending_services: None,
+            declared_services: None,
         };
         let json = serde_json::to_string(&bare).unwrap();
         assert!(!json.contains("wantsPayloadUrl"));
@@ -2869,6 +2920,7 @@ mod tests {
             unanalysed_total: None,
             scan_final: None,
             pending_services: None,
+            declared_services: None,
         };
         let json = serde_json::to_string(&inline).unwrap();
         assert!(!json.contains("payloadSha256"));
@@ -2912,6 +2964,7 @@ mod tests {
             unanalysed_total: None,
             scan_final: None,
             pending_services: None,
+            declared_services: None,
         };
         let json = serde_json::to_string(&cached).unwrap();
         assert!(
@@ -3507,6 +3560,7 @@ mod tests {
             unanalysed_total: None,
             scan_final: None,
             pending_services: None,
+            declared_services: None,
         };
         let json = serde_json::to_string(&ci).unwrap();
         for field in [
@@ -3614,6 +3668,7 @@ mod tests {
             unanalysed_total: sent.total,
             scan_final: Some(true),
             pending_services: Some(vec!["api".to_string()]),
+            declared_services: None,
         })
         .unwrap()
     }
@@ -5082,6 +5137,90 @@ mod tests {
             assert_eq!(last["scan_final"], true);
             assert!(last.get("pending_services").is_none(), "{flag:?}: {last}");
         }
+    }
+
+    /// carrick-cloud#909: a noted set rides whole on every write of the run,
+    /// `null` for a service whose write sends no name, and on no write of a
+    /// run that noted none.
+    #[tokio::test]
+    async fn the_declared_set_rides_every_write_whole() {
+        let ok = || (200, serde_json::json!({ "success": true }).to_string());
+        let (storage, server) = bearer_storage(vec![
+            start_scan_ok(None),
+            check_ok(),
+            ok(),
+            check_ok(),
+            ok(),
+        ]);
+        storage.begin_run(&run_context(false)).await.unwrap();
+        storage.note_declared_services(&[
+            Some("api".to_string()),
+            Some("worker".to_string()),
+            None,
+        ]);
+
+        storage.upload_repo_data(&blob(), false).await.unwrap();
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let requests = server.join().unwrap();
+        let expected = serde_json::json!(["api", "worker", null]);
+        assert_eq!(body_of(&requests[2])["declared_services"], expected);
+        assert_eq!(body_of(&requests[4])["declared_services"], expected);
+        assert!(
+            body_of(&requests[1]).get("declared_services").is_none(),
+            "the existence check indexes nothing: {}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_noted_no_set_sends_none() {
+        let (storage, server) = bearer_storage(vec![
+            start_scan_ok(None),
+            check_ok(),
+            (200, serde_json::json!({ "success": true }).to_string()),
+        ]);
+        storage.begin_run(&run_context(false)).await.unwrap();
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+        let write = body_of(&server.join().unwrap()[2]);
+        assert!(write.get("declared_services").is_none(), "{write}");
+    }
+
+    /// The close of a run that wrote nothing because no service changed
+    /// states the set; the closes that do not speak for main's config do not.
+    #[tokio::test]
+    async fn only_the_no_change_close_states_the_declared_set() {
+        for (reason, sent) in [
+            ("no_change", true),
+            ("pull_request", false),
+            ("no_upload", false),
+            ("superseded", false),
+        ] {
+            let (storage, server) = bearer_storage_in_scan(
+                vec![(200, serde_json::json!({ "ok": true }).to_string())],
+                "scan_01J",
+            );
+            storage.note_declared_services(&[Some("api".to_string()), None]);
+            storage.report_scan_closed(reason).await;
+            let body = body_of(&server.join().unwrap()[0]);
+            assert_eq!(body["action"], "close-scan", "{reason}");
+            if sent {
+                assert_eq!(body["declared_services"], serde_json::json!(["api", null]));
+            } else {
+                assert!(body.get("declared_services").is_none(), "{reason}: {body}");
+            }
+        }
+
+        let (storage, server) = bearer_storage_in_scan(
+            vec![(200, serde_json::json!({ "ok": true }).to_string())],
+            "scan_01J",
+        );
+        storage.report_scan_closed("no_change").await;
+        let body = body_of(&server.join().unwrap()[0]);
+        assert!(
+            body.get("declared_services").is_none(),
+            "no set noted: {body}"
+        );
     }
 
     /// An empty list is a complete run: no field is sent, and the cloud stamps.

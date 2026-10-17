@@ -1503,6 +1503,18 @@ pub trait CloudStorage {
         false
     }
 
+    /// State the repo's full declared service set for this run
+    /// (carrick-cloud#909): every service the run's config resolution
+    /// produced, before `--changed-only` and any service filter, each as the
+    /// `service_name` that service's own write sends (`None` where it sends
+    /// none). The cloud retires the repo's rows whose service is not in it.
+    ///
+    /// Called once, only by a run that resolved its set from a clean tree. A
+    /// backend that talks to the cloud carries it on its write actions and on
+    /// the close of a run that wrote nothing because no service changed; the
+    /// default ignores it, and a backend that WRAPS one must forward it.
+    fn note_declared_services(&self, _declared: &[Option<String>]) {}
+
     /// Whether this backend can store more than one service per git repo
     /// without collision. The production index keys on
     /// (workspace, project, repo) only — no service discriminator — so real

@@ -151,6 +151,11 @@ impl CloudStorage for TeeStorage {
         self.cloud.name_pending_on_final_write(pending_services)
     }
 
+    /// The cloud side: the declared set retires rows in the hosted index only.
+    fn note_declared_services(&self, declared: &[Option<String>]) {
+        self.cloud.note_declared_services(declared);
+    }
+
     fn supports_multi_service(&self) -> bool {
         self.cloud.supports_multi_service()
     }
