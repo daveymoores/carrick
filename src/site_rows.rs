@@ -367,19 +367,10 @@ pub struct SiteFold {
     pub leads: Vec<PossibleCall>,
 }
 
-/// `file` relative to `root`, `/`-separated, whichever form it is held in.
+/// `file` relative to `root`, `/`-separated, whichever form it is held in
+/// ([`crate::utils::repo_relative_source_path`]).
 pub fn relative(root: &Path, file: &str) -> String {
-    let file = file.strip_prefix("./").unwrap_or(file);
-    let root = root.to_string_lossy();
-    let root = root.trim_start_matches("./").trim_end_matches('/');
-    let file = if root.is_empty() || root == "." {
-        file
-    } else {
-        file.strip_prefix(root)
-            .map(|rest| rest.trim_start_matches('/'))
-            .unwrap_or(file)
-    };
-    file.replace('\\', "/")
+    crate::utils::repo_relative_source_path(file, &root.to_string_lossy()).replace('\\', "/")
 }
 
 /// A row's `file:line`, relative to `root`.

@@ -21458,7 +21458,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let at_site: Vec<(String, Option<ResolutionSource>, bool)> = cloud_data
             .calls
             .iter()
-            .filter(|row| row.file_path == PathBuf::from("svc/src/orders.ts:7"))
+            .filter(|row| row.file_path == Path::new("svc/src/orders.ts:7"))
             .map(|row| {
                 (
                     row.key.canonical(),
