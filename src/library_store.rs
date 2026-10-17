@@ -16,8 +16,11 @@
 //!   asks npm about every name it receives, so a private name would reach the
 //!   public registry. Anything this cannot prove is not sent.
 //! - **The answer** is read one element at a time ([`parse_answer`]) and can
-//!   never fail a scan. An entry the store has not finished is `pending`, and
-//!   is asked once more after the analysis ([`settle`]), and again next scan.
+//!   never fail a scan. An entry the store has not finished is `pending`. One
+//!   whose build is queued, in flight or starting ([`WAITED_REASONS`]) is
+//!   asked again every [`POLL_INTERVAL`] for up to [`WAIT_CAP`] from the first
+//!   ask ([`ask_until_settled`], carrick#2496); any other pending package is
+//!   named at the end and asked again next scan.
 //! - **Transport (A5)** is the agent service's one path
 //!   ([`crate::agent_service::AgentService::post_to_lambda`]): the scan slot,
 //!   the scanner version, the pacer. The route's 2xx body is the answer
@@ -53,6 +56,23 @@ pub const MOCK_SEED: &str = "default";
 
 /// How long one ask may take before the scan goes on without it.
 pub const ASK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long between two asks for the packages the store is still building.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long, from the first ask, the scan waits for those packages.
+pub const WAIT_CAP: Duration = Duration::from_secs(600);
+
+/// The store's pending reasons (carrick-cloud `lambdas/library-claims/http.ts`
+/// `missing`) that a wait can end: a build is running (`in_flight`) or is
+/// about to be started by this very ask (`building`). Every other pending
+/// reason is a state asking again does not change within a scan: a stage the
+/// store has no pin for (`classifier_unavailable`, `picker_unavailable`,
+/// `lister_unavailable`), a store it could not read (`store_unavailable`,
+/// `store_row_unreadable`) or a build it could not dispatch
+/// (`dispatch_failed`). A failed build is not pending at all: the store
+/// answers it `skipped` (`build_failed`, due a retry later).
+pub const WAITED_REASONS: [&str; 2] = ["in_flight", "building"];
 
 /// The most registry packages one request carries (the store's cap).
 const MAX_PACKAGES: usize = 200;
@@ -124,6 +144,26 @@ pub struct Asked {
 }
 
 impl Asked {
+    /// A request naming `packages` at 1.0.0, for tests that drive the wait
+    /// without an install.
+    #[cfg(test)]
+    pub(crate) fn naming(packages: &[&str]) -> Self {
+        Self {
+            request: LibraryClaimsRequest {
+                roles: ROLES.to_vec(),
+                packages: packages
+                    .iter()
+                    .map(|name| RegistryPackage {
+                        package: name.to_string(),
+                        version: "1.0.0".to_string(),
+                        specifiers: vec![name.to_string()],
+                    })
+                    .collect(),
+            },
+            spellings: BTreeMap::new(),
+        }
+    }
+
     /// The request for only `packages`, or `None` when it names none of
     /// them.
     fn only(&self, packages: &BTreeSet<String>) -> Option<LibraryClaimsRequest> {
@@ -746,8 +786,13 @@ fn deno_lock_key(key: &str) -> Option<(&str, &str)> {
 pub struct LibraryAnswer {
     /// Every export of every `answered` package, element by element.
     pub exports: Vec<ExportClaims>,
-    /// The packages the store has not finished (`pending`): asked again.
+    /// The packages the store has not finished (`pending`).
     pub pending: BTreeSet<String>,
+    /// The part of `pending` a wait can end ([`WAITED_REASONS`]).
+    pub building: BTreeSet<String>,
+    /// The packages answered `skipped` with `build_failed`: named, never
+    /// waited on (carrick#2496).
+    pub build_failed: BTreeSet<String>,
     /// Entries answered, for the log.
     pub answered: usize,
     /// Entries skipped, for the log.
@@ -778,12 +823,19 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
             "pending" => {
                 if let Some(package) = package {
                     answer.pending.insert(package.to_string());
+                    let reason = entry.get("reason").and_then(Value::as_str);
+                    if reason.is_some_and(|reason| WAITED_REASONS.contains(&reason)) {
+                        answer.building.insert(package.to_string());
+                    }
                 }
                 continue;
             }
             other => {
                 answer.skipped += 1;
                 let reason = entry.get("reason").and_then(|reason| reason.as_str());
+                if let (Some(package), Some("build_failed")) = (package, reason) {
+                    answer.build_failed.insert(package.to_string());
+                }
                 debug!(
                     package = package.unwrap_or("?"),
                     status = other,
@@ -929,50 +981,118 @@ where
     S: FnOnce(LibraryClaimsRequest) -> Fut,
     Fut: Future<Output = Result<String, AgentCallError>>,
 {
-    let _turn = gate(&request).await;
-    match tokio::time::timeout(ASK_TIMEOUT, send(request)).await {
-        Ok(Ok(text)) => parse_answer(&text),
-        Ok(Err(error)) => {
-            warn!(%error, "library store: no claims this scan");
-            LibraryAnswer::default()
-        }
-        Err(_) => {
-            warn!("library store: no answer in time; no claims this scan");
-            LibraryAnswer::default()
-        }
-    }
+    try_ask(request, gate, send, ASK_TIMEOUT)
+        .await
+        .unwrap_or_default()
 }
 
-/// The claims the service reads its library rows through: `first`'s, and,
-/// when the store had packages pending, theirs from one more ask through
-/// `send`. A package still pending is asked again next scan.
-pub async fn settle<G, GateFut, S, Fut>(
-    asked: &Asked,
-    first: LibraryAnswer,
+/// [`ask`], saying when there was no answer (a refusal, an error, a timeout
+/// of `limit`) instead of reading it as an answer naming nothing.
+async fn try_ask<G, GateFut, S, Fut>(
+    request: LibraryClaimsRequest,
     gate: G,
     send: S,
-) -> Vec<ExportClaims>
+    limit: Duration,
+) -> Option<LibraryAnswer>
 where
     G: FnOnce(&LibraryClaimsRequest) -> GateFut,
     GateFut: Future,
     S: FnOnce(LibraryClaimsRequest) -> Fut,
     Fut: Future<Output = Result<String, AgentCallError>>,
 {
-    let mut exports = first.exports;
-    let mut pending = first.pending;
-    if let Some(again) = asked.only(&pending) {
-        let second = ask(again, gate, send).await;
-        exports.extend(second.exports);
-        pending = second.pending;
+    let _turn = gate(&request).await;
+    match tokio::time::timeout(limit, send(request)).await {
+        Ok(Ok(text)) => Some(parse_answer(&text)),
+        Ok(Err(error)) => {
+            warn!(%error, "library store: no claims this scan");
+            None
+        }
+        Err(_) => {
+            warn!("library store: no answer in time; no claims this scan");
+            None
+        }
     }
+}
+
+/// What the store gave a scan once it stopped asking.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Settled {
+    /// Every export of every package answered, from any ask.
+    pub exports: Vec<ExportClaims>,
+    /// The packages the scan ends without: pending at the last answer, or
+    /// still being built when the wait ran out or the store stopped answering.
+    pub pending: BTreeSet<String>,
+    /// The packages the store answered `skipped` with `build_failed`.
+    pub build_failed: BTreeSet<String>,
+    /// Whether the store was asked at all.
+    pub asked: bool,
+}
+
+/// The store's answer for `asked`, waiting for the packages it is building
+/// (carrick#2496). The first ask is the whole request. The packages it
+/// answered `pending` for a reason a build can end ([`WAITED_REASONS`]) are
+/// asked again, alone, every [`POLL_INTERVAL`] until each is answered or
+/// [`WAIT_CAP`] has passed since the first ask began. The wait is this
+/// future's alone, so the caller runs it beside the analysis. A store that
+/// stops answering ends the wait: it never fails the scan.
+///
+/// `gate` is taken before every ask, as [`ask`]'s is.
+pub async fn ask_until_settled<G, GateFut, S, Fut>(asked: &Asked, gate: G, send: S) -> Settled
+where
+    G: Fn(&LibraryClaimsRequest) -> GateFut,
+    GateFut: Future,
+    S: Fn(LibraryClaimsRequest) -> Fut,
+    Fut: Future<Output = Result<String, AgentCallError>>,
+{
+    let started = tokio::time::Instant::now();
+    let deadline = started + WAIT_CAP;
+    let Some(first) = try_ask(asked.request.clone(), &gate, &send, ASK_TIMEOUT).await else {
+        return Settled {
+            asked: true,
+            ..Settled::default()
+        };
+    };
+    let mut exports = first.exports;
+    let mut pending: BTreeSet<String> =
+        first.pending.difference(&first.building).cloned().collect();
+    let mut building = first.building;
+    let mut build_failed = first.build_failed;
+    let mut polls = 0usize;
+    while !building.is_empty() {
+        let next = tokio::time::Instant::now() + POLL_INTERVAL;
+        if next >= deadline {
+            break;
+        }
+        tokio::time::sleep_until(next).await;
+        let Some(again) = asked.only(&building) else {
+            break;
+        };
+        let limit = ASK_TIMEOUT.min(deadline - tokio::time::Instant::now());
+        polls += 1;
+        let Some(second) = try_ask(again, &gate, &send, limit).await else {
+            break;
+        };
+        exports.extend(second.exports);
+        pending.extend(second.pending.difference(&second.building).cloned());
+        build_failed.extend(second.build_failed);
+        building = second.building;
+    }
+    pending.extend(building);
     debug!(
         answered = first.answered,
         skipped = first.skipped,
         dropped = first.dropped,
+        polls,
+        waited_s = started.elapsed().as_secs(),
         pending = pending.len(),
         "library store: answered"
     );
-    asked.claims(exports)
+    Settled {
+        exports: asked.claims(exports),
+        pending,
+        build_failed,
+        asked: true,
+    }
 }
 
 /// The store's own 200 bodies, for the tests on both sides of the
@@ -2014,33 +2134,6 @@ mod tests {
         request(&specifiers(&["lib", "other"]), &install_at(dir)).unwrap()
     }
 
-    #[tokio::test]
-    async fn a_pending_package_is_asked_once_more_and_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let asked = asked_lib_and_other(dir.path());
-        let first = parse_answer(STORE_PENDING);
-        let mut sent = None;
-        let claims = settle(
-            &asked,
-            first,
-            |_| async {},
-            |request| {
-                sent = Some(request);
-                async { Ok(STORE_ANSWERED.to_string()) }
-            },
-        )
-        .await;
-        let sent = sent.expect("the pending package is asked again");
-        assert_eq!(
-            sent.packages
-                .iter()
-                .map(|p| p.package.as_str())
-                .collect::<Vec<_>>(),
-            vec!["lib"]
-        );
-        assert_eq!(claims.len(), 1);
-    }
-
     /// carrick#1066. The turn is taken before the ask and held until it has
     /// its answer, so a second service asking the same thing sends after it.
     #[tokio::test]
@@ -2080,25 +2173,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_pending_asks_nothing_more() {
-        let dir = tempfile::tempdir().unwrap();
-        let asked = asked_lib_and_other(dir.path());
-        let first = parse_answer(STORE_ANSWERED);
-        let claims = settle(
-            &asked,
-            first,
-            |_| async {},
-            |_| async {
-                panic!("nothing was pending");
-                #[allow(unreachable_code)]
-                Ok(String::new())
-            },
-        )
-        .await;
-        assert_eq!(claims.len(), 1);
-    }
-
-    #[tokio::test]
     async fn a_refused_ask_is_no_claims_and_never_an_error() {
         let refused = ask(
             LibraryClaimsRequest {
@@ -2115,15 +2189,193 @@ mod tests {
         )
         .await;
         assert_eq!(refused, LibraryAnswer::default());
+    }
+
+    /// The store's pending body for `lib` with `reason`, as `http.ts` sends it.
+    fn pending_for(reason: &str) -> String {
+        format!(
+            r#"{{"library_claims":[{{"package":"lib","version":"1.0.0","status":"pending","reason":"{reason}"}}]}}"#
+        )
+    }
+
+    /// A fake store: the nth ask gets `bodies[n]` (the last one repeats; an
+    /// empty string is a refusal), and every request is kept with the
+    /// (paused) clock's reading when it arrived.
+    struct FakeStore {
+        bodies: Vec<String>,
+        seen: std::sync::Mutex<Vec<(Duration, Vec<String>)>>,
+        start: tokio::time::Instant,
+    }
+
+    impl FakeStore {
+        fn new(bodies: Vec<String>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                bodies,
+                seen: Default::default(),
+                start: tokio::time::Instant::now(),
+            })
+        }
+
+        async fn send(&self, request: LibraryClaimsRequest) -> Result<String, AgentCallError> {
+            let mut seen = self.seen.lock().unwrap();
+            let n = seen.len();
+            seen.push((
+                self.start.elapsed(),
+                request.packages.iter().map(|p| p.package.clone()).collect(),
+            ));
+            match &self.bodies[n.min(self.bodies.len() - 1)] {
+                body if body.is_empty() => Err(AgentCallError::permanent(
+                    "scan_not_started",
+                    "no scan is running for this credential".to_string(),
+                )),
+                body => Ok(body.clone()),
+            }
+        }
+
+        async fn run(self: &std::sync::Arc<Self>, asked: &Asked) -> Settled {
+            let store = self.clone();
+            ask_until_settled(
+                asked,
+                |_| async {},
+                move |request| {
+                    let store = store.clone();
+                    async move { store.send(request).await }
+                },
+            )
+            .await
+        }
+
+        fn asks(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_package_being_built_is_waited_for_and_read_once_answered() {
         let dir = tempfile::tempdir().unwrap();
         let asked = asked_lib_and_other(dir.path());
-        let kept = settle(
-            &asked,
-            parse_answer(STORE_ANSWERED),
-            |_| async {},
-            |_| async { Ok(String::new()) },
-        )
-        .await;
-        assert_eq!(kept.len(), 1, "a failed re-ask keeps the first answer");
+        let store = FakeStore::new(vec![
+            pending_for("in_flight"),
+            pending_for("in_flight"),
+            pending_for("building"),
+            STORE_ANSWERED.to_string(),
+        ]);
+        let settled = store.run(&asked).await;
+        assert_eq!(settled.exports.len(), 1, "the claims are read");
+        assert!(settled.pending.is_empty());
+        assert_eq!(store.asks(), 4);
+        let seen = store.seen.lock().unwrap();
+        assert_eq!(
+            seen[1].0, POLL_INTERVAL,
+            "the first poll is one interval on"
+        );
+        assert_eq!(seen[3].0, POLL_INTERVAL * 3);
+        assert_eq!(seen[1].1, vec!["lib".to_string()], "asked alone");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_package_still_building_at_the_cap_stops_the_wait_and_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let store = FakeStore::new(vec![pending_for("in_flight")]);
+        let settled = store.run(&asked).await;
+        assert_eq!(settled.pending, specifiers(&["lib"]));
+        assert!(settled.exports.is_empty());
+        let seen = store.seen.lock().unwrap();
+        // Ruled 2026-10-17: every 10 s, for 10 minutes from the first ask.
+        assert_eq!(POLL_INTERVAL, Duration::from_secs(10));
+        assert_eq!(WAIT_CAP, Duration::from_secs(600));
+        assert_eq!(seen.len(), 60, "the first ask at 0, then one per interval");
+        assert_eq!(seen.last().unwrap().0, Duration::from_secs(590));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reason_no_build_can_end_is_not_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        for reason in [
+            "lister_unavailable",
+            "classifier_unavailable",
+            "picker_unavailable",
+            "store_unavailable",
+            "store_row_unreadable",
+            "dispatch_failed",
+        ] {
+            let store = FakeStore::new(vec![pending_for(reason)]);
+            let settled = store.run(&asked).await;
+            assert_eq!(store.asks(), 1, "{reason}: no second ask");
+            assert_eq!(settled.pending, specifiers(&["lib"]), "{reason}: named");
+        }
+        let failed = r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"skipped","reason":"build_failed"}]}"#;
+        let store = FakeStore::new(vec![failed.to_string()]);
+        let settled = store.run(&asked).await;
+        assert_eq!(
+            store.asks(),
+            1,
+            "a failed build due a retry later is not waited for"
+        );
+        assert!(settled.pending.is_empty(), "and it is skipped, not pending");
+        assert_eq!(settled.build_failed, specifiers(&["lib"]), "but named");
+        let invalid = r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"skipped","reason":"invalid_package"}]}"#;
+        let settled = FakeStore::new(vec![invalid.to_string()]).run(&asked).await;
+        assert!(settled.build_failed.is_empty(), "no other skipped reason");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_package_being_built_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let body = r#"{"library_claims":[
+            {"package":"lib","version":"1.0.0","status":"pending","reason":"in_flight"},
+            {"package":"other","version":"1.0.0","status":"pending","reason":"lister_unavailable"}]}"#;
+        let store = FakeStore::new(vec![body.to_string(), STORE_ANSWERED.to_string()]);
+        let settled = store.run(&asked).await;
+        assert_eq!(store.asks(), 2);
+        assert_eq!(store.seen.lock().unwrap()[1].1, vec!["lib".to_string()]);
+        assert_eq!(settled.pending, specifiers(&["other"]));
+        assert_eq!(settled.exports.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_package_answered_first_time_asks_nothing_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let store = FakeStore::new(vec![STORE_ANSWERED.to_string()]);
+        let settled = store.run(&asked).await;
+        assert_eq!(store.asks(), 1);
+        assert_eq!(store.start.elapsed(), Duration::ZERO, "and waits nothing");
+        assert_eq!(settled.exports.len(), 1);
+        assert!(settled.pending.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_store_that_stops_answering_ends_the_wait_and_never_fails_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let store = FakeStore::new(vec![pending_for("building"), String::new()]);
+        let settled = store.run(&asked).await;
+        assert_eq!(store.asks(), 2, "one refused poll ends it");
+        assert_eq!(settled.pending, specifiers(&["lib"]));
+        let store = FakeStore::new(vec![String::new()]);
+        let settled = store.run(&asked).await;
+        assert_eq!(store.asks(), 1);
+        assert!(settled.exports.is_empty());
+        assert!(
+            settled.pending.is_empty(),
+            "a store that never answered named nothing pending"
+        );
+    }
+
+    #[test]
+    fn the_store_s_pending_reasons_split_into_waited_and_not() {
+        let answer = parse_answer(
+            r#"{"library_claims":[
+                {"package":"a","version":"1.0.0","status":"pending","reason":"in_flight"},
+                {"package":"b","version":"1.0.0","status":"pending","reason":"building"},
+                {"package":"c","version":"1.0.0","status":"pending","reason":"lister_unavailable"},
+                {"package":"d","version":"1.0.0","status":"pending"}]}"#,
+        );
+        assert_eq!(answer.pending, specifiers(&["a", "b", "c", "d"]));
+        assert_eq!(answer.building, specifiers(&["a", "b"]));
     }
 }
