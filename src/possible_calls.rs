@@ -117,13 +117,16 @@ fn kind_of(role: &str) -> Option<&'static str> {
 }
 
 /// `producer` or `consumer` from the label's role and op. An HTTP client
-/// that requests consumes a route; a server that receives produces one;
-/// elsewhere a send produces and a receive consumes.
+/// that requests or sends consumes a route; a server both receives and
+/// replies as part of the route it serves, so both produce; elsewhere a send
+/// produces and a receive consumes.
 fn role_of(role: &str, op: Option<&str>) -> Option<&'static str> {
-    let http = matches!(role, "http_client" | "graphql_client" | "server_framework");
+    if role == "server_framework" {
+        return matches!(op?, "receive" | "send").then_some("producer");
+    }
+    let http = matches!(role, "http_client" | "graphql_client");
     match (op?, http) {
         ("request" | "send", true) => Some("consumer"),
-        ("receive", true) => Some("producer"),
         ("send", false) => Some("producer"),
         ("receive", false) => Some("consumer"),
         _ => None,
@@ -150,10 +153,12 @@ fn slot_of(role: &str) -> &'static str {
 /// as `any` with no declaration is an import the scan could not read.
 /// Otherwise nothing says, and the call was not checked on this scan.
 fn reason_of(record: &SiteRecord) -> UnreadReason {
-    let unreadable = record.state.compiler.names.iter().any(|name| {
-        name.declaration.is_none()
-            && name.package.is_none()
-            && name.type_text.as_deref() == Some("any")
+    let unreadable = record.compiler().is_some_and(|compiler| {
+        compiler.names.iter().any(|name| {
+            name.declaration.is_none()
+                && name.package.is_none()
+                && name.type_text.as_deref() == Some("any")
+        })
     });
     if unreadable {
         UnreadReason::UnresolvedImport
@@ -277,6 +282,23 @@ mod tests {
             "last_updated": "2026-10-17T00:00:00Z", "commit_hash": "abc"
         }))
         .unwrap()
+    }
+
+    /// A server's reply is part of the route it serves: `receive` and `send`
+    /// of a server framework both produce; a client's request and send
+    /// consume.
+    #[test]
+    fn a_server_reply_is_the_producer_side() {
+        assert_eq!(
+            role_of("server_framework", Some("receive")),
+            Some("producer")
+        );
+        assert_eq!(role_of("server_framework", Some("send")), Some("producer"));
+        assert_eq!(role_of("http_client", Some("request")), Some("consumer"));
+        assert_eq!(role_of("http_client", Some("send")), Some("consumer"));
+        assert_eq!(role_of("graphql_client", Some("send")), Some("consumer"));
+        assert_eq!(role_of("server_framework", Some("request")), None);
+        assert_eq!(role_of("server_framework", None), None);
     }
 
     /// Past the cap the rows kept are the first by file and line, in that

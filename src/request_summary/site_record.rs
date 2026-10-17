@@ -263,6 +263,12 @@ impl SiteRecord {
     pub fn state_bytes(&self) -> usize {
         serde_json::to_vec(&self.state).map_or(0, |bytes| bytes.len())
     }
+
+    /// The state's `compiler` part, read back from the wire value. `None`
+    /// when the value is not a [`Compiler`].
+    pub fn compiler(&self) -> Option<Compiler> {
+        serde_json::from_value(self.state.compiler.clone()).ok()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1750,7 +1756,7 @@ mod tests {
 
     /// The state's `compiler` part, read back from the wire value.
     fn compiler_of(record: &SiteRecord) -> Compiler {
-        serde_json::from_value(record.state.compiler.clone()).unwrap()
+        record.compiler().unwrap()
     }
 
     fn record<'r>(records: &'r [SiteRecord], at: &str) -> &'r SiteRecord {
