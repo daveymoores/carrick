@@ -24,7 +24,11 @@
 //!   one stated value fills it and the chain ends at a labelled export (every
 //!   decided site's does). A forced slot is a fact and is not asked. Several
 //!   stated values: asked. None: unstated, and a site whose name is unstated
-//!   is a lead. Kind and role are forced by the label's role and op.
+//!   is a lead. A value is stated only when the code states all of it: one
+//!   literal piece of a joined name is offered, never forced. The method is
+//!   read at the label's method slot. Kind and role are forced by the
+//!   label's role and op where they say one; a label that names no name slot
+//!   forces neither the name nor its argument.
 //! - **No absolute path** in any field: every file is repo-relative, so two
 //!   checkouts of one tree give equal records.
 //! - **The asked-slot list is part of the record**, so a change to which
@@ -47,7 +51,9 @@ use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
 use super::RequestSummaryInputs;
-use super::decided_sites::{Decided, DecidedSite, HandlerAt, PayloadBinding, SiteLabel};
+use super::decided_sites::{
+    Decided, DecidedSite, HandlerAt, MethodValue, PayloadBinding, SiteLabel,
+};
 use crate::position_rows::{Kind, PositionIndex};
 use crate::type_manifest::is_http_method;
 
@@ -59,6 +65,8 @@ pub const MAX_STATED: usize = 24;
 pub const MAX_STATED_CHARS: usize = 120;
 /// The most places one stated value lists.
 pub const MAX_PLACES: usize = 4;
+/// The most syntax nodes a state carries.
+const MAX_SYNTAX_NODES: usize = 60;
 /// The most lines of a reached function's code.
 const MAX_CODE_LINES: usize = 30;
 /// The most characters of one line of code or one syntax text.
@@ -233,9 +241,24 @@ pub struct SyntaxNode {
 pub struct Library {
     pub package: String,
     pub labels: Vec<LibraryLabel>,
-    pub argument_labels: Vec<serde_json::Value>,
+    pub argument_labels: Vec<ArgumentLabel>,
     pub in_store: bool,
 }
+
+/// One op of a labelled export: what it does and the arguments its name
+/// and payload are read from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArgumentLabel {
+    pub export: String,
+    pub member: Option<String>,
+    pub does: String,
+    pub name_argument: Option<usize>,
+    pub name_key: Option<String>,
+    pub payload_argument: Option<usize>,
+}
+
+/// The most argument labels one package lists.
+const MAX_ARGUMENT_LABELS: usize = 20;
 
 /// One labelled export of a package.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,11 +383,14 @@ impl Parsed {
     /// The source text of `span`, as one line of at most
     /// [`MAX_LINE_CHARS`].
     fn text_of(&self, span: Span) -> String {
+        cap(&one_line(self.raw(span)), MAX_LINE_CHARS)
+    }
+
+    /// The source text of `span` as written.
+    fn raw(&self, span: Span) -> &str {
         let start = (span.lo.0 as usize).saturating_sub(crate::swc_scanner::SWC_SPAN_BASE as usize);
         let end = (span.hi.0 as usize).saturating_sub(crate::swc_scanner::SWC_SPAN_BASE as usize);
-        let text = self.text.get(start..end).unwrap_or_default();
-        let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        cap(&one_line, MAX_LINE_CHARS)
+        self.text.get(start..end).unwrap_or_default()
     }
 
     /// Lines `from..=to` (1-based), each numbered.
@@ -386,6 +412,117 @@ impl Parsed {
 
 fn cap(text: &str, chars: usize) -> String {
     text.chars().take(chars).collect()
+}
+
+/// `text` with every run of whitespace one space.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Every whole value `expr` may take, as the code states it: a string or a
+/// plain template literal, a name whose type is a literal or a union of
+/// literals (`literals`), or a choice between such values. `None` when any
+/// value it may take is not stated whole (a concatenation with a value the
+/// code does not state, a call, a member read).
+fn whole_values(expr: &Expr, literals: &dyn Fn(&str) -> Vec<String>) -> Option<BTreeSet<String>> {
+    match super::unwrap_value(expr) {
+        Expr::Lit(Lit::Str(lit)) => lit.value.as_str().map(|text| BTreeSet::from([text.into()])),
+        Expr::Tpl(tpl) if tpl.exprs.is_empty() => match tpl.quasis.as_slice() {
+            [quasi] => quasi
+                .cooked
+                .as_ref()
+                .and_then(|cooked| cooked.as_str())
+                .map(|text| BTreeSet::from([text.to_string()])),
+            _ => None,
+        },
+        Expr::Cond(cond) => {
+            let mut values = whole_values(&cond.cons, literals)?;
+            values.extend(whole_values(&cond.alt, literals)?);
+            Some(values)
+        }
+        Expr::Bin(bin) if matches!(bin.op, BinaryOp::LogicalOr | BinaryOp::NullishCoalescing) => {
+            let mut values = whole_values(&bin.left, literals)?;
+            values.extend(whole_values(&bin.right, literals)?);
+            Some(values)
+        }
+        Expr::Ident(ident) => {
+            let values: BTreeSet<String> = literals(ident.sym.as_ref()).into_iter().collect();
+            (!values.is_empty()).then_some(values)
+        }
+        _ => None,
+    }
+}
+
+/// The first expression inside `exprs` whose source text is `text`.
+fn expr_written_as(parsed: &Parsed, exprs: &[&Expr], text: &str) -> Option<Expr> {
+    struct Find<'p> {
+        parsed: &'p Parsed,
+        text: String,
+        found: Option<Expr>,
+    }
+    impl Visit for Find<'_> {
+        fn visit_expr(&mut self, expr: &Expr) {
+            if self.found.is_some() {
+                return;
+            }
+            if one_line(self.parsed.raw(expr.span())) == self.text {
+                self.found = Some(expr.clone());
+                return;
+            }
+            expr.visit_children_with(self);
+        }
+    }
+    let mut find = Find {
+        parsed,
+        text: one_line(text),
+        found: None,
+    };
+    for expr in exprs {
+        expr.visit_with(&mut find);
+    }
+    find.found
+}
+
+/// The whole values a slot's composed value (`pieces`) states: its text
+/// when every piece is literal, or when it is one value this pass does not
+/// read, the values of the expression the call writes for it among `exprs`.
+fn stated_whole(
+    parsed: Option<&Parsed>,
+    pieces: &[super::Piece],
+    exprs: &[&Expr],
+    literals: &dyn Fn(&str) -> Vec<String>,
+) -> Option<BTreeSet<String>> {
+    if let Some(text) = literal_text(pieces) {
+        return Some(BTreeSet::from([text]));
+    }
+    match pieces {
+        [super::Piece::Opaque { text, .. }] => {
+            whole_values(&expr_written_as(parsed?, exprs, text)?, literals)
+        }
+        _ => None,
+    }
+}
+
+/// The text of `pieces` when every one is literal and the text is not empty.
+fn literal_text(pieces: &[super::Piece]) -> Option<String> {
+    let text: String = pieces
+        .iter()
+        .map(|piece| match piece {
+            super::Piece::Lit(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Option<String>>()?;
+    (!text.is_empty()).then_some(text)
+}
+
+/// A declaration file as the record names it: an installed package outside
+/// the repo (`pkg:<name>/<path>` in the rows) under `node_modules/`, as an
+/// installed package inside it is.
+fn declaration_path(decl_file: &str) -> String {
+    match decl_file.strip_prefix("pkg:") {
+        Some(rest) => format!("node_modules/{rest}"),
+        None => decl_file.to_string(),
+    }
 }
 
 /// The parsed files a run's records read, by repo-relative path.
@@ -416,6 +553,23 @@ struct CallParts {
     /// The identifiers the callee writes.
     in_callee: Written,
     enclosing: Option<(String, u32)>,
+    /// The arguments as written.
+    arg_exprs: Vec<Expr>,
+    /// Every object entry written in the arguments: its key and span.
+    props: Vec<(String, Span)>,
+}
+
+/// The object entries an expression writes, in source order.
+#[derive(Default)]
+struct Props(Vec<(String, Span)>);
+
+impl Visit for Props {
+    fn visit_key_value_prop(&mut self, entry: &KeyValueProp) {
+        if let Some(key) = super::prop_name(&entry.key) {
+            self.0.push((key, entry.span()));
+        }
+        entry.visit_children_with(self);
+    }
 }
 
 /// The literals, object keys and identifiers an expression writes.
@@ -491,7 +645,13 @@ impl CallFinder<'_> {
         if let Some(callee) = callee {
             callee.visit_with(&mut in_callee);
         }
+        let mut props = Props::default();
+        for arg in args {
+            arg.expr.visit_with(&mut props);
+        }
         self.found = Some(CallParts {
+            arg_exprs: args.iter().map(|arg| (*arg.expr).clone()).collect(),
+            props: props.0,
             text: self.parsed.text_of(span),
             callee: callee
                 .map(|callee| self.parsed.text_of(callee.span()))
@@ -669,6 +829,44 @@ fn literal_of_type(type_text: &str) -> Option<String> {
     None
 }
 
+/// Every text a string literal type or a union of string literal types
+/// stands for (`"a" | "b"` gives `a` and `b`); none when any member is not
+/// a string literal.
+fn literals_of_type(type_text: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut rest = type_text.trim();
+    while !rest.is_empty() {
+        if !rest.starts_with('"') {
+            return Vec::new();
+        }
+        // The closing quote: the first one no backslash escapes.
+        let mut escaped = false;
+        let Some(end) = rest
+            .char_indices()
+            .skip(1)
+            .find(|&(_, c)| {
+                let closes = c == '"' && !escaped;
+                escaped = c == '\\' && !escaped;
+                closes
+            })
+            .map(|(index, _)| index)
+        else {
+            return Vec::new();
+        };
+        let Ok(value) = serde_json::from_str::<String>(&rest[..=end]) else {
+            return Vec::new();
+        };
+        values.push(value);
+        rest = rest[end + 1..].trim_start();
+        match rest.strip_prefix('|') {
+            Some(after) => rest = after.trim_start(),
+            None if rest.is_empty() => {}
+            None => return Vec::new(),
+        }
+    }
+    values
+}
+
 /// Whether a row's declaration file is a file of the repo, whose text the
 /// scanner may slice (not the default library, not a package).
 fn in_repo(decl_file: &str) -> bool {
@@ -724,8 +922,8 @@ fn compiler_names(
         };
         let line = sources.get(file).map_or(0, |parsed| parsed.line(span.lo.0));
         let declaration = match (row.decl_file(), row.decl_line()) {
-            (Some(decl), Some(at)) => Some(format!("{decl}:{at}")),
-            (Some(decl), None) => Some(decl.to_string()),
+            (Some(decl), Some(at)) => Some(format!("{}:{at}", declaration_path(decl))),
+            (Some(decl), None) => Some(declaration_path(decl)),
             _ => None,
         };
         let declaration_text = match (row.decl_file(), row.decl_line()) {
@@ -802,9 +1000,9 @@ fn kind_and_role(role: &str, op: Option<&str>) -> (Option<&'static str>, Option<
     let kind = match role {
         "http_client" | "server_framework" => Some("http"),
         "socket" => Some("socket_event"),
-        "in_process_bus" => Some("event"),
-        // A broker carries topics and job or message names alike: the
-        // label does not say which.
+        // A broker carries topics and job or message names alike, and an
+        // in-process channel events or messages (a send to a forked child
+        // process is a message): the label does not say which.
         _ => None,
     };
     let side = match op {
@@ -851,7 +1049,7 @@ pub fn site_records(
                 inputs.positions.as_ref(),
                 root,
                 site,
-                label,
+                (label, labels),
                 &roles,
             )
         })
@@ -863,7 +1061,7 @@ fn record(
     positions: Option<&PositionIndex>,
     root: &Path,
     site: &DecidedSite,
-    label: &SiteLabel,
+    (label, labels): (&SiteLabel, &[SiteLabel]),
     roles: &BTreeMap<String, BTreeSet<String>>,
 ) -> Option<SiteRecord> {
     let file = site.file.as_str();
@@ -901,11 +1099,14 @@ fn record(
         idents.extend(written.idents.iter().cloned());
     }
     let names = compiler_names(sources, positions, root, file, &idents);
-    let literal_of = |ident: &str| {
+    // The literals a name's type stands for: one, or each of a union's.
+    let literals = |ident: &str| -> Vec<String> {
         names
             .iter()
             .find(|name| name.text == ident)
-            .and_then(|name| name.literal.clone())
+            .and_then(|name| name.type_text.as_deref())
+            .map(literals_of_type)
+            .unwrap_or_default()
     };
 
     // The functions the call runs, two levels down.
@@ -941,7 +1142,7 @@ fn record(
     let callees = vec![CompilerCallee {
         text: parts.callee.clone(),
         declaration: match callee_row.and_then(|row| row.decl_file().zip(row.decl_line())) {
-            Some((decl, line)) => Some(format!("{decl}:{line}")),
+            Some((decl, line)) => Some(format!("{}:{line}", declaration_path(decl))),
             None => reached.first().map(|body| body.function.clone()),
         },
         package: match &reached.first() {
@@ -953,30 +1154,27 @@ fn record(
 
     // The values the code states.
     let mut stated = StatedBuilder::default();
-    let mut name_candidates: BTreeSet<String> = BTreeSet::new();
-    if let Some(key) = &site.key {
-        stated.value(key, place(PlaceFrom::ObjectKey, &at));
-        name_candidates.insert(key.clone());
-    } else if let Some(text) = site.name_text() {
-        stated.value(&text, place(PlaceFrom::StringLiteral, &at));
-        name_candidates.insert(text);
-    } else if label.name.is_some() {
-        for index in &site.name_args {
-            let Some(written) = parts.in_args.get(*index) else {
-                continue;
-            };
-            for text in written.strings.iter().chain(&written.templates) {
-                if !is_http_method(text) {
-                    name_candidates.insert(text.clone());
-                }
-            }
-            for (ident, _) in &written.idents {
-                if let Some(literal) = literal_of(ident) {
-                    name_candidates.insert(literal);
-                }
-            }
+    // The whole values the name may take: a value is a candidate only when
+    // the code states all of it, never one literal piece of a joined name.
+    // `None` where any value it may take is not stated whole.
+    let name_exprs: Vec<&Expr> = site
+        .name_args
+        .iter()
+        .filter_map(|index| parts.arg_exprs.get(*index))
+        .collect();
+    let whole_names: Option<BTreeSet<String>> = match (&site.key, &label.name) {
+        (Some(key), _) => {
+            stated.value(key, place(PlaceFrom::ObjectKey, &at));
+            Some(BTreeSet::from([key.clone()]))
         }
-    }
+        (None, Some(_)) => {
+            if let Some(text) = literal_text(&site.name) {
+                stated.value(&text, place(PlaceFrom::StringLiteral, &at));
+            }
+            stated_whole(sources.get(file), &site.name, &name_exprs, &literals)
+        }
+        (None, None) => None,
+    };
     for written in &parts.in_args {
         for text in &written.strings {
             stated.value(text, place(PlaceFrom::StringLiteral, &call_at));
@@ -985,11 +1183,17 @@ fn record(
             stated.value(text, place(PlaceFrom::TemplateLiteral, &call_at));
         }
     }
+    // A constant's literal, or each literal of a name typed as their union.
     for name in &names {
-        if let Some(literal) = &name.literal {
+        for literal in name
+            .type_text
+            .as_deref()
+            .map(literals_of_type)
+            .unwrap_or_default()
+        {
             let mut checker = place(PlaceFrom::Checker, &name.at);
             checker.name = Some(name.text.clone());
-            stated.value(literal, checker);
+            stated.value(&literal, checker);
         }
     }
     for written in &parts.in_args {
@@ -1047,27 +1251,32 @@ fn record(
         role.map(str::to_string).into_iter().collect(),
         true,
     );
-    // Where the label names no name slot, every name the site states may
-    // be it.
-    let name_candidates: Vec<String> = if label.name.is_some() {
-        name_candidates.into_iter().collect()
-    } else {
-        stated
-            .names
-            .iter()
-            .map(|value| value.text.clone())
-            .collect()
+    // The name: forced only when the code states one whole value; asked
+    // when it states several; a lead when it states none whole. A label
+    // that names no name slot forces neither the name nor the argument it
+    // is read from: both are asked.
+    let name_unstated = match (&label.name, &whole_names) {
+        (None, _) => {
+            decide(Slot::Name, Vec::new(), true);
+            if site.key.is_none() {
+                decide(Slot::NameArgument, Vec::new(), true);
+            }
+            false
+        }
+        (Some(_), Some(values)) if !values.is_empty() => {
+            decide(Slot::Name, values.iter().cloned().collect(), false);
+            false
+        }
+        (Some(_), _) => true,
     };
-    let name_unstated = name_candidates.is_empty();
-    decide(Slot::Name, name_candidates, false);
     if site.key.is_none() {
-        let name_argument: Vec<String> = match &label.name {
-            Some(_) => site.name_args.iter().map(usize::to_string).collect(),
-            None => (0..parts.args.len())
-                .map(|index| index.to_string())
-                .collect(),
-        };
-        decide(Slot::NameArgument, name_argument, false);
+        if label.name.is_some() {
+            decide(
+                Slot::NameArgument,
+                site.name_args.iter().map(usize::to_string).collect(),
+                false,
+            );
+        }
         // Built below the call, no payload at it, or no payload slot in the
         // label: no argument of this call is stated as one.
         if let (Some(_), Some(PayloadBinding::Arg { arg, .. })) = (&label.payload, &site.payload) {
@@ -1075,31 +1284,37 @@ fn record(
         }
     }
     if http {
-        let mut methods: BTreeSet<String> = BTreeSet::new();
-        if let Some(literal) = &method_label.literal {
-            methods.insert(literal.clone());
-        } else {
-            for written in &parts.in_args {
-                for text in written.strings.iter().chain(&written.templates) {
-                    if is_http_method(text) {
-                        methods.insert(text.to_ascii_uppercase());
-                    }
+        // Read at the label's method slot: the one method the member always
+        // sends, the default where nothing writes the slot, or the whole
+        // values the code writes there. Forced only when that is a single
+        // request method; asked otherwise.
+        let methods: Option<BTreeSet<String>> = match (&method_label.literal, &method_label.from) {
+            (Some(literal), _) => Some(BTreeSet::from([literal.clone()])),
+            (None, Some(_)) => match &site.method {
+                Some(MethodValue::Unwritten) => method_label
+                    .default
+                    .clone()
+                    .map(|default| BTreeSet::from([default])),
+                Some(MethodValue::Pieces(pieces)) => {
+                    let exprs: Vec<&Expr> = parts.arg_exprs.iter().collect();
+                    stated_whole(sources.get(file), pieces, &exprs, &literals)
                 }
-            }
-            for body in &reached {
-                for text in &body.strings {
-                    if is_http_method(text) {
-                        methods.insert(text.to_ascii_uppercase());
-                    }
-                }
-            }
-            if methods.is_empty()
-                && let Some(default) = &method_label.default
-            {
-                methods.insert(default.clone());
-            }
+                None => None,
+            },
+            (None, None) => method_label
+                .default
+                .clone()
+                .map(|default| BTreeSet::from([default])),
+        };
+        let methods: Vec<String> = methods
+            .unwrap_or_default()
+            .into_iter()
+            .map(|method| method.to_ascii_uppercase())
+            .collect();
+        match methods.as_slice() {
+            [one] if is_http_method(one) => decide(Slot::Method, methods.clone(), true),
+            _ => decide(Slot::Method, Vec::new(), true),
         }
-        decide(Slot::Method, methods.into_iter().collect(), true);
     }
     asked.sort();
     asked.dedup();
@@ -1124,6 +1339,48 @@ fn record(
         .collect();
 
     let call_text = parts.text.clone();
+    // The call, then each object entry written in its arguments.
+    let mut syntax = vec![SyntaxNode {
+        node: if parts.constructed {
+            "NewExpression"
+        } else {
+            "CallExpression"
+        }
+        .to_string(),
+        at: call_at.clone(),
+        text: call_text.clone(),
+        callee: Some(parts.callee.clone()),
+        args: Some(parts.args.clone()),
+        key: None,
+    }];
+    if let Some(parsed) = sources.get(file) {
+        for (key, span) in parts.props.iter().take(MAX_SYNTAX_NODES - 1) {
+            syntax.push(SyntaxNode {
+                node: "KeyValueProperty".to_string(),
+                at: format!("{file}:{}", parsed.line(span.lo.0)),
+                text: parsed.text_of(*span),
+                callee: None,
+                args: None,
+                key: Some(key.clone()),
+            });
+        }
+    }
+    // Every op the store labels on the site's export.
+    let argument_labels: Vec<ArgumentLabel> = labels
+        .iter()
+        .filter(|other| other.package == label.package && other.export == label.export)
+        .filter_map(|other| {
+            Some(ArgumentLabel {
+                export: other.export.clone(),
+                member: other.member.clone(),
+                does: other.op.clone()?,
+                name_argument: other.name.as_ref().map(|slot| slot.arg),
+                name_key: other.name.as_ref().and_then(|slot| slot.key.clone()),
+                payload_argument: other.payload.as_ref().map(|slot| slot.arg),
+            })
+        })
+        .take(MAX_ARGUMENT_LABELS)
+        .collect();
     let state = SiteState {
         point,
         compiler: Compiler {
@@ -1135,19 +1392,7 @@ fn record(
             }),
             reached,
         },
-        syntax: vec![SyntaxNode {
-            node: if parts.constructed {
-                "NewExpression"
-            } else {
-                "CallExpression"
-            }
-            .to_string(),
-            at: call_at.clone(),
-            text: call_text.clone(),
-            callee: Some(parts.callee.clone()),
-            args: Some(parts.args.clone()),
-            key: None,
-        }],
+        syntax,
         libraries: vec![Library {
             package: label.package.clone(),
             labels: vec![LibraryLabel {
@@ -1165,7 +1410,7 @@ fn record(
                     _ => Vec::new(),
                 },
             }],
-            argument_labels: Vec::new(),
+            argument_labels,
             in_store: true,
         }],
         package_network_roles: (!package_network_roles.is_empty()).then_some(package_network_roles),
@@ -1189,14 +1434,15 @@ fn record(
             span_end: site.span_end,
         },
         payload: site.payload.clone(),
-        handler: site.handler.map(
+        handler: site.handler.clone().map(
             |HandlerAt {
+                 file,
                  line,
                  span_start,
                  span_end,
              }| HandlerAnchor {
                 at: AnchorAt {
-                    file: file.to_string(),
+                    file,
                     line,
                     span_start,
                     span_end,
@@ -1487,6 +1733,9 @@ mod tests {
         let bus = record(&records, "bus.ts:7");
         assert_eq!(bus.bucket, Bucket::Asked);
         assert!(bus.state.asked.contains(&Slot::Name));
+        // A send to a forked child process is a message by the kind
+        // criteria, not an event: the label does not say which.
+        assert!(bus.state.asked.contains(&Slot::Kind), "{:?}", bus.state);
 
         // A handler table's key: the name is the key, the anchor its
         // handler.
@@ -1670,5 +1919,280 @@ mod tests {
             let read: SiteState = serde_json::from_value(value.clone()).unwrap();
             assert_eq!(serde_json::to_value(&read).unwrap(), value);
         }
+        let (records, _) = rooms_records(true);
+        for record in &records {
+            let value = serde_json::to_value(&record.state).unwrap();
+            let read: SiteState = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&read).unwrap(), value);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // `decided-sites/src/slots/rooms.ts`, each call its own discovery site.
+
+    use super::super::decided_sites::tests::{
+        ROOMS, decided_fixture, line_of, rooms_sites, span_of,
+    };
+
+    /// The records of `rooms.ts`, with or without the compiler's rows: the
+    /// local `topic` typed as a union of two literals, and the call it is
+    /// sent through declared in the installed package.
+    fn rooms_records(with_rows: bool) -> (Vec<SiteRecord>, String) {
+        let root = decided_fixture();
+        let mut inputs = crate::engine::discover_request_inputs(&root);
+        let text = std::fs::read_to_string(root.join(ROOMS)).unwrap();
+        if with_rows {
+            let at = |needle: &str, inner: &str| {
+                (text.find(needle).unwrap() + needle.find(inner).unwrap()) as u32
+            };
+            let topic = at("wire.emit(topic", "topic");
+            let call = "wire.emit(topic, { paid })";
+            let call_start = at(call, call);
+            let rows = vec![
+                Row(
+                    Kind::Ident,
+                    topic,
+                    topic + 5,
+                    Some("topic".into()),
+                    Some(ROOMS.into()),
+                    Some(line_of(&text, "const topic")),
+                    None,
+                    Some("\"order.paid\" | \"order.cancelled\"".into()),
+                    0,
+                ),
+                Row(
+                    Kind::Call,
+                    call_start,
+                    call_start + call.len() as u32,
+                    Some("emit".into()),
+                    Some("pkg:@fixture/wire/index.d.ts".into()),
+                    Some(2),
+                    Some("@fixture/wire".into()),
+                    Some("void".into()),
+                    0,
+                ),
+            ];
+            let mut index = PositionIndex::of(
+                &root,
+                RowsFile {
+                    header: Header {
+                        v: crate::position_rows::FORMAT_VERSION,
+                        typescript: "6.0.0".into(),
+                        service: "rooms".into(),
+                        files: 1,
+                    },
+                    files: vec![FileRows {
+                        f: ROOMS.into(),
+                        h: Some(content_hash(text.as_bytes())),
+                        skip: None,
+                        r: rows,
+                    }],
+                },
+            );
+            index.bind(&root.join(ROOMS), &text);
+            inputs.positions = Some(index);
+        }
+        let (sites, labels) = rooms_sites(&text);
+        let decided = decided_sites(&inputs, &root, &sites, &labels);
+        (site_records(&inputs, &root, &decided, &labels), text)
+    }
+
+    fn rooms_record<'r>(records: &'r [SiteRecord], text: &str, needle: &str) -> &'r SiteRecord {
+        let at = format!("{ROOMS}:{}", line_of(text, needle));
+        records
+            .iter()
+            .find(|record| record.state.point.at == at)
+            .unwrap_or_else(|| panic!("{at}"))
+    }
+
+    /// A name built from a literal and a value the code does not state is
+    /// not that literal: it is never forced, and with no whole value stated
+    /// the site is a lead. The literal is still offered.
+    #[test]
+    fn a_partly_stated_name_is_never_forced() {
+        for with_rows in [false, true] {
+            let (records, text) = rooms_records(with_rows);
+            let join = rooms_record(&records, &text, "wire.emit(\"room:\"");
+            assert_eq!(join.state.forced.get(&Slot::Name), None, "{:?}", join.state);
+            assert_eq!(join.bucket, Bucket::Lead);
+            assert!(
+                join.state.stated.names.iter().any(|v| v.text == "room:"),
+                "{:?}",
+                join.state.stated
+            );
+        }
+    }
+
+    /// The method is read at the label's method slot: a literal written
+    /// there is forced, and a value the slot holds that the code does not
+    /// state is never the label's default.
+    #[test]
+    fn a_method_is_forced_only_when_one_is_stated() {
+        let (records, text) = rooms_records(false);
+        let create = rooms_record(&records, &text, "fetch(\"/items\",");
+        assert_eq!(
+            create.state.forced.get(&Slot::Method).map(String::as_str),
+            Some("POST"),
+            "{:?}",
+            create.state
+        );
+        let remove = rooms_record(&records, &text, "fetch(\"/items/1\"");
+        // The options object is a module constant the value flow reads.
+        assert_eq!(
+            remove.state.forced.get(&Slot::Method).map(String::as_str),
+            Some("DELETE"),
+            "{:?}",
+            remove.state
+        );
+        // Options a caller hands in: the method is not stated here.
+        let forward = rooms_record(&records, &text, "fetch(\"/items/3\"");
+        assert_eq!(forward.state.forced.get(&Slot::Method), None);
+        assert!(
+            forward.state.asked.contains(&Slot::Method),
+            "{:?}",
+            forward.state
+        );
+    }
+
+    /// A name typed as a union of literals states several values: asked,
+    /// each offered from the checker. Without the rows nothing states it: a
+    /// lead.
+    #[test]
+    fn a_union_typed_name_is_asked() {
+        let (records, text) = rooms_records(true);
+        let settle = rooms_record(&records, &text, "wire.emit(topic");
+        assert_eq!(settle.bucket, Bucket::Asked, "{:?}", settle.state);
+        assert!(settle.state.asked.contains(&Slot::Name));
+        for value in ["order.paid", "order.cancelled"] {
+            let stated = settle
+                .state
+                .stated
+                .names
+                .iter()
+                .find(|v| v.text == value)
+                .unwrap_or_else(|| panic!("{value} in {:?}", settle.state.stated));
+            assert!(
+                stated
+                    .places
+                    .iter()
+                    .any(|p| p.from == PlaceFrom::Checker && p.name.as_deref() == Some("topic")),
+                "{stated:?}"
+            );
+        }
+        let topic = settle
+            .state
+            .compiler
+            .names
+            .iter()
+            .find(|name| name.text == "topic")
+            .unwrap();
+        assert_eq!(topic.literal, None);
+
+        let (records, text) = rooms_records(false);
+        let settle = rooms_record(&records, &text, "wire.emit(topic");
+        assert_eq!(settle.bucket, Bucket::Lead, "{:?}", settle.state);
+    }
+
+    /// A label that names no name slot forces neither the name nor the
+    /// argument it is read from, however few values the call states, and a
+    /// process channel's kind is asked.
+    #[test]
+    fn a_label_with_no_name_slot_forces_no_name() {
+        let (records, text) = rooms_records(false);
+        let ping = rooms_record(&records, &text, "worker.send(");
+        for slot in [Slot::Name, Slot::NameArgument, Slot::Kind] {
+            assert!(!ping.state.forced.contains_key(&slot), "{:?}", ping.state);
+            assert!(ping.state.asked.contains(&slot), "{:?}", ping.state);
+        }
+        assert_eq!(ping.bucket, Bucket::Asked);
+        assert_eq!(
+            ping.state
+                .forced
+                .get(&Slot::PayloadArgument)
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    /// A receive site's anchors name its handler, in its own file, and the
+    /// argument the payload arrives through.
+    #[test]
+    fn a_receive_record_anchors_its_handler() {
+        let (records, text) = rooms_records(false);
+        let inline = "(data) => {\n    console.log(data);\n  }";
+        let joined = rooms_record(&records, &text, "wire.on(\"user.joined\"");
+        let handler = joined.anchors.handler.as_ref().unwrap();
+        assert_eq!(
+            (
+                handler.at.file.as_str(),
+                handler.at.line,
+                handler.at.span_start
+            ),
+            (ROOMS, line_of(&text, inline), span_of(&text, inline).0)
+        );
+        assert_eq!(
+            joined.anchors.payload,
+            Some(PayloadBinding::Arg { arg: 1, key: None })
+        );
+        let left = rooms_record(&records, &text, "wire.on(\"user.left\"");
+        assert_eq!(
+            left.anchors.handler.as_ref().map(|h| h.at.line),
+            Some(line_of(&text, "function onLeft"))
+        );
+    }
+
+    /// The state's parts as the contract writes them: the object entries
+    /// the call is handed are syntax nodes, a package's declaration is
+    /// named under `node_modules/`, and the package's argument labels are
+    /// listed.
+    #[test]
+    fn the_state_carries_the_contracts_parts() {
+        let (records, text) = rooms_records(true);
+        let create = rooms_record(&records, &text, "fetch(\"/items\",");
+        let line = line_of(&text, "fetch(\"/items\",");
+        assert_eq!(
+            serde_json::to_value(&create.state.syntax).unwrap(),
+            serde_json::json!([
+                {
+                    "type": "CallExpression",
+                    "at": format!("{ROOMS}:{line}"),
+                    "text": "fetch(\"/items\", { method: \"POST\" })",
+                    "callee": "fetch",
+                    "args": ["\"/items\"", "{ method: \"POST\" }"]
+                },
+                {
+                    "type": "KeyValueProperty",
+                    "at": format!("{ROOMS}:{line}"),
+                    "text": "method: \"POST\"",
+                    "key": "method"
+                }
+            ])
+        );
+        let settle = rooms_record(&records, &text, "wire.emit(topic");
+        assert_eq!(
+            settle.state.compiler.callees[0].declaration.as_deref(),
+            Some("node_modules/@fixture/wire/index.d.ts:2")
+        );
+        assert_eq!(
+            serde_json::to_value(&settle.state.libraries[0].argument_labels).unwrap(),
+            serde_json::json!([
+                {
+                    "export": "connect",
+                    "member": "emit",
+                    "does": "send",
+                    "name_argument": 0,
+                    "name_key": null,
+                    "payload_argument": 1
+                },
+                {
+                    "export": "connect",
+                    "member": "on",
+                    "does": "receive",
+                    "name_argument": 0,
+                    "name_key": null,
+                    "payload_argument": null
+                }
+            ])
+        );
     }
 }

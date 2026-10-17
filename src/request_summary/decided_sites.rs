@@ -245,16 +245,22 @@ pub enum PayloadBinding {
         key: Option<String>,
     },
     BuiltInside {
+        /// `file:line` of the call that builds it.
         built_inside: String,
+        /// That call's SWC span.
+        span_start: u32,
+        span_end: u32,
         arg: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         key: Option<String>,
     },
 }
 
-/// A function that handles one key of a handler table: its line and span.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The function that handles a receive site or one key of a handler table:
+/// its repo-relative file, line and span.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandlerAt {
+    pub file: String,
     pub line: u32,
     pub span_start: u32,
     pub span_end: u32,
@@ -289,10 +295,14 @@ pub struct DecidedSite {
     /// The calls below this one down to the labelled call, outermost
     /// first: each is written inside the function the call above enters.
     pub via: Vec<Via>,
-    /// Where the payload is bound, when the label states a payload slot.
+    /// Where the payload is bound: at the label's payload slot, or for a
+    /// receive at its handler slot (the payload arrives in the handler's
+    /// first parameter).
     pub payload: Option<PayloadBinding>,
-    /// For a handler table's key: the function that handles it.
+    /// The function that handles a receive site, or a handler table's key.
     pub handler: Option<HandlerAt>,
+    /// What the label's method slot holds here, when it names one.
+    pub method: Option<MethodValue>,
 }
 
 impl DecidedSite {
@@ -542,6 +552,24 @@ fn slot_value(call: &CallIr, slot: &ArgSlot) -> Vec<Piece> {
 /// first call that writes anything else there. `None` when a call hands
 /// nothing there: it sends no payload.
 fn payload_binding(root: &Path, down: &[Placed<'_>], slot: &ArgSlot) -> Option<PayloadBinding> {
+    let (at, arg, key) = bound_at(down, slot)?;
+    if at == 0 {
+        return Some(PayloadBinding::Arg { arg, key });
+    }
+    let placed = &down[at];
+    Some(PayloadBinding::BuiltInside {
+        built_inside: format!("{}:{}", relative(root, placed.file), placed.call.site.line),
+        span_start: placed.call.site.span_start,
+        span_end: placed.call.site.span_end,
+        arg,
+        key,
+    })
+}
+
+/// Where the value `slot` names at the labelled call (the last of `down`)
+/// is written, as [`payload_binding`] reads it: the index in `down` of the
+/// call that writes it, and that call's argument and option key.
+fn bound_at(down: &[Placed<'_>], slot: &ArgSlot) -> Option<(usize, usize, Option<String>)> {
     let whole_param = |value: &Value| match value {
         Value::Str(pieces) => match pieces.as_slice() {
             [Piece::Param(index, _)] => Some(*index),
@@ -573,24 +601,173 @@ fn payload_binding(root: &Path, down: &[Placed<'_>], slot: &ArgSlot) -> Option<P
                 arg = index;
                 key = field;
             }
-            None => {
-                return Some(PayloadBinding::BuiltInside {
-                    built_inside: format!(
-                        "{}:{}",
-                        relative(root, placed.file),
-                        placed.call.site.line
-                    ),
-                    arg,
-                    key,
-                });
-            }
+            None => return Some((k, arg, key)),
         }
     }
     let first = down.first()?;
     if first.call.site_args.is_some() && first.call.args.get(arg).is_none() {
         return None;
     }
-    Some(PayloadBinding::Arg { arg, key })
+    Some((0, arg, key))
+}
+
+/// What a label's method slot holds at a decided site (label v2,
+/// carrick#2434).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MethodValue {
+    /// No call down to the labelled one writes the slot (the argument is
+    /// absent, or an object with no spread lacks the key): the label's
+    /// default is sent.
+    Unwritten,
+    /// The slot's value as the deciding call's arguments write it.
+    Pieces(Vec<Piece>),
+}
+
+/// The value `call` writes at argument `arg` (one option key of it).
+fn written_at(call: &CallIr, arg: usize, key: Option<&str>) -> MethodValue {
+    if call.site_args.is_some() && call.args.get(arg).is_none() {
+        return MethodValue::Unwritten;
+    }
+    let Some(value) = argument(call, arg) else {
+        return MethodValue::Pieces(vec![Piece::Unknown]);
+    };
+    match (key, value) {
+        (None, value) => MethodValue::Pieces(value.pieces()),
+        (Some(key), Value::Obj(object)) => match object.fields.get(key) {
+            Some(value) => MethodValue::Pieces(value.pieces()),
+            None if !object.open && object.under_param.is_none() => MethodValue::Unwritten,
+            None => MethodValue::Pieces(vec![Piece::Unknown]),
+        },
+        (Some(key), Value::Str(pieces)) => match pieces.as_slice() {
+            [Piece::Param(index, name)] => {
+                MethodValue::Pieces(vec![Piece::ParamKey(*index, key.to_string(), name.clone())])
+            }
+            _ => MethodValue::Pieces(vec![Piece::Unknown]),
+        },
+        _ => MethodValue::Pieces(vec![Piece::Unknown]),
+    }
+}
+
+/// The method `slot` reads at the labelled call (the last of `down`),
+/// composed up to the deciding call (the first) as the name is: each call
+/// fills the parameters of the function below it.
+fn method_value(down: &[Placed<'_>], slot: &ArgSlot) -> Option<MethodValue> {
+    let last = down.last()?;
+    let mut value = written_at(last.call, slot.arg, slot.key.as_deref());
+    for k in (0..down.len() - 1).rev() {
+        let MethodValue::Pieces(pieces) = &value else {
+            break;
+        };
+        if !holds_parameter(pieces) {
+            break;
+        }
+        let Some(own) = to_definition(pieces, down[k + 1].depth) else {
+            return Some(MethodValue::Pieces(vec![Piece::Unknown]));
+        };
+        value = match own.as_slice() {
+            [Piece::Param(index, _)] => written_at(down[k].call, *index, None),
+            [Piece::ParamKey(index, key, _)] => written_at(down[k].call, *index, Some(key)),
+            _ => MethodValue::Pieces(filled(&own, down[k].call)),
+        };
+    }
+    Some(value)
+}
+
+/// The functions a module declares at its top level by name: function
+/// declarations, and constants holding an arrow or a function expression.
+fn module_functions(module: &Module) -> HashMap<String, Span> {
+    let mut functions: HashMap<String, Span> = HashMap::new();
+    for item in &module.body {
+        let decl = match item {
+            ModuleItem::Stmt(Stmt::Decl(decl)) => decl,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => &export.decl,
+            _ => continue,
+        };
+        match decl {
+            Decl::Fn(function) => {
+                functions.insert(function.ident.sym.to_string(), function.function.span);
+            }
+            Decl::Var(var) if var.kind == VarDeclKind::Const => {
+                for declarator in &var.decls {
+                    let Pat::Ident(name) = &declarator.name else {
+                        continue;
+                    };
+                    match declarator.init.as_deref().map(super::unwrap_value) {
+                        Some(Expr::Arrow(arrow)) => {
+                            functions.insert(name.id.sym.to_string(), arrow.span);
+                        }
+                        Some(Expr::Fn(function)) => {
+                            functions.insert(name.id.sym.to_string(), function.function.span);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    functions
+}
+
+/// The function `placed`'s call hands at argument `arg`: one written there,
+/// or one the module declares under the name written there; otherwise the
+/// argument itself.
+fn handler_at(root: &Path, placed: &Placed<'_>, arg: usize) -> Option<HandlerAt> {
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = swc_common::errors::Handler::with_tty_emitter(
+        swc_common::errors::ColorConfig::Never,
+        false,
+        false,
+        Some(cm.clone()),
+    );
+    let module = crate::parser::parse_file(placed.file, &cm, &handler)?;
+    let mut finder = CallAt {
+        target: (placed.call.site.span_start, placed.call.site.span_end),
+        args: None,
+    };
+    module.visit_with(&mut finder);
+    let args = finder.args?;
+    if args.iter().take(arg + 1).any(|arg| arg.spread.is_some()) {
+        return None;
+    }
+    let written = args.get(arg)?;
+    let span = match super::unwrap_value(&written.expr) {
+        Expr::Arrow(arrow) => arrow.span,
+        Expr::Fn(function) => function.function.span,
+        Expr::Ident(name) => module_functions(&module)
+            .get(name.sym.as_str())
+            .copied()
+            .unwrap_or(name.span),
+        other => other.span(),
+    };
+    Some(HandlerAt {
+        file: relative(root, placed.file),
+        line: cm.lookup_char_pos(span.lo).line as u32,
+        span_start: span.lo.0,
+        span_end: span.hi.0,
+    })
+}
+
+/// Finds the arguments of the call or construction at a span.
+struct CallAt {
+    target: (u32, u32),
+    args: Option<Vec<ExprOrSpread>>,
+}
+
+impl Visit for CallAt {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if (call.span.lo.0, call.span.hi.0) == self.target {
+            self.args = Some(call.args.clone());
+        }
+        call.visit_children_with(self);
+    }
+
+    fn visit_new_expr(&mut self, new: &NewExpr) {
+        if (new.span.lo.0, new.span.hi.0) == self.target {
+            self.args = Some(new.args.clone().unwrap_or_default());
+        }
+        new.visit_children_with(self);
+    }
 }
 
 /// `file` as the record names it: relative to `root`, `/`-separated.
@@ -629,10 +806,19 @@ impl<'a> Walk<'a, '_> {
         if !self.seen.insert(id) {
             return;
         }
-        let payload = self
-            .label
-            .and_then(|label| label.payload.as_ref())
-            .and_then(|slot| payload_binding(self.root, down, slot));
+        let label = self.label;
+        let handler_slot = label.and_then(|label| label.handler.as_ref());
+        let payload = match label.and_then(|label| label.payload.as_ref()) {
+            Some(slot) => payload_binding(self.root, down, slot),
+            None => handler_slot.and_then(|slot| payload_binding(self.root, down, slot)),
+        };
+        let handler = handler_slot
+            .and_then(|slot| bound_at(down, slot))
+            .and_then(|(at, arg, _)| handler_at(self.root, &down[at], arg));
+        let method = label
+            .and_then(|label| label.method.as_ref())
+            .and_then(|method| method.from.as_ref())
+            .and_then(|slot| method_value(down, slot));
         self.out.sites.push(DecidedSite {
             file,
             line: placed.call.site.line,
@@ -644,7 +830,8 @@ impl<'a> Walk<'a, '_> {
             name_args,
             via,
             payload,
-            handler: None,
+            handler,
+            method,
         });
     }
 
@@ -730,6 +917,7 @@ impl<'a> Walk<'a, '_> {
                 via: Vec::new(),
                 payload: None,
                 handler: Some(entry.handler),
+                method: None,
             });
         }
     }
@@ -890,12 +1078,13 @@ fn place_chain<'a>(
     }
     // Discovery follows calls the call graph may not resolve (a member of a
     // call's result, through the compiler's rows): a call it leaves
-    // unresolved is taken as discovery says; one it resolves elsewhere is
-    // not this hop.
-    let enters = |placed: &Placed<'a>, hop: &ChainHop| {
-        calls
-            .target(placed)
-            .is_none_or(|(file, key)| file == &root.join(&hop.file) && key == &hop.function)
+    // unresolved enters the hop only when it calls the hop's function by its
+    // own name (`openSession(url).notify` for `Session.notify`), so a log
+    // line or a global function in the body is never the hop. A call it
+    // resolves elsewhere is not this hop.
+    let enters = |placed: &Placed<'a>, hop: &ChainHop| match calls.target(placed) {
+        Some((file, key)) => file == &root.join(&hop.file) && key == &hop.function,
+        None => called_name(&placed.call.callee_text) == called_name(&hop.function),
     };
     if !enters(&first, &site.chain[0]) {
         return None;
@@ -920,6 +1109,13 @@ fn place_chain<'a>(
     }
     chain.push(*last);
     Some(chain)
+}
+
+/// The name a call reaches its function by, or a definition key names its
+/// function by: the last `.` segment (`notify` for
+/// `openSession(url).notify` and for `Session.notify`).
+fn called_name(text: &str) -> &str {
+    text.rsplit('.').next().unwrap_or(text)
 }
 
 /// One key of a handler table.
@@ -953,7 +1149,7 @@ fn loop_table(file: &Path, end: &LabelledEnd, arg: usize) -> Option<Vec<TableKey
     };
     module.visit_with(&mut finder);
     let table_name = finder.found?;
-    let mut functions: HashMap<String, Span> = HashMap::new();
+    let functions = module_functions(&module);
     let mut table: Option<&ObjectLit> = None;
     for item in &module.body {
         let decl = match item {
@@ -961,31 +1157,23 @@ fn loop_table(file: &Path, end: &LabelledEnd, arg: usize) -> Option<Vec<TableKey
             ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => &export.decl,
             _ => continue,
         };
-        match decl {
-            Decl::Fn(function) => {
-                functions.insert(function.ident.sym.to_string(), function.function.span);
-            }
-            Decl::Var(var) if var.kind == VarDeclKind::Const => {
-                for declarator in &var.decls {
-                    let Pat::Ident(name) = &declarator.name else {
-                        continue;
-                    };
-                    match declarator.init.as_deref().map(super::unwrap_value) {
-                        Some(Expr::Object(object)) if name.id.sym == *table_name => {
-                            table = Some(object)
-                        }
-                        Some(Expr::Arrow(arrow)) => {
-                            functions.insert(name.id.sym.to_string(), arrow.span);
-                        }
-                        _ => {}
-                    }
+        if let Decl::Var(var) = decl
+            && var.kind == VarDeclKind::Const
+        {
+            for declarator in &var.decls {
+                if let Pat::Ident(name) = &declarator.name
+                    && name.id.sym == *table_name
+                    && let Some(Expr::Object(object)) =
+                        declarator.init.as_deref().map(super::unwrap_value)
+                {
+                    table = Some(object);
                 }
             }
-            _ => {}
         }
     }
     let line = |span: Span| cm.lookup_char_pos(span.lo).line as u32;
     let at = |span: Span| HandlerAt {
+        file: end.file.clone(),
         line: line(span),
         span_start: span.lo.0,
         span_end: span.hi.0,
@@ -1239,7 +1427,7 @@ pub(crate) mod tests {
             .iter()
             .find(|site| site.key.as_deref() == Some("image.resize"))
             .unwrap();
-        assert_eq!(resize.handler.map(|at| at.line), Some(5));
+        assert_eq!(resize.handler.as_ref().map(|at| at.line), Some(5));
     }
 
     /// A path parameter filled only at an entry point is a lead.
@@ -1424,6 +1612,8 @@ pub(crate) mod tests {
                 Some("room:open".to_string()),
                 Some(PayloadBinding::BuiltInside {
                     built_inside: "src/realtime/session.ts:7".to_string(),
+                    span_start: start,
+                    span_end: start + call.len() as u32,
                     arg: 1,
                     key: None
                 })
@@ -1481,5 +1671,257 @@ pub(crate) mod tests {
             }
         }
         assert!(compared > 0, "no summary row compared: {rows:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Hand-built sites on the `decided-sites` fixture.
+
+    pub(crate) fn decided_fixture() -> PathBuf {
+        std::fs::canonicalize(manifest().join("tests/fixtures/decided-sites")).unwrap()
+    }
+
+    /// The SWC span of the first `call` in `text`.
+    pub(crate) fn span_of(text: &str, call: &str) -> (u32, u32) {
+        let start = text.find(call).unwrap() as u32 + crate::swc_scanner::SWC_SPAN_BASE;
+        (start, start + call.len() as u32)
+    }
+
+    /// The 1-based line of the first `needle` in `text`.
+    pub(crate) fn line_of(text: &str, needle: &str) -> u32 {
+        text[..text.find(needle).unwrap()].matches('\n').count() as u32 + 1
+    }
+
+    /// A label of the fixture's `@fixture/wire` `connect` export.
+    pub(crate) fn wire_label(
+        member: &str,
+        op: &str,
+        payload: Option<usize>,
+        handler: Option<usize>,
+    ) -> SiteLabel {
+        SiteLabel {
+            package: "@fixture/wire".into(),
+            export: "connect".into(),
+            member: Some(member.into()),
+            role: "socket".into(),
+            op: Some(op.into()),
+            side: Some("client".into()),
+            name: Some(ArgSlot { arg: 0, key: None }),
+            payload: payload.map(|arg| ArgSlot { arg, key: None }),
+            handler: handler.map(|arg| ArgSlot { arg, key: None }),
+            method: None,
+        }
+    }
+
+    /// The language's own `fetch`, with label v2's method fields.
+    pub(crate) fn fetch_label() -> SiteLabel {
+        SiteLabel {
+            package: "lib.dom".into(),
+            export: "fetch".into(),
+            member: None,
+            role: "http_client".into(),
+            op: Some("request".into()),
+            side: Some("client".into()),
+            name: Some(ArgSlot { arg: 0, key: None }),
+            payload: None,
+            handler: None,
+            method: Some(MethodLabel {
+                from: Some(ArgSlot {
+                    arg: 1,
+                    key: Some("method".into()),
+                }),
+                default: Some("GET".into()),
+                literal: None,
+            }),
+        }
+    }
+
+    /// A send to a forked child process: its label names a payload and no
+    /// name.
+    pub(crate) fn child_send_label() -> SiteLabel {
+        SiteLabel {
+            package: "node:child_process".into(),
+            export: "ChildProcess".into(),
+            member: Some("send".into()),
+            role: "in_process_bus".into(),
+            op: Some("send".into()),
+            side: Some("client".into()),
+            name: None,
+            payload: Some(ArgSlot { arg: 0, key: None }),
+            handler: None,
+            method: None,
+        }
+    }
+
+    /// The labelled call `call` of `file` (its text `text`) under `label`.
+    pub(crate) fn end_for(label: &SiteLabel, file: &str, text: &str, call: &str) -> LabelledEnd {
+        let (span_start, span_end) = span_of(text, call);
+        LabelledEnd {
+            package: label.package.clone(),
+            export: label.export.clone(),
+            member: label.member.clone(),
+            role: label.role.clone(),
+            op: label.op.clone(),
+            file: file.into(),
+            line: line_of(text, call),
+            span_start,
+            span_end,
+        }
+    }
+
+    /// A discovery site that is its own labelled call.
+    pub(crate) fn bottom(end: &LabelledEnd, callee: &str) -> DiscoverySite {
+        DiscoverySite {
+            file: end.file.clone(),
+            line: end.line,
+            span_start: end.span_start,
+            span_end: end.span_end,
+            callee: callee.into(),
+            end: Some(end.clone()),
+            chain: Vec::new(),
+            stop: None,
+        }
+    }
+
+    pub(crate) const ROOMS: &str = "src/slots/rooms.ts";
+
+    /// The calls of `slots/rooms.ts` as discovery lists them, each with its
+    /// label: `(call, callee, label)`.
+    pub(crate) fn rooms_calls() -> Vec<(&'static str, &'static str, SiteLabel)> {
+        let send = wire_label("emit", "send", Some(1), None);
+        let on = wire_label("on", "receive", None, Some(1));
+        vec![
+            (
+                "wire.emit(\"room:\" + roomId, { at: 1 })",
+                "wire.emit",
+                send.clone(),
+            ),
+            ("fetch(\"/items/1\", init)", "fetch", fetch_label()),
+            (
+                "wire.on(\"user.joined\", (data) => {\n    console.log(data);\n  })",
+                "wire.on",
+                on.clone(),
+            ),
+            ("wire.emit(topic, { paid })", "wire.emit", send),
+            (
+                "fetch(\"/items\", { method: \"POST\" })",
+                "fetch",
+                fetch_label(),
+            ),
+            ("wire.on(\"user.left\", onLeft)", "wire.on", on),
+            ("fetch(\"/items/3\", options)", "fetch", fetch_label()),
+            ("worker.send(\"ping\")", "worker.send", child_send_label()),
+        ]
+    }
+
+    /// The discovery sites and labels of `slots/rooms.ts`.
+    pub(crate) fn rooms_sites(text: &str) -> (Vec<DiscoverySite>, Vec<SiteLabel>) {
+        let mut sites = Vec::new();
+        let mut labels: Vec<SiteLabel> = Vec::new();
+        for (call, callee, label) in rooms_calls() {
+            sites.push(bottom(&end_for(&label, ROOMS, text, call), callee));
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        (sites, labels)
+    }
+
+    /// A call the call graph leaves unresolved (a log line, a global
+    /// function) in a hop's body is not the hop: the chain is placed through
+    /// the call that enters the next function, and nothing is walked.
+    #[test]
+    fn an_unrelated_call_in_a_hop_body_is_not_the_hop() {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let session = std::fs::read_to_string(root.join("src/inert/session.ts")).unwrap();
+        let presence = std::fs::read_to_string(root.join("src/inert/presence.ts")).unwrap();
+        assert!(session.contains("console.log(name);"));
+        let send = wire_label("emit", "send", Some(1), None);
+        let end = end_for(
+            &send,
+            "src/inert/session.ts",
+            &session,
+            "wire.emit(name, data)",
+        );
+        let call = "openSession(\"ws://chat\").notify(\"user.joined\", { at: 1 })";
+        let (span_start, span_end) = span_of(&presence, call);
+        let site = DiscoverySite {
+            file: "src/inert/presence.ts".into(),
+            line: line_of(&presence, call),
+            span_start,
+            span_end,
+            callee: "openSession(\"ws://chat\").notify".into(),
+            end: Some(end),
+            chain: vec![
+                ChainHop {
+                    function: "Session.notify".into(),
+                    file: "src/inert/session.ts".into(),
+                    line: line_of(&session, "notify(name"),
+                },
+                ChainHop {
+                    function: "relay".into(),
+                    file: "src/inert/session.ts".into(),
+                    line: line_of(&session, "function relay"),
+                },
+            ],
+            stop: None,
+        };
+        let decided = decided_sites(&inputs, &root, &[site], &[send]);
+        assert_eq!(
+            decided
+                .sites
+                .iter()
+                .map(|s| (s.file.as_str(), s.line, s.name_text()))
+                .collect::<Vec<_>>(),
+            vec![("src/inert/presence.ts", 4, Some("user.joined".to_string()))]
+        );
+        assert!(decided.leads.is_empty(), "{:?}", decided.leads);
+        assert!(decided.walked.is_empty(), "{:?}", decided.walked);
+    }
+
+    /// A receive site names the function that handles it, written at the
+    /// call or declared under the name the call hands, and where the
+    /// payload arrives: the handler's argument.
+    #[test]
+    fn a_receive_site_is_anchored_at_its_handler() {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let text = std::fs::read_to_string(root.join(ROOMS)).unwrap();
+        let (sites, labels) = rooms_sites(&text);
+        let decided = decided_sites(&inputs, &root, &sites, &labels);
+        let site = |name: &str| {
+            decided
+                .sites
+                .iter()
+                .find(|site| site.name_text().as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let inline = "(data) => {\n    console.log(data);\n  }";
+        let (start, end) = span_of(&text, inline);
+        let joined = site("user.joined");
+        assert_eq!(
+            joined.handler,
+            Some(HandlerAt {
+                file: ROOMS.into(),
+                line: line_of(&text, inline),
+                span_start: start,
+                span_end: end,
+            })
+        );
+        assert_eq!(
+            joined.payload,
+            Some(PayloadBinding::Arg { arg: 1, key: None })
+        );
+        let left = site("user.left");
+        assert_eq!(
+            left.handler.as_ref().map(|at| (at.file.as_str(), at.line)),
+            Some((ROOMS, line_of(&text, "function onLeft")))
+        );
+        assert_eq!(
+            left.payload,
+            Some(PayloadBinding::Arg { arg: 1, key: None })
+        );
+        // A send names no handler.
+        assert_eq!(site("/items").handler, None);
     }
 }
