@@ -317,9 +317,7 @@ impl RowCalls {
 
 /// Every call a file's IR records, in every body: (file, the call, whether
 /// a construction).
-pub(crate) fn every_call<'a>(
-    files: &'a HashMap<PathBuf, FileIr>,
-) -> Vec<(&'a Path, &'a CallIr, bool)> {
+pub(crate) fn every_call(files: &HashMap<PathBuf, FileIr>) -> Vec<(&Path, &CallIr, bool)> {
     fn walk<'a>(file: &'a Path, ir: &'a FnIr, out: &mut Vec<(&'a Path, &'a CallIr, bool)>) {
         out.extend(
             ir.read_calls()
