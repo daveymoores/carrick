@@ -61,8 +61,8 @@ impl Walked {
 }
 
 /// `tests/fixtures/<fixture>/repo`'s first service, rooted at `service_dir`
-/// and named `service`, with `edit` applied (paths under `service_dir`;
-/// empty text removes the file).
+/// and named `service`, with `edit` applied (paths under `service_dir`,
+/// directories made as needed; empty text removes the file).
 pub(crate) fn walked(
     fixture: &str,
     service_dir: &str,
@@ -84,6 +84,7 @@ pub(crate) fn walked(
         if text.is_empty() {
             std::fs::remove_file(&path).unwrap();
         } else {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, text).unwrap();
         }
     }

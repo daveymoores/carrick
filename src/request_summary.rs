@@ -923,6 +923,23 @@ struct FnIr {
     /// as a call is, for the chains alone (carrick#2386): the send side never
     /// reads it, so a construction composes into no summary.
     constructions: Vec<CallIr>,
+    /// Each optional call (`socket?.emit(…)`), read as a call is, for
+    /// discovery and the rows' call targets alone (carrick#2431): the
+    /// summaries compose none, so the body stays [`Self::unfollowed`].
+    optional_calls: Vec<CallIr>,
+}
+
+impl FnIr {
+    /// The calls discovery and the rows' call targets read in this body:
+    /// its calls, its constructions and its optional calls, each with
+    /// whether it is a construction.
+    fn read_calls(&self) -> impl Iterator<Item = (&CallIr, bool)> {
+        self.calls
+            .iter()
+            .map(|call| (call, false))
+            .chain(self.constructions.iter().map(|call| (call, true)))
+            .chain(self.optional_calls.iter().map(|call| (call, false)))
+    }
 }
 
 /// What one `return` hands back, read for whether a call of the function is
@@ -1184,6 +1201,11 @@ pub struct FileIr {
     /// where a compiler row's declaration joins a definition (carrick#2413
     /// slice D).
     definition_lines: HashMap<u32, Vec<String>>,
+    /// Each import or `require` binding the file holds as bound, by its
+    /// local name: what the module publishes it as and the specifier, the
+    /// names the library store keys an export by (carrick#2431). A binding
+    /// assigned again or declared again below is left out.
+    bindings: HashMap<String, ImportBinding>,
 }
 
 /// Every expression-position identifier among `names`, by name, with its
@@ -1366,7 +1388,15 @@ pub fn extract_file_ir(
     module.visit_with(&mut idents);
     let import_uses = idents.spans;
     let (loads, computed_load) = module_loads(module, &bound_requires);
+    let bindings = imports
+        .iter()
+        .filter(|(name, import)| {
+            !import.reassignable && !module_scope.declared_below.declares_name(name)
+        })
+        .map(|(name, import)| (name.clone(), import.clone()))
+        .collect();
     let mut file = FileIr {
+        bindings,
         import_uses,
         imported,
         value_specifiers,
@@ -6117,6 +6147,7 @@ impl Visit for CallWalker<'_, '_, '_> {
 
     fn visit_opt_call(&mut self, call: &OptCall) {
         self.ir.unfollowed = true;
+        self.record_optional_call(call);
         call.visit_children_with(self);
     }
 
@@ -7509,12 +7540,11 @@ impl Composer<'_> {
     /// Anywhere else nothing is stated, and the call is one this pass cannot
     /// read: the body is not complete, so no model row is withdrawn on it.
     ///
-    /// With rows, a call they cannot say the callee of is no request either
-    /// (carrick#2413 slice D): it may be a function of the service.
+    /// With rows, a call they cannot say the callee of is still read as the
+    /// request its shape states, as without rows: the rows fail closed on
+    /// composing it ([`Self::target`]), never on the request it makes
+    /// (carrick#2413 slice D). Its body is not complete ([`Self::compose`]).
     fn request_of<'c>(&self, file: &Path, call: &'c CallIr) -> Option<Cow<'c, RequestShape>> {
-        if self.unknown(file, call) {
-            return None;
-        }
         shape_of(call, file, self.semantics, &self.clients).filter(|request| {
             !request.init_only
                 || call.waited
@@ -7541,8 +7571,8 @@ impl Composer<'_> {
     }
 
     /// Whether the rows cannot say what a call reaches (carrick#2413 slice
-    /// D): it may be any function, so it is neither composed nor read as a
-    /// request, and the body it sits in is not complete.
+    /// D): it may be any function, so it is not composed, and the body it
+    /// sits in is not complete, whatever request its shape states.
     fn unknown(&self, file: &Path, call: &CallIr) -> bool {
         self.inputs.row_calls.is_some()
             && !call.jsx
@@ -7628,6 +7658,9 @@ impl Composer<'_> {
                                 .into_iter()
                                 .map(|effect| ir.settle_forward(effect)),
                         );
+                        if self.unknown(file, call) {
+                            summary.complete = false;
+                        }
                     } else if !call.inert {
                         summary.complete = false;
                     }
