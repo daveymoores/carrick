@@ -1438,6 +1438,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     if let Some(line) = crate::scan_health::in_process_pubsub_line() {
         crate::progress::announce(&line);
     }
+    // Library packages the store had not built by the end of the wait
+    // (carrick#2496): named, so a gap in the library rows is not silent.
+    if let Some(line) = crate::scan_health::library_pending_line() {
+        crate::progress::announce(&line);
+    }
     if let Some(summary) = crate::scan_health::summary_line() {
         warn!("{summary}");
     }
@@ -3870,7 +3875,7 @@ async fn analyze_current_repo_incremental(
                     &semantics_root,
                     summaries_sender,
                 ),
-                first_library_answer(library_ask.as_ref()),
+                settled_library_answer(library_ask.as_ref()),
             );
             let analysis = analysis?;
             setup.detection.client_semantics = settled;
@@ -3933,8 +3938,7 @@ async fn analyze_current_repo_incremental(
                 library_answer,
                 sidecar,
                 &semantics_root,
-            )
-            .await;
+            );
             protocol_extractions.library = library;
             protocol_extractions.site = site_rows_of(
                 crate::site_questions::enabled(),
@@ -4730,27 +4734,32 @@ fn library_turn(
     }
 }
 
-/// The store's first answer for `ask`, asked beside the analysis.
-async fn first_library_answer(ask: Option<&LibraryAsk>) -> crate::library_store::LibraryAnswer {
+/// The store's answer for `ask`, waiting for the packages it is building up
+/// to [`crate::library_store::WAIT_CAP`] from the first ask (carrick#2496).
+/// Run beside the analysis, so a scan whose analysis outlasts the builds
+/// waits nothing more.
+async fn settled_library_answer(ask: Option<&LibraryAsk>) -> crate::library_store::Settled {
     match ask {
         Some(ask) => {
-            crate::library_store::ask(
-                ask.asked.request.clone(),
-                library_turn(&ask.turns),
+            crate::library_store::ask_until_settled(
+                &ask.asked,
+                |request| library_turn(&ask.turns)(request),
                 send_to_library_store,
             )
             .await
         }
-        None => crate::library_store::LibraryAnswer::default(),
+        None => crate::library_store::Settled::default(),
     }
 }
 
 /// The service's library rows: its library sites read through the claims
-/// the store answered (packages it had pending asked once more), each
-/// verified by the sidecar from `from_dir`. Nothing asked reads nothing.
-async fn library_rows(
+/// the store answered, each verified by the sidecar from `from_dir`. The
+/// packages the scan ends without are recorded for the summary and the
+/// upload ([`crate::scan_health::record_library_packages_pending`]). Nothing
+/// asked reads nothing.
+fn library_rows(
     ask: Option<&LibraryAsk>,
-    first: crate::library_store::LibraryAnswer,
+    settled: crate::library_store::Settled,
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
 ) -> (
@@ -4760,16 +4769,10 @@ async fn library_rows(
     let Some(ask) = ask else {
         return Default::default();
     };
-    let claims = crate::library_store::settle(
-        &ask.asked,
-        first,
-        library_turn(&ask.turns),
-        send_to_library_store,
-    )
-    .await;
+    crate::scan_health::record_library_packages_pending(settled.pending);
     (
-        read_library_rows(&ask.sites, &claims, sidecar, from_dir),
-        claims,
+        read_library_rows(&ask.sites, &settled.exports, sidecar, from_dir),
+        settled.exports,
     )
 }
 
@@ -9821,7 +9824,7 @@ async fn analyze_current_repo(
             &service_root,
             summaries_sender,
         ),
-        first_library_answer(library_ask.as_ref()),
+        settled_library_answer(library_ask.as_ref()),
     );
     let analysis_result = analysis_result?;
     setup.detection.client_semantics = settled;
@@ -9868,7 +9871,7 @@ async fn analyze_current_repo(
         graphql_schemas,
     );
     let (library, claims) =
-        library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root).await;
+        library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root);
     protocol_extractions.library = library;
     protocol_extractions.site = site_rows_of(
         crate::site_questions::enabled(),

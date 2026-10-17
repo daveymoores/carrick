@@ -109,6 +109,13 @@ struct Registry {
     /// a count a reader needs to know the rows were dropped on purpose. A
     /// service analysed twice in one run keeps its last count.
     in_process_pubsub: BTreeMap<Scope, usize>,
+    /// The library packages each service's scan ended without, after the wait
+    /// for the store's builds (carrick#2496): pending at the last answer, or
+    /// still building when the wait ran out. A service that asked the store
+    /// and ended without nothing keeps an empty set, so "asked, none left"
+    /// reads differently from "never asked". Not a loss: the file reader's
+    /// rows stand, the library rows are missing and are asked again next scan.
+    library_pending: BTreeMap<Scope, std::collections::BTreeSet<String>>,
     /// What the time limits that ran out while each service was analysed
     /// cost it, by kind (carrick#2021). The cross-service check's are read
     /// off its outcomes instead ([`crate::time_limits::from_check_outcomes`]),
@@ -306,6 +313,7 @@ impl Registry {
         self.attempted = self.attempted.saturating_sub(before - self.lost.len());
         self.intents_failed.retain(|(s, _, _)| s != scope);
         self.time_limits.remove(scope);
+        self.library_pending.remove(scope);
     }
 
     /// Records that `limit` ran out while `scope` was analysed, at a cost of
@@ -431,6 +439,48 @@ impl Registry {
     /// again is not counted twice.
     fn record_in_process_pubsub(&mut self, scope: &Scope, count: usize) {
         self.in_process_pubsub.insert(scope.clone(), count);
+    }
+
+    /// Records the packages `scope` ended without (carrick#2496). Replaces
+    /// the service's earlier set, so a service analysed again is not counted
+    /// twice.
+    fn record_library_packages_pending(
+        &mut self,
+        scope: &Scope,
+        packages: std::collections::BTreeSet<String>,
+    ) {
+        self.library_pending.insert(scope.clone(), packages);
+    }
+
+    /// How many packages `scope` ended without, or `None` when it never asked
+    /// the store.
+    fn library_packages_pending_for(&self, scope: &Scope) -> Option<usize> {
+        self.library_pending.get(scope).map(|set| set.len())
+    }
+
+    /// One sentence naming the packages the run ended without, or `None`.
+    fn library_pending_line(&self) -> Option<String> {
+        let names: std::collections::BTreeSet<&String> =
+            self.library_pending.values().flatten().collect();
+        if names.is_empty() {
+            return None;
+        }
+        let shown: Vec<&str> = names
+            .iter()
+            .take(LIBRARY_PENDING_NAMED)
+            .map(|name| name.as_str())
+            .collect();
+        let more = names.len() - shown.len();
+        let more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "{} library package(s) were not ready in the library store, so calls made through them may be missing from this index: {}{more}. They are asked again on the next scan.",
+            names.len(),
+            shown.join(", "),
+        ))
     }
 
     /// One line saying how many pub/sub calls were left out, or `None`.
@@ -642,6 +692,35 @@ pub fn unanalysed_files_for(service: Option<&str>) -> Vec<crate::cloud_storage::
         .lock()
         .expect("scan health lock")
         .unanalysed_files_for(&service.map(str::to_string))
+}
+
+/// How many package names the library-pending sentence spells out.
+const LIBRARY_PENDING_NAMED: usize = 5;
+
+/// Records the library packages the current service's scan ended without
+/// (carrick#2496), empty when it asked the store and ended without none.
+pub fn record_library_packages_pending(packages: std::collections::BTreeSet<String>) {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .record_library_packages_pending(&crate::current_service::name(), packages);
+}
+
+/// How many library packages `service` ended without, or `None` when it did
+/// not ask the store.
+pub fn library_packages_pending_for(service: Option<&str>) -> Option<usize> {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .library_packages_pending_for(&service.map(str::to_string))
+}
+
+/// One sentence naming the library packages the run ended without, or `None`.
+pub fn library_pending_line() -> Option<String> {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .library_pending_line()
 }
 
 /// Records how many pub/sub rows the current service left out as in-process
@@ -1020,6 +1099,41 @@ mod tests {
         );
         assert_eq!(run.summary_line(), None);
         assert!(run.service_losses(&Some("api".to_string())).is_empty());
+    }
+
+    /// carrick#2496: the packages a scan ended without are named in one
+    /// sentence, are not a loss, and a service that asked and ended without
+    /// none counts zero while one that never asked counts nothing.
+    #[test]
+    fn packages_the_scan_ended_without_are_named_and_counted_not_lost() {
+        let mut run = run();
+        assert_eq!(run.library_pending_line(), None);
+        let api = Some("api".to_string());
+        let web = Some("web".to_string());
+        run.record_library_packages_pending(&api, ["b", "a"].map(String::from).into());
+        run.record_library_packages_pending(&web, Default::default());
+        assert_eq!(run.library_packages_pending_for(&api), Some(2));
+        assert_eq!(run.library_packages_pending_for(&web), Some(0));
+        assert_eq!(
+            run.library_packages_pending_for(&Some("other".to_string())),
+            None
+        );
+        assert_eq!(
+            run.library_pending_line().as_deref(),
+            Some(
+                "2 library package(s) were not ready in the library store, so calls made through them may be missing from this index: a, b. They are asked again on the next scan."
+            )
+        );
+        assert_eq!(run.summary_line(), None);
+        assert!(run.service_losses(&api).is_empty());
+        run.record_library_packages_pending(&api, (0..7).map(|n| format!("p{n}")).collect());
+        assert!(
+            run.library_pending_line()
+                .unwrap()
+                .contains("p0, p1, p2, p3, p4 and 2 more.")
+        );
+        run.forget_service_losses(&api);
+        assert_eq!(run.library_pending_line(), None);
     }
 
     /// The regression: one lost file must reach the summary AND its service's
