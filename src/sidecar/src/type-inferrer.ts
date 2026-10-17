@@ -2142,7 +2142,10 @@ export class TypeInferrer {
    *  - the row's line is neither a route registration nor a line inside the
    *    handler the located send sits in;
    *  - the located expression is neither a send nor the argument of one;
-   *  - that send is not one the handler returns;
+   *  - that send is neither one the handler returns nor a statement of it;
+   *  - it is a success send the handler does not return (a statement send
+   *    joins only when the located send is dropped, and only when it ends
+   *    the handler's path);
    *  - it is a success send and the only one that survives, so the join would
    *    be the located body anyway;
    *  - no joined body is the located one (a text body beside JSON ones).
@@ -2174,25 +2177,47 @@ export class TypeInferrer {
       return undefined;
     }
 
-    const branches = this.responseReturnedExpressions(func).flatMap((expression) =>
+    const returnedBranches = this.responseReturnedExpressions(func).flatMap((expression) =>
       this.expandResponseBranches(expression, 0)
     );
-    if (branches.length === 0) return undefined;
-    const serialisers = this.calleesProvenSerialiser(branches);
+    const serialisers = this.calleesProvenSerialiser(returnedBranches);
     const isSend = (candidate: Node): boolean =>
       this.isResponseSend(candidate, extractionConfig, serialisers);
+    // carrick#2427: a handler that sends through a parameter returns nothing,
+    // its sends are statements, and the located one can be an error send.
+    // Statement sends find and drop that branch. A call whose result is
+    // response machinery is not always a body send, though (a header or
+    // cookie setter returns the response too), so a statement send is a
+    // success body only when the located send is dropped and the statement
+    // ends the handler's path. A located success send joins the returned
+    // sends alone.
+    const statementSends = this.responseSendStatements(func, isSend);
+    const locatingBranches = [...returnedBranches, ...statementSends.map((s) => s.send)];
+    if (locatingBranches.length === 0) return undefined;
 
     const peeled = this.peelTransparentExpression(located);
     const site = isSend(peeled) ? peeled : this.receivingCallOf(located, isSend);
     if (!site) return undefined;
     const contains = (outer: Node, inner: Node): boolean =>
       outer.getStart() <= inner.getStart() && inner.getEnd() <= outer.getEnd();
-    const locatedBranch = branches.find((branch) => contains(branch, site));
+    const locatedBranch = locatingBranches.find((branch) => contains(branch, site));
     if (!locatedBranch) return undefined;
 
     const dropped = (status: ResponseSiteStatus): boolean =>
       status === 'error' || status === 'redirect';
     const siteStatus = this.responseSiteStatus(site, true);
+    let branches: Node[];
+    if (dropped(siteStatus)) {
+      branches = [
+        ...returnedBranches,
+        ...statementSends
+          .filter((s) => s.send === locatedBranch || this.statementEndsFunctionPath(s.statement, func))
+          .map((s) => s.send),
+      ];
+    } else {
+      if (!returnedBranches.includes(locatedBranch)) return undefined;
+      branches = returnedBranches;
+    }
     const survivors: Node[] = [];
     for (const branch of branches) {
       const status = branch === locatedBranch ? siteStatus : this.responseSiteStatus(branch, true);
@@ -2245,6 +2270,68 @@ export class TypeInferrer {
       return this.inferredFromRecoveredPayload(request, recovered);
     }
     return undefined;
+  }
+
+  /**
+   * The response sends `func` makes as statements (`res.status(409).json(e);`),
+   * for a handler that sends through a parameter and returns nothing. Only the
+   * outermost call of a statement is a send, only in `func`'s own scope, and
+   * only where `isSend` accepts it, so a logger call or an `await save()`
+   * statement is never one.
+   */
+  private responseSendStatements(
+    func: FunctionLike,
+    isSend: (candidate: Node) => boolean
+  ): Array<{ statement: Node; send: Node }> {
+    const body = func.getBody();
+    if (!body || !Node.isBlock(body)) return [];
+    const sends: Array<{ statement: Node; send: Node }> = [];
+    for (const statement of body.getDescendantsOfKind(SyntaxKind.ExpressionStatement)) {
+      if (this.findContainingFunctionForNode(statement) !== func) continue;
+      const expression = this.peelTransparentExpression(statement.getExpression());
+      if (isSend(expression)) sends.push({ statement, send: expression });
+    }
+    return sends;
+  }
+
+  /**
+   * True when nothing in `func` runs after `statement`: a bare `return;`
+   * follows it, or it is the last statement of its block and the statement
+   * that block belongs to (an `if` branch, a `try` or `catch` block) is itself
+   * last, up to `func`'s body. A statement inside a loop, a `switch` case or
+   * any other construct does not end the path; a send there is not read as a
+   * success body.
+   */
+  private statementEndsFunctionPath(statement: Node, func: FunctionLike): boolean {
+    const body = func.getBody();
+    const next = statement.getNextSibling();
+    if (next && Node.isReturnStatement(next) && !next.getExpression()) return true;
+    let current: Node = statement;
+    for (;;) {
+      const parent = current.getParent();
+      if (!parent) return false;
+      if (Node.isIfStatement(parent)) {
+        current = parent;
+        continue;
+      }
+      if (!Node.isBlock(parent)) return false;
+      const statements = parent.getStatements();
+      if (statements[statements.length - 1] !== current) return false;
+      if (parent === body) return true;
+      const owner = parent.getParent();
+      if (!owner) return false;
+      if (Node.isIfStatement(owner) || Node.isTryStatement(owner) || Node.isBlock(owner)) {
+        current = Node.isBlock(owner) ? parent : owner;
+        continue;
+      }
+      if (Node.isCatchClause(owner)) {
+        const tryStatement = owner.getParent();
+        if (!tryStatement || !Node.isTryStatement(tryStatement)) return false;
+        current = tryStatement;
+        continue;
+      }
+      return false;
+    }
   }
 
   /**
