@@ -66,6 +66,11 @@ The sources:
   one on an environment read with a default of its own, and
   `src/i6-env-fallback.ts` calls it while declaring a loopback default for the
   same variable.
+- `src/o1-options-const.ts` to `src/o4-options-local.ts` hand the factory a
+  constant instead of a literal (carrick#2451): a module constant the file
+  declares once and uses nowhere else (o1), one the file then writes through
+  (o2), one also handed to another call (o3), and a constant and factory call
+  inside one function (o4).
 
 `variants/http-without-base-key.d.ts` is `@fixture/http` as a release whose
 `create` takes `baseUrl`. The tests install it over the vendored declaration
@@ -114,6 +119,8 @@ With the vendored declarations, through the real type sidecar:
 | `i4-barrel.ts:6` | `GET /svc/default` | factory, `verb:get` |
 | `shared/env-api.ts:5` | `GET ${process.env.SHARED_API_URL}/own` | factory, `verb:get` |
 | `i6-env-fallback.ts:5` | `GET ${process.env.SHARED_API_URL}/read`, its base described as `env-api.ts:5` describes it (default `https://shared.example`, not a loopback URL) | factory, `verb:get` |
+| `o1-options-const.ts:6` | `GET /o1/users` | factory, `verb:get` |
+| `o4-options-local.ts:6` | `GET /o4/users` | factory, `verb:get` |
 
 Every row above is `request_summary` and carries `library_semantics`.
 
@@ -153,6 +160,8 @@ the reading cannot see:
 | `i3-shadowed.ts:5` | none: the name is a `Map` there |
 | `i3-shadowed.ts:8` | `GET /unshadowed`, the model's: a file declaring the imported name again reads no call through it |
 | `i5-own-config.ts:5` | `GET /read`, the model's: a base that names a binding is read in its own module only |
+| `o2-options-written.ts:8` | `GET /users`, `receiver_type`: the file writes `options.baseURL` |
+| `o3-options-passed.ts:8` | `GET /users`, `receiver_type`: the file also hands `options` to `log` |
 
 `n9-phase1-fetch.ts` has no library in it. Its request summaries state `POST
 /api/f2` at line 10 (the method written after the spread) and `GET /api/f5`

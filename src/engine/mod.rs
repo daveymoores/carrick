@@ -16127,7 +16127,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     /// semantics the client's own sites state nothing (the verb rule), a
     /// `Map` built in place or bound to the client's name reaches no claim,
     /// a field written twice holds no instance, and a factory handed
-    /// anything but one object literal builds nothing.
+    /// anything but one object literal, or a constant holding one that the
+    /// file hands nowhere else (carrick#2451), builds nothing.
     #[test]
     fn nothing_but_the_named_client_reaches_a_claim() {
         let (dir, discovery) = discover_sources(&[
@@ -16136,7 +16137,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 "src/negatives.ts",
                 "import http from \"@fixture/http\";\n\
                  \n\
+                 declare function log(o: object): void;\n\
                  const options = { baseURL: \"/opts\" };\n\
+                 log(options);\n\
                  const indirect = http.create(options);\n\
                  \n\
                  export function cached() {\n\

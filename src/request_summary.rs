@@ -1784,6 +1784,11 @@ struct BindingUse {
     /// `instanceof`, `typeof` or a comparison is not: it reads the value and
     /// keeps nothing of it (carrick#1568).
     other: bool,
+    /// The span start of each use that sets [`Self::other`] (discovery
+    /// numbering, as [`Self::returned_at`]; a use with no span of its own
+    /// records none). A constant handed to one call is read where that call
+    /// is ([`Self::handed_only_to`], carrick#2451).
+    other_at: BTreeSet<u32>,
     /// Exported by name (`export { api }`, `export default api`,
     /// `module.exports.api = api`). Not a use that changes anything; it says
     /// another module may import the binding (carrick#1568).
@@ -1896,6 +1901,7 @@ impl BindingUse {
         self.member_read |= other.member_read;
         self.spread |= other.spread;
         self.other |= other.other;
+        self.other_at.extend(other.other_at.iter().copied());
         self.exported |= other.exported;
         self.read |= other.read;
         self.tested |= other.tested;
@@ -1947,8 +1953,13 @@ impl BindingUse {
     /// test before carrick#1665 and a return before carrick#1562; each counts
     /// as one here.
     fn keeps_object(&self) -> bool {
+        !self.other && self.keeps_object_apart_from_other()
+    }
+
+    /// [`Self::keeps_object`] but for [`Self::other`], which it leaves to the
+    /// caller.
+    fn keeps_object_apart_from_other(&self) -> bool {
         !self.written
-            && !self.other
             && !self.tested
             && self.returned_at.is_empty()
             && !self.library_calls.contains(&MemberUse {
@@ -1956,6 +1967,18 @@ impl BindingUse {
                 path: Vec::new(),
                 member: None,
             })
+    }
+}
+
+impl BindingUse {
+    /// An object constant that keeps exactly the keys its literal writes and
+    /// is handed to one call, the one whose argument starts at `at`: its
+    /// only use that sets [`Self::other`] (carrick#2451). A use with no span
+    /// of its own records none, so it is never this one.
+    fn handed_only_to(&self, at: u32) -> bool {
+        self.other_at.len() == 1
+            && self.other_at.contains(&at)
+            && self.keeps_object_apart_from_other()
     }
 }
 
@@ -1974,11 +1997,21 @@ struct EntityAlias {
     alias: String,
     root: String,
     exported: bool,
+    /// The span start of the declaration.
+    at: u32,
 }
 
 impl BindingUses {
     fn mark(&mut self, key: String, record: impl FnOnce(&mut BindingUse)) {
         record(self.uses.entry(key).or_default());
+    }
+
+    /// `key` is used as a value, at `at`.
+    fn mark_other(&mut self, key: String, at: u32) {
+        self.mark(key, |used| {
+            used.other = true;
+            used.other_at.insert(at);
+        });
     }
 
     /// `member` is read and not called: its chain's root is read.
@@ -2193,6 +2226,7 @@ impl Visit for BindingUses {
                     alias: decl.id.sym.to_string(),
                     root: ident.sym.to_string(),
                     exported: decl.is_export,
+                    at: decl.span.lo.0,
                 });
             }
         }
@@ -2200,7 +2234,7 @@ impl Visit for BindingUses {
 
     fn visit_expr(&mut self, expr: &Expr) {
         if let Some(key) = binding_key(expr) {
-            self.mark(key, |used| used.other = true);
+            self.mark_other(key, expr.span().lo.0);
             return;
         }
         if let Expr::Member(member) = expr {
@@ -2390,7 +2424,7 @@ impl Visit for BindingUses {
 
     fn visit_prop(&mut self, prop: &Prop) {
         if let Prop::Shorthand(ident) = prop {
-            self.mark(ident.sym.to_string(), |used| used.other = true);
+            self.mark_other(ident.sym.to_string(), ident.span.lo.0);
             return;
         }
         prop.visit_children_with(self);
@@ -2465,7 +2499,8 @@ impl BindingUses {
             for index in ready {
                 settled.insert(index);
                 let root = self.aliases[index].root.clone();
-                self.mark(root, |used| used.other = true);
+                let at = self.aliases[index].at;
+                self.mark_other(root, at);
             }
         }
     }
@@ -4934,10 +4969,12 @@ impl Reader<'_> {
         if args.iter().any(|arg| arg.spread.is_some()) {
             return None;
         }
-        // An HTTP factory's options: exactly one object literal, as before.
+        // An HTTP factory's options: exactly one object literal, or a
+        // constant that holds one (carrick#2451).
         let options = match args {
             [options] => match crate::graphql_document_sites::unwrap_expression(&options.expr) {
                 Expr::Object(literal) => Some(self.object(literal, scope)),
+                Expr::Ident(ident) => self.options_constant(ident, scope),
                 _ => None,
             },
             _ => None,
@@ -4968,6 +5005,28 @@ impl Reader<'_> {
             returned: client.returned.clone(),
             shared: None,
         })
+    }
+
+    /// The object literal a maker call's one argument names, when it is a
+    /// `const` the file declares once, holds an object literal, and is handed
+    /// to this call and nothing else: never written through, spread, aliased,
+    /// returned or handed to another call (carrick#2451). Anything else
+    /// reads no options, as before.
+    fn options_constant(&self, ident: &Ident, scope: &Scope<'_>) -> Option<ObjValue> {
+        let name = ident.sym.as_ref();
+        if !scope.module.object_consts.contains(name)
+            || !scope
+                .module
+                .uses
+                .get(name)
+                .is_some_and(|used| used.handed_only_to(ident.span.lo.0))
+        {
+            return None;
+        }
+        match self.eval(&Expr::Ident(ident.clone()), scope) {
+            Value::Obj(options) => Some(options),
+            _ => None,
+        }
     }
 
     /// The library client a call is made through, when the syntax names one
