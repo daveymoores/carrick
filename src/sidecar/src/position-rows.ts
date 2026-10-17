@@ -427,7 +427,9 @@ class PositionWalker {
       }
       const typeText = this.paths.scrubType(typeToStringAsDeclared(this.checker, type, undefined));
       if (!symbol) return [kind, start, end, null, null, null, null, typeText, flags];
-      const declaration = attributedDeclaration(() => this.program, symbol.declarations ?? []);
+      const declaration =
+        attributedDeclaration(() => this.program, symbol.declarations ?? []) ??
+        this.ownerDeclaration(kind, node, symbol);
       if (!declaration) return [kind, start, end, ts.symbolName(symbol), null, null, null, typeText, flags];
       // A file's own module symbol is named by the compiler as the quoted
       // absolute file name (`"/<checkout>/pkg/index"`). Name it as `decl_file`
@@ -450,6 +452,31 @@ class PositionWalker {
     } catch {
       return [kind, start, end, null, null, null, null, null, FLAG_CHECKER_THREW];
     }
+  }
+
+  /**
+   * The declaration a member with none is attributed to (carrick#2448): the
+   * mapped type node, or the alias naming it, of the receiver's type. A
+   * mapped type's members are made by the checker and have no declaration of
+   * their own. This is the owner `memberTypeWithoutDeclaration` reads such a
+   * member at (type-structural-expander.ts): the type's symbol, else its
+   * alias symbol. A union or intersection receiver contributes the one
+   * constituent that has the property; with several the row is left as it is.
+   */
+  private ownerDeclaration(kind: PositionKind, node: ts.Node, symbol: ts.Symbol): ts.Declaration | undefined {
+    if (kind !== 'member' && kind !== 'call') return undefined;
+    const named = nameNodeOf(kind, node);
+    const access = named?.parent;
+    if (!access || !(ts.isPropertyAccessExpression(access) || ts.isElementAccessExpression(access))) {
+      return undefined;
+    }
+    const receiver = this.checker.getTypeAtLocation(access.expression);
+    const holders = (receiver.isUnionOrIntersection() ? receiver.types : [receiver]).filter(
+      (constituent) => constituent.getProperty(symbol.name) !== undefined
+    );
+    if (holders.length !== 1) return undefined;
+    const owner = holders[0].getSymbol() ?? holders[0].aliasSymbol;
+    return attributedDeclaration(() => this.program, owner?.declarations ?? []);
   }
 
   /** The row's symbol, following aliases to a target that has a declaration. */
