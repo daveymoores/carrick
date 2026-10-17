@@ -1801,7 +1801,7 @@ pub(crate) mod tests {
                 "wire.on",
                 on.clone(),
             ),
-            ("wire.emit(topic, { paid })", "wire.emit", send),
+            ("wire.emit(topic, { shipped })", "wire.emit", send),
             (
                 "fetch(\"/items\", { method: \"POST\" })",
                 "fetch",

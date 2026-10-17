@@ -19,9 +19,9 @@ export function listen(): void {
   });
 }
 
-export function settle(paid: boolean): void {
-  const topic = paid ? "order.paid" : "order.cancelled";
-  wire.emit(topic, { paid });
+export function settle(shipped: boolean): void {
+  const topic = shipped ? "order.shipped" : "order.cancelled";
+  wire.emit(topic, { shipped });
 }
 
 export function create(): Promise<Response> {

@@ -1949,7 +1949,7 @@ mod tests {
                 (text.find(needle).unwrap() + needle.find(inner).unwrap()) as u32
             };
             let topic = at("wire.emit(topic", "topic");
-            let call = "wire.emit(topic, { paid })";
+            let call = "wire.emit(topic, { shipped })";
             let call_start = at(call, call);
             let rows = vec![
                 Row(
@@ -1960,7 +1960,7 @@ mod tests {
                     Some(ROOMS.into()),
                     Some(line_of(&text, "const topic")),
                     None,
-                    Some("\"order.paid\" | \"order.cancelled\"".into()),
+                    Some("\"order.shipped\" | \"order.cancelled\"".into()),
                     0,
                 ),
                 Row(
@@ -2066,7 +2066,7 @@ mod tests {
         let settle = rooms_record(&records, &text, "wire.emit(topic");
         assert_eq!(settle.bucket, Bucket::Asked, "{:?}", settle.state);
         assert!(settle.state.asked.contains(&Slot::Name));
-        for value in ["order.paid", "order.cancelled"] {
+        for value in ["order.shipped", "order.cancelled"] {
             let stated = settle
                 .state
                 .stated
