@@ -1353,6 +1353,7 @@ impl CallWalker<'_, '_, '_> {
             handed: self.reader.handed(args, self.scope, bound),
             names: self.reader.arg_names(args, self.scope),
             spread_args: Vec::new(),
+            receiver_spans: super::discovery::receiver_spans(&new.callee),
         };
         self.ir.constructions.push(construction);
     }

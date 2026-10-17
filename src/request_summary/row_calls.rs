@@ -349,7 +349,7 @@ fn join(declared: &FileIr, line: Option<u32>, symbol: &str) -> Join {
     }
 }
 
-fn hole_key(reason: HoleReason) -> String {
+pub(crate) fn hole_key(reason: HoleReason) -> String {
     serde_json::to_value(reason)
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
