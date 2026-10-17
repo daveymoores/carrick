@@ -192,6 +192,21 @@ use guards::{GuardIr, Subject, Tested, WrittenIn};
 // rows when the run walks them (carrick#2413 slice B).
 mod row_links;
 
+// The definition each call reaches, read from the compiler's per-position
+// rows when the run walks them (carrick#2413 slice D).
+mod row_calls;
+
+// Every call that reaches a labelled library export, at any depth, read
+// from the rows (carrick#2431). Record-only: only tests and the offline
+// census read it so far, so the binary sees it as unused.
+#[allow(dead_code)]
+pub(crate) mod discovery;
+
+// One fixture service walked with or without rows, for the tests of what
+// the summaries read through them.
+#[cfg(test)]
+mod fixture_walk;
+
 // What the compiler's per-position rows say at each lookup the summaries
 // make by name today (carrick#2413): an offline census.
 #[cfg(test)]
@@ -814,6 +829,12 @@ struct CallIr {
     /// Each argument as a spread of the callee's parameter puts it in place
     /// (carrick#2411): empty for an element.
     spread_args: Vec<SpreadArg>,
+    /// Each object the callee's member chain is read on, innermost first,
+    /// as its span (discovery numbering) and whether it is a member access
+    /// rather than a name (`this.child` then nothing for
+    /// `this.child.send()`): where a compiler row names the receiver's type
+    /// (carrick#2431). Read by discovery alone.
+    receiver_spans: Vec<(u32, u32, bool)>,
 }
 
 /// What a call's argument puts in place of the callee's spread of that
@@ -902,6 +923,23 @@ struct FnIr {
     /// as a call is, for the chains alone (carrick#2386): the send side never
     /// reads it, so a construction composes into no summary.
     constructions: Vec<CallIr>,
+    /// Each optional call (`socket?.emit(…)`), read as a call is, for
+    /// discovery and the rows' call targets alone (carrick#2431): the
+    /// summaries compose none, so the body stays [`Self::unfollowed`].
+    optional_calls: Vec<CallIr>,
+}
+
+impl FnIr {
+    /// The calls discovery and the rows' call targets read in this body:
+    /// its calls, its constructions and its optional calls, each with
+    /// whether it is a construction.
+    fn read_calls(&self) -> impl Iterator<Item = (&CallIr, bool)> {
+        self.calls
+            .iter()
+            .map(|call| (call, false))
+            .chain(self.constructions.iter().map(|call| (call, true)))
+            .chain(self.optional_calls.iter().map(|call| (call, false)))
+    }
 }
 
 /// What one `return` hands back, read for whether a call of the function is
@@ -1154,6 +1192,20 @@ pub struct FileIr {
     /// `import(name)`), which may be any module of the service
     /// ([`module_loads`]).
     computed_load: bool,
+    /// The declarations this file holds that no definition the extractor
+    /// keys opens at: an overload's signatures, an interface's members
+    /// (carrick#2413 slice D).
+    declaration_lines: row_calls::DeclarationLines,
+    /// Each line a definition the extractor keyed opens on, or the compiler
+    /// starts it on, with the definitions there ([`Self::place_definitions`]):
+    /// where a compiler row's declaration joins a definition (carrick#2413
+    /// slice D).
+    definition_lines: HashMap<u32, Vec<String>>,
+    /// Each import or `require` binding the file holds as bound, by its
+    /// local name: what the module publishes it as and the specifier, the
+    /// names the library store keys an export by (carrick#2431). A binding
+    /// assigned again or declared again below is left out.
+    bindings: HashMap<String, ImportBinding>,
 }
 
 /// Every expression-position identifier among `names`, by name, with its
@@ -1336,13 +1388,22 @@ pub fn extract_file_ir(
     module.visit_with(&mut idents);
     let import_uses = idents.spans;
     let (loads, computed_load) = module_loads(module, &bound_requires);
+    let bindings = imports
+        .iter()
+        .filter(|(name, import)| {
+            !import.reassignable && !module_scope.declared_below.declares_name(name)
+        })
+        .map(|(name, import)| (name.clone(), import.clone()))
+        .collect();
     let mut file = FileIr {
+        bindings,
         import_uses,
         imported,
         value_specifiers,
         loads,
         computed_load,
         declared_at: module_declarations(module, source_map),
+        declaration_lines: row_calls::DeclarationLines::of(module, source_map),
         names_commonjs_exports: names_commonjs_exports(module),
         source_start: source_map
             .try_lookup_byte_offset(module.span.lo)
@@ -5845,6 +5906,10 @@ impl Visit for CallWalker<'_, '_, '_> {
             handed,
             names,
             spread_args,
+            receiver_spans: match &call.callee {
+                Callee::Expr(callee) => discovery::receiver_spans(callee),
+                _ => Vec::new(),
+            },
         });
     }
 
@@ -5908,6 +5973,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 handed: Vec::new(),
                 names: Vec::new(),
                 spread_args: Vec::new(),
+                receiver_spans: Vec::new(),
             });
         }
         element.visit_children_with(self);
@@ -6081,6 +6147,7 @@ impl Visit for CallWalker<'_, '_, '_> {
 
     fn visit_opt_call(&mut self, call: &OptCall) {
         self.ir.unfollowed = true;
+        self.record_optional_call(call);
         call.visit_children_with(self);
     }
 
@@ -6838,6 +6905,11 @@ pub struct RequestSummaryInputs {
     /// when the run walks rows. `None` without rows, and then they are read
     /// by name through [`Self::bindings`].
     pub(crate) links: Option<row_links::RowLinks>,
+    /// With rows, the calls that stay on the call graph (carrick#2413 slice
+    /// D), set by [`Self::linked`]: every other call reaches what its row
+    /// names ([`Self::reach`]). `None` without rows, and then every call
+    /// reaches what [`Self::sites`] names.
+    pub(crate) row_calls: Option<row_calls::RowCalls>,
 }
 
 impl RequestSummaryInputs {
@@ -6863,6 +6935,7 @@ impl RequestSummaryInputs {
                 &self.bindings,
                 positions,
             ));
+            self.row_calls = Some(self.row_calls());
         }
         let mut wanted: BTreeSet<(PathBuf, library_sites::NamedRef)> = BTreeSet::new();
         for (path, ir) in &mut self.files {
@@ -7051,6 +7124,10 @@ struct LinkedClients {
     /// (importer, local) -> the client it reads, for an import that reaches
     /// one only through modules that publish nothing through `exports`.
     imports: HashMap<(PathBuf, String), (PathBuf, String)>,
+    /// (importer, local) for each import its rows name a declaration of the
+    /// repository for (carrick#2413 slice E): whatever its specifier says,
+    /// it is no package's client.
+    in_repo: HashSet<(PathBuf, String)>,
     /// Some use could not be followed to what it names.
     unfollowable: bool,
 }
@@ -7091,7 +7168,11 @@ impl LinkedClients {
         for (file, ir) in files {
             for (local, used) in &ir.imported {
                 if let Some(links) = links {
-                    match links.get(file, local) {
+                    let link = links.get(file, local);
+                    if link.is_some_and(row_links::RowLink::in_repo) {
+                        linked.in_repo.insert((file.clone(), local.clone()));
+                    }
+                    match link {
                         Some(row_links::RowLink::Declared(at, name)) => {
                             if let Some(declaring) = files.get(at)
                                 && declaring.module_clients.contains_key(name)
@@ -7251,6 +7332,7 @@ impl LinkedClients {
                         .clients
                         .get(held)
                         .map(|client| (client, held.0.as_path())),
+                    None if self.in_repo.contains(&(file.to_path_buf(), local.clone())) => None,
                     None => package.as_ref().map(|client| (client, file)),
                 }
             }
@@ -7411,7 +7493,7 @@ impl RequestSummaryIndex {
 
 struct Composer<'a> {
     files: &'a HashMap<PathBuf, FileIr>,
-    sites: &'a CallSiteTargets,
+    inputs: &'a RequestSummaryInputs,
     semantics: &'a LibrarySemantics,
     clients: LinkedClients,
     memo: HashMap<(PathBuf, String), Summary>,
@@ -7457,20 +7539,52 @@ impl Composer<'_> {
     ///
     /// Anywhere else nothing is stated, and the call is one this pass cannot
     /// read: the body is not complete, so no model row is withdrawn on it.
+    ///
+    /// With rows, a call they cannot say the callee of is still read as the
+    /// request its shape states, as without rows: the rows fail closed on
+    /// composing it ([`Self::target`]), never on the request it makes
+    /// (carrick#2413 slice D). Its body is not complete ([`Self::compose`]).
     fn request_of<'c>(&self, file: &Path, call: &'c CallIr) -> Option<Cow<'c, RequestShape>> {
         shape_of(call, file, self.semantics, &self.clients).filter(|request| {
             !request.init_only
                 || call.waited
                 || self
-                    .sites
-                    .target_at(file, call.site.lo, call.site.hi)
+                    .inputs
+                    .call_target(file, call.site.lo, call.site.hi)
                     .is_some()
         })
     }
 
+    /// The definition a call resolves to. Without rows, the call graph's
+    /// answer for the call's span start, which a chain's outer call shares
+    /// with its inner one (carrick#1695). With rows, the call's own.
+    fn target(&self, file: &Path, call: &CallIr) -> Option<(PathBuf, String)> {
+        if self.inputs.row_calls.is_none() || call.jsx {
+            return self.inputs.sites.target(file, call.site.lo).cloned();
+        }
+        match self.inputs.reach(file, call.site.lo, call.site.hi) {
+            row_calls::Reach::Function(file, key) | row_calls::Reach::OutsideService(file, key) => {
+                Some((file, key))
+            }
+            row_calls::Reach::NoFunction | row_calls::Reach::Unknown(_) => None,
+        }
+    }
+
+    /// Whether the rows cannot say what a call reaches (carrick#2413 slice
+    /// D): it may be any function, so it is not composed, and the body it
+    /// sits in is not complete, whatever request its shape states.
+    fn unknown(&self, file: &Path, call: &CallIr) -> bool {
+        self.inputs.row_calls.is_some()
+            && !call.jsx
+            && matches!(
+                self.inputs.reach(file, call.site.lo, call.site.hi),
+                row_calls::Reach::Unknown(_)
+            )
+    }
+
     /// The callee a call resolves to, when it is a function this pass read.
     fn callee(&mut self, file: &Path, call: &CallIr) -> Option<(PathBuf, Summary)> {
-        let (target_file, key) = self.sites.target(file, call.site.lo)?.clone();
+        let (target_file, key) = self.target(file, call)?;
         let summary = self.summary(&target_file, &key)?;
         Some((target_file, summary))
     }
@@ -7544,6 +7658,9 @@ impl Composer<'_> {
                                 .into_iter()
                                 .map(|effect| ir.settle_forward(effect)),
                         );
+                        if self.unknown(file, call) {
+                            summary.complete = false;
+                        }
                     } else if !call.inert {
                         summary.complete = false;
                     }
@@ -7642,7 +7759,7 @@ pub fn summarize(
     let files = &inputs.files;
     let mut composer = Composer {
         files,
-        sites: &inputs.sites,
+        inputs,
         semantics,
         clients: LinkedClients::link(files, &inputs.bindings, inputs.links.as_ref()),
         memo: HashMap::new(),
@@ -7802,7 +7919,7 @@ fn emit(
     index: &mut RequestSummaryIndex,
     top_level: bool,
 ) {
-    let (files, sites) = (composer.files, composer.sites);
+    let files = composer.files;
     for call in &ir.calls {
         if call.invokes_param.is_some() {
             continue;
@@ -7810,9 +7927,9 @@ fn emit(
         let mut rows: Vec<SummaryRow> = Vec::new();
         match composer.callee(file, call) {
             Some((callee_file, callee)) => {
-                let callee_ir = sites
-                    .target(file, call.site.lo)
-                    .and_then(|(target, key)| files.get(target)?.functions.get(key));
+                let callee_ir = composer
+                    .target(file, call)
+                    .and_then(|(target, key)| files.get(&target)?.functions.get(&key));
                 for effect in &callee.effects {
                     // A JSX element states only what its props fill in
                     // (carrick#1949).

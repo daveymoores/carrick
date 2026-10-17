@@ -1,0 +1,8 @@
+{
+  "name": "calls-api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-kit": "^1.0.0"
+  }
+}

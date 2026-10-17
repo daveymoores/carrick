@@ -38,11 +38,30 @@ pub(crate) enum RowLink {
     Unrecorded,
     /// A whole module, with what it publishes as the module graph says.
     Module(Vec<PublishedBinding>),
-    /// A declaration outside the service's files: the default library, a
-    /// package, a file of another service.
-    Outside,
+    /// A declaration outside the repository: the default library or a
+    /// package, with the package the compiler names for it
+    /// (carrick#2413 slice E).
+    Outside(Option<String>),
+    /// A declaration in a file of the repository that is not one of the
+    /// service's: another workspace package, or code an alias names.
+    OtherService,
     /// The rows do not say.
     Hole(HoleReason),
+}
+
+impl RowLink {
+    /// Whether the import reaches a declaration of the repository, whatever
+    /// its specifier says (carrick#2413 slice E): then it is no package's
+    /// client.
+    pub(crate) fn in_repo(&self) -> bool {
+        matches!(
+            self,
+            RowLink::Declared(..)
+                | RowLink::Unrecorded
+                | RowLink::Module(_)
+                | RowLink::OtherService
+        )
+    }
 }
 
 /// Why every exported object, instance and published getter of a service is
@@ -109,31 +128,43 @@ impl RowLinks {
         local: &str,
         spans: &[(u32, u32)],
     ) -> RowLink {
-        let mut agreed: Option<(Option<&str>, Option<u32>, Option<&str>)> = None;
+        type Named<'r> = (
+            Option<&'r str>,
+            Option<u32>,
+            Option<&'r str>,
+            Option<&'r str>,
+        );
+        let mut agreed: Option<Named<'_>> = None;
         for (lo, hi) in spans {
             let row = match positions.declaration(file, *lo, *hi, Kind::Ident, true) {
                 Ok(row) => row,
                 Err(reason) => return RowLink::Hole(reason),
             };
-            let named = (row.decl_file(), row.decl_line(), row.symbol());
+            let named = (
+                row.decl_file(),
+                row.decl_line(),
+                row.symbol(),
+                row.decl_package(),
+            );
             match agreed {
                 None => agreed = Some(named),
                 Some(earlier) if earlier == named => {}
                 Some(_) => return RowLink::Hole(HoleReason::RowsMissing),
             }
         }
-        let Some((Some(decl_file), decl_line, Some(symbol))) = agreed else {
-            return RowLink::Outside;
+        let package = agreed.and_then(|(_, _, _, package)| package.map(str::to_string));
+        let Some((Some(decl_file), decl_line, Some(symbol), _)) = agreed else {
+            return RowLink::Outside(package);
         };
         if decl_file.starts_with("lib:")
             || decl_file.starts_with("pkg:")
             || decl_file.split('/').any(|part| part == "node_modules")
         {
-            return RowLink::Outside;
+            return RowLink::Outside(package);
         }
         let declaring = positions.path_of(decl_file);
         let Some(declared) = files.get(&declaring) else {
-            return RowLink::Outside;
+            return RowLink::OtherService;
         };
         if declaring == file {
             // Every use names a declaration of the importing file itself:
@@ -180,7 +211,8 @@ impl RowLinks {
                 RowLink::Declared(..) => "declared".to_string(),
                 RowLink::Unrecorded => "unrecorded".to_string(),
                 RowLink::Module(_) => "module".to_string(),
-                RowLink::Outside => "outside".to_string(),
+                RowLink::Outside(_) => "outside".to_string(),
+                RowLink::OtherService => "other_service".to_string(),
                 RowLink::Hole(reason) => format!(
                     "hole:{}",
                     serde_json::to_value(reason)
@@ -206,111 +238,35 @@ impl RowLinks {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fixture_walk::Walked;
     use super::super::library_sites::{LibrarySite, MemberUse, MemberWire, library_sites};
     use super::*;
-    use crate::config::Config;
 
     /// Every use reads as a claimed maker or op.
     fn on_wire(_: &str, _: &MemberUse) -> MemberWire {
         MemberWire::OnWire
     }
 
-    fn copy_tree(from: &Path, to: &Path) {
-        std::fs::create_dir_all(to).unwrap();
-        for entry in std::fs::read_dir(from).unwrap() {
-            let entry = entry.unwrap();
-            let target = to.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_tree(&entry.path(), &target);
-            } else {
-                std::fs::copy(entry.path(), &target).unwrap();
-            }
-        }
-    }
-
-    /// The sidecar script, when node and the built sidecar are here. CI
-    /// builds it before the Rust tests, so a skip there would mean nothing.
-    fn sidecar() -> Option<PathBuf> {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
-        let node = std::process::Command::new("node")
-            .arg("--version")
-            .output()
-            .is_ok();
-        if script.exists() && node {
-            return Some(script);
-        }
-        assert!(
-            std::env::var("CI").is_err(),
-            "node or the built sidecar is missing in CI"
-        );
-        crate::errln!("Skipping: node or the built sidecar is missing");
-        None
-    }
-
     /// One service of `tests/fixtures/position-rows-names/`, with `edit`
     /// applied to its tree (paths under `services/names`; empty text removes the
     /// file), read by discovery with the rows the real sidecar walks
     /// (`with_rows`) or with none, as a run without `CARRICK_POSITION_ROWS`.
-    struct Walked {
-        _dir: tempfile::TempDir,
-        inputs: RequestSummaryInputs,
-    }
-
     fn walked(edit: &[(&str, &str)], with_rows: bool) -> Option<Walked> {
-        let script = sidecar()?;
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let dir = tempfile::tempdir().unwrap();
-        let repo = std::fs::canonicalize(dir.path()).unwrap().join("repo");
-        copy_tree(
-            &manifest.join("tests/fixtures/position-rows-names/repo"),
-            &repo,
-        );
-        let service_root = repo.join("services/names");
-        for (name, text) in edit {
-            let path = service_root.join(name);
-            if text.is_empty() {
-                std::fs::remove_file(&path).unwrap();
-            } else {
-                std::fs::write(&path, text).unwrap();
-            }
-        }
-        let service = Config::load_services(vec![repo.join("carrick.json")])
-            .unwrap()
-            .remove(0);
-        let positions = with_rows.then(|| {
-            let mut files =
-                crate::file_finder::walk_service(&repo.to_string_lossy(), &service, &[]).files;
-            files.sort();
-            // A directory beside the tree: the walk refuses to write into it.
-            let positions = dir.path().join("positions");
-            std::fs::create_dir_all(&positions).unwrap();
-            let out = positions.join("repo__names.jsonl.gz");
-            let sidecar = crate::services::TypeSidecar::spawn(&script).expect("spawn the sidecar");
-            sidecar.set_scan_root(&repo);
-            let recipe = sidecar.recipe();
-            drop(sidecar);
-            crate::position_rows::record_service_rows(
-                &recipe,
-                &crate::position_rows::ServiceWalk {
-                    service_root: &service_root,
-                    tsconfig: Some("tsconfig.json"),
-                    scan_root: &repo,
-                    files: &files,
-                    out: &out,
-                    service: "names",
-                },
-            )
-            .expect("the walk writes its rows");
-            PositionIndex::of(
-                &repo,
-                crate::position_rows::read_rows_file(&out).expect("the rows read"),
-            )
-        });
-        let inputs = crate::engine::discover_service_inputs(&repo, &service, positions);
-        Some(Walked { _dir: dir, inputs })
+        super::super::fixture_walk::walked(
+            "position-rows-names",
+            "services/names",
+            "names",
+            edit,
+            with_rows,
+        )
     }
 
-    impl Walked {
+    trait Reads {
+        fn sites(&self) -> Vec<LibrarySite>;
+        fn link(&self, file: &str, local: &str) -> Option<RowLink>;
+    }
+
+    impl Reads for Walked {
         fn sites(&self) -> Vec<LibrarySite> {
             library_sites(&self.inputs).sites
         }

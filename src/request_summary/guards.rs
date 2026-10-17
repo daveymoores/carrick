@@ -57,7 +57,7 @@ use crate::binding_scope::{BindingKey, Declarations, ident_key};
 use crate::env_alias::{env_get_call_name, env_member_name};
 use crate::graphql_document_sites::unwrap_expression;
 use crate::swc_scanner::is_producer_route_path;
-use crate::visitor::{FunctionDefinition, FunctionNodeType};
+use crate::visitor::FunctionDefinition;
 use crate::wrapper_request_shape::literal_string;
 
 /// How many caller paths one guard is followed down before the rest are
@@ -1353,8 +1353,50 @@ impl CallWalker<'_, '_, '_> {
             handed: self.reader.handed(args, self.scope, bound),
             names: self.reader.arg_names(args, self.scope),
             spread_args: Vec::new(),
+            receiver_spans: super::discovery::receiver_spans(&new.callee),
         };
         self.ir.constructions.push(construction);
+    }
+
+    /// An optional call (`socket?.emit(…)`), read as a call is, for
+    /// discovery and the rows' call targets alone (carrick#2431): its
+    /// callee, where it is written and the objects its member chain reads.
+    /// The summaries compose none of these.
+    pub(super) fn record_optional_call(&mut self, call: &OptCall) {
+        let callee = match unwrap_expression(&call.callee) {
+            Expr::Ident(ident) => ident.sym.to_string(),
+            Expr::Member(member) => member_prop(member).unwrap_or_default(),
+            Expr::OptChain(OptChainExpr { base, .. }) => match &**base {
+                OptChainBase::Member(member) => member_prop(member).unwrap_or_default(),
+                OptChainBase::Call(_) => String::new(),
+            },
+            _ => String::new(),
+        };
+        self.ir.optional_calls.push(CallIr {
+            site: self.reader.site(call.span),
+            callee,
+            args: Vec::new(),
+            request: None,
+            waited: false,
+            inert: false,
+            // `produce?.()`: the body invokes a parameter.
+            invokes_param: match unwrap_expression(&call.callee) {
+                Expr::Ident(ident) => self.scope.param_index(ident),
+                _ => None,
+            },
+            receiver: None,
+            site_args: None,
+            name_line: self.reader.line(call.callee.span()),
+            jsx: false,
+            arg_subjects: Vec::new(),
+            callee_subject: None,
+            callee_text: self.reader.text(call.callee.span()),
+            tested: None,
+            handed: Vec::new(),
+            names: Vec::new(),
+            spread_args: Vec::new(),
+            receiver_spans: super::discovery::receiver_spans(&call.callee),
+        });
     }
 
     /// The literal one operand states.
@@ -1553,19 +1595,20 @@ impl FileIr {
     /// detached function (an exported object's member) and what makes a
     /// function an entry point (carrick#2386).
     pub fn place_definitions(&mut self, definitions: &HashMap<String, FunctionDefinition>) {
+        self.definition_lines = super::row_calls::definition_lines(
+            definitions
+                .iter()
+                .map(|(key, definition)| (key.as_str(), definition)),
+        );
+        self.declaration_lines.place(
+            definitions
+                .iter()
+                .map(|(key, definition)| (key.as_str(), definition)),
+        );
         self.definitions = definitions
             .iter()
             .map(|(key, definition)| {
-                let start = match &definition.node_type {
-                    FunctionNodeType::ArrowFunction(arrow) => Some(arrow.span.lo.0),
-                    FunctionNodeType::FunctionDeclaration(declaration) => {
-                        Some(declaration.function.span.lo.0)
-                    }
-                    FunctionNodeType::FunctionExpression(expression) => {
-                        Some(expression.function.span.lo.0)
-                    }
-                    FunctionNodeType::FromPayload(_) | FunctionNodeType::Placeholder => None,
-                };
+                let start = super::row_calls::node_start(definition);
                 (key.clone(), (start, definition.is_exported))
             })
             .collect();
@@ -1676,6 +1719,11 @@ pub enum ChainEnd {
         specifier: String,
         export: String,
         steps: Vec<String>,
+        /// With rows, the package the compiler says the export is declared
+        /// in (carrick#2413 slice E), which a type re-export or an alias
+        /// can make another than the specifier's.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        package: Option<String>,
     },
     Hole {
         reason: HoleReason,
@@ -1866,12 +1914,34 @@ impl<'a> Chains<'a> {
                 }
             }
         }
-        for (file, lo, hi, target) in inputs.sites.every_site() {
-            chains
-                .callers
-                .entry(target.clone())
-                .or_default()
-                .push((file.to_path_buf(), lo, hi));
+        if inputs.row_calls.is_some() {
+            // With rows, each call and construction reaches what its row
+            // names (carrick#2413 slice D).
+            let mut every: Vec<(&'a Path, u32, u32)> = chains
+                .calls
+                .keys()
+                .chain(chains.constructions.keys())
+                .copied()
+                .collect();
+            every.sort();
+            every.dedup();
+            for (file, lo, hi) in every {
+                if let Some(target) = inputs.call_target(file, lo, hi) {
+                    chains
+                        .callers
+                        .entry(target)
+                        .or_default()
+                        .push((file.to_path_buf(), lo, hi));
+                }
+            }
+        } else {
+            for (file, lo, hi, target) in inputs.sites.every_site() {
+                chains.callers.entry(target.clone()).or_default().push((
+                    file.to_path_buf(),
+                    lo,
+                    hi,
+                ));
+            }
         }
         for callers in chains.callers.values_mut() {
             callers.sort();
@@ -2045,9 +2115,8 @@ impl<'a> Chains<'a> {
                 line: call.site.line,
                 target: self
                     .inputs
-                    .sites
-                    .target_at(node.file, call.site.lo, call.site.hi)
-                    .map(|(file, key)| format!("{}:{key}", self.rel(file))),
+                    .call_target(node.file, call.site.lo, call.site.hi)
+                    .map(|(file, key)| format!("{}:{key}", self.rel(&file))),
             })
             .collect()
     }
@@ -2113,13 +2182,33 @@ impl<'a> Chains<'a> {
     /// import hole for a module of this service, its own reason for a
     /// specifier nothing resolves, and `None` for a package the manifests
     /// declare, which is an external import.
+    ///
+    /// With rows (carrick#2413 slice E), the declaration the import's rows
+    /// name decides: one of the repository is the in-repo import hole, and
+    /// one the rows do not give is its own reason.
     fn import_hole(&self, file: &Path, local: &str) -> Option<HoleReason> {
         use crate::call_graph::ImportedBinding;
+        if let Some(links) = &self.inputs.links {
+            return match links.get(file, local)? {
+                super::row_links::RowLink::Hole(reason) => Some(*reason),
+                link if link.in_repo() => Some(HoleReason::InRepoValueImport),
+                _ => None,
+            };
+        }
         match self.inputs.bindings.get(file, local)? {
             ImportedBinding::Unresolved => Some(HoleReason::UnresolvedImport),
             ImportedBinding::Binding { .. }
             | ImportedBinding::Module(_)
             | ImportedBinding::Unfollowable => Some(HoleReason::InRepoValueImport),
+        }
+    }
+
+    /// The package the rows say an external import's export is declared in
+    /// (carrick#2413 slice E). `None` without rows.
+    fn import_package(&self, file: &Path, local: &str) -> Option<String> {
+        match self.inputs.links.as_ref()?.get(file, local)? {
+            super::row_links::RowLink::Outside(package) => package.clone(),
+            _ => None,
         }
     }
 
@@ -2141,6 +2230,7 @@ impl<'a> Chains<'a> {
                 let end = match self.import_hole(self.nodes[node].file, &local) {
                     Some(reason) => self.hole(reason, node),
                     None => ChainEnd::ExternalImport {
+                        package: self.import_package(self.nodes[node].file, &local),
                         specifier,
                         export,
                         steps,
@@ -2301,14 +2391,17 @@ impl<'a> Chains<'a> {
             line: call.site.line,
             text,
         };
-        if self
-            .inputs
-            .sites
-            .target_at(file, call.site.lo, call.site.hi)
-            .is_some()
-        {
-            ends.push(trace, at_call(HoleReason::CallbackIntoOwnFunction, None));
-            return;
+        match self.inputs.reach(file, call.site.lo, call.site.hi) {
+            super::row_calls::Reach::Function(..) | super::row_calls::Reach::OutsideService(..) => {
+                ends.push(trace, at_call(HoleReason::CallbackIntoOwnFunction, None));
+                return;
+            }
+            // The rows cannot say whose the callee is (carrick#2413 slice D).
+            super::row_calls::Reach::Unknown(reason) => {
+                ends.push(trace, at_call(reason, None));
+                return;
+            }
+            super::row_calls::Reach::NoFunction => {}
         }
         let Some(callee) = call.callee_subject.clone() else {
             ends.push(trace, at_call(HoleReason::CalleeUnread, None));
@@ -2334,6 +2427,7 @@ impl<'a> Chains<'a> {
                         specifier: specifier.clone(),
                         export: export.clone(),
                         steps,
+                        package: self.import_package(file, local),
                     },
                 };
                 ends.push(trace, end);
@@ -2679,14 +2773,17 @@ impl<'a> Chains<'a> {
             line: call.site.line,
             text,
         };
-        if self
-            .inputs
-            .sites
-            .target_at(file, call.site.lo, call.site.hi)
-            .is_some()
-        {
-            ends.push(trace, at_call(HoleReason::OwnFunction, None));
-            return;
+        match self.inputs.reach(file, call.site.lo, call.site.hi) {
+            super::row_calls::Reach::Function(..) | super::row_calls::Reach::OutsideService(..) => {
+                ends.push(trace, at_call(HoleReason::OwnFunction, None));
+                return;
+            }
+            // The rows cannot say whose the callee is (carrick#2413 slice D).
+            super::row_calls::Reach::Unknown(reason) => {
+                ends.push(trace, at_call(reason, None));
+                return;
+            }
+            super::row_calls::Reach::NoFunction => {}
         }
         let Some(callee) = call.callee_subject.clone() else {
             ends.push(trace, at_call(HoleReason::CalleeUnread, None));
@@ -2709,6 +2806,7 @@ impl<'a> Chains<'a> {
                     specifier: specifier.clone(),
                     export: export.clone(),
                     steps,
+                    package: self.import_package(file, local),
                 },
             },
             Root::Global(name) => ChainEnd::Global {

@@ -180,6 +180,9 @@ impl Row {
     pub fn decl_package(&self) -> Option<&str> {
         self.6.as_deref()
     }
+    pub fn type_text(&self) -> Option<&str> {
+        self.7.as_deref()
+    }
     pub fn flags(&self) -> u8 {
         self.8
     }
@@ -324,6 +327,10 @@ pub struct PositionIndex {
     scan_root: PathBuf,
     /// By repo-relative path with `/` separators, as [`FileRows::f`].
     files: HashMap<String, IndexedFile>,
+    /// How many lookups converted a span, for the tests that a reader asks
+    /// once per position.
+    #[cfg(test)]
+    lookups: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -355,7 +362,7 @@ impl PositionIndex {
     pub fn missing(scan_root: &Path) -> Self {
         Self {
             scan_root: scan_root.to_path_buf(),
-            files: HashMap::new(),
+            ..Self::default()
         }
     }
 
@@ -387,9 +394,15 @@ impl PositionIndex {
             })
             .collect();
         Self {
-            scan_root: scan_root.to_path_buf(),
             files,
+            ..Self::missing(scan_root)
         }
+    }
+
+    /// How many lookups converted a span so far.
+    #[cfg(test)]
+    pub(crate) fn lookups(&self) -> usize {
+        self.lookups.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// How many files the rows name.
@@ -463,6 +476,9 @@ impl PositionIndex {
     /// (what [`crate::request_summary::FileIr`] spans convert to).
     pub fn lookup(&self, file: &Path, lo: u32, hi: u32, kind: Kind) -> Result<&Row, HoleReason> {
         let (indexed, text) = self.file(file)?;
+        #[cfg(test)]
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (start, end) = rows_span(text, lo, hi);
         let row = indexed
             .rows
