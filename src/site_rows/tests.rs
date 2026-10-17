@@ -160,6 +160,8 @@ fn cases() -> (Decided, Vec<SiteRecord>) {
         site("src/no-name.ts", "broker", "send", "Queue"),
         site("src/neither.ts", "broker", "send", "Queue"),
         site("src/low-name.ts", "http_client", "request", "get"),
+        site("src/mixed.ts", "broker", "send", "Queue"),
+        site("src/role-split.ts", "broker", "send", "Queue"),
         site("src/failed.ts", "broker", "send", "Queue"),
         site("src/forced-http.ts", "http_client", "request", "get"),
         site("src/forced-topic.ts", "broker", "receive", "Queue"),
@@ -309,17 +311,16 @@ fn forced_rows_are_facts_and_asked_rows_are_candidates() {
         Some(SiteInference {
             by: InferenceBy::SiteQuestion,
             question_set: Some("qs-fixture".to_string()),
-            confidence: 0.95,
+            confidence: 0.9,
             orders_agree: true,
         })
     );
 }
 
-/// The band reads the kind slot: at 0.8 or above with both orders agreeing
-/// a row is in band, below it or with the orders split it is not. A forced
-/// kind reads the asked name instead.
+/// The band reads every asked slot the row depends on: a row is in band
+/// only when each is at 0.8 or above with both orders agreeing.
 #[test]
-fn the_band_reads_the_kind_slot_or_the_asked_name() {
+fn the_band_reads_every_asked_slot_the_row_depends_on() {
     let rows = rows();
     let in_band = |file: &str| row(&rows, file).map(|row| row.in_band);
     assert_eq!(in_band("src/topic.ts"), Some(true));
@@ -327,6 +328,17 @@ fn the_band_reads_the_kind_slot_or_the_asked_name() {
     assert_eq!(in_band("src/disagree.ts"), Some(false));
     assert_eq!(in_band("src/http.ts"), Some(true));
     assert_eq!(in_band("src/low-name.ts"), Some(false));
+    // Every asked slot counts: a high kind does not carry a low name or a
+    // role whose orders split, and the row carries the lowest.
+    assert_eq!(in_band("src/mixed.ts"), Some(false));
+    assert_eq!(in_band("src/role-split.ts"), Some(false));
+    assert_eq!(in_band("src/message.ts"), Some(true));
+    let inference = |file: &str| row(&rows, file).and_then(|row| row.inference.clone());
+    assert_eq!(inference("src/mixed.ts").map(|i| i.confidence), Some(0.5));
+    assert_eq!(
+        inference("src/role-split.ts").map(|i| i.orders_agree),
+        Some(false)
+    );
     assert_eq!(
         row(&rows, "src/low-name.ts")
             .and_then(|row| row.inference.as_ref())
@@ -494,7 +506,7 @@ fn an_answer_in_the_band_replaces_the_readers_row() {
             .as_ref()
             .and_then(|inference| inference.answer.as_ref())
             .map(|answer| answer.confidence),
-        Some(0.95)
+        Some(0.9)
     );
     assert_eq!(
         fold.withdrawn,
@@ -514,6 +526,8 @@ fn below_the_band_the_readers_row_stands_with_the_alternative() {
     for (file, name) in [
         ("src/low.ts", "order.maybe"),
         ("src/disagree.ts", "order.split"),
+        ("src/mixed.ts", "order.guessed"),
+        ("src/role-split.ts", "order.rolesplit"),
     ] {
         let reader = OperationKey::pubsub("orders");
         let mut calls = vec![blob_row(
@@ -546,13 +560,16 @@ fn with_no_reader_row_the_band_decides_row_or_lead() {
     assert_eq!(at_site(&calls, "src/topic.ts").len(), 1);
     assert_eq!(fold.stated.len(), 1);
 
-    let mut calls = Vec::new();
-    let fold = fold_one("src/low.ts", &mut calls, &mut Vec::new());
-    assert!(calls.is_empty());
-    assert_eq!(
-        lead_reason(&fold.leads, "src/low.ts"),
-        Some(UnreadReason::BelowBand)
-    );
+    for file in ["src/low.ts", "src/mixed.ts", "src/role-split.ts"] {
+        let mut calls = Vec::new();
+        let fold = fold_one(file, &mut calls, &mut Vec::new());
+        assert!(calls.is_empty(), "{file}");
+        assert_eq!(
+            lead_reason(&fold.leads, file),
+            Some(UnreadReason::BelowBand),
+            "{file}"
+        );
+    }
 }
 
 /// A row on the other side of the index is another site: a subscriber

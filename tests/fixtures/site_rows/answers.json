@@ -1,5 +1,5 @@
 {
-  "about": "Cassette answers for the site-row tests (carrick#2439), in the POST /site-questions response shape (tests/fixtures/site_questions/contract.json). One site per case: each kind, a socket send on a server's and on a client's socket, an answer below the band, one whose option orders disagree, one that names no option for the name, one that is no network call, a forced kind with a low-confidence name, and a site the cloud failed.",
+  "about": "Cassette answers for the site-row tests (carrick#2439), in the POST /site-questions response shape (tests/fixtures/site_questions/contract.json). One site per case: each kind, a socket send on a server's and on a client's socket, an answer below the band, one whose option orders disagree, one that names no option for the name, one that is no network call, a forced kind with a low-confidence name, a high kind with a low name, a high kind and name with a role whose orders disagree, and a site the cloud failed.",
   "question_set": "qs-fixture",
   "answers": [
     {"site_id": "src/http.ts:100-130", "ok": true, "kind": null, "role": null,
@@ -53,6 +53,16 @@
      "method": null, "namespace": null, "name_argument": null, "payload_argument": null},
     {"site_id": "src/low-name.ts:100-130", "ok": true, "kind": null, "role": null,
      "name": {"value": "/v1/guess", "confidence": 0.58, "orders_agree": true},
+     "method": null, "namespace": null, "name_argument": null, "payload_argument": null},
+    {"site_id": "src/mixed.ts:100-130", "ok": true,
+     "kind": {"value": "topic", "confidence": 0.95, "orders_agree": true},
+     "role": {"value": "sends", "confidence": 0.95, "orders_agree": true},
+     "name": {"value": "order.guessed", "confidence": 0.5, "orders_agree": true},
+     "method": null, "namespace": null, "name_argument": null, "payload_argument": null},
+    {"site_id": "src/role-split.ts:100-130", "ok": true,
+     "kind": {"value": "topic", "confidence": 0.95, "orders_agree": true},
+     "role": {"value": "sends", "confidence": 0.9, "orders_agree": false},
+     "name": {"value": "order.rolesplit", "confidence": 0.9, "orders_agree": true},
      "method": null, "namespace": null, "name_argument": null, "payload_argument": null},
     {"site_id": "src/failed.ts:100-130", "ok": false, "code": "answer_malformed", "retriable": false}
   ]
