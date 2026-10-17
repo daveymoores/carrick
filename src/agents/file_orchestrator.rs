@@ -141,11 +141,7 @@ pub struct FileTooLarge {
 
 impl std::fmt::Display for FileTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the file cannot be cut into requests of at most {} bytes",
-            self.max_prompt_bytes
-        )
+        f.write_str("the file is too large for Carrick to analyse, even split into parts")
     }
 }
 
@@ -12008,6 +12004,18 @@ impl FileOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The warning for a file that cannot be asked says it in these words.
+    #[test]
+    fn a_file_too_large_reads_as_the_approved_sentence() {
+        let lost = FileTooLarge {
+            max_prompt_bytes: 250_000,
+        };
+        assert_eq!(
+            lost.to_string(),
+            "the file is too large for Carrick to analyse, even split into parts"
+        );
+    }
     use crate::agents::file_analyzer_agent::{DataCallResult, EndpointResult, MountResult};
     use crate::dispatch::{Dispatch, DispatchLocation};
 
