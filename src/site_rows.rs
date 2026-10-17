@@ -26,10 +26,13 @@
 //!   `inference.alternative`. With no row at the site an answer in the band
 //!   stands, and one below it is a possible call
 //!   ([`crate::possible_calls`], reason `below_band`).
-//! - **The band slot.** The ruling reads the kind slot. A site whose kind
-//!   the code forces is read on its name slot instead, when the name is
-//!   asked, so a forced kind never lets a low-confidence name through; with
-//!   neither asked, nothing in the key was the model's and it is in band.
+//! - **The band** (amended by David, 2026-10-17). An answer is in band only
+//!   when every slot the model answered that the row depends on (kind, role,
+//!   name, method, namespace: the slots that feed the key and the side) is at
+//!   or above [`BAND`] with its option orders agreeing. Forced slots count as
+//!   1.0 and agreeing; with no such slot asked, nothing in the key was the
+//!   model's and the row is in band. [`SiteInference::confidence`] is the
+//!   lowest of those slots and `orders_agree` is true only if all agree.
 //! - **Unanswered.** An asked site the cloud did not answer states no row
 //!   and withdraws none; it is a possible call (`unanswered`).
 //! - **Switch.** Nothing here runs unless `CARRICK_SITE_QUESTIONS=1`
@@ -302,8 +305,12 @@ pub fn of(
             _ => continue,
         };
         let label = SiteLabel::find(labels, &site.end);
-        let method = slot(Slot::Method).and_then(|method| method.text);
-        let namespace = slot(Slot::Namespace).and_then(|namespace| namespace.text);
+        let method_slot = slot(Slot::Method);
+        let namespace_slot = slot(Slot::Namespace);
+        let method = method_slot.as_ref().and_then(|method| method.text.clone());
+        let namespace = namespace_slot
+            .as_ref()
+            .and_then(|namespace| namespace.text.clone());
         let Some((key, name_scope)) = key_of(
             &kind_text,
             name_text,
@@ -316,15 +323,16 @@ pub fn of(
             continue;
         };
         let fact = record.bucket == Bucket::Forced;
-        let band = if kind.asked {
-            Some(&kind)
-        } else if name.asked {
-            Some(&name)
-        } else {
-            None
-        };
-        let (confidence, orders_agree) =
-            band.map_or((1.0, true), |slot| (slot.confidence, slot.orders_agree));
+        // Every slot the model answered that feeds the key or the side:
+        // forced slots are 1.0 and agreeing, so only asked ones can lower it.
+        let (confidence, orders_agree) = [Some(&kind), Some(&role), Some(&name)]
+            .into_iter()
+            .chain([method_slot.as_ref(), namespace_slot.as_ref()])
+            .flatten()
+            .filter(|slot| slot.asked)
+            .fold((1.0_f64, true), |(low, agree), slot| {
+                (low.min(slot.confidence), agree && slot.orders_agree)
+            });
         let source = match (fact, &key) {
             (true, OperationKey::Http { .. }) if side == RowSide::Call => {
                 ResolutionSource::RequestSummary
