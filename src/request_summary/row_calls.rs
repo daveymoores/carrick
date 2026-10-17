@@ -460,6 +460,62 @@ mod tests {
         );
     }
 
+    /// The specifier each library site in `kit-user.ts` is read through.
+    fn kit_sites(walked: &Walked) -> Vec<(u32, String)> {
+        let path = walked.path("services/calls/src/kit-user.ts");
+        let mut sites: Vec<(u32, String)> = super::super::library_sites(&walked.inputs)
+            .sites
+            .into_iter()
+            .filter(|site| site.file == path)
+            .map(|site| (site.line, site.specifier))
+            .collect();
+        sites.sort();
+        sites
+    }
+
+    /// The end of the chain from the `/kit-health` comparison in
+    /// `server.ts`.
+    fn kit_health_end(walked: &Walked) -> serde_json::Value {
+        let chains = super::super::guard_chains(&walked.inputs, &walked.repo);
+        let chain = chains
+            .iter()
+            .find(|chain| chain.literal == "/kit-health")
+            .expect("a chain for /kit-health");
+        serde_json::to_value(&chain.end).unwrap()
+    }
+
+    /// carrick#2413 slice E: an import whose rows name a declaration of the
+    /// repository is no package's client, whatever its specifier says: a
+    /// tsconfig alias to in-repo code reads as a package without rows and as
+    /// nothing with them. An external import's end names the package the
+    /// compiler says its export is declared in.
+    #[test]
+    fn with_rows_a_package_is_the_one_the_declaration_is_in() {
+        let Some(off) = calls(&[], false) else {
+            return;
+        };
+        let on = calls(&[], true).unwrap();
+        assert_eq!(
+            kit_sites(&off),
+            vec![(5, "http-kit".to_string()), (9, "fixture-kit".to_string())]
+        );
+        assert_eq!(kit_sites(&on), vec![(9, "fixture-kit".to_string())]);
+        assert_eq!(
+            kit_health_end(&off),
+            serde_json::json!({
+                "kind": "external_import", "specifier": "fixture-kit",
+                "export": "serve", "steps": []
+            })
+        );
+        assert_eq!(
+            kit_health_end(&on),
+            serde_json::json!({
+                "kind": "external_import", "specifier": "fixture-kit",
+                "export": "serve", "steps": [], "package": "fixture-kit"
+            })
+        );
+    }
+
     /// Without rows, the call graph's answer stands, byte for byte: the
     /// lines it cannot follow state nothing.
     #[test]

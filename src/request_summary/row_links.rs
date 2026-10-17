@@ -38,11 +38,30 @@ pub(crate) enum RowLink {
     Unrecorded,
     /// A whole module, with what it publishes as the module graph says.
     Module(Vec<PublishedBinding>),
-    /// A declaration outside the service's files: the default library, a
-    /// package, a file of another service.
-    Outside,
+    /// A declaration outside the repository: the default library or a
+    /// package, with the package the compiler names for it
+    /// (carrick#2413 slice E).
+    Outside(Option<String>),
+    /// A declaration in a file of the repository that is not one of the
+    /// service's: another workspace package, or code an alias names.
+    OtherService,
     /// The rows do not say.
     Hole(HoleReason),
+}
+
+impl RowLink {
+    /// Whether the import reaches a declaration of the repository, whatever
+    /// its specifier says (carrick#2413 slice E): then it is no package's
+    /// client.
+    pub(crate) fn in_repo(&self) -> bool {
+        matches!(
+            self,
+            RowLink::Declared(..)
+                | RowLink::Unrecorded
+                | RowLink::Module(_)
+                | RowLink::OtherService
+        )
+    }
 }
 
 /// Why every exported object, instance and published getter of a service is
@@ -109,31 +128,43 @@ impl RowLinks {
         local: &str,
         spans: &[(u32, u32)],
     ) -> RowLink {
-        let mut agreed: Option<(Option<&str>, Option<u32>, Option<&str>)> = None;
+        type Named<'r> = (
+            Option<&'r str>,
+            Option<u32>,
+            Option<&'r str>,
+            Option<&'r str>,
+        );
+        let mut agreed: Option<Named<'_>> = None;
         for (lo, hi) in spans {
             let row = match positions.declaration(file, *lo, *hi, Kind::Ident, true) {
                 Ok(row) => row,
                 Err(reason) => return RowLink::Hole(reason),
             };
-            let named = (row.decl_file(), row.decl_line(), row.symbol());
+            let named = (
+                row.decl_file(),
+                row.decl_line(),
+                row.symbol(),
+                row.decl_package(),
+            );
             match agreed {
                 None => agreed = Some(named),
                 Some(earlier) if earlier == named => {}
                 Some(_) => return RowLink::Hole(HoleReason::RowsMissing),
             }
         }
-        let Some((Some(decl_file), decl_line, Some(symbol))) = agreed else {
-            return RowLink::Outside;
+        let package = agreed.and_then(|(_, _, _, package)| package.map(str::to_string));
+        let Some((Some(decl_file), decl_line, Some(symbol), _)) = agreed else {
+            return RowLink::Outside(package);
         };
         if decl_file.starts_with("lib:")
             || decl_file.starts_with("pkg:")
             || decl_file.split('/').any(|part| part == "node_modules")
         {
-            return RowLink::Outside;
+            return RowLink::Outside(package);
         }
         let declaring = positions.path_of(decl_file);
         let Some(declared) = files.get(&declaring) else {
-            return RowLink::Outside;
+            return RowLink::OtherService;
         };
         if declaring == file {
             // Every use names a declaration of the importing file itself:
@@ -180,7 +211,8 @@ impl RowLinks {
                 RowLink::Declared(..) => "declared".to_string(),
                 RowLink::Unrecorded => "unrecorded".to_string(),
                 RowLink::Module(_) => "module".to_string(),
-                RowLink::Outside => "outside".to_string(),
+                RowLink::Outside(_) => "outside".to_string(),
+                RowLink::OtherService => "other_service".to_string(),
                 RowLink::Hole(reason) => format!(
                     "hole:{}",
                     serde_json::to_value(reason)

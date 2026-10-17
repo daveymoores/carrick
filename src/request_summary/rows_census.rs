@@ -265,7 +265,8 @@ fn census_repo(root: &Path, positions: &Path) -> RepoCensus {
                         let kind = match other {
                             RowLink::Unrecorded => "unrecorded",
                             RowLink::Module(_) => "module",
-                            RowLink::Outside => "outside",
+                            RowLink::Outside(_) => "outside",
+                            RowLink::OtherService => "other_service",
                             RowLink::Hole(reason) => {
                                 census.links.add(format!(
                                     "{}{}",
