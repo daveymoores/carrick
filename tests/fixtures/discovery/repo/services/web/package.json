@@ -1,0 +1,13 @@
+{
+  "name": "discovery-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-broker": "^1.0.0",
+    "fixture-socket": "^1.0.0",
+    "fixture-store": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

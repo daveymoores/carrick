@@ -1,0 +1,129 @@
+{
+  "library_claims": [
+    {
+      "package": "lib.dom",
+      "version": "0.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "lib.dom",
+          "export": "fetch",
+          "role": "http_client",
+          "side": "client",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            { "op": "request", "member": null, "on": "export", "name": { "arg": 0 }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "node:child_process",
+      "version": "22.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "node:child_process",
+          "export": "ChildProcess",
+          "role": "in_process_bus",
+          "side": "client",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            { "op": "send", "member": "send", "on": "instance", "payload": { "arg": 0 }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "node:child_process",
+          "export": "fork",
+          "role": "none",
+          "makes": [],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "fixture-socket",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-socket",
+          "export": "Socket",
+          "role": "socket",
+          "side": "client",
+          "makes": [{ "form": "new", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "send", "member": "send", "on": "instance", "name": { "arg": 0 }, "payload": { "arg": 1 }, "picker": "fixture-picker" },
+            { "op": "receive", "member": "on", "on": "instance", "name": { "arg": 0 }, "handler": { "arg": 1 }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "fixture-broker",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-broker",
+          "export": "Broker",
+          "role": "broker",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            { "op": "send", "member": "publish", "on": "instance", "name": { "arg": 0 }, "payload": { "arg": 1 }, "picker": "fixture-picker" },
+            { "op": "receive", "member": "subscribe", "on": "instance", "name": { "arg": 0 }, "handler": { "arg": 1 }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "fixture-broker",
+          "export": "connect",
+          "role": "none",
+          "makes": [],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "fixture-store",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-store",
+          "export": "createStore",
+          "role": "none",
+          "makes": [],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}
