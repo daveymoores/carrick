@@ -275,7 +275,7 @@ impl OwedWork {
         }
         if self.losses.final_files > 0 {
             parts.push(format!(
-                "{} file(s) the cloud cannot analyse",
+                "{} file(s) Carrick cannot analyse",
                 self.losses.final_files
             ));
         }
@@ -300,7 +300,10 @@ impl OwedWork {
 /// - Deferred: its files were never sent, so no unanalysed-file list describes
 ///   the gap. It lands only when there is no index to thin (`has_index`
 ///   false).
-/// - Files the analyzer did not answer for: it lands when the cloud decides
+/// - Files the analyzer did not answer for: only files a re-run can mend
+///   count (`files - final_files`); a file whose answer is final is missing
+///   from the index either way, so holding the service back gains nothing.
+///   It lands when the cloud decides
 ///   with the service's own list (a laptop first index of the service,
 ///   `laptop && !has_index`). CI never sends the list, so CI holds it back.
 ///
@@ -316,7 +319,8 @@ pub fn holds_back(owed: &OwedWork, has_index: bool, laptop: bool, allow_partial:
     if owed.deferred.is_some() {
         return has_index;
     }
-    owed.losses.files > 0 && (has_index || !laptop)
+    let mendable = owed.losses.files.saturating_sub(owed.losses.final_files);
+    mendable > 0 && (has_index || !laptop)
 }
 
 /// Set to a number of seconds to change how long a run waits before it
@@ -853,8 +857,8 @@ mod tests {
         assert!(only_final.thins_the_index());
         assert!(!only_final.only_refused());
         assert_eq!(only_final.refused_for_capacity(), None);
-        assert!(holds_back(&only_final, true, true, false));
-        assert!(holds_back(&only_final, false, false, false));
+        assert!(!holds_back(&only_final, true, true, false));
+        assert!(!holds_back(&only_final, false, false, false));
         assert!(!holds_back(&only_final, false, true, false));
 
         assert!(lost_with_final(2, 1).worth_retrying());
@@ -876,6 +880,14 @@ mod tests {
         assert!(deferred.worth_retrying());
     }
 
+    /// A service whose only losses are final lands in CI with an index; one
+    /// final loss beside a loss a re-run can mend is still held back.
+    #[test]
+    fn only_losses_a_rerun_can_mend_hold_a_service_back() {
+        assert!(!holds_back(&lost_with_final(1, 1), true, false, false));
+        assert!(holds_back(&lost_with_final(2, 1), true, false, false));
+    }
+
     const FINAL_ANSWER_FOR_ONE: &str = "The answer for 1 file(s) is final: a re-run gives the \
                                         same result until the file changes or Carrick is updated.";
 
@@ -890,7 +902,7 @@ mod tests {
             assert_eq!(
                 pending_summary(&["api".to_string()], &pending, laptop),
                 format!(
-                    "Complete: api. Pending model analysis: billing (1 file(s) the cloud cannot \
+                    "Complete: api. Pending model analysis: billing (1 file(s) Carrick cannot \
                      analyse). {FINAL_ANSWER_FOR_ONE}"
                 )
             );
@@ -910,7 +922,7 @@ mod tests {
             pending_summary(&[], &mixed, true),
             format!(
                 "Complete: none. Pending model analysis: billing (2 file(s) not analysed; 1 \
-                 file(s) the cloud cannot analyse), worker (1 file(s) not analysed). Re-run \
+                 file(s) Carrick cannot analyse), worker (1 file(s) not analysed). Re-run \
                  `carrick index` to finish the rest: it asks the model only for the pending work \
                  and replays everything else from cache. {FINAL_ANSWER_FOR_ONE}"
             )
@@ -919,7 +931,7 @@ mod tests {
             pending_summary(&[], &mixed, false),
             format!(
                 "Complete: none. Pending model analysis: billing (2 file(s) not analysed; 1 \
-                 file(s) the cloud cannot analyse), worker (1 file(s) not analysed). The next \
+                 file(s) Carrick cannot analyse), worker (1 file(s) not analysed). The next \
                  scan asks the model only for the pending work and replays everything else from \
                  cache. {FINAL_ANSWER_FOR_ONE}"
             )
