@@ -114,12 +114,20 @@ describe('graphql probe shape (resolver-return envelope unwrap)', () => {
 
   it('non-graphql pairs keep the raw sent assignment and their gates', () => {
     for (const protocol of ['http', 'socket', 'pubsub'] as const) {
-      const plan = buildProbe(spec({ protocol }), PKG);
+      const plan = buildProbe(
+        spec({ protocol, ...(protocol === 'pubsub' ? { topic: 'orders' } : {}) }),
+        PKG
+      );
       assert.ok(!plan.source.includes('GqlComparand'), protocol);
       assert.ok(!plan.source.includes('__typename'), protocol);
       // any/unknown/never on both sides, plus void on both sides (carrick#1162),
       // plus bytes on both sides of an http pair (carrick#1793).
-      assert.strictEqual(plan.gateLines.size, protocol === 'http' ? 10 : 8, protocol);
+      // plus the two envelope gates on a pub/sub pair (carrick#1979).
+      assert.strictEqual(
+        plan.gateLines.size,
+        protocol === 'http' ? 10 : protocol === 'pubsub' ? 10 : 8,
+        protocol
+      );
       const lines = plan.source.split('\n');
       assert.strictEqual(lines[plan.assignmentLine - 1], 'const expected: Expected = sent;');
     }
@@ -783,5 +791,59 @@ describe('recorded resolution edges become parent-scoped overrides (#2091)', () 
       JSON.stringify({ name: 'carrick-check-workspace', version: '0.0.0', private: true }, null, 2) + '\n'
     );
     fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+// carrick#1979: the pub/sub envelope gates are for pub/sub pairs only.
+describe('the pub/sub envelope gates', () => {
+  it('http, graphql and socket probes carry no envelope line, with or without a topic', () => {
+    for (const protocol of ['http', 'graphql', 'socket'] as const) {
+      const plain = buildProbe(spec({ protocol }), PKG).source;
+      const withTopic = buildProbe(spec({ protocol, topic: 'orders' }), PKG).source;
+      assert.strictEqual(withTopic, plain, protocol);
+      assert.ok(!plain.includes('Ps'), protocol);
+    }
+  });
+
+  it('a pub/sub probe names both envelope gates and writes the topic as a string literal', () => {
+    const plan = buildProbe(spec({ protocol: 'pubsub', topic: 'a"b\\c' }), PKG);
+    const names = [...plan.gateLines.values()];
+    assert.ok(names.includes('sent:envelope') && names.includes('expected:envelope'));
+    assert.ok(plan.source.includes('type PsTopic = "a\\"b\\\\c";'), plan.source);
+  });
+
+  it('a pub/sub probe with no topic has no envelope gate', () => {
+    const plan = buildProbe(spec({ protocol: 'pubsub' }), PKG);
+    assert.ok(!plan.source.includes('PsTopic'));
+  });
+});
+
+describe('the check pair schema and the topic', () => {
+  const base = {
+    action: 'check_v2',
+    request_id: 'v-1',
+    stubs: [{ service_name: 'a', stub_dir: '/s' }],
+  };
+  const pair = (protocol: string, extra: object = {}) => ({
+    pair_key: 'k',
+    protocol,
+    type_kind: 'both',
+    producer: { service_name: 'a', alias: 'A' },
+    consumer: { service_name: 'b', alias: 'B' },
+    ...extra,
+  });
+
+  it('a pubsub pair without a topic is rejected, and one with a topic is kept', async () => {
+    const { parseRequest } = await import('../src/validators.js');
+    assert.strictEqual(parseRequest({ ...base, pairs: [pair('pubsub')] }).success, false);
+    const ok = parseRequest({ ...base, pairs: [pair('pubsub', { topic: 'orders' })] });
+    assert.strictEqual(ok.success, true, JSON.stringify(ok));
+    assert.strictEqual((ok as any).request.pairs[0].topic, 'orders');
+  });
+
+  it('an http pair with a topic is rejected', async () => {
+    const { parseRequest } = await import('../src/validators.js');
+    assert.strictEqual(parseRequest({ ...base, pairs: [pair('http', { topic: 'orders' })] }).success, false);
+    assert.strictEqual(parseRequest({ ...base, pairs: [pair('http')] }).success, true);
   });
 });

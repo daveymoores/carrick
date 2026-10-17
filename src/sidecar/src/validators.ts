@@ -255,13 +255,25 @@ const CheckPairEndpointSchema = z.object({
   alias: z.string().min(1),
 });
 
-const CheckPairSpecSchema = z.object({
-  pair_key: z.string().min(1),
-  protocol: z.enum(['http', 'graphql', 'socket', 'pubsub']),
-  type_kind: z.enum(['request', 'response', 'both']),
-  producer: CheckPairEndpointSchema,
-  consumer: CheckPairEndpointSchema,
-});
+const CheckPairSpecSchema = z
+  .object({
+    pair_key: z.string().min(1),
+    protocol: z.enum(['http', 'graphql', 'socket', 'pubsub']),
+    type_kind: z.enum(['request', 'response', 'both']),
+    producer: CheckPairEndpointSchema,
+    consumer: CheckPairEndpointSchema,
+    topic: z.string().min(1).optional(),
+  })
+  .superRefine((spec, ctx) => {
+    // carrick#1979: the topic is the pub/sub operation's own key. It is
+    // required there and refused elsewhere, so zod can never strip a stray one.
+    if (spec.protocol === 'pubsub' && spec.topic === undefined) {
+      ctx.addIssue({ code: 'custom', path: ['topic'], message: 'A pubsub pair requires a topic' });
+    }
+    if (spec.protocol !== 'pubsub' && spec.topic !== undefined) {
+      ctx.addIssue({ code: 'custom', path: ['topic'], message: 'Only a pubsub pair carries a topic' });
+    }
+  });
 
 export const CheckV2RequestSchema = BaseRequestSchema.extend({
   action: z.literal('check_v2'),
