@@ -360,9 +360,8 @@ impl PositionIndex {
             })
             .collect();
         Self {
-            scan_root: scan_root.to_path_buf(),
             files,
-            ..Self::default()
+            ..Self::missing(scan_root)
         }
     }
 
