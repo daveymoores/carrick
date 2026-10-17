@@ -838,6 +838,20 @@ pub struct CloudRepoData {
     /// does not state dispatch tables", never as "this service has none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_tables: Option<Vec<crate::dispatch::DispatchTable>>,
+    /// Calls the scan saw but could not name (carrick#2438): a library call
+    /// whose path, event name or method the code does not state. Labelled
+    /// leads for the agent, never rows; nothing in matching, the type check,
+    /// the findings or the PR result reads them. At most
+    /// [`crate::possible_calls::MAX_PER_SERVICE`] per service.
+    ///
+    /// Written only when `CARRICK_SITE_QUESTIONS=1`. Additive and optional:
+    /// `None` is "this scan did not write the field" (the switch was off, or
+    /// the blob predates it), never "no possible calls".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub possible_calls: Option<Vec<crate::possible_calls::PossibleCall>>,
+    /// How many possible calls were left out past the cap. Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub possible_calls_omitted: Option<u32>,
 }
 
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
@@ -1031,6 +1045,8 @@ impl CloudRepoData {
             // see `crate::boundary::ServiceBoundary::collect`.
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }
     }
 }
@@ -2593,6 +2609,8 @@ mod tests {
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }
     }
 

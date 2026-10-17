@@ -60,6 +60,8 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
         scanner_build: None,
         boundary: None,
         dispatch_tables: None,
+        possible_calls: None,
+        possible_calls_omitted: None,
     }
 }
 

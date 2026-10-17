@@ -343,6 +343,11 @@ pub enum Undecided {
 pub struct DecidedLead {
     pub file: String,
     pub line: u32,
+    pub span_start: u32,
+    pub span_end: u32,
+    /// Functions the walk entered from this call (0 when it is at the call
+    /// that holds the open name).
+    pub depth: u32,
     pub end: LabelledEnd,
     pub reason: Undecided,
 }
@@ -839,6 +844,9 @@ impl<'a> Walk<'a, '_> {
         let lead = DecidedLead {
             file: relative(self.root, placed.file),
             line: placed.call.site.line,
+            span_start: placed.call.site.span_start,
+            span_end: placed.call.site.span_end,
+            depth: u32::from(placed.depth),
             end: end.clone(),
             reason: why,
         };

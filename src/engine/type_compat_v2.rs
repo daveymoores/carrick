@@ -3191,6 +3191,8 @@ mod tests {
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }
     }
 
