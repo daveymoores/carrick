@@ -436,6 +436,8 @@ class PositionWalker {
    * program, so it is asked once per declaration, never per call.
    */
   private readonly implementations = new Map<ts.Declaration, PositionRow[]>();
+  /** The same for a member whose symbol has no declaration, keyed by symbol. */
+  private readonly undeclaredImplementations = new Map<ts.Symbol, PositionRow[]>();
 
   constructor(
     private readonly program: ts.Program,
@@ -539,6 +541,7 @@ class PositionWalker {
     let declaration: ts.Declaration | undefined;
     try {
       const symbol = this.symbolOf(kind, node);
+      if (symbol && (symbol.declarations ?? []).length === 0) return this.undeclaredImplRows(kind, node, symbol);
       declaration = symbol ? attributedDeclaration(() => this.program, symbol.declarations ?? []) : undefined;
       if (!declaration || !isBodyless(declaration, this.checker)) return [];
     } catch {
@@ -557,16 +560,41 @@ class PositionWalker {
   }
 
   /**
+   * The `impl` rows of a member whose symbol has no declaration (a mapped
+   * type's member): there is no declaration name to ask at, so the answer is
+   * asked at the use site's name, once per symbol. Same shape as
+   * {@link implementationsOf}; nothing of the symbol's own is filtered out.
+   */
+  private undeclaredImplRows(kind: 'call' | 'member', node: ts.Node, symbol: ts.Symbol): PositionRow[] {
+    const cached = this.undeclaredImplementations.get(symbol);
+    if (cached) return cached;
+    let rows: PositionRow[];
+    try {
+      const named = nameNodeOf(kind, node);
+      rows = named ? this.implementationRows(named, []) : [];
+    } catch {
+      rows = [['impl', 0, 0, null, null, null, null, null, FLAG_CHECKER_THREW]];
+    }
+    this.undeclaredImplementations.set(symbol, rows);
+    return rows;
+  }
+
+  /**
    * What go-to-implementation names for `declaration`, asked at its name:
    * every declaration the language service answers, except the symbol's own
    * (an overloaded method answers with its other signatures), in file and
    * position order.
    */
   private implementationsOf(declaration: ts.Declaration): PositionRow[] {
-    const declaringFile = declaration.getSourceFile();
     const name = ts.getNameOfDeclaration(declaration) ?? declaration;
     const own = (this.checker.getSymbolAtLocation(name) ?? (declaration as { symbol?: ts.Symbol }).symbol)
       ?.declarations ?? [declaration];
+    return this.implementationRows(name, own);
+  }
+
+  /** Go-to-implementation at `name`, minus results inside `own`, as sorted `impl` rows. */
+  private implementationRows(name: ts.Node, own: readonly ts.Declaration[]): PositionRow[] {
+    const declaringFile = name.getSourceFile();
     const found = new Map<string, { file: ts.SourceFile; start: number }>();
     for (const location of this.service.getImplementationAtPosition(
       declaringFile.fileName,
