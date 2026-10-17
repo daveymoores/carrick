@@ -1814,7 +1814,7 @@ impl<'a> Chains<'a> {
         let mut chains = Self {
             inputs,
             root,
-            names: LinkedNames::link(&inputs.files, &inputs.bindings),
+            names: LinkedNames::link(&inputs.files, &inputs.bindings, inputs.links.as_ref()),
             nodes: Vec::new(),
             calls: HashMap::new(),
             constructions: HashMap::new(),
