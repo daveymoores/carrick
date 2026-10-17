@@ -96,6 +96,31 @@ export function findUnresolvedPlaceholders(
     .map((finding) => finding.path);
 }
 
+/**
+ * The member paths of `root` whose type is declared in a file `uncarried`
+ * names (carrick#2418): a referenced project's source, which the anchor
+ * program reads but the surface emit, under the compiler's own resolution,
+ * reaches only as an unbuilt output. Where the emitted text then holds a top
+ * type, its cause is the import the emit could not follow, as it would be for
+ * an unresolved placeholder. The walk stops at the first such position on
+ * each path.
+ */
+export function findUncarriedPositions(
+  root: ts.Type,
+  program: ts.Program,
+  checker: ts.TypeChecker,
+  location: ts.Node,
+  uncarried: (fileName: string) => boolean
+): string[] {
+  const declaredThere = (t: ts.Type): boolean =>
+    [t.aliasSymbol, t.getSymbol()].some((symbol) =>
+      (symbol?.declarations ?? []).some((d) => uncarried(d.getSourceFile().fileName))
+    );
+  return walkTopTypes(root, program, checker, location, (t) => (declaredThere(t) ? 'unknown' : undefined))
+    .filter((finding) => finding.kind !== 'budget_exhausted')
+    .map((finding) => finding.path);
+}
+
 /** TypeScript's unresolved-reference placeholder: `TypeFlags.Any` with the
  * internal `intrinsicName === 'error'` (stable since TS 1.x; see `anchors.ts`). */
 export function isErrorPlaceholder(t: ts.Type): boolean {

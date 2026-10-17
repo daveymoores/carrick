@@ -471,8 +471,8 @@ class PositionWalker {
   }
 }
 
-/** The kind of row a node gives, if any. */
-function kindOf(node: ts.Node): PositionKind | undefined {
+/** The kind of row a node gives, if any (exported for the editor-parity test, carrick#2418). */
+export function kindOf(node: ts.Node): PositionKind | undefined {
   if (ts.isCallExpression(node) || ts.isNewExpression(node) || ts.isTaggedTemplateExpression(node)) {
     return 'call';
   }

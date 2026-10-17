@@ -18,6 +18,7 @@ import {
   DenoProject,
   findDenoConfig,
   findServiceTsconfig,
+  referenceRedirectOf,
   serviceConfigPath,
   sidecarCompilerOptions,
   untrustedReadBound,
@@ -417,9 +418,10 @@ export class ProjectLoader {
       compilerOptions: sidecarCompilerOptions(optionsFor(kind, getCompilerOptionsFromTsConfig(configPath).options)),
       skipAddingFilesFromTsConfig: kind === 'scripts',
       // Each import resolves in its file's own module format (carrick#1619),
-      // and every external-library answer is kept past the program rebuilds
-      // that drop it (carrick#1731).
-      resolutionHost: imports.recording(moduleFormatResolutionHost),
+      // a referenced project's unbuilt output reads as its source, under its
+      // own options (carrick#2418), and every external-library answer is kept
+      // past the program rebuilds that drop it (carrick#1731).
+      resolutionHost: imports.recording(moduleFormatResolutionHost(referenceRedirectOf(configPath, this.repoRoot))),
     });
     registerExternalImports(project, imports);
     return project;
@@ -427,11 +429,11 @@ export class ProjectLoader {
 
   /**
    * Which project types `file` (carrick#1604): the key of its owning
-   * project's program, or `''` for the default one. A tsconfig that
-   * references other projects owns only the files it lists itself; any other
-   * file belongs to the first project it references (depth-first, in
-   * declared order) whose file list includes it, and is typed under that
-   * project's options. A file no project includes, and every request that
+   * project's program, or `''` for the default one. In a tsconfig that
+   * references other projects, a file belongs to the first project in search
+   * order (the named config, then its references depth-first, in declared
+   * order) that lists it while none of its own references does (carrick#2418),
+   * and is typed under that project's options. A file no project includes, and every request that
    * names no file, uses the default project, built from the named tsconfig
    * as before.
    */
