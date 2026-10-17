@@ -224,6 +224,66 @@ impl SiteLabel {
         labels
     }
 
+    /// Every op the claims the scan settled label (carrick#2439), one label
+    /// each, as [`Self::from_store_answer`] reads them off the store's raw
+    /// answer: the scan holds the claims, already read and grouped by export.
+    /// A maker, a scope and a reserved name label no op.
+    pub fn from_exports(exports: &[crate::library_claims::ExportClaims]) -> Vec<SiteLabel> {
+        use crate::services::type_sidecar::{LibraryClaim, OpName};
+        let word = |value: serde_json::Result<serde_json::Value>| -> Option<String> {
+            value.ok()?.as_str().map(str::to_string)
+        };
+        let slot = |slot: &crate::services::type_sidecar::ClaimSlot| ArgSlot {
+            arg: slot.arg as usize,
+            key: slot.key.clone(),
+        };
+        let mut labels = Vec::new();
+        for export in exports {
+            let role = word(serde_json::to_value(export.role)).unwrap_or_default();
+            let side = export
+                .side
+                .and_then(|side| word(serde_json::to_value(side)));
+            for claim in &export.claims {
+                let LibraryClaim::Op {
+                    op,
+                    member,
+                    name,
+                    payload,
+                    handler,
+                    method,
+                    method_key,
+                    method_default,
+                    ..
+                } = claim
+                else {
+                    continue;
+                };
+                let method = (method.is_some() || method_key.is_some() || method_default.is_some())
+                    .then(|| MethodLabel {
+                        from: method_key.as_ref().map(slot),
+                        default: method_default.clone(),
+                        literal: method.clone(),
+                    });
+                labels.push(SiteLabel {
+                    package: export.package.clone(),
+                    export: export.export.clone(),
+                    member: member.clone(),
+                    role: role.clone(),
+                    op: word(serde_json::to_value(op)),
+                    side: side.clone(),
+                    name: match name {
+                        Some(OpName::Slot(name)) => Some(slot(name)),
+                        _ => None,
+                    },
+                    payload: payload.as_ref().map(slot),
+                    handler: handler.as_ref().map(slot),
+                    method,
+                });
+            }
+        }
+        labels
+    }
+
     /// The label for `end` among `labels`: the same package, export and
     /// member.
     pub fn find<'l>(labels: &'l [SiteLabel], end: &LabelledEnd) -> Option<&'l SiteLabel> {

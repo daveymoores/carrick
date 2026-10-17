@@ -1069,6 +1069,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
         let data = CloudRepoData {
             endpoints: vec![
@@ -1150,6 +1151,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
         let mut graph = MountGraph::new();
         graph.data_calls.push(DataFetchingCall {

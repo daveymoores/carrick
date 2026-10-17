@@ -88,6 +88,7 @@ pub mod services;
 pub mod shutdown;
 pub mod signature_pass;
 pub mod site_questions;
+pub mod site_rows;
 pub mod socket_io;
 pub mod swc_scanner;
 pub mod time_limits;

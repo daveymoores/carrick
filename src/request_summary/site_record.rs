@@ -224,6 +224,11 @@ pub struct AnchorAt {
 pub struct TypeAnchors {
     pub call: AnchorAt,
     pub payload: Option<PayloadBinding>,
+    /// The payload's own expression, when it is an argument of the deciding
+    /// call or one option key of it (carrick#2439): the span the type
+    /// capture reads a send's payload at. `None` for a payload a call below
+    /// builds.
+    pub payload_at: Option<AnchorAt>,
     pub handler: Option<HandlerAnchor>,
 }
 
@@ -233,6 +238,10 @@ pub struct HandlerAnchor {
     #[serde(flatten)]
     pub at: AnchorAt,
     pub param: usize,
+    /// That parameter as the source writes it (a name, or a destructuring
+    /// pattern), which the type capture finds it by; `None` when the
+    /// function takes none or is not one this pass can read.
+    pub param_name: Option<String>,
 }
 
 /// Which bucket a site falls in under the slot rule.
@@ -1547,21 +1556,33 @@ fn record(
         asked,
         forced,
     };
-    let anchors = TypeAnchors {
-        call: AnchorAt {
-            file: file.to_string(),
-            line: call_line,
-            span_start: site.span_start,
-            span_end: site.span_end,
-        },
-        payload: site.payload.clone(),
-        handler: site.handler.clone().map(
-            |HandlerAt {
-                 file,
-                 line,
-                 span_start,
-                 span_end,
-             }| HandlerAnchor {
+    let payload_at = match &site.payload {
+        Some(PayloadBinding::Arg { arg, key }) => parts
+            .arg_exprs
+            .get(*arg)
+            .and_then(|expr| payload_expr(expr, key.as_deref()))
+            .and_then(|span| {
+                let parsed = sources.get(file)?;
+                Some(AnchorAt {
+                    file: file.to_string(),
+                    line: parsed.line(span.lo.0),
+                    span_start: span.lo.0,
+                    span_end: span.hi.0,
+                })
+            }),
+        _ => None,
+    };
+    let handler = site.handler.clone().map(
+        |HandlerAt {
+             file,
+             line,
+             span_start,
+             span_end,
+         }| {
+            let param_name = sources
+                .get(&file)
+                .and_then(|parsed| first_param_at(parsed, span_start, span_end));
+            HandlerAnchor {
                 at: AnchorAt {
                     file,
                     line,
@@ -1571,8 +1592,20 @@ fn record(
                 // The payload a handler is run with arrives in its first
                 // parameter.
                 param: 0,
-            },
-        ),
+                param_name,
+            }
+        },
+    );
+    let anchors = TypeAnchors {
+        call: AnchorAt {
+            file: file.to_string(),
+            line: call_line,
+            span_start: site.span_start,
+            span_end: site.span_end,
+        },
+        payload: site.payload.clone(),
+        payload_at,
+        handler,
     };
     Some(SiteRecord {
         state,
@@ -1580,6 +1613,89 @@ fn record(
         bucket,
         lead: (bucket == Bucket::Lead).then_some("name_unstated"),
     })
+}
+
+/// The span of a payload written at an argument: the argument itself, or
+/// with `key` the value its object literal gives that key. `None` for a key
+/// the argument does not write as a literal property.
+fn payload_expr(expr: &Expr, key: Option<&str>) -> Option<Span> {
+    let Some(key) = key else {
+        return Some(expr.span());
+    };
+    let Expr::Object(object) = expr else {
+        return None;
+    };
+    object.props.iter().find_map(|prop| match prop {
+        PropOrSpread::Prop(prop) => match &**prop {
+            Prop::KeyValue(pair) if prop_key_text(&pair.key).as_deref() == Some(key) => {
+                Some(pair.value.span())
+            }
+            Prop::Shorthand(name) if name.sym.as_ref() == key => Some(name.span),
+            _ => None,
+        },
+        PropOrSpread::Spread(_) => None,
+    })
+}
+
+fn prop_key_text(key: &PropName) -> Option<String> {
+    match key {
+        PropName::Ident(name) => Some(name.sym.to_string()),
+        PropName::Str(text) => text.value.as_str().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// The first parameter, as written, of the function whose span is
+/// `start..end` in `parsed`: a name, or a destructuring pattern without its
+/// annotation.
+fn first_param_at(parsed: &Parsed, start: u32, end: u32) -> Option<String> {
+    struct Finder<'p> {
+        parsed: &'p Parsed,
+        target: (u32, u32),
+        found: Option<String>,
+    }
+    impl Finder<'_> {
+        fn written(&self, pat: &Pat) -> Option<String> {
+            let text = match pat {
+                Pat::Ident(binding) => binding.id.sym.to_string(),
+                Pat::Object(_) => {
+                    let raw = self.parsed.raw(pat.span());
+                    raw.get(..=raw.rfind('}')?)?.to_string()
+                }
+                Pat::Array(_) => {
+                    let raw = self.parsed.raw(pat.span());
+                    raw.get(..=raw.rfind(']')?)?.to_string()
+                }
+                Pat::Assign(assign) => return self.written(&assign.left),
+                _ => return None,
+            };
+            Some(text)
+        }
+    }
+    impl Visit for Finder<'_> {
+        fn visit_function(&mut self, function: &Function) {
+            if (function.span.lo.0, function.span.hi.0) == self.target {
+                self.found = function
+                    .params
+                    .first()
+                    .and_then(|param| self.written(&param.pat));
+            }
+            function.visit_children_with(self);
+        }
+        fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+            if (arrow.span.lo.0, arrow.span.hi.0) == self.target {
+                self.found = arrow.params.first().and_then(|param| self.written(param));
+            }
+            arrow.visit_children_with(self);
+        }
+    }
+    let mut finder = Finder {
+        parsed,
+        target: (start, end),
+        found: None,
+    };
+    parsed.module.visit_with(&mut finder);
+    finder.found
 }
 
 #[cfg(test)]
@@ -2420,6 +2536,51 @@ mod tests {
         assert_eq!(
             left.anchors.handler.as_ref().map(|h| h.at.line),
             Some(line_of(&text, "function onLeft"))
+        );
+    }
+
+    /// A handler's anchor names its first parameter as written, whether
+    /// the function is written at the call or declared by name, so the type
+    /// capture can read the payload's type there (carrick#2439).
+    #[test]
+    fn a_receive_record_names_its_handlers_parameter() {
+        let (records, text) = rooms_records(false);
+        let joined = rooms_record(&records, &text, "wire.on(\"user.joined\"");
+        let left = rooms_record(&records, &text, "wire.on(\"user.left\"");
+        for record in [joined, left] {
+            assert_eq!(
+                record
+                    .anchors
+                    .handler
+                    .as_ref()
+                    .and_then(|handler| handler.param_name.as_deref()),
+                Some("data"),
+                "{:?}",
+                record.anchors
+            );
+        }
+    }
+
+    /// A send's payload written at an argument of the deciding call is
+    /// anchored at that expression's own span (carrick#2439).
+    #[test]
+    fn a_send_record_anchors_its_payload_expression() {
+        let (records, text) = rooms_records(false);
+        let settle = rooms_record(&records, &text, "wire.emit(topic");
+        let payload = settle
+            .anchors
+            .payload_at
+            .as_ref()
+            .expect("a payload anchor");
+        let (start, end) = span_of(&text, "{ shipped }");
+        assert_eq!(
+            (
+                payload.file.as_str(),
+                payload.line,
+                payload.span_start,
+                payload.span_end
+            ),
+            (ROOMS, line_of(&text, "{ shipped }"), start, end)
         );
     }
 

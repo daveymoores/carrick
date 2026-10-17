@@ -725,6 +725,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         }
     }
 
@@ -749,6 +750,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         }
     }
 
@@ -1194,6 +1196,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
 
         let result = ApiAnalysisResult {
@@ -1282,6 +1285,7 @@ mod tests {
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
+                inference: None,
             }],
             findings: vec![],
             dependency_conflicts: vec![],
@@ -1445,6 +1449,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],
@@ -1521,6 +1526,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],

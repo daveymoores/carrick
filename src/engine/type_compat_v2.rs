@@ -6873,6 +6873,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         }
     }
 

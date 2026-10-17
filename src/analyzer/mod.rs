@@ -339,6 +339,13 @@ pub struct ApiEndpointDetails {
     /// (carrick#1662). Empty, and skipped on the wire, on every other row.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub library_semantics: Vec<String>,
+    /// What the site questions said about this row (carrick#2439): on a row
+    /// an answer stated (`resolution_source: model`), the answer; on a reader
+    /// row an answer below the fold band disagreed with, that answer as
+    /// `alternative`. `None` on every other row and on every blob written
+    /// with the switch off ([`crate::site_rows`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<crate::site_rows::Inference>,
 }
 
 /// `name_scope` off a row, read exactly as the cloud's `readNameScope`
@@ -4722,6 +4729,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         }
     }
 
@@ -5367,6 +5375,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         });
 
         // 2. Unclassified env var (not in internal/external list)
@@ -5390,6 +5399,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         });
 
         // 3. Process.env pattern (should be detected as env var)
@@ -5413,6 +5423,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         });
 
         // 4. Raw code pattern with UPPERCASE var (common in legacy code)
@@ -5437,6 +5448,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         });
 
         let mount_graph = MountGraph::new(); // Empty graph
@@ -5516,6 +5528,7 @@ mod tests {
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
+                inference: None,
             });
         }
 
@@ -5589,6 +5602,7 @@ mod tests {
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
+                inference: None,
             });
         }
 
@@ -5641,6 +5655,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5735,6 +5750,7 @@ mod tests {
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
+                inference: None,
             });
 
             let mut mount_graph = MountGraph::new();
@@ -5893,6 +5909,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         }
     }
 
@@ -6485,6 +6502,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -6641,6 +6659,7 @@ mod tests {
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
+                inference: None,
             });
         };
         call(Some("search-by-intent"), 115);
@@ -6728,6 +6747,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -6856,6 +6876,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -6921,6 +6942,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -6986,6 +7008,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         });
 
         let mut mount_graph = MountGraph::new();
