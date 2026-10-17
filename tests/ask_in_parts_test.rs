@@ -29,14 +29,16 @@
 use carrick::agent_service::{self, AgentService};
 use carrick::agents::file_analyzer_agent::{FileAnalysisResult, FileAnalyzerAgent};
 use carrick::agents::file_orchestrator::{
-    FileCentricAnalysisResult, FileOrchestrator, ListedCandidate, MAX_PART_CANDIDATES,
-    PART_CONTEXT_BYTES, PART_WINDOW_BYTES, PartAnswer, merge_part_answers,
+    FILE_TOO_LARGE_CODE, FileCentricAnalysisResult, FileOrchestrator, ListedCandidate,
+    MAX_PART_CANDIDATES, PART_CONTEXT_BYTES, PART_WINDOW_BYTES, PartAnswer, WHOLE_PROMPT_MAX_BYTES,
+    merge_part_answers,
 };
 use carrick::agents::framework_guidance_agent::{
     FrameworkGuidance, PatternExample, ProtocolGuidance,
 };
 use carrick::agents::source_parts::{Limits, SourcePart, source_parts};
 use carrick::framework_detector::DetectionResult;
+use carrick::graphql::GraphqlConsumerHints;
 use carrick::operation::Protocol;
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -158,23 +160,46 @@ impl Fixture {
     }
 
     async fn analyze(&self) -> FileCentricAnalysisResult {
+        self.analyze_with(&HashMap::new(), &Default::default())
+            .await
+    }
+
+    /// A scan with `cached` as the answers a previous scan stored, and
+    /// `consumer` as the service's GraphQL consumer hints.
+    async fn analyze_with(
+        &self,
+        cached: &HashMap<String, FileAnalysisResult>,
+        consumer: &GraphqlConsumerHints,
+    ) -> FileCentricAnalysisResult {
         FileOrchestrator::new(AgentService::new())
             .analyze_files(
                 &self.files,
-                &HashMap::new(),
+                cached,
                 &ProtocolGuidance::from([(Protocol::Http, guidance())]),
                 &detection(),
                 &self.root,
                 &self.root,
                 &[],
                 &Default::default(),
-                &Default::default(),
+                consumer,
                 &carrick::url_normalizer::UrlNormalizer::default_permissive(),
                 &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(&self.root, None),
                 None,
             )
             .await
             .expect("the analysis runs")
+    }
+
+    /// What one scan in which every request answers sent about the subject,
+    /// read back from its dump, and how many requests it sent.
+    async fn dumped_run(&self) -> (Dumps, usize) {
+        let dump = tempfile::tempdir().unwrap();
+        dump_into(Some(dump.path()));
+        let before = requests();
+        self.analyze().await;
+        let sent = requests() - before;
+        dump_into(None);
+        (self.dumps(dump.path()), sent)
     }
 
     /// What every request about the subject carries and no other file's does.
@@ -243,6 +268,15 @@ struct Listed {
     span_start: u32,
     span_end: u32,
     line: i64,
+}
+
+/// The candidates a file asked in parts lists, in source order: each part's,
+/// parts in the order their labels sort, which is source order.
+fn listed_in_parts(parts: &BTreeMap<String, String>) -> Vec<Listed> {
+    parts
+        .values()
+        .flat_map(|prompt| listed_in(prompt))
+        .collect()
 }
 
 fn listed_in(prompt: &str) -> Vec<Listed> {
@@ -1384,11 +1418,33 @@ async fn a_mocked_scan_sends_one_request_a_file() {
     );
 }
 
+/// Answer each of `parts` with a call row for each of its candidates, rows
+/// last first: the order a part's rows arrive in is the model's.
+fn answer_parts_with_call_rows(parts: &[SourcePart], listed: &[Listed]) {
+    for part in parts {
+        let rows: Vec<Value> = part
+            .candidates
+            .iter()
+            .rev()
+            .map(|position| data_call_row(&listed[*position], *position))
+            .collect();
+        let answer = json!({ "mounts": [], "endpoints": [], "data_calls": rows });
+        let first = &listed[part.candidates[0]].id;
+        agent_service::inject_mock_answer(
+            ROUTE,
+            &format!("- Candidate {first}: "),
+            1,
+            &answer.to_string(),
+        );
+    }
+}
+
 /// carrick#2308: a part's request holds its window and the declarations the
 /// window uses, and nothing else of the file.
 ///
 /// A generated module of 400 one-request functions under one import line of
-/// several hundred names. Its whole answer is cut, and every part answers
+/// several hundred names. Its whole prompt is over the line, so it is asked
+/// in parts from its first request (carrick#2309), and every part answers
 /// with a call row for each of its candidates.
 #[tokio::test]
 #[serial]
@@ -1398,9 +1454,18 @@ async fn a_part_sends_its_window_and_not_the_file() {
     const FUNCTIONS: usize = 400;
     let shape = shapes::flat_module(tag, FUNCTIONS);
     let subject = format!("src/{tag}_client.ts");
+    // The whole prompt of a small file at the same path: its header and the
+    // line under it are what every part of the large one must repeat.
+    let whole = Fixture::of(
+        &[(subject.clone(), shapes::flat_module(tag, 3).source)],
+        &subject,
+    )
+    .whole_prompt()
+    .await;
     let fx = Fixture::of(&[(subject.clone(), shape.source.clone())], &subject);
-    let whole = fx.whole_prompt().await;
-    let listed = listed_in(&whole);
+    let (first, _) = fx.dumped_run().await;
+    assert!(first.whole.is_none(), "the file is never sent whole");
+    let listed = listed_in_parts(&first.parts);
     assert_eq!(listed.len(), FUNCTIONS, "one candidate a function");
     assert!(
         listed
@@ -1421,34 +1486,13 @@ async fn a_part_sends_its_window_and_not_the_file() {
         "32 candidates a part"
     );
 
-    agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 1, &cut());
-    for part in &parts {
-        // Last first: the order a part's rows arrive in is the model's.
-        let rows: Vec<Value> = part
-            .candidates
-            .iter()
-            .rev()
-            .map(|position| data_call_row(&listed[*position], *position))
-            .collect();
-        let answer = json!({ "mounts": [], "endpoints": [], "data_calls": rows });
-        let first = &listed[part.candidates[0]].id;
-        agent_service::inject_mock_answer(
-            ROUTE,
-            &format!("- Candidate {first}: "),
-            1,
-            &answer.to_string(),
-        );
-    }
+    answer_parts_with_call_rows(&parts, &listed);
     let dump = tempfile::tempdir().unwrap();
     dump_into(Some(dump.path()));
     let before = requests();
     let result = fx.analyze().await;
     dump_into(None);
-    assert_eq!(
-        requests() - before,
-        1 + parts.len(),
-        "the whole request and one a part"
-    );
+    assert_eq!(requests() - before, parts.len(), "one request a part");
 
     let dumps = fx.dumps(dump.path());
     assert_eq!(
@@ -1499,11 +1543,6 @@ async fn a_part_sends_its_window_and_not_the_file() {
         largest < 130_000,
         "the largest part request is {largest} bytes"
     );
-    assert!(
-        largest * 3 < whole.len(),
-        "the largest part ({largest} bytes) against the whole request ({} bytes)",
-        whole.len()
-    );
 
     let stored = &result.raw_model_results[&fx.table];
     let targets: Vec<&str> = stored
@@ -1513,6 +1552,492 @@ async fn a_part_sends_its_window_and_not_the_file() {
         .collect();
     let expected: Vec<String> = (0..FUNCTIONS).map(|i| format!("/called/{i}")).collect();
     assert_eq!(targets, expected, "400 call rows in source order");
+    assert_eq!(lost_reason(&fx.table), None);
+}
+
+/// carrick#2309: a file whose whole prompt is over the line is asked in
+/// parts from its first request, no request is over the line, the parts'
+/// answers are stored as one, and a scan over that stored answer sends
+/// nothing.
+#[tokio::test]
+#[serial]
+async fn a_file_over_the_line_is_never_sent_whole() {
+    offline();
+    let tag = "overline";
+    const FUNCTIONS: usize = 400;
+    let shape = shapes::flat_module(tag, FUNCTIONS);
+    let subject = format!("src/{tag}_client.ts");
+    let fx = Fixture::of(&[(subject.clone(), shape.source.clone())], &subject);
+
+    let (first, sent) = fx.dumped_run().await;
+    assert!(first.whole.is_none(), "no whole request");
+    assert_eq!(sent, first.parts.len(), "the requests are the parts");
+    for (label, prompt) in &first.parts {
+        assert!(
+            prompt.len() <= WHOLE_PROMPT_MAX_BYTES,
+            "part {label} is {} bytes",
+            prompt.len()
+        );
+    }
+    let listed = listed_in_parts(&first.parts);
+    assert_eq!(listed.len(), FUNCTIONS);
+    let parts = source_parts(
+        Path::new(&subject),
+        &shape.source,
+        &as_listed_candidates(&listed),
+        &LIMITS,
+    )
+    .expect("the module parses");
+    assert_eq!(
+        first.parts.keys().cloned().collect::<Vec<_>>(),
+        parts.iter().map(SourcePart::label).collect::<Vec<_>>(),
+        "the parts asked are the file's windows"
+    );
+
+    answer_parts_with_call_rows(&parts, &listed);
+    let before = requests();
+    let result = fx.analyze().await;
+    assert_eq!(requests() - before, parts.len());
+    assert_eq!(
+        result.stats.files_model_dispatched, 1,
+        "a file is counted once"
+    );
+    let stored = &result.raw_model_results[&fx.table];
+    assert_eq!(
+        stored.data_calls.len(),
+        FUNCTIONS,
+        "one stored answer, 400 rows"
+    );
+    assert_eq!(lost_reason(&fx.table), None);
+
+    let before = requests();
+    let again = fx
+        .analyze_with(&result.raw_model_results, &Default::default())
+        .await;
+    assert_eq!(requests() - before, 0, "the stored answer is replayed");
+    assert_eq!(again.stats.files_model_reused, 1);
+}
+
+/// carrick#2309: a file whose whole prompt is at the line is sent whole, in
+/// the bytes it was always sent in, and one byte more asks it in parts.
+#[tokio::test]
+#[serial]
+async fn a_file_at_the_line_is_sent_whole() {
+    offline();
+    let tag = "atline";
+    let subject = format!("src/{tag}_client.ts");
+    // A request, then a declaration under a comment that pads the file.
+    let source = |padding: usize| {
+        format!(
+            "declare const client: any;\n\
+             export function readOne(id: string) {{\n  \
+             return client.get({{ url: \"/{tag}/items/0\", params: {{ id }} }});\n}}\n\
+             // {}\n\
+             export const padding = 0;\n",
+            "p".repeat(padding)
+        )
+    };
+    let whole_of = |padding: usize| {
+        let subject = subject.clone();
+        let source = source(padding);
+        async move {
+            let fx = Fixture::of(&[(subject.clone(), source)], &subject);
+            fx.dumped_run().await
+        }
+    };
+    let (unpadded, _) = whole_of(0).await;
+    let base = unpadded.whole.expect("a small file is sent whole").len();
+    let padding = WHOLE_PROMPT_MAX_BYTES - base;
+
+    let (at, sent) = whole_of(padding).await;
+    assert_eq!(sent, 1, "one request");
+    assert!(at.parts.is_empty());
+    let at_whole = at.whole.expect("a file at the line is sent whole");
+    assert_eq!(at_whole.len(), WHOLE_PROMPT_MAX_BYTES);
+    assert!(
+        at_whole.contains(&format!("// {}\n", "p".repeat(padding))),
+        "the whole file, in the whole prompt's bytes"
+    );
+
+    let (over, _) = whole_of(padding + 1).await;
+    assert!(over.whole.is_none(), "one byte more is not sent whole");
+    assert!(!over.parts.is_empty());
+    assert!(
+        over.parts
+            .values()
+            .all(|prompt| prompt.len() <= WHOLE_PROMPT_MAX_BYTES)
+    );
+}
+
+/// carrick#2309: a module whose one exported array literal holds 400 route
+/// objects and is most of the file is cut between the literal's elements,
+/// and the stored answer holds every route once.
+#[tokio::test]
+#[serial]
+async fn the_route_table_literal_keeps_every_route() {
+    offline();
+    let tag = "routetable";
+    const ROUTES: usize = 400;
+    let shape = shapes::route_array(tag, ROUTES);
+    let subject = format!("src/{tag}.ts");
+    let fx = Fixture::of(&[(subject.clone(), shape.source.clone())], &subject);
+    let (first, _) = fx.dumped_run().await;
+    assert!(first.whole.is_none(), "the file is over the line");
+    let listed = listed_in_parts(&first.parts);
+    assert_eq!(listed.len(), ROUTES, "one candidate a route");
+    let parts = source_parts(
+        Path::new(&subject),
+        &shape.source,
+        &as_listed_candidates(&listed),
+        &LIMITS,
+    )
+    .expect("the module parses");
+    assert!(parts.len() > 1);
+
+    // Each part answers the routes the generator states for its candidates.
+    for part in &parts {
+        let rows: Vec<Value> = part
+            .candidates
+            .iter()
+            .map(|position| {
+                let mut row = endpoint_row(&listed[*position], *position);
+                row["path"] = json!(format!("/{tag}/routes/{position}"));
+                row["handler_name"] = json!(shapes::route_array_handler(*position));
+                row
+            })
+            .collect();
+        let answer = json!({ "mounts": [], "endpoints": rows, "data_calls": [] });
+        let first = &listed[part.candidates[0]].id;
+        agent_service::inject_mock_answer(
+            ROUTE,
+            &format!("- Candidate {first}: "),
+            1,
+            &answer.to_string(),
+        );
+    }
+    let before = requests();
+    let result = fx.analyze().await;
+    assert_eq!(requests() - before, parts.len());
+    let stored = &result.raw_model_results[&fx.table];
+    let routes: Vec<(&str, &str)> = stored
+        .endpoints
+        .iter()
+        .map(|row| (row.path.as_str(), row.handler_name.as_str()))
+        .collect();
+    let expected: Vec<(String, String)> = (0..ROUTES)
+        .map(|i| (format!("/{tag}/routes/{i}"), shapes::route_array_handler(i)))
+        .collect();
+    assert_eq!(
+        routes,
+        expected
+            .iter()
+            .map(|(path, handler)| (path.as_str(), handler.as_str()))
+            .collect::<Vec<_>>(),
+        "400 route rows, once each, in source order"
+    );
+}
+
+/// A module of `requests` one-request functions after `head`, under one
+/// ambient declaration of the client they call.
+fn requests_after(tag: &str, head: &str, requests: usize) -> String {
+    let mut source = String::from("declare const client: any;\n");
+    source.push_str(head);
+    for i in 0..requests {
+        writeln!(
+            source,
+            "export function read{i}(id: string) {{\n  return client.get({{ url: \"/{tag}/items/{i}\", params: {{ id }} }});\n}}"
+        )
+        .unwrap();
+    }
+    source
+}
+
+/// carrick#2309: an item with no list to cut that is over the line on its
+/// own, and holds no candidate, is left out; the rest of the file is asked.
+#[tokio::test]
+#[serial]
+async fn an_item_that_cannot_be_cut_and_holds_no_candidate_is_left_out() {
+    offline();
+    let tag = "leftout";
+    let blob = "leftoutblob".repeat(300_000 / 11);
+    let source = requests_after(tag, &format!("export const BLOB = \"{blob}\";\n"), 4);
+    let subject = format!("src/{tag}.ts");
+    let fx = Fixture::of(&[(subject.clone(), source)], &subject);
+
+    let (dumps, sent) = fx.dumped_run().await;
+    assert!(dumps.whole.is_none(), "the file is over the line");
+    assert_eq!(sent, 1, "only the window of requests is asked");
+    let [prompt] = dumps.parts.values().collect::<Vec<_>>()[..] else {
+        panic!("one part: {:?}", dumps.parts.keys());
+    };
+    assert!(!prompt.contains("leftoutblob"), "the literal is not sent");
+    assert_eq!(listed_in(prompt).len(), 4, "every request is asked");
+
+    let listed = listed_in(prompt);
+    let rows: Vec<Value> = listed
+        .iter()
+        .enumerate()
+        .map(|(position, candidate)| data_call_row(candidate, position))
+        .collect();
+    agent_service::inject_mock_answer(
+        ROUTE,
+        &format!("- Candidate {}: ", listed[0].id),
+        1,
+        &json!({ "mounts": [], "endpoints": [], "data_calls": rows }).to_string(),
+    );
+    let result = fx.analyze().await;
+    assert_eq!(result.raw_model_results[&fx.table].data_calls.len(), 4);
+    assert_eq!(lost_reason(&fx.table), None);
+}
+
+/// carrick#2309: a candidate inside an item that cannot be cut under the line
+/// names the file under its own reason. No request is sent, the file keeps
+/// its deterministic rows, nothing is stored as its answer, and the next scan
+/// decides the same.
+#[tokio::test]
+#[serial]
+async fn a_candidate_inside_an_item_that_cannot_be_cut_names_the_file() {
+    offline();
+    let tag = "uncuttable";
+    let body = "uncuttablebody".repeat(300_000 / 14);
+    let source = format!(
+        "declare const client: any;\nexport function sendBig() {{\n  return client.post({{ url: \"/{tag}/items/0\", body: \"{body}\" }});\n}}\n"
+    );
+    let subject = format!("src/{tag}.ts");
+    let fx = Fixture::of(&[(subject.clone(), source)], &subject);
+
+    for scan in ["first", "next"] {
+        offline();
+        let before = requests();
+        let result = fx.analyze().await;
+        assert_eq!(requests() - before, 0, "{scan} scan: no request");
+        assert_eq!(
+            lost_reason(&fx.table).as_deref(),
+            Some(FILE_TOO_LARGE_CODE),
+            "{scan} scan"
+        );
+        assert!(
+            !result.raw_model_results.contains_key(&fx.table),
+            "{scan} scan: nothing is stored as its answer"
+        );
+        let calls: Vec<&str> = result.file_results[&fx.table]
+            .data_calls
+            .iter()
+            .map(|row| row.target.as_str())
+            .collect();
+        assert!(
+            calls
+                .iter()
+                .any(|target| target.contains(&format!("/{tag}/items/0"))),
+            "{scan} scan: the deterministic call row is kept: {calls:?}"
+        );
+    }
+    assert!(
+        carrick::scan_health::unanalysed_files_for(None)
+            .iter()
+            .any(|lost| lost.path == fx.table),
+        "the file is named"
+    );
+}
+
+/// `count` interfaces, each a declaration that runs nothing.
+fn interfaces(count: usize) -> String {
+    (0..count)
+        .map(|i| {
+            format!("export interface OnlyATypeNumber{i:04} {{ value: string; other: number }}\n")
+        })
+        .collect()
+}
+
+/// carrick#2309: a window that holds no candidate and only declarations that
+/// run nothing is not sent.
+#[tokio::test]
+#[serial]
+async fn a_window_of_types_only_is_not_sent() {
+    offline();
+    let tag = "typesonly";
+    let source = requests_after(tag, &interfaces(4_000), 4);
+    let subject = format!("src/{tag}.ts");
+    let fx = Fixture::of(&[(subject.clone(), source)], &subject);
+    let (dumps, _) = fx.dumped_run().await;
+    assert!(dumps.whole.is_none(), "the file is over the line");
+    assert!(!dumps.parts.is_empty(), "the requests are asked");
+    assert!(
+        dumps
+            .parts
+            .values()
+            .all(|prompt| !prompt.contains("OnlyATypeNumber0100 {")),
+        "the windows of types alone are not sent"
+    );
+    assert_eq!(listed_in_parts(&dumps.parts).len(), 4);
+}
+
+/// carrick#2309: beside a GraphQL section a type can be the thing located, so
+/// the same windows of types are sent.
+#[tokio::test]
+#[serial]
+async fn a_window_of_types_only_is_sent_beside_a_graphql_section() {
+    offline();
+    let tag = "typesgraphql";
+    let source = requests_after(tag, &interfaces(4_000), 4);
+    let subject = format!("src/{tag}.ts");
+    let fx = Fixture::of(&[(subject.clone(), source)], &subject);
+    let consumer = GraphqlConsumerHints {
+        lines: vec!["query|typesGraphqlField @ src/elsewhere.ts".to_string()],
+        files: Default::default(),
+    };
+    let dump = tempfile::tempdir().unwrap();
+    dump_into(Some(dump.path()));
+    fx.analyze_with(&HashMap::new(), &consumer).await;
+    dump_into(None);
+    let dumps = fx.dumps(dump.path());
+    assert!(dumps.whole.is_none(), "the file is over the line");
+    assert!(
+        dumps
+            .parts
+            .values()
+            .any(|prompt| prompt.contains("OnlyATypeNumber0100 {")),
+        "the windows of types are sent"
+    );
+}
+
+/// The cloud's final verdict that a request is too large to ask
+/// (carrick-cloud#2267), stating `details`.
+fn too_large(details: Value) -> String {
+    json!({
+        "success": false,
+        "error": {
+            "code": "prompt_too_large",
+            "message": "stated by the test",
+            "retriable": false,
+            "details": details,
+        },
+    })
+    .to_string()
+}
+
+/// carrick#2310: a file under the scanner's line whose whole request the
+/// cloud refuses as too large is asked in parts under the limit it states.
+#[tokio::test]
+#[serial]
+async fn a_whole_request_refused_for_size_is_asked_in_parts() {
+    offline();
+    let tag = "refusedwhole";
+    let shape = shapes::flat_module(tag, 150);
+    let subject = format!("src/{tag}_client.ts");
+    let fx = Fixture::of(&[(subject.clone(), shape.source.clone())], &subject);
+    let whole = fx.whole_prompt().await;
+    assert!(
+        (100_000..WHOLE_PROMPT_MAX_BYTES).contains(&whole.len()),
+        "a whole prompt between the stated limit and the line: {}",
+        whole.len()
+    );
+
+    agent_service::inject_mock_envelope(
+        ROUTE,
+        &fx.whole_marker(),
+        1,
+        &too_large(json!({ "max_prompt_bytes": 100_000, "user_message_bytes": whole.len() })),
+    );
+    let (dumps, sent) = fx.dumped_run().await;
+    assert!(
+        dumps.whole.is_none(),
+        "the refused request is not sent again"
+    );
+    assert_eq!(
+        sent,
+        1 + dumps.parts.len(),
+        "the refused request and the parts"
+    );
+    for (label, prompt) in &dumps.parts {
+        assert!(
+            prompt.len() <= 100_000,
+            "part {label}: {} bytes",
+            prompt.len()
+        );
+    }
+    assert_eq!(listed_in_parts(&dumps.parts).len(), 150);
+    assert_eq!(lost_reason(&fx.table), None, "the file's rows are stored");
+}
+
+/// carrick#2310: a part the cloud refuses as too large is halved by its
+/// bytes and its halves asked; the refused part is never sent again.
+#[tokio::test]
+#[serial]
+async fn a_refused_part_is_halved() {
+    offline();
+    let tag = "refusedpart";
+    let shape = shapes::flat_module(tag, 400);
+    let subject = format!("src/{tag}_client.ts");
+    let fx = Fixture::of(&[(subject.clone(), shape.source.clone())], &subject);
+    let (first, _) = fx.dumped_run().await;
+    let labels: Vec<String> = first.parts.keys().cloned().collect();
+    let refused = &labels[1];
+    let refused_first = listed_in(&first.parts[refused])[0].id.clone();
+
+    agent_service::inject_mock_envelope(
+        ROUTE,
+        &format!("- Candidate {refused_first}: "),
+        1,
+        &too_large(json!({})),
+    );
+    let (dumps, sent) = fx.dumped_run().await;
+    assert_eq!(
+        sent,
+        labels.len() + 2,
+        "every part, then the refused one's halves"
+    );
+    assert!(
+        !dumps.parts.contains_key(refused),
+        "the refused part is not sent again"
+    );
+    assert_eq!(dumps.parts.len(), labels.len() + 1);
+    assert_eq!(
+        listed_in_parts(&dumps.parts).len(),
+        400,
+        "every candidate is asked"
+    );
+    assert_eq!(lost_reason(&fx.table), None);
+}
+
+/// carrick#2310: a window of one item the cloud refuses as too large cannot
+/// be cut again, and the file is named under the reason step 2 introduced.
+#[tokio::test]
+#[serial]
+async fn a_single_item_refused_for_size_loses_the_file_by_name() {
+    offline();
+    let tag = "refusedone";
+    // One line, so the file is one item however far it is opened.
+    let source = format!(
+        "declare const client: any; export function readOne() {{ return client.get({{ url: \"/{tag}/items/0\" }}); }}\n"
+    );
+    let subject = format!("src/{tag}.ts");
+    let fx = Fixture::of(&[(subject.clone(), source)], &subject);
+    assert_eq!(fx.listed().await.len(), 1);
+
+    // Every request about the file is refused.
+    agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 3, &too_large(json!({})));
+    let before = requests();
+    let result = fx.analyze().await;
+    let sent = requests() - before;
+    assert!((1..=2).contains(&sent), "{sent} request(s)");
+    assert_eq!(lost_reason(&fx.table).as_deref(), Some(FILE_TOO_LARGE_CODE));
+    assert!(!result.raw_model_results.contains_key(&fx.table));
+}
+
+/// carrick#2310: a request refused for size is never sent again as it was.
+#[tokio::test]
+#[serial]
+async fn a_request_refused_for_size_is_never_sent_again() {
+    offline();
+    let fx = Fixture::table("refusedonce");
+    let whole = fx.whole_prompt().await;
+    agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 1, &too_large(json!({})));
+    let (dumps, sent) = fx.dumped_run().await;
+    assert!(dumps.whole.is_none(), "the whole request is not sent again");
+    assert!(!dumps.parts.is_empty());
+    assert!(dumps.parts.values().all(|part| part.len() < whole.len()));
+    assert_eq!(sent, HANDLER_MODULES + 1 + dumps.parts.len());
     assert_eq!(lost_reason(&fx.table), None);
 }
 

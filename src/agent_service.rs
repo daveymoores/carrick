@@ -359,10 +359,21 @@ impl AgentCallError {
     /// Parsed here and nowhere else. Absent, zero, negative, a fraction or
     /// not a number at all reads as `None`, and the caller keeps its own
     /// constant.
-    #[allow(dead_code)] // Its reader is the file orchestrator's split (carrick#1898), not yet built.
     pub fn max_part_candidates(&self) -> Option<usize> {
         let stated = self.detail("max_part_candidates")?.as_u64()?;
         usize::try_from(stated).ok().filter(|count| *count > 0)
+    }
+
+    /// `details.max_prompt_bytes`: the most bytes of user message the cloud
+    /// sends to the model. The cloud states it on its final verdict that a
+    /// request is too large to ask (`prompt_too_large`, carrick#2310,
+    /// carrick-cloud#2267), and the file is cut smaller under it.
+    ///
+    /// Read as [`Self::max_part_candidates`] is: absent, zero, negative, a
+    /// fraction or not a number at all reads as `None`.
+    pub fn max_prompt_bytes(&self) -> Option<usize> {
+        let stated = self.detail("max_prompt_bytes")?.as_u64()?;
+        usize::try_from(stated).ok().filter(|bytes| *bytes > 0)
     }
 
     /// Whether the model was deliberately not asked, rather than asked and
@@ -5808,6 +5819,41 @@ pub(crate) mod tests {
         assert_eq!(cut.details, None);
         assert_eq!(cut.max_part_candidates(), None);
         assert!(!cut.cloud_stated);
+    }
+
+    /// carrick#2310: the size limit the cloud states on its size verdict is a
+    /// positive integer or nothing, read as the part size is.
+    #[test]
+    fn max_prompt_bytes_is_a_positive_integer_or_nothing() {
+        let call = |details: &str| {
+            call_error_from_envelope(envelope_error(&format!(
+                r#"{{"success":false,"error":{{"code":"prompt_too_large","message":"x","retriable":false,"details":{details}}}}}"#
+            )))
+        };
+        let stated = call(r#"{"max_prompt_bytes":300000,"user_message_bytes":412345}"#);
+        assert_eq!(stated.max_prompt_bytes(), Some(300_000));
+        assert!(stated.is_final_answer());
+        assert_eq!(
+            call(r#"{"max_prompt_bytes":1}"#).max_prompt_bytes(),
+            Some(1)
+        );
+        for no_limit in [
+            "{}",
+            r#"{"max_prompt_bytes":0}"#,
+            r#"{"max_prompt_bytes":-300000}"#,
+            r#"{"max_prompt_bytes":300000.5}"#,
+            r#"{"max_prompt_bytes":"300000"}"#,
+            r#"{"max_prompt_bytes":true}"#,
+            r#"{"max_prompt_bytes":null}"#,
+            r#"{"max_prompt_bytes":[300000]}"#,
+            r#"{"user_message_bytes":412345}"#,
+            r#""300000""#,
+            "300000",
+        ] {
+            assert_eq!(call(no_limit).max_prompt_bytes(), None, "{no_limit}");
+        }
+        let scanner_side = AgentCallError::transient("gateway_error", "cut".to_string());
+        assert_eq!(scanner_side.max_prompt_bytes(), None);
     }
 
     /// Spec test 9, a near miss: an envelope on the last attempt is the

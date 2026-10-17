@@ -45,7 +45,13 @@ pub const CONTEXT_DECLARATION_MAX: usize = crate::agents::file_orchestrator::WRA
 
 /// Two runs of shown lines this close together are shown as one: the lines
 /// between them cost less than the line that would say they are missing.
+/// Only while those lines hold at most [`SHOWN_GAP_MAX_BYTES`]: a gap of one
+/// long line is not cheap, and filling it could carry the very item a window
+/// was cut to leave out (carrick#2309).
 const SHOWN_GAP_FILLED: u32 = 2;
+
+/// The most bytes of the lines between two runs that are shown to join them.
+const SHOWN_GAP_MAX_BYTES: usize = 200;
 
 /// What a window may hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +89,9 @@ pub struct SourcePart {
     pub context: Vec<Lines>,
     /// The items the window holds, as runs of siblings in source order.
     runs: Vec<Run>,
+    /// Every run of lines the part shows, in source order
+    /// ([`SourceCut::shown_runs`]).
+    shown_runs: Vec<Lines>,
 }
 
 /// The lines one part shows, in source order.
@@ -134,23 +143,9 @@ impl SourcePart {
 
     /// The lines the part shows.
     pub fn shown(&self) -> ShownLines {
-        let mut runs: Vec<Lines> = vec![self.window()];
-        for enclosing in &self.enclosing {
-            runs.extend([enclosing.opening, enclosing.closing]);
-        }
-        runs.extend(self.context.iter().copied());
-        runs.retain(|(first, last)| first <= last);
-        runs.sort_unstable();
-        let mut merged: Vec<Lines> = Vec::with_capacity(runs.len());
-        for (first, last) in runs {
-            match merged.last_mut() {
-                Some(held) if first <= held.1 + 1 + SHOWN_GAP_FILLED => held.1 = held.1.max(last),
-                _ => merged.push((first, last)),
-            }
-        }
         let mut shown = ShownLines {
             window: self.window(),
-            runs: merged,
+            runs: self.shown_runs.clone(),
             markers: false,
         };
         shown.markers = (shown.runs.len() - 1) * 10 < shown.line_count();
@@ -158,13 +153,16 @@ impl SourcePart {
     }
 }
 
-/// One item of a list: its lines, and the list it holds when it can be
-/// opened.
+/// One item of a list: its lines, the list it holds when it can be opened,
+/// and whether it can state nothing the model is asked about.
 #[derive(Debug)]
 struct Item {
     first: u32,
     last: u32,
     list: Option<List>,
+    /// Every sibling on the item's lines is a declaration that runs nothing
+    /// ([`Node::states_nothing`]).
+    states_nothing: bool,
 }
 
 /// The list of an item that can be opened.
@@ -458,14 +456,45 @@ impl SourceCut {
             .map(|(_, _, position)| *position)
             .collect();
         candidates.sort_unstable();
+        let context = self.context_of(window, limits.context_bytes);
+        let shown_runs = self.shown_runs(window, &enclosing, &context);
         SourcePart {
             first_line: window.0,
             last_line: window.1,
             candidates,
-            context: self.context_of(window, limits.context_bytes),
+            context,
             enclosing,
             runs,
+            shown_runs,
         }
+    }
+
+    /// The runs of lines a part shows: its window, the opening and closing
+    /// lines of the constructs it was cut out of and the declarations it
+    /// uses, in source order. Two runs at most [`SHOWN_GAP_FILLED`] lines
+    /// apart are one when those lines hold at most [`SHOWN_GAP_MAX_BYTES`].
+    fn shown_runs(&self, window: Lines, enclosing: &[Enclosing], context: &[Lines]) -> Vec<Lines> {
+        let mut runs: Vec<Lines> = vec![window];
+        for construct in enclosing {
+            runs.extend([construct.opening, construct.closing]);
+        }
+        runs.extend(context.iter().copied());
+        runs.retain(|(first, last)| first <= last);
+        runs.sort_unstable();
+        let mut merged: Vec<Lines> = Vec::with_capacity(runs.len());
+        for (first, last) in runs {
+            match merged.last_mut() {
+                Some(held)
+                    if first <= held.1 + 1
+                        || (first <= held.1 + 1 + SHOWN_GAP_FILLED
+                            && self.bytes((held.1 + 1, first - 1)) <= SHOWN_GAP_MAX_BYTES) =>
+                {
+                    held.1 = held.1.max(last)
+                }
+                _ => merged.push((first, last)),
+            }
+        }
+        merged
     }
 
     /// The declarations the lines of `window` use: the statements that
@@ -532,8 +561,44 @@ impl SourceCut {
     /// item. A part that is one item is opened first, and its list is what is
     /// halved; one item with no list cannot be cut.
     pub fn halves(&self, part: &SourcePart, limits: &Limits) -> Option<(SourcePart, SourcePart)> {
+        self.halve(part, limits, Halving::ByGroups)
+    }
+
+    /// The two halves of a part whose own prompt is too large to ask
+    /// (carrick#2309, carrick#2310), or `None` when it cannot be cut again.
+    ///
+    /// A part is cut between two of its items so that the front half holds
+    /// about half its bytes, whatever its candidates: a prompt's size is its
+    /// lines', and candidates that share a start still share a line, so they
+    /// are never separated. A part that is one item is opened first; one item
+    /// with no list cannot be cut.
+    pub fn halves_by_size(
+        &self,
+        part: &SourcePart,
+        limits: &Limits,
+    ) -> Option<(SourcePart, SourcePart)> {
+        self.halve(part, limits, Halving::BySize)
+    }
+
+    /// Whether every item of `part`'s window is a declaration that runs
+    /// nothing: an import, a re-export, a type alias, an interface or an
+    /// ambient declaration (carrick#2309). Such a window, holding no
+    /// candidate, states nothing the model is asked about.
+    pub fn states_nothing(&self, part: &SourcePart) -> bool {
+        part.runs.iter().all(|(path, held)| {
+            held.clone()
+                .all(|index| self.item_at(path, index).states_nothing)
+        })
+    }
+
+    fn halve(
+        &self,
+        part: &SourcePart,
+        limits: &Limits,
+        halving: Halving,
+    ) -> Option<(SourcePart, SourcePart)> {
         let groups = self.groups_in(part.window());
-        if groups == 1 {
+        if groups == 1 && halving == Halving::ByGroups {
             return None;
         }
         // The part's items, each with the list it sits in.
@@ -550,7 +615,28 @@ impl SourceCut {
                 .map(|index| (opened.clone(), index))
                 .collect();
         }
-        let middle = if groups == 0 {
+        let middle = if halving == Halving::BySize {
+            // The first boundary with half the bytes in front of it, and at
+            // least one item behind it.
+            let sizes: Vec<usize> = items
+                .iter()
+                .map(|(path, index)| {
+                    let item = self.item_at(path, *index);
+                    self.bytes((item.first, item.last))
+                })
+                .collect();
+            let total: usize = sizes.iter().sum();
+            let mut held = 0;
+            let mut boundary = items.len() - 1;
+            for (place, size) in sizes[..items.len() - 1].iter().enumerate() {
+                held += size;
+                if 2 * held >= total {
+                    boundary = place + 1;
+                    break;
+                }
+            }
+            boundary
+        } else if groups == 0 {
             items.len() / 2
         } else {
             // The first boundary with half the groups in front of it, and at
@@ -587,6 +673,15 @@ impl SourceCut {
 /// A run of consecutive items of one list: the list, as the item opened at
 /// each depth on the way to it, and which of its items.
 type Run = (Vec<usize>, Range<usize>);
+
+/// What a part is halved for: an answer that was cut, which is halved by its
+/// candidates' groups, or a prompt too large to ask, which is halved by its
+/// bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Halving {
+    ByGroups,
+    BySize,
+}
 
 /// The window being filled while a file is packed, and the ones filled.
 struct Packing<'a> {
@@ -649,8 +744,9 @@ impl LineReader<'_> {
     /// the first line of `within` and the last to its last. Siblings that end
     /// on one line are one item, opened as the largest of them is.
     fn items(&self, within: Lines, nodes: &[Node<'_>]) -> Vec<Item> {
-        // (the line the item ends on, its largest sibling and that one's size)
-        let mut ends: Vec<(u32, Node<'_>, u32)> = Vec::new();
+        // (the line the item ends on, its largest sibling and that one's
+        // size, whether every sibling on it states nothing)
+        let mut ends: Vec<(u32, Node<'_>, u32, bool)> = Vec::new();
         for node in nodes {
             let span = node.span();
             let Some((_, last)) = self.lines_of(span) else {
@@ -663,20 +759,22 @@ impl LineReader<'_> {
                     if size > held.2 {
                         (held.1, held.2) = (*node, size);
                     }
+                    held.3 &= node.states_nothing();
                 }
-                _ => ends.push((last, *node, size)),
+                _ => ends.push((last, *node, size, node.states_nothing())),
             }
         }
         let count = ends.len();
         let mut items = Vec::with_capacity(count);
         let mut first = within.0;
-        for (index, (end, node, _)) in ends.into_iter().enumerate() {
+        for (index, (end, node, _, states_nothing)) in ends.into_iter().enumerate() {
             let last = if index + 1 == count { within.1 } else { end };
             let lines = (first, last);
             items.push(Item {
                 first,
                 last,
                 list: self.list(lines, node),
+                states_nothing,
             });
             first = last + 1;
         }
@@ -770,6 +868,52 @@ impl<'a> Node<'a> {
             },
             Node::Prop(PropOrSpread::Spread(_)) => None,
         }
+    }
+
+    /// Whether the item is a declaration that runs nothing, and so states
+    /// nothing the model is asked about (carrick#2309): an import, a
+    /// re-export, a type alias, an interface or an ambient declaration. Read
+    /// off the kind of the item, never a name.
+    fn states_nothing(&self) -> bool {
+        match self {
+            Node::ModuleItem(ModuleItem::ModuleDecl(decl)) => match decl {
+                ModuleDecl::Import(_)
+                | ModuleDecl::ExportAll(_)
+                | ModuleDecl::TsImportEquals(_)
+                | ModuleDecl::TsNamespaceExport(_) => true,
+                ModuleDecl::ExportNamed(named) => named.src.is_some(),
+                ModuleDecl::ExportDecl(export) => decl_states_nothing(&export.decl),
+                ModuleDecl::ExportDefaultDecl(export) => {
+                    matches!(export.decl, DefaultDecl::TsInterfaceDecl(_))
+                }
+                _ => false,
+            },
+            Node::ModuleItem(ModuleItem::Stmt(stmt)) => stmt_states_nothing(stmt),
+            Node::Stmt(stmt) => stmt_states_nothing(stmt),
+            Node::Member(_) | Node::Expr(_) | Node::Prop(_) => false,
+        }
+    }
+}
+
+/// Whether `stmt` is an empty statement or a declaration that runs nothing.
+fn stmt_states_nothing(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Decl(decl) => decl_states_nothing(decl),
+        Stmt::Empty(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether `decl` is a type alias, an interface or an ambient declaration.
+fn decl_states_nothing(decl: &Decl) -> bool {
+    match decl {
+        Decl::TsInterface(_) | Decl::TsTypeAlias(_) => true,
+        Decl::Var(var) => var.declare,
+        Decl::Fn(function) => function.declare,
+        Decl::Class(class) => class.declare,
+        Decl::TsEnum(declared) => declared.declare,
+        Decl::TsModule(namespace) => namespace.declare,
+        Decl::Using(_) => false,
     }
 }
 
@@ -1283,6 +1427,106 @@ export function register(app: any) {
                 assert!(b.candidates.windows(2).all(|pair| pair[0] < pair[1]));
             }
         }
+    }
+
+    /// carrick#2309: a window states nothing exactly when every item it holds
+    /// is an import, a re-export, a type alias, an interface or an ambient
+    /// declaration, read off the item's kind.
+    #[test]
+    fn a_window_of_declarations_that_run_nothing_states_nothing() {
+        let cut_of = |source: &str| {
+            SourceCut::of(Path::new("src/generated.ts"), source, &[]).expect("it parses")
+        };
+        let window = |cut: &SourceCut| -> SourcePart {
+            let [whole] = cut.parts(&LIMITS).try_into().expect("one part");
+            whole
+        };
+        for nothing in [
+            "import { a } from \"./a\";\n",
+            "import * as b from \"./b\";\nexport * from \"./c\";\nexport { d } from \"./d\";\n",
+            "export type T = { value: string };\ninterface I { value: number }\n",
+            "export interface E { value: string }\nexport default interface F {}\n",
+            "declare const client: any;\ndeclare function make(): any;\ndeclare class K {}\n",
+            "declare enum Shade { Dark }\ndeclare namespace Space { const x: number; }\n",
+            "export declare const declared: string;\n",
+            "import x = require(\"./x\");\n",
+        ] {
+            let cut = cut_of(nothing);
+            assert!(cut.states_nothing(&window(&cut)), "{nothing}");
+        }
+        for something in [
+            "const table = makeTable();\n",
+            "export const value = 1;\n",
+            "export function f() {}\n",
+            "enum Shade { Dark }\n",
+            "namespace Space { export const x = 1; }\n",
+            "export { local };\nconst local = 1;\n",
+            "import { a } from \"./a\";\na();\n",
+            "export default {};\n",
+            "type T = string; call();\n",
+        ] {
+            let cut = cut_of(something);
+            assert!(!cut.states_nothing(&window(&cut)), "{something}");
+        }
+    }
+
+    /// carrick#2309: a short gap between a window and a declaration it uses
+    /// is shown, and a gap of one long line is not: it could be the item the
+    /// window was cut to leave out.
+    #[test]
+    fn a_long_line_between_a_window_and_its_context_is_not_shown() {
+        let shown_with_gap = |gap: &str| {
+            let source = format!(
+                "declare const client: any;\n{gap}\nexport function f() {{\n  return client.get({{ url: \"/one\" }});\n}}\n"
+            );
+            let cut = SourceCut::of(Path::new("src/generated.ts"), &source, &[]).expect("parses");
+            // The function's window, and the declaration it uses.
+            assert_eq!(cut.context_of((3, 5), LIMITS.context_bytes), [(1, 1)]);
+            cut.shown_runs((3, 5), &[], &[(1, 1)])
+        };
+        assert_eq!(shown_with_gap("export const short = 1;"), [(1, 5)]);
+        let long = format!("export const long = \"{}\";", "x".repeat(1_000));
+        assert_eq!(shown_with_gap(&long), [(1, 1), (3, 5)]);
+    }
+
+    /// carrick#2309: a part too large to ask is halved by its bytes, whatever
+    /// its candidates, opening an item that is the whole part; one item with
+    /// no list cannot be halved.
+    #[test]
+    fn a_part_is_halved_by_its_bytes_down_to_one_item() {
+        // One group of candidates, which halving for a cut answer refuses.
+        let mut source = String::from("declare const client: any;\n");
+        source.push_str(&format!("export const big = \"{}\";\n", "x".repeat(900)));
+        source.push_str("export function f() {\n");
+        for i in 0..6 {
+            source.push_str(&format!("  const v{i} = {i};\n"));
+        }
+        let start = source.len();
+        source.push_str("  return client.get({ url: \"/one\" });\n}\n");
+        let listed = listed_at(&[start + 9]);
+        let cut = SourceCut::of(Path::new("src/generated.ts"), &source, &listed).expect("parses");
+        let [whole] = cut.parts(&LIMITS).try_into().expect("one part");
+        assert!(cut.halves(&whole, &LIMITS).is_none(), "one group");
+
+        let (front, back) = cut.halves_by_size(&whole, &LIMITS).expect("three items");
+        assert_eq!(
+            front.window(),
+            (1, 2),
+            "the first half holds half the bytes"
+        );
+        assert_eq!(back.window(), (3, cut.line_count()));
+        assert_eq!(back.candidates.len(), 1);
+        // The function alone is opened and its statements halved.
+        let (head, tail) = cut.halves_by_size(&back, &LIMITS).expect("its statements");
+        assert_eq!(head.first_line, 3);
+        assert_eq!(tail.last_line, cut.line_count());
+        assert_eq!(tail.first_line, head.last_line + 1);
+
+        // One line holding one item with nothing to cut along.
+        let one = format!("export const big = \"{}\";\n", "x".repeat(900));
+        let cut = SourceCut::of(Path::new("src/generated.ts"), &one, &[]).expect("parses");
+        let [whole] = cut.parts(&LIMITS).try_into().expect("one part");
+        assert!(cut.halves_by_size(&whole, &LIMITS).is_none());
     }
 
     #[test]

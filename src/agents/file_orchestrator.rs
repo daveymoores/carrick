@@ -20,8 +20,8 @@ use crate::{
     agent_service::AgentService,
     agents::{
         file_analyzer_agent::{
-            DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent,
-            MountResult, PubsubOperation, ResolutionSource,
+            AnalysisPrompt, DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult,
+            FileAnalyzerAgent, MountResult, PubsubOperation, ResolutionSource,
         },
         framework_guidance_agent::ProtocolGuidance,
         source_parts::{Limits, ShownLines, SourceCut, SourcePart},
@@ -105,6 +105,78 @@ pub const MAX_PART_CANDIDATES: usize = 32;
 
 /// The cloud's error code for an answer that ended at the response's limit.
 const OUTPUT_TRUNCATED_CODE: &str = "output_truncated";
+
+/// The most bytes of user message ([`crate::agents::file_analyzer_agent::AnalysisPrompt`]'s
+/// `text`) a file is asked in whole, and the most any one request carries
+/// (carrick#2309). A file whose whole prompt is over it is asked in parts
+/// from its first request.
+///
+/// Measured on one first index (carrick#2299): every request under 300 KB of
+/// user message was answered, and every refusal for capacity and every
+/// request that ran to the cloud's 120 s limit was on 395 KB or more. Bytes,
+/// because the scanner has no tokenizer: on that run's prompts of 100 KB and
+/// more a prompt token was 2.2 to 3.3 bytes (median 2.6), so this is about
+/// 96,000 tokens and at most about 115,000. No prompt of 128,000 tokens or
+/// under failed, and failures began at 150,000.
+pub const WHOLE_PROMPT_MAX_BYTES: usize = 250_000;
+
+/// The cloud's error code for a request too large to ask the model
+/// (carrick-cloud#2267). Its `details.max_prompt_bytes` states the limit.
+const PROMPT_TOO_LARGE_CODE: &str = "prompt_too_large";
+
+/// The reason a file is recorded as not analysed under when it cannot be cut
+/// into requests under the line: an item with no list to cut, holding a
+/// candidate, is over it on its own, or the file does not parse for the cut
+/// (carrick#2309). Final: the same bytes are cut the same way on every scan.
+pub const FILE_TOO_LARGE_CODE: &str = "file_too_large";
+
+/// A file that cannot be asked in requests under the line (carrick#2309).
+/// Decided before any request about it is sent, or when the cloud's size
+/// verdict refuses a part that cannot be cut again (carrick#2310).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTooLarge {
+    /// The line the file could not be cut under.
+    pub max_prompt_bytes: usize,
+}
+
+impl std::fmt::Display for FileTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the file cannot be cut into requests of at most {} bytes",
+            self.max_prompt_bytes
+        )
+    }
+}
+
+impl std::error::Error for FileTooLarge {}
+
+/// The cloud's final verdict that a request is too large to ask, when `error`
+/// is one (carrick#2310): the code, on an answer the cloud called final. A
+/// cloud that sends no such verdict never reaches the code that reads it.
+fn size_verdict<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a crate::agent_service::AgentCallError> {
+    error
+        .downcast_ref::<crate::agent_service::AgentCallError>()
+        .filter(|e| e.code == PROMPT_TOO_LARGE_CODE && e.is_final_answer())
+}
+
+/// The line a request refused for size is cut under: the cloud's stated limit
+/// when it states one, and never the refused request's own size or more, so
+/// that request is never sent again as it was.
+fn line_after_size_verdict(
+    verdict: &crate::agent_service::AgentCallError,
+    line: usize,
+    refused_bytes: usize,
+) -> usize {
+    let refused_under = refused_bytes.saturating_sub(1);
+    verdict
+        .max_prompt_bytes()
+        .unwrap_or(refused_under)
+        .min(line)
+        .min(refused_under)
+}
 
 /// The cloud's final verdict that an answer does not fit one response, when
 /// `error` is one: the code, on an answer the cloud itself called final
@@ -352,6 +424,37 @@ struct PartedFile<'a> {
     graphql_consumer_hints: &'a [String],
     wrapper_context: &'a [String],
     wrapper_imports: &'a BTreeMap<String, Vec<usize>>,
+}
+
+impl PartedFile<'_> {
+    /// Whether the file's prompt carries a GraphQL section, where a type can
+    /// be the thing a row locates.
+    fn has_graphql_section(&self) -> bool {
+        !self.graphql_producer_hints.is_empty() || !self.graphql_consumer_hints.is_empty()
+    }
+}
+
+/// How a file is asked, decided before its first request (carrick#2309).
+enum Asking {
+    /// In one request: its whole prompt is at or under the line.
+    Whole(AnalysisPrompt),
+    /// In parts, each prompt at or under the line.
+    Parts(PartPlan),
+    /// Not at all: the file has nothing in it.
+    Nothing,
+}
+
+/// The parts a file is asked in, each with its prompt, and what cutting a
+/// part again reads.
+struct PartPlan {
+    cut: SourceCut,
+    limits: Limits,
+    /// The most bytes one request may carry.
+    line: usize,
+    /// The attached modules each listed candidate names
+    /// ([`modules_named_by_candidates`]).
+    named: Option<Vec<BTreeSet<usize>>>,
+    parts: Vec<(SourcePart, AnalysisPrompt)>,
 }
 
 /// Every place a file's source names one of `imports`, as (where the name
@@ -1597,24 +1700,148 @@ impl FileOrchestrator {
         self
     }
 
+    /// How `file` is asked, decided before its first request (carrick#2309).
+    ///
+    /// A file whose whole prompt is at or under [`WHOLE_PROMPT_MAX_BYTES`] is
+    /// asked in one request, in the bytes it was always asked in. A file over
+    /// it is never sent whole: it is cut into parts ([`Self::plan_parts`])
+    /// under that line, and a file that cannot be cut under it is
+    /// [`FileTooLarge`].
+    fn asking(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+    ) -> Result<Asking, FileTooLarge> {
+        let Some(whole) = self.file_analyzer.prompt_for(
+            file.prompt_path,
+            file.content,
+            guidance,
+            file.candidate_hints,
+            file.candidate_contexts,
+            file.imported_symbols,
+            file.graphql_producer_hints,
+            file.graphql_consumer_hints,
+            file.wrapper_context,
+        ) else {
+            return Ok(Asking::Nothing);
+        };
+        if whole.text.len() <= WHOLE_PROMPT_MAX_BYTES {
+            return Ok(Asking::Whole(whole));
+        }
+        debug!(
+            "{}: its whole prompt is {} bytes, over the line of {}; asking it in parts",
+            file.prompt_path,
+            whole.text.len(),
+            WHOLE_PROMPT_MAX_BYTES
+        );
+        self.plan_parts(file, guidance, WHOLE_PROMPT_MAX_BYTES)
+            .map(Asking::Parts)
+    }
+
+    /// The parts `file` is asked in so that no request carries more than
+    /// `line` bytes (carrick#2309, carrick#2310).
+    ///
+    /// The file is cut into windows of its lines
+    /// ([`crate::agents::source_parts`]), each of at most
+    /// [`PART_WINDOW_BYTES`] and [`MAX_PART_CANDIDATES`] candidates, and each
+    /// part's prompt is fitted under the line ([`Self::fit`]). A file that
+    /// does not parse for the cut cannot be asked under the line.
+    fn plan_parts(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        line: usize,
+    ) -> Result<PartPlan, FileTooLarge> {
+        let too_large = FileTooLarge {
+            max_prompt_bytes: line,
+        };
+        let cut = SourceCut::of(Path::new(file.prompt_path), file.content, file.listed)
+            .ok_or_else(|| too_large.clone())?;
+        let limits = Limits {
+            window_bytes: PART_WINDOW_BYTES,
+            context_bytes: PART_CONTEXT_BYTES,
+            candidates: MAX_PART_CANDIDATES,
+        };
+        let wave = cut.parts(&limits);
+        let mut plan = PartPlan {
+            named: modules_named_by_candidates(file),
+            cut,
+            limits,
+            line,
+            parts: Vec::new(),
+        };
+        for part in wave {
+            plan.parts.extend(self.fit(file, guidance, &plan, part)?);
+        }
+        Ok(plan)
+    }
+
+    /// `part` as the requests it is asked in under `plan.line`, in source
+    /// order (carrick#2309).
+    ///
+    /// - A window that holds no candidate and whose items are all
+    ///   declarations that run nothing (imports, re-exports, type aliases,
+    ///   interfaces, ambient declarations) states nothing the model is asked
+    ///   about, and is not sent. The exception is a file whose prompt carries
+    ///   a GraphQL section, where a type can be the thing located.
+    /// - A part whose prompt is at or under the line is one request.
+    /// - A part over it is halved by its bytes
+    ///   ([`SourceCut::halves_by_size`]) and each half fitted in turn.
+    /// - A part over it that cannot be halved, one item with no list to cut,
+    ///   is not sent when it holds no candidate: it states nothing the model
+    ///   is asked about, which is the rule that already skips a file with no
+    ///   candidate. When it holds one, the file is [`FileTooLarge`].
+    fn fit(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        plan: &PartPlan,
+        part: SourcePart,
+    ) -> Result<Vec<(SourcePart, AnalysisPrompt)>, FileTooLarge> {
+        let mut fitted = Vec::new();
+        let mut pending = vec![part];
+        // Last first, so the halves come off in source order.
+        while let Some(part) = pending.pop() {
+            if part.candidates.is_empty()
+                && !file.has_graphql_section()
+                && plan.cut.states_nothing(&part)
+            {
+                continue;
+            }
+            let Some(prompt) =
+                self.part_prompt(file, guidance, &plan.cut, &part, plan.named.as_deref())
+            else {
+                continue;
+            };
+            if prompt.text.len() <= plan.line {
+                fitted.push((part, prompt));
+                continue;
+            }
+            match plan.cut.halves_by_size(&part, &plan.limits) {
+                Some((front, back)) => pending.extend([back, front]),
+                None if part.candidates.is_empty() => debug!(
+                    "{}: lines {} are one item over the line of {} bytes and hold no candidate; not asked",
+                    file.prompt_path,
+                    part.label(),
+                    plan.line
+                ),
+                None => {
+                    return Err(FileTooLarge {
+                        max_prompt_bytes: plan.line,
+                    });
+                }
+            }
+        }
+        Ok(fitted)
+    }
+
     /// Ask about a file in parts, after the cloud's verdict that its whole
     /// answer does not fit one response (carrick#1898).
     ///
-    /// The file is cut into windows of its lines
-    /// ([`crate::agents::source_parts`], carrick#2308), each of at most
-    /// [`PART_WINDOW_BYTES`] and at most the candidates the verdict states,
-    /// or [`MAX_PART_CANDIDATES`] when it states none. A file with no
-    /// candidate is cut by size alone. Each part is asked on its own, showing
-    /// its window and the declarations the window uses and not the file, and
-    /// the answers are merged into the one answer the file stores
-    /// ([`merge_part_answers`]).
-    ///
-    /// A part whose own answer is cut is halved between its items
-    /// ([`SourceCut::halves`]) and its halves asked, down to a single group
-    /// of candidates; a part that cannot be halved loses the file with that
-    /// verdict. A part that fails any other way loses the file with that
-    /// failure. Either way nothing of the file's answer is kept, and when
-    /// several parts fail it is the first in source order that is reported.
+    /// The file is cut as [`Self::plan_parts`] cuts it, at most the
+    /// candidates the verdict states a part, or [`MAX_PART_CANDIDATES`] when
+    /// it states none, and asked as [`Self::ask_parts`] asks it. A file with
+    /// no candidate is cut by size alone.
     ///
     /// A file that is one window is the request that was cut. It is not sent
     /// again: it is halved first. A file that does not parse here cannot be
@@ -1643,53 +1870,141 @@ impl FileOrchestrator {
             };
             wave = vec![front, back];
         }
-        let named = modules_named_by_candidates(file);
+        let mut plan = PartPlan {
+            named: modules_named_by_candidates(file),
+            cut,
+            limits,
+            line: WHOLE_PROMPT_MAX_BYTES,
+            parts: Vec::new(),
+        };
+        for part in wave {
+            plan.parts.extend(self.fit(file, guidance, &plan, part)?);
+        }
         debug!(
             "{}: the answer does not fit one response; asking about its {} candidate(s) in {} part(s)",
             file.prompt_path,
             file.listed.len(),
-            wave.len()
+            plan.parts.len()
         );
+        self.ask_parts(file, guidance, plan).await
+    }
 
+    /// Ask about a file in parts after the cloud's final verdict that its
+    /// whole request is too large to ask (carrick#2310): cut as a file over
+    /// the line is cut, under the limit the verdict states, and never under
+    /// the refused request's own size or more.
+    async fn ask_smaller(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        verdict: &crate::agent_service::AgentCallError,
+        refused_bytes: usize,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        let line = line_after_size_verdict(verdict, WHOLE_PROMPT_MAX_BYTES, refused_bytes);
+        debug!(
+            "{}: its whole request of {} bytes is too large to ask; asking it in parts of at most {} bytes",
+            file.prompt_path, refused_bytes, line
+        );
+        let plan = self.plan_parts(file, guidance, line)?;
+        self.ask_parts(file, guidance, plan).await
+    }
+
+    /// Ask every part of `plan` and merge the answers into the one answer the
+    /// file stores ([`merge_part_answers`], carrick#1898, carrick#2308).
+    ///
+    /// Each part shows its window and the declarations the window uses, and
+    /// not the file. A part whose own answer is cut is halved between its
+    /// items ([`SourceCut::halves`]) and its halves asked, down to a single
+    /// group of candidates; a part that cannot be halved loses the file with
+    /// that verdict. A part the cloud refuses as too large to ask is halved
+    /// by its bytes under the limit the refusal states (carrick#2310), and a
+    /// part that cannot be cut again loses the file as [`FileTooLarge`]. A
+    /// part that fails any other way loses the file with that failure. Either
+    /// way nothing of the file's answer is kept, and when several parts fail
+    /// it is the first in source order that is reported.
+    async fn ask_parts(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        mut plan: PartPlan,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         let mut answers: Vec<PartAnswer> = Vec::new();
+        let mut wave = std::mem::take(&mut plan.parts);
         while !wave.is_empty() {
-            let outcomes = futures::future::join_all(
-                wave.iter()
-                    .map(|part| self.ask_part(file, guidance, &cut, part, named.as_deref())),
-            )
-            .await;
+            let labels: Vec<String> = wave.iter().map(|(part, _)| part.label()).collect();
+            let outcomes =
+                futures::future::join_all(wave.iter().zip(&labels).map(|((_, prompt), label)| {
+                    self.file_analyzer.analyze_part_prompt(
+                        file.prompt_path,
+                        label,
+                        prompt,
+                        guidance,
+                    )
+                }))
+                .await;
             // `join_all` answers in the order it was given the parts, which is
             // source order, so the failure kept is the first in the source
             // whichever request came back first.
-            let mut halves: Vec<SourcePart> = Vec::new();
+            let mut again: Vec<SourcePart> = Vec::new();
             let mut lost: Option<Box<dyn std::error::Error>> = None;
-            for (part, outcome) in wave.iter().zip(outcomes) {
-                match outcome {
-                    Ok(answer) => answers.push(PartAnswer {
-                        window: part.window(),
-                        answer,
-                    }),
-                    Err(error) if lost.is_some() => drop(error),
-                    Err(error) => match (
-                        cut_verdict(error.as_ref()).is_some(),
-                        cut.halves(part, &limits),
-                    ) {
-                        (true, Some((front, back))) => {
+            for ((part, prompt), outcome) in wave.into_iter().zip(outcomes) {
+                let error = match outcome {
+                    Ok(answer) => {
+                        answers.push(PartAnswer {
+                            window: part.window(),
+                            answer,
+                        });
+                        continue;
+                    }
+                    Err(_) if lost.is_some() => continue,
+                    Err(error) => error,
+                };
+                if cut_verdict(error.as_ref()).is_some() {
+                    match plan.cut.halves(&part, &plan.limits) {
+                        Some((front, back)) => {
                             debug!(
                                 "{}: the answer for part {} does not fit either; asking its halves",
                                 file.prompt_path,
                                 part.label()
                             );
-                            halves.extend([front, back]);
+                            again.extend([front, back]);
                         }
-                        _ => lost = Some(error),
-                    },
+                        None => lost = Some(error),
+                    }
+                } else if let Some(verdict) = size_verdict(error.as_ref()) {
+                    plan.line = line_after_size_verdict(verdict, plan.line, prompt.text.len());
+                    match plan.cut.halves_by_size(&part, &plan.limits) {
+                        Some((front, back)) => {
+                            debug!(
+                                "{}: part {} is too large to ask; asking its halves under {} bytes",
+                                file.prompt_path,
+                                part.label(),
+                                plan.line
+                            );
+                            again.extend([front, back]);
+                        }
+                        // One item with no list, holding no candidate: it
+                        // states nothing the model is asked about.
+                        None if part.candidates.is_empty() => {}
+                        None => {
+                            lost = Some(Box::new(FileTooLarge {
+                                max_prompt_bytes: plan.line,
+                            }))
+                        }
+                    }
+                } else {
+                    lost = Some(error);
                 }
             }
             if let Some(error) = lost {
                 return Err(error);
             }
-            wave = halves;
+            // Fitted once every refusal of this wave is read, so each half is
+            // held to the smallest limit the cloud has stated.
+            wave = Vec::new();
+            for part in again {
+                wave.extend(self.fit(file, guidance, &plan, part)?);
+            }
         }
         debug!(
             "{}: answered in {} part(s)",
@@ -1699,9 +2014,9 @@ impl FileOrchestrator {
         Ok(merge_part_answers(file.listed, answers))
     }
 
-    /// Ask about one part of a file (carrick#1898, carrick#2308): the file's
-    /// own prompt, showing the part's window and what the window uses in
-    /// place of the file, listing only the part's candidates and only the
+    /// The prompt of one part of a file (carrick#1898, carrick#2308): the
+    /// file's own prompt, showing the part's window and what the window uses
+    /// in place of the file, listing only the part's candidates and only the
     /// imports its shown lines name, and carrying only the modules its
     /// candidates name through an import.
     ///
@@ -1709,14 +2024,14 @@ impl FileOrchestrator {
     /// through an import, and every part of a file with no candidate at all
     /// carries every module the file imports: such a file is asked about
     /// because it imports one.
-    async fn ask_part(
+    fn part_prompt(
         &self,
         file: &PartedFile<'_>,
         guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
         cut: &SourceCut,
         part: &SourcePart,
         named: Option<&[BTreeSet<usize>]>,
-    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+    ) -> Option<AnalysisPrompt> {
         let positions = &part.candidates;
         let hints: Vec<String> = positions
             .iter()
@@ -1768,7 +2083,7 @@ impl FileOrchestrator {
             .filter(|(local, _)| shown_names.contains(local.as_str()))
             .map(|(local, symbol)| (local.clone(), symbol.clone()))
             .collect();
-        let prompt = self.file_analyzer.prompt_for_part(
+        self.file_analyzer.prompt_for_part(
             file.prompt_path,
             file.content,
             &shown,
@@ -1779,13 +2094,7 @@ impl FileOrchestrator {
             file.graphql_producer_hints,
             file.graphql_consumer_hints,
             &modules,
-        );
-        let Some(prompt) = prompt else {
-            return Ok(FileAnalysisResult::default());
-        };
-        self.file_analyzer
-            .analyze_part_prompt(file.prompt_path, &part.label(), &prompt, guidance)
-            .await
+        )
     }
 
     /// Run AST-gated file-centric analysis on all provided files.
@@ -2032,6 +2341,24 @@ impl FileOrchestrator {
             /// Calls in this file that hand an inline function the instance
             /// it registers routes on (carrick#2092).
             registration_sites: Vec<crate::registration_scope::RegistrationSite>,
+        }
+
+        impl PendingFile {
+            /// What asking the file, whole or in parts, reads of it.
+            fn parted(&self) -> PartedFile<'_> {
+                PartedFile {
+                    prompt_path: &self.prompt_path,
+                    content: &self.content,
+                    listed: &self.listed,
+                    candidate_hints: &self.candidate_hints,
+                    candidate_contexts: &self.candidate_contexts,
+                    imported_symbols: &self.symbol_table.imported_symbols,
+                    graphql_producer_hints: &self.graphql_producer_hints,
+                    graphql_consumer_hints: &self.graphql_consumer_hints,
+                    wrapper_context: &self.wrapper_context,
+                    wrapper_imports: &self.wrapper_imports,
+                }
+            }
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -3276,18 +3603,19 @@ impl FileOrchestrator {
                     crate::analysis_channel::degrade(service.as_deref().unwrap_or("this service"));
                     break;
                 };
-                if let Some(prompt) = self.file_analyzer.prompt_for(
-                    &pf.prompt_path,
-                    &pf.content,
-                    guidance,
-                    &pf.candidate_hints,
-                    &pf.candidate_contexts,
-                    &pf.symbol_table.imported_symbols,
-                    &pf.graphql_producer_hints,
-                    &pf.graphql_consumer_hints,
-                    &pf.wrapper_context,
-                ) {
-                    crate::analysis_channel::record(service.as_deref(), key, &prompt, &schema);
+                // One prompt a request the file would make: its whole prompt,
+                // or one a part when it is over the line (carrick#2309). A
+                // file that cannot be asked under the line records none, and
+                // the resume that follows decides the same.
+                let prompts: Vec<AnalysisPrompt> = match self.asking(&pf.parted(), guidance) {
+                    Ok(Asking::Whole(prompt)) => vec![prompt],
+                    Ok(Asking::Parts(plan)) => {
+                        plan.parts.into_iter().map(|(_, prompt)| prompt).collect()
+                    }
+                    Ok(Asking::Nothing) | Err(_) => Vec::new(),
+                };
+                for prompt in &prompts {
+                    crate::analysis_channel::record(service.as_deref(), key, prompt, &schema);
                     collecting = true;
                 }
             }
@@ -3295,23 +3623,32 @@ impl FileOrchestrator {
         } else if let Some(answers) = crate::analysis_channel::answers() {
             let mut unanswered: Vec<PendingFile> = Vec::with_capacity(to_dispatch.len());
             for pf in to_dispatch.drain(..) {
-                let replay = self
-                    .file_analyzer
-                    .prompt_for(
-                        &pf.prompt_path,
-                        &pf.content,
-                        guidance,
-                        &pf.candidate_hints,
-                        &pf.candidate_contexts,
-                        &pf.symbol_table.imported_symbols,
-                        &pf.graphql_producer_hints,
-                        &pf.graphql_consumer_hints,
-                        &pf.wrapper_context,
-                    )
-                    .and_then(|prompt| {
-                        answers.text_for(&crate::analysis_job::body_id(prompt.body()))
-                    })
-                    .map(|text| FileAnalyzerAgent::result_from_answer(&pf.prompt_path, text));
+                let answer_to = |prompt: &AnalysisPrompt| {
+                    answers
+                        .text_for(&crate::analysis_job::body_id(prompt.body()))
+                        .map(|text| FileAnalyzerAgent::result_from_answer(&pf.prompt_path, text))
+                };
+                // A file asked in parts is answered from the bundle only when
+                // every part is (carrick#2309); otherwise its parts are asked.
+                let replay = match self.asking(&pf.parted(), guidance) {
+                    Ok(Asking::Whole(prompt)) => answer_to(&prompt),
+                    Ok(Asking::Parts(plan)) => plan
+                        .parts
+                        .iter()
+                        .map(|(part, prompt)| {
+                            answer_to(prompt).map(|answer| {
+                                answer.map(|answer| PartAnswer {
+                                    window: part.window(),
+                                    answer,
+                                })
+                            })
+                        })
+                        .collect::<Option<Result<Vec<PartAnswer>, String>>>()
+                        .map(|answers| {
+                            answers.map(|answers| merge_part_answers(&pf.listed, answers))
+                        }),
+                    Ok(Asking::Nothing) | Err(_) => None,
+                };
                 match replay {
                     Some(Ok(result)) => collected.push((pf, result)),
                     Some(Err(error)) => {
@@ -3396,45 +3733,41 @@ impl FileOrchestrator {
         crate::scan_health::record_files_attempted(to_dispatch.len());
         let dispatched: Vec<(PendingFile, Result<FileAnalysisResult, ModelAnswer>)> =
             futures::stream::iter(to_dispatch.into_iter().map(|pf| async move {
-                let whole = self
-                    .file_analyzer
-                    .analyze_file_with_candidates(
-                        &pf.prompt_path,
-                        &pf.content,
-                        guidance,
-                        &pf.candidate_hints,
-                        &pf.candidate_contexts,
-                        &pf.symbol_table.imported_symbols,
-                        &pf.graphql_producer_hints,
-                        &pf.graphql_consumer_hints,
-                        &pf.wrapper_context,
-                    )
-                    .await;
-                // A file is asked whole, and only the cloud's final verdict
-                // that its answer does not fit one response asks it again, in
-                // parts (carrick#1898). Every other outcome is what it was:
-                // an answer is the file's answer, and any other failure is
-                // the file's failure.
-                let asked = match whole {
-                    Err(error) => match cut_verdict(error.as_ref()).cloned() {
-                        Some(verdict) => {
-                            let file = PartedFile {
-                                prompt_path: &pf.prompt_path,
-                                content: &pf.content,
-                                listed: &pf.listed,
-                                candidate_hints: &pf.candidate_hints,
-                                candidate_contexts: &pf.candidate_contexts,
-                                imported_symbols: &pf.symbol_table.imported_symbols,
-                                graphql_producer_hints: &pf.graphql_producer_hints,
-                                graphql_consumer_hints: &pf.graphql_consumer_hints,
-                                wrapper_context: &pf.wrapper_context,
-                                wrapper_imports: &pf.wrapper_imports,
-                            };
-                            self.ask_in_parts(&file, guidance, verdict).await
+                let file = pf.parted();
+                // A file at or under the line is asked whole, and only the
+                // cloud's final verdict that its answer does not fit one
+                // response (carrick#1898) or that the request is too large to
+                // ask (carrick#2310) asks it again, in parts. A file over the
+                // line is asked in parts from its first request, and one that
+                // cannot be cut under it is not asked (carrick#2309). Every
+                // other outcome is what it was: an answer is the file's
+                // answer, and any other failure is the file's failure.
+                let asked: Result<FileAnalysisResult, Box<dyn std::error::Error>> = match self
+                    .asking(&file, guidance)
+                {
+                    Ok(Asking::Nothing) => Ok(FileAnalysisResult::default()),
+                    Ok(Asking::Parts(plan)) => self.ask_parts(&file, guidance, plan).await,
+                    Err(too_large) => Err(Box::new(too_large)),
+                    Ok(Asking::Whole(prompt)) => {
+                        match self
+                            .file_analyzer
+                            .analyze_prompt(&pf.prompt_path, &prompt, guidance)
+                            .await
+                        {
+                            Err(error) => {
+                                if let Some(verdict) = cut_verdict(error.as_ref()).cloned() {
+                                    self.ask_in_parts(&file, guidance, verdict).await
+                                } else if let Some(verdict) = size_verdict(error.as_ref()).cloned()
+                                {
+                                    self.ask_smaller(&file, guidance, &verdict, prompt.text.len())
+                                        .await
+                                } else {
+                                    Err(error)
+                                }
+                            }
+                            answered => answered,
                         }
-                        None => Err(error),
-                    },
-                    answered => answered,
+                    }
                 };
                 let result = asked.map_err(|e| {
                     // Recorded here, where the error is still typed: this
@@ -3442,7 +3775,18 @@ impl FileOrchestrator {
                     // not call itself a success. A call a limit refused
                     // is excluded, because the model was never asked
                     // (carrick#555, `counts_as_lost_file`).
-                    if crate::scan_health::counts_as_lost_file(e.as_ref()) {
+                    if e.downcast_ref::<FileTooLarge>().is_some() {
+                        // Decided by the scanner from the file's bytes, so
+                        // the same on every scan of them: final, and never
+                        // described as something a re-run mends.
+                        crate::scan_health::record_unanalysed_file(
+                            &pf.path_str,
+                            &crate::scan_health::LossReason {
+                                code: FILE_TOO_LARGE_CODE.to_string(),
+                                is_final: true,
+                            },
+                        );
+                    } else if crate::scan_health::counts_as_lost_file(e.as_ref()) {
                         crate::scan_health::record_unanalysed_file(
                             &pf.path_str,
                             &crate::scan_health::analysis_failure_reason(e.as_ref()),
