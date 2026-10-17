@@ -1803,7 +1803,7 @@ mod tests {
         assert!(call.labelled_end.is_some(), "{call:?}");
         // No row: the lead's record states no name, and the forced and
         // asked sites of the file are not possible calls.
-        assert!(fire.state.forced.get(&Slot::Name).is_none());
+        assert!(!fire.state.forced.contains_key(&Slot::Name));
         for bucket_site in ["choices.ts:10", "choices.ts:14"] {
             let line = record(&records, bucket_site).anchors.call.line;
             assert!(in_choices.iter().all(|c| c.line_number != line));
