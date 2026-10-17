@@ -376,6 +376,12 @@ export class Retyper {
           remaining.set(k, left - 1);
           continue;
         }
+        // The rewrite only removes or replaces source text, so an unused
+        // declaration that is new after it is the rewrite's own doing: the
+        // statement it replaced was the declaration's only use
+        // (carrick#2426). Unused diagnostics the file already raised are
+        // matched out above and never reach here.
+        if (UNUSED_DECLARATION_CODES.has(d.code)) continue;
         added.push(mapped);
       }
       added.sort((a, b) => a.start - b.start || a.code - b.code);
@@ -946,6 +952,13 @@ function bodyReadEdit(read: CallExpression): (stated: string) => Edit[] {
 function declaresTypeParameters(call: CallExpression): boolean {
   return (resolvedDeclaration(call)?.typeParameters?.length ?? 0) > 0;
 }
+
+/**
+ * "Declared but never used" and its grouped forms: unused locals and imports
+ * (6133, 6192, 6196, 6198, 6199), unused properties (6138) and unused type
+ * parameters (6205).
+ */
+const UNUSED_DECLARATION_CODES = new Set([6133, 6138, 6192, 6196, 6198, 6199, 6205]);
 
 function key(d: Diag): string {
   return `${d.start}:${d.code}`;

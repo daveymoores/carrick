@@ -505,3 +505,120 @@ describe('carrick#1491: the retype under noUnusedLocals', () => {
     });
   }
 });
+
+// carrick#2426: the rewrite replaces the consumer's own statement of a type,
+// so a declaration only that statement used (an import, a local alias) is
+// unused in the rewritten file. Under `noUnusedLocals` the compiler reports
+// it, and the diff read it as a break the producer caused.
+describe('carrick#2426: a declaration the rewrite leaves unused is not a mismatch', () => {
+  let client: SidecarClient;
+  let repoDir: string;
+  let consumerPath: string;
+
+  const CONSUMER_2426 = `import { create } from 'http-client';
+import type { Payload } from './payload';
+
+type Local = { x: number };
+
+const api = create({});
+
+export async function viaImport(): Promise<number> {
+  const response = await api.post<Payload>('/p');
+  return response.data.x;
+}
+
+export async function viaAlias(): Promise<number> {
+  const response = await api.post<Local>('/p');
+  return response.data.x;
+}
+
+export function stillUnused(): void {
+  const forgotten = 1;
+}
+`;
+
+  before(async () => {
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-2426-'));
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: {
+          strict: true,
+          noUnusedLocals: true,
+          module: 'esnext',
+          moduleResolution: 'bundler',
+          target: 'es2022',
+          lib: ['es2022', 'dom'],
+          skipLibCheck: true,
+        },
+        include: ['src'],
+      })
+    );
+    fs.writeFileSync(path.join(repoDir, 'src', 'http-client.d.ts'), CLIENT_DECL);
+    fs.writeFileSync(path.join(repoDir, 'src', 'payload.ts'), 'export interface Payload { x: number }\n');
+    consumerPath = path.join(repoDir, 'src', 'client.ts');
+    fs.writeFileSync(consumerPath, CONSUMER_2426);
+    client = new SidecarClient();
+    await client.start();
+    await client.send({ action: 'init', request_id: 'init', repo_root: repoDir });
+  });
+
+  after(async () => {
+    await client.stop();
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  const lineOf = (marker: string): number =>
+    CONSUMER_2426.split('\n').findIndex((l) => l.includes(marker)) + 1;
+
+  for (const [name, marker, text] of [
+    ['an import used only by the stated type argument', 'api.post<Payload>', "api.post<Payload>('/p')"],
+    ['a local alias used only by the stated type argument', 'api.post<Local>', "api.post<Local>('/p')"],
+  ] as const) {
+    it(`agrees when the types match: ${name}`, async () => {
+      const res = await client.send<{ outcomes?: Outcome[] }>({
+        action: 'retype_check',
+        request_id: `agree-${name}`,
+        items: [
+          {
+            item_id: 'i',
+            file_path: consumerPath,
+            line_number: lineOf(marker),
+            expression_text: text,
+            expression_line: lineOf(marker),
+            producer_type: '{ x: number; }',
+            wire: false,
+          },
+        ],
+      });
+      const outcome = res.outcomes![0];
+      assert.strictEqual(outcome.outcome, 'agrees', JSON.stringify(outcome));
+    });
+
+    it(`still flags a real mismatch, without the unused declaration: ${name}`, async () => {
+      const res = await client.send<{ outcomes?: Outcome[] }>({
+        action: 'retype_check',
+        request_id: `mismatch-${name}`,
+        items: [
+          {
+            item_id: 'i',
+            file_path: consumerPath,
+            line_number: lineOf(marker),
+            expression_text: text,
+            expression_line: lineOf(marker),
+            producer_type: '{ y: number; }',
+            wire: false,
+          },
+        ],
+      });
+      const outcome = res.outcomes![0];
+      assert.strictEqual(outcome.outcome, 'mismatch', JSON.stringify(outcome));
+      assert.ok(
+        outcome.diagnostics.every((d) => ![6133, 6192, 6196, 6198, 6199, 6205].includes(d.code)),
+        JSON.stringify(outcome.diagnostics)
+      );
+      assert.ok(outcome.diagnostics.some((d) => d.code === 2339), JSON.stringify(outcome.diagnostics));
+    });
+  }
+});
