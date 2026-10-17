@@ -3431,7 +3431,8 @@ impl FileOrchestrator {
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: ctx,
-                // No candidate, so the file is never asked in parts and
+                // No candidate, so a part of the file, when it is over the
+                // line and asked in parts, names no module through one, and
                 // nothing reads which name reaches which module.
                 wrapper_imports: BTreeMap::new(),
                 wrapper_request_shape: rescued_shape,

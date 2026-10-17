@@ -798,56 +798,6 @@ impl FileAnalyzerAgent {
         Self { agent_service }
     }
 
-    /// Analyze a single file with the given framework patterns.
-    ///
-    /// # Arguments
-    /// * `file_path` - Path to the file being analyzed (for context)
-    /// * `file_content` - Full content of the file
-    /// * `guidance` - Framework-specific patterns to use for matching
-    ///
-    /// # Returns
-    /// A `FileAnalysisResult` containing all detected mounts, endpoints, and data calls.
-    /// Analyze a single file with the given framework patterns (legacy method without candidates).
-    ///
-    /// This method is kept for backward compatibility. Prefer `analyze_file_with_candidates`
-    /// for the AST-gated architecture.
-    pub async fn analyze_file(
-        &self,
-        file_path: &str,
-        file_content: &str,
-        guidance: &FrameworkGuidance,
-    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
-        // Delegate to the new method with empty candidates
-        self.analyze_file_with_candidates(
-            file_path,
-            file_content,
-            guidance,
-            &[],
-            &[],
-            &HashMap::new(),
-            &[],
-            &[],
-            &[],
-        )
-        .await
-    }
-
-    /// Analyze a single file with AST-detected candidate targets.
-    ///
-    /// This is the primary method for the AST-Gated architecture:
-    /// 1. SWC Scanner has already found candidate lines
-    /// 2. We send Full File + Patterns + Candidate Hints to the LLM
-    /// 3. The LLM uses candidates as "Focused Targets" to ensure 100% recall
-    ///
-    /// # Arguments
-    /// * `file_path` - Path to the file being analyzed (for context)
-    /// * `file_content` - Full content of the file
-    /// * `guidance` - Framework-specific patterns to use for matching
-    /// * `candidate_hints` - AST-detected candidate lines (formatted hints from SWC Scanner)
-    /// * `candidate_contexts` - Structured candidate details (JSON strings)
-    ///
-    /// # Returns
-    /// A `FileAnalysisResult` containing all detected mounts, endpoints, and data calls.
     /// Eval-harness diagnostics (off in normal runs). When `CARRICK_EVAL_DUMP_DIR`
     /// is set, write the file-analyzer's input (`request_user_message` — which
     /// embeds the framework guidance + candidates the model received) and its
@@ -891,36 +841,6 @@ impl FileAnalyzerAgent {
         if let Ok(s) = serde_json::to_string_pretty(&payload) {
             let _ = std::fs::write(dir.join(name), s);
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn analyze_file_with_candidates(
-        &self,
-        file_path: &str,
-        file_content: &str,
-        guidance: &FrameworkGuidance,
-        candidate_hints: &[String],
-        candidate_contexts: &[String],
-        imported_symbols: &HashMap<String, ImportedSymbol>,
-        graphql_producer_hints: &[String],
-        graphql_consumer_hints: &[String],
-        wrapper_context: &[String],
-    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
-        // Skip empty files
-        let Some(prompt) = self.prompt_for(
-            file_path,
-            file_content,
-            guidance,
-            candidate_hints,
-            candidate_contexts,
-            imported_symbols,
-            graphql_producer_hints,
-            graphql_consumer_hints,
-            wrapper_context,
-        ) else {
-            return Ok(FileAnalysisResult::default());
-        };
-        self.analyze_prompt(file_path, &prompt, guidance).await
     }
 
     /// This file's prompt, built and not sent.
