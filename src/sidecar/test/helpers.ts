@@ -284,3 +284,20 @@ export class SidecarClient {
     }
   }
 }
+
+/** The kinds a version-1 rows file holds (carrick#2405); version 2 adds `impl` and `jsx` (carrick#2430). */
+const VERSION_1_KINDS = new Set(['call', 'member', 'compare', 'ident']);
+
+/**
+ * A decompressed rows file as version 1 wrote it: the header's `v` set to 1
+ * and every row of a later kind dropped, every other byte as written.
+ */
+export function asVersion1Rows(text: string): string {
+  const lines = text.trimEnd().split('\n');
+  const header = { ...(JSON.parse(lines[0]) as Record<string, unknown>), v: 1 };
+  const files = lines.slice(1).map((line) => {
+    const file = JSON.parse(line) as { r: unknown[][] };
+    return JSON.stringify({ ...file, r: file.r.filter((row) => VERSION_1_KINDS.has(row[0] as string)) });
+  });
+  return [JSON.stringify(header), ...files].join('\n') + '\n';
+}

@@ -307,13 +307,19 @@ fn the_committed_rows_parse_with_the_format_types() {
     assert_eq!(file.header.v, carrick::position_rows::FORMAT_VERSION);
     assert_eq!(file.header.service, "api");
     let rows: Vec<_> = file.files.iter().flat_map(|line| &line.r).collect();
-    assert!(rows.iter().all(|row| row.flags() & !15 == 0));
+    assert!(rows.iter().all(|row| row.flags() & !31 == 0));
     assert!(rows.iter().any(|row| row.flags() & FLAG_ERROR_TYPE != 0));
     assert!(
         rows.iter()
             .all(|row| row.flags() & FLAG_ANY == 0 || row.flags() & FLAG_ERROR_TYPE == 0)
     );
-    for kind in [Kind::Call, Kind::Member, Kind::Compare, Kind::Ident] {
+    for kind in [
+        Kind::Call,
+        Kind::Member,
+        Kind::Compare,
+        Kind::Ident,
+        Kind::Jsx,
+    ] {
         assert!(rows.iter().any(|row| row.kind() == kind), "no {kind:?} row");
     }
 }
@@ -925,4 +931,90 @@ fn census() {
             );
         }
     }
+}
+
+/// The calls a scan of `tests/fixtures/position-rows-names/` states, run as
+/// the Action runs it (`.` from the repo root) with the real sidecar, with
+/// or without the walk, and with or without its module that imports a
+/// package nothing declares (`src/other.ts`). Each call as its file, line,
+/// source, method and URL.
+fn names_scan_calls(rows_on: bool, unfollowable: bool) -> BTreeSet<String> {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let repo = fs::canonicalize(dir.path())
+        .expect("canonical temp dir")
+        .join("repo");
+    copy_tree(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/position-rows-names/repo"),
+        &repo,
+    );
+    if !unfollowable {
+        fs::remove_file(repo.join("services/names/src/other.ts")).expect("remove other.ts");
+    }
+    let cache = tempfile::tempdir().expect("cache dir");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    cmd.arg(".")
+        .current_dir(&repo)
+        .env("CARRICK_CACHE_DIR", cache.path())
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_OUTPUT_JSON", "1")
+        .env("CARRICK_SKIP_INTENTS", "1")
+        .env_remove("CARRICK_SIDECAR_DIR")
+        .env_remove("CARRICK_LOCAL_STORAGE_DIR");
+    if rows_on {
+        cmd.env("CARRICK_POSITION_ROWS", "1");
+    } else {
+        cmd.env_remove("CARRICK_POSITION_ROWS");
+    }
+    for var in [
+        "GITHUB_REPOSITORY",
+        "GITHUB_ACTIONS",
+        "CI",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    ] {
+        cmd.env_remove(var);
+    }
+    let output = cmd.output().expect("spawn carrick");
+    assert!(
+        output.status.success(),
+        "scan exited non-zero:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let projection: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the scan prints its projection");
+    projection["calls"]
+        .as_array()
+        .expect("the projection carries calls")
+        .iter()
+        .map(|call| {
+            format!(
+                "{}:{} {} {} {}",
+                call["file"].as_str().unwrap_or_default(),
+                call["line"],
+                call["resolution_source"].as_str().unwrap_or_default(),
+                call["method"].as_str().unwrap_or_default(),
+                call["target_url"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+/// carrick#2413 slice B, end to end (carrick#2402): a request whose URL is
+/// built from a constant another module declares (`api.ts`, called from
+/// `page.ts`). Without the walk, a module that imports a package nothing
+/// declares and only calls it turns every imported constant off, so the
+/// summary states the call with the constant unread. With the walk, that
+/// module changes nothing: the scan states what it states without it.
+#[test]
+fn an_unrelated_unfollowable_import_changes_no_call_with_rows() {
+    if !sidecar_available() {
+        return;
+    }
+    let unread = "services/names/src/page.ts:4 request_summary GET ${API_BASE}/users";
+    let followable = names_scan_calls(false, false);
+    assert!(!followable.contains(unread), "{followable:#?}");
+    let off = names_scan_calls(false, true);
+    assert!(off.contains(unread), "{off:#?}");
+    assert_eq!(names_scan_calls(true, true), followable);
+    assert_eq!(names_scan_calls(true, false), followable);
 }

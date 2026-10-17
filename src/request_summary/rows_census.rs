@@ -29,6 +29,7 @@
 
 use serde::Serialize;
 
+use super::row_links::RowLink;
 use super::*;
 use crate::config::Config;
 use crate::position_rows::{FLAG_ANY, FLAG_ERROR_TYPE, Kind, PositionIndex, Row};
@@ -110,6 +111,13 @@ struct RepoCensus {
     /// Import bindings (per file) whose uses name more than one declaration.
     imports_disagreeing: usize,
     import_bindings: usize,
+    /// What each import binding reaches through the rows (slice B), against
+    /// where today's walk ends: `declared/agree`, `declared/differ`, and each
+    /// other link kind marked `/today_declared` where today reads a
+    /// declaration the rows do not give (a loss risk).
+    links: Tally,
+    /// The services whose exported values the rows contest, with why.
+    open_services: Vec<String>,
     calls: Tally,
     /// For a call row in the target's file on another line: decl − target.
     call_line_deltas: Tally,
@@ -130,6 +138,32 @@ impl RepoCensus {
             list.push(text);
         }
     }
+}
+
+/// Where today's by-name walk ends for `local`, imported in `file`: the
+/// module-scope binding, of a file the service reads, that the call graph's
+/// resolution names, followed through the modules that re-export it as the
+/// summaries' tables follow it.
+fn today_declaration(
+    inputs: &RequestSummaryInputs,
+    file: &Path,
+    local: &str,
+) -> Option<(PathBuf, String)> {
+    let Some(ImportedBinding::Binding { file, name }) = inputs.bindings.get(file, local) else {
+        return None;
+    };
+    let mut at = (file.clone(), name.clone());
+    for _ in 0..=MAX_REEXPORT_HOPS {
+        let ir = inputs.files.get(&at.0)?;
+        if !ir.imported.contains_key(&at.1) {
+            return Some(at);
+        }
+        match inputs.bindings.get(&at.0, &at.1)? {
+            ImportedBinding::Binding { file, name } => at = (file.clone(), name.clone()),
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn census_repo(root: &Path, positions: &Path) -> RepoCensus {
@@ -184,7 +218,7 @@ fn census_repo(root: &Path, positions: &Path) -> RepoCensus {
                 PositionIndex::missing(&root)
             }
         };
-        let inputs = crate::engine::discover_service_inputs(&root, service, index);
+        let inputs = crate::engine::discover_service_inputs(&root, service, Some(index));
         let positions = inputs.positions.as_ref().expect("bound");
         for (state, count) in positions.file_states() {
             *census.files.entry(state.to_string()).or_default() += count;
@@ -195,8 +229,71 @@ fn census_repo(root: &Path, positions: &Path) -> RepoCensus {
                 .to_string_lossy()
                 .replace('\\', "/")
         };
+        // 1b. What each import binding reaches through the rows (slice B),
+        // against where today's by-name walk ends.
+        let links = inputs.links.as_ref().expect("linked with rows");
+        if links.open() {
+            census
+                .open_services
+                .push(format!("{label}: {}", links.describe()));
+        }
         let mut files: Vec<&PathBuf> = inputs.files.keys().collect();
         files.sort();
+        for file in &files {
+            let mut locals: Vec<&String> = inputs.files[*file].imported.keys().collect();
+            locals.sort();
+            for local in locals {
+                let today = today_declaration(&inputs, file, local);
+                let link = links.get(file, local).expect("every import is linked");
+                let kind = match link {
+                    RowLink::Declared(at, name) => match &today {
+                        Some(today) if today == &(at.clone(), name.clone()) => "declared/agree",
+                        Some(_) => {
+                            census.example(
+                                "links/declared/differ",
+                                format!(
+                                    "{} {local}: today {today:?}, row {}:{name}",
+                                    relative(file),
+                                    relative(at)
+                                ),
+                            );
+                            "declared/differ"
+                        }
+                        None => "declared/today_none",
+                    },
+                    other => {
+                        let kind = match other {
+                            RowLink::Unrecorded => "unrecorded",
+                            RowLink::Module(_) => "module",
+                            RowLink::Outside => "outside",
+                            RowLink::Hole(reason) => {
+                                census.links.add(format!(
+                                    "{}{}",
+                                    hole(*reason),
+                                    if today.is_some() {
+                                        "/today_declared"
+                                    } else {
+                                        ""
+                                    }
+                                ));
+                                continue;
+                            }
+                            RowLink::Declared(..) => unreachable!(),
+                        };
+                        if today.is_some() {
+                            census.example(
+                                &format!("links/{kind}/today_declared"),
+                                format!("{} {local}: today {today:?}", relative(file)),
+                            );
+                            census.links.add(format!("{kind}/today_declared"));
+                            continue;
+                        }
+                        kind
+                    }
+                };
+                census.links.add(kind);
+            }
+        }
         for file in files {
             let ir = &inputs.files[file];
             let rel = relative(file);
@@ -232,7 +329,14 @@ fn census_repo(root: &Path, positions: &Path) -> RepoCensus {
                         Ok(row) => {
                             declarations
                                 .insert((row.decl_file().map(str::to_string), row.decl_line()));
-                            match (&today, place(row)) {
+                            // Read only through the other-file rule (slice B):
+                            // before it, this use was `hole:unresolved_import`.
+                            let error_type = if row.flags() & FLAG_ERROR_TYPE != 0 {
+                                "/error_type"
+                            } else {
+                                ""
+                            };
+                            let key = match (&today, place(row)) {
                                 (Some(declaring), "repo")
                                     if row.decl_file() == Some(declaring.as_str()) =>
                                 {
@@ -250,7 +354,8 @@ fn census_repo(root: &Path, positions: &Path) -> RepoCensus {
                                     "other_file".to_string()
                                 }
                                 (_, place) => place.to_string(),
-                            }
+                            };
+                            format!("{key}{error_type}")
                         }
                     };
                     census.imports.add(format!("{today_kind}/{key}"));
@@ -616,6 +721,17 @@ fn census() {
             census.import_bindings,
             census.imports_disagreeing
         );
+        crate::outln!("  links (slice B): {} binding(s)", census.links.total());
+        for (key, count) in &census.links.0 {
+            crate::outln!("    {key}: {count}");
+        }
+        crate::outln!(
+            "  services whose exported values are contested: {}",
+            census.open_services.len()
+        );
+        for service in &census.open_services {
+            crate::outln!("    {service}");
+        }
         crate::outln!("  call line deltas {:?}", census.call_line_deltas.0);
         crate::outln!(
             "  error-type ident rows, top 3 services {:?}",

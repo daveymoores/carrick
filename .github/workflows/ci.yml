@@ -26,7 +26,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The Rust tests run as 16 shards on 16 runners. Each shard compiles only the
+  # The Rust tests run as 17 shards on 17 runners. Each shard compiles only the
   # library and the test binaries it runs (about 40 s), so the slowest shard,
   # not the sum, is what a PR waits on. Before the split four shards of
   # 260-400 s each compiled every target they ran in one `cargo test` call.
@@ -35,7 +35,7 @@ jobs:
   # test-seconds each (about 70 s at four tests at once); scan shards hold
   # about 66 s each. Two things cut a binary across shards, both with nextest
   # `--partition slice:k/m` (even; `count:` is deprecated upstream): the
-  # library's unit tests (lib-1, lib-2) and `local_mode_test` (n2, n3). A
+  # library's unit tests (lib-1, lib-2) and `local_mode_test` (n2, n3) and `call_through_rows_test` (n6, n4, n5). A
   # `partitioned:` target runs in its own nextest call, because `--partition`
   # slices every test of a call, not one binary of it. `local_mode_test` runs
   # first in its shard; two of its tests claim every slot (.config/nextest.toml).
@@ -89,16 +89,22 @@ jobs:
               --test sidecar_parent_gone_test --test library_claims_sidecar_test --test log_value_guard_test --test file_based_routing_test --test url_alias_matching_test --test parallel_services_test
           - shard: n4
             runner: nextest
+            partitioned: --test call_through_rows_test
+            partition: slice:2/3
             targets: >-
-              --test shadowed_binding_test --test library_store_test --test graphql_declared_result_types_test --test nested_service_walk_test --test graphql_code_first_resolvers_test --test wrapper_chain_const_url_test --test service_derivation_test --test llm_mock_pipeline_test --test extraction_config_test
+              --test shadowed_binding_test --test library_store_test --test site_questions_test --test graphql_declared_result_types_test --test nested_service_walk_test --test graphql_code_first_resolvers_test --test wrapper_chain_const_url_test --test service_derivation_test --test llm_mock_pipeline_test --test extraction_config_test
           - shard: n5
             runner: nextest
+            partitioned: --test call_through_rows_test
+            partition: slice:3/3
             targets: >-
               --test request_summary_test --test spread_parameter_body_test --test object_key_url_wrapper_test --test composed_strings_test --test incremental_raw_cache_test --test socket_class_field_test --test alias_shaped_type_imports_test --test span_locator_units_test --test ask_in_parts_test --test dispatch_resume_test --test socket_extraction_test --test class_client_construction_test
           - shard: n6
             runner: nextest
+            partitioned: --test call_through_rows_test
+            partition: slice:1/3
             targets: >-
-              --test conditional_request_url_test --test registration_veto_test --test in_process_publish_test --test listener_receivers_test --test graphql_located_operation_types_test --test wrapper_dispatch_test --test workspace_member_callers_test --test factory_receiver_test --test call_through_rows_test --test named_dispatch_test --test jsx_component_callers_test --test module_resolution_parity_test --test mock_storage_test --test graphql_extraction_test
+              --test conditional_request_url_test --test registration_veto_test --test in_process_publish_test --test listener_receivers_test --test graphql_located_operation_types_test --test wrapper_dispatch_test --test workspace_member_callers_test --test factory_receiver_test --test named_dispatch_test --test jsx_component_callers_test --test module_resolution_parity_test --test mock_storage_test --test graphql_extraction_test
           - shard: n7
             runner: nextest
             targets: >-
@@ -118,7 +124,11 @@ jobs:
           - shard: scan-2
             runner: cargo
             targets: >-
-              --test keep_awake_test --test pubsub_wrapper_type_capture_test --test descriptor_route_anchor_test --test undeclared_external_host_test --test method_per_site_test --test payload_without_method_test --test unprepared_refusal_test --test runner_flags_test --test changed_only_test
+              --test keep_awake_test --test pubsub_wrapper_type_capture_test --test descriptor_route_anchor_test --test undeclared_external_host_test
+          - shard: scan-5
+            runner: cargo
+            targets: >-
+              --test method_per_site_test --test payload_without_method_test --test unprepared_refusal_test --test runner_flags_test --test changed_only_test
           - shard: scan-3
             runner: cargo
             targets: >-

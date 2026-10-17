@@ -1308,7 +1308,7 @@ pub(crate) mod tests {
         let inputs = crate::engine::discover_service_inputs(
             &repo,
             &service,
-            crate::position_rows::PositionIndex::missing(&repo),
+            Some(crate::position_rows::PositionIndex::missing(&repo)),
         );
         let text = std::fs::read_to_string(fixture.join("sites.expected.json")).unwrap();
         let sites = serde_json::from_str::<DiscoveryFile>(&text).unwrap().sites;

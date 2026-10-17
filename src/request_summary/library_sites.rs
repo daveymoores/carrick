@@ -101,6 +101,7 @@ use swc_common::{Span, Spanned};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use super::row_links::{RowLink, RowLinks};
 use super::{
     BindingUse, BindingUses, ClassFields, ClientBinding, ClientInstance, ClientRef, FileIr, FnIr,
     LinkedClients, MadeBy, ModuleScope, OwnCallee, Reader, RequestSummaryInputs, Scope, Site,
@@ -707,8 +708,8 @@ pub(super) const MAX_MAKERS: usize = 4;
 /// service's functions that fills a name that function's library call takes
 /// from a parameter ([`LibrarySite::origin`]).
 pub fn library_sites(inputs: &RequestSummaryInputs) -> LibrarySites {
-    let clients = LinkedClients::link(&inputs.files, &inputs.bindings);
-    let names = LinkedNames::link(&inputs.files, &inputs.bindings);
+    let clients = LinkedClients::link(&inputs.files, &inputs.bindings, inputs.links.as_ref());
+    let names = LinkedNames::link(&inputs.files, &inputs.bindings, inputs.links.as_ref());
     let callers = Callers::index(inputs);
     let mut sites = Vec::new();
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
@@ -865,13 +866,41 @@ impl<'a> GetterHolders<'a> {
             bindings: &inputs.bindings,
             held: HashMap::new(),
             unaccounted: HashSet::new(),
-            unfollowable: !inputs.bindings.unresolved_in().is_empty(),
+            unfollowable: match &inputs.links {
+                Some(links) => links.open(),
+                None => !inputs.bindings.unresolved_in().is_empty(),
+            },
         };
         if inputs.files.values().all(|ir| ir.getters.is_empty()) {
             return linked;
         }
         for (file, ir) in &inputs.files {
             for (local, used) in &ir.imported {
+                // With rows, an import is the declaration its rows name
+                // (carrick#2413 slice B).
+                if let Some(links) = &inputs.links {
+                    match links.get(file, local) {
+                        Some(RowLink::Declared(at, name))
+                            if inputs
+                                .files
+                                .get(at)
+                                .is_some_and(|declaring| declaring.getters.contains_key(name)) =>
+                        {
+                            linked
+                                .held
+                                .entry((at.clone(), name.clone()))
+                                .or_default()
+                                .push(GetterBinding {
+                                    file,
+                                    used,
+                                    member: None,
+                                });
+                        }
+                        Some(RowLink::Module(published)) => linked.namespace(file, used, published),
+                        _ => {}
+                    }
+                    continue;
+                }
                 match inputs.bindings.get(file, local) {
                     Some(super::ImportedBinding::Binding { file: at, name }) => {
                         match linked.reach(at, name) {
@@ -1420,13 +1449,20 @@ impl SiteReader<'_> {
 /// reaches its module through a namespace import or loads it some other way,
 /// and, read in another module, where the scan can follow every module of
 /// the service (as for an imported instance, [`LinkedClients`]).
+///
+/// With the compiler's rows (`links`, carrick#2413 slice B), an import is
+/// read as the declaration its rows name, and only a constant object is
+/// turned off service-wide, when a use no row follows may change one
+/// ([`RowLinks::open`]): text and a builder's return cannot change.
 pub(super) struct LinkedNames<'a> {
     files: &'a HashMap<PathBuf, FileIr>,
     bindings: &'a super::ImportedBindings,
+    links: Option<&'a RowLinks>,
     /// Constant objects some module's use may change, by declaring module
     /// and name.
     contested: HashSet<(PathBuf, String)>,
-    /// Some module names a specifier the scan cannot follow.
+    /// Some module names a specifier the scan cannot follow; with rows, a
+    /// use no row follows may change an exported object.
     unfollowable: bool,
 }
 
@@ -1434,10 +1470,15 @@ impl<'a> LinkedNames<'a> {
     pub(super) fn link(
         files: &'a HashMap<PathBuf, FileIr>,
         bindings: &'a super::ImportedBindings,
+        links: Option<&'a RowLinks>,
     ) -> Self {
+        if let Some(links) = links {
+            return Self::link_rows(files, bindings, links);
+        }
         let mut linked = LinkedNames {
             files,
             bindings,
+            links: None,
             contested: HashSet::new(),
             unfollowable: !bindings.unresolved_in().is_empty(),
         };
@@ -1483,14 +1524,93 @@ impl<'a> LinkedNames<'a> {
                 }
             }
         }
-        // A namespace import, or a module loaded some other way, may reach
-        // any object its module publishes in any way.
-        for (file, name) in every {
-            if let Some((declared, NameValue::Map(_))) = linked.declared(&file, &name, 0) {
-                linked.contested.insert(declared);
+        linked.contest_every(every);
+        linked
+    }
+
+    /// [`Self::link`] over the rows: each import is the declaration its rows
+    /// name, with no re-export followed by name.
+    fn link_rows(
+        files: &'a HashMap<PathBuf, FileIr>,
+        bindings: &'a super::ImportedBindings,
+        links: &'a RowLinks,
+    ) -> Self {
+        let mut linked = LinkedNames {
+            files,
+            bindings,
+            links: Some(links),
+            contested: HashSet::new(),
+            unfollowable: links.open(),
+        };
+        let mut every: Vec<(PathBuf, String)> = Vec::new();
+        for (file, ir) in files {
+            for (local, used) in &ir.imported {
+                match links.get(file, local) {
+                    Some(RowLink::Declared(at, name)) => {
+                        if let Some(value @ NameValue::Map(_)) = files
+                            .get(at)
+                            .and_then(|declaring| declaring.names.get(name))
+                            && !used.keeps_entries(value)
+                        {
+                            linked.contested.insert((at.clone(), name.clone()));
+                        }
+                    }
+                    Some(RowLink::Module(published)) => {
+                        every.extend(
+                            published
+                                .iter()
+                                .map(|binding| (binding.file.clone(), binding.name.clone())),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            for specifier in &ir.loads {
+                if let Some(super::ImportedBinding::Module(published)) =
+                    bindings.load(file, specifier)
+                {
+                    every.extend(
+                        published
+                            .iter()
+                            .map(|binding| (binding.file.clone(), binding.name.clone())),
+                    );
+                }
             }
         }
+        linked.contest_every(every);
         linked
+    }
+
+    /// A namespace import, or a module loaded some other way, may reach any
+    /// object its module publishes in any way. What it publishes is the
+    /// module graph's answer, with or without rows.
+    fn contest_every(&mut self, every: Vec<(PathBuf, String)>) {
+        for (file, name) in every {
+            if let Some((declared, NameValue::Map(_))) = self.declared(&file, &name, 0) {
+                self.contested.insert(declared);
+            }
+        }
+    }
+
+    /// What `name` in `file` holds, with the module and name that declare
+    /// it: the file's own name, or, for an import, the declaration its rows
+    /// name ([`RowLinks`]) or, without rows, the one [`Self::declared`]
+    /// follows to by name.
+    fn reached(&self, file: &Path, name: &str) -> Option<((PathBuf, String), &'a NameValue)> {
+        let Some(links) = self.links else {
+            return self.declared(file, name, 0);
+        };
+        let ir = self.files.get(file)?;
+        if let Some(value) = ir.names.get(name) {
+            return Some(((file.to_path_buf(), name.to_string()), value));
+        }
+        match links.get(file, name)? {
+            RowLink::Declared(at, declared) => {
+                let value = self.files.get(at)?.names.get(declared)?;
+                Some(((at.clone(), declared.clone()), value))
+            }
+            _ => None,
+        }
     }
 
     /// What `name` in `file` holds, following a module that re-exports an
@@ -1550,10 +1670,15 @@ impl<'a> LinkedNames<'a> {
             }
             let ir = self.files.get(file)?;
             let own = ir.names.contains_key(&named.binding);
-            if !own && self.unfollowable {
+            if !own && self.unfollowable && self.links.is_none() {
                 return None;
             }
-            let ((declared_in, declared), value) = self.declared(file, &named.binding, 0)?;
+            let ((declared_in, declared), value) = self.reached(file, &named.binding)?;
+            // With rows, only an object can be changed by a use no row
+            // follows.
+            if !own && self.unfollowable && matches!(value, NameValue::Map(_)) {
+                return None;
+            }
             if self
                 .contested
                 .contains(&(declared_in.clone(), declared.clone()))
@@ -1593,7 +1718,30 @@ impl<'a> LinkedNames<'a> {
     /// builder not called, an instance, a router). A package's binding, a
     /// namespace's, or one the scan cannot follow may hold anything, so is
     /// not known (carrick#2386).
+    ///
+    /// With rows, an import is the declaration its rows name: one the
+    /// declaring file records as something other than a name holds no text,
+    /// and one it records nowhere is not known.
     pub(super) fn holds_no_text(&self, file: &Path, name: &str) -> bool {
+        if let Some(links) = self.links {
+            let holds_none = |ir: &FileIr, name: &str| match ir.names.get(name) {
+                Some(value) => matches!(value, NameValue::Builder(_)),
+                None => true,
+            };
+            let Some(ir) = self.files.get(file) else {
+                return false;
+            };
+            if ir.names.contains_key(name) || !ir.imported.contains_key(name) {
+                return holds_none(ir, name);
+            }
+            return match links.get(file, name) {
+                Some(RowLink::Declared(at, declared)) => self
+                    .files
+                    .get(at)
+                    .is_some_and(|declaring| holds_none(declaring, declared)),
+                _ => false,
+            };
+        }
         let mut at = (file.to_path_buf(), name.to_string());
         for _ in 0..=super::MAX_REEXPORT_HOPS {
             let Some(ir) = self.files.get(&at.0) else {

@@ -670,6 +670,24 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage + Sync>(
     result
 }
 
+/// Tell the cloud the repo's full declared service set (carrick-cloud#909).
+///
+/// `services` is what config resolution produced for the whole repo, so it is
+/// the set whatever `--changed-only` analyses or carries. Each entry is the
+/// `service_name` that service's own write sends, `None` where it sends none.
+/// A dirty tree names none: its config is not main's, and the cloud retires
+/// rows by this set.
+fn note_declared_services<T: CloudStorage>(storage: &T, services: &[Config], dirty: bool) {
+    if dirty {
+        return;
+    }
+    let declared: Vec<Option<String>> = services
+        .iter()
+        .map(|service| service.service_name.clone())
+        .collect();
+    storage.note_declared_services(&declared);
+}
+
 /// The marker a finished run owes the scan it opened, if any.
 ///
 /// A failure says so with `scan-failed`. A `--pr` run closes with
@@ -959,6 +977,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     if multi_service {
         info!("Resolved {} services in {}", services.len(), repo_name);
     }
+    // The whole declared set, before `--changed-only` narrows what is analysed
+    // (carrick-cloud#909).
+    note_declared_services(storage, &services, git_state.dirty);
     // What was downloaded is every OTHER repo in the project: a project whose
     // only repo is this one has nothing to fetch, and "from 0 repos" under a
     // green tick read as a download that had silently failed (carrick#1023
@@ -7780,8 +7801,16 @@ fn discover_with_positions(
         sites: resolution.sites,
         bindings: resolution.bindings,
         positions,
+        links: None,
     }
     .linked();
+    if let Some(links) = &request_inputs.links {
+        debug!(
+            "Position rows for service {}: {}",
+            service.service_name.as_deref().unwrap_or("(root)"),
+            links.describe()
+        );
+    }
 
     debug!(
         "Extracted {} import facts and {} function definitions from {} files",
@@ -7811,20 +7840,21 @@ pub(crate) fn discover_request_inputs(root: &Path) -> crate::request_summary::Re
 }
 
 /// What discovery hands the request summaries for one service of the repo
-/// at `repo`, with `positions` bound as a scan binds them: for the census of
-/// the compiler rows' lookups (carrick#2413).
+/// at `repo`, with `positions` bound as a scan binds them, or with none as a
+/// scan without rows has: for the census of the compiler rows' lookups and
+/// the tests of what the summaries read through them (carrick#2413).
 #[cfg(test)]
 pub(crate) fn discover_service_inputs(
     repo: &Path,
     service: &Config,
-    positions: crate::position_rows::PositionIndex,
+    positions: Option<crate::position_rows::PositionIndex>,
 ) -> crate::request_summary::RequestSummaryInputs {
     let cm: Lrc<SourceMap> = Default::default();
     discover_with_positions(
         &canonical_repo_path(&repo.to_string_lossy()),
         service,
         cm,
-        Some(positions),
+        positions,
     )
     .expect("discovery reads the service")
     .request_inputs
@@ -11726,6 +11756,33 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         }
     }
 
+    /// carrick-cloud#909: the run states every service its config resolution
+    /// produced, named as each one's own write names it, and a dirty tree
+    /// states none.
+    #[test]
+    fn the_run_states_every_declared_service_and_a_dirty_tree_none() {
+        let named = |name: Option<&str>| Config {
+            service_name: name.map(str::to_string),
+            ..Default::default()
+        };
+        let services = [named(Some("api")), named(Some("worker")), named(None)];
+
+        let clean = ScriptedStorage::new(Vec::new(), Vec::new());
+        note_declared_services(&clean, &services, false);
+        assert_eq!(
+            clean.declared.lock().unwrap().clone(),
+            Some(vec![
+                Some("api".to_string()),
+                Some("worker".to_string()),
+                None
+            ])
+        );
+
+        let dirty = ScriptedStorage::new(Vec::new(), Vec::new());
+        note_declared_services(&dirty, &services, true);
+        assert_eq!(dirty.declared.lock().unwrap().clone(), None);
+    }
+
     /// A storage whose every answer is scripted, so the upload loop's
     /// decisions can be driven without a cloud: what each upload returns, what
     /// the landed-check says on each successive ask, and what was asked.
@@ -11740,6 +11797,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         /// files, and so that its write actions must supersede the stored
         /// generation (carrick#1306).
         analyzed_noted: std::sync::atomic::AtomicBool,
+        /// The declared service set the run stated (carrick-cloud#909).
+        declared: std::sync::Mutex<Option<Vec<Option<String>>>>,
     }
 
     impl ScriptedStorage {
@@ -11754,6 +11813,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 uploaded_bodies: std::sync::Mutex::new(Vec::new()),
                 landed_asks: std::sync::Mutex::new(Vec::new()),
                 analyzed_noted: std::sync::atomic::AtomicBool::new(false),
+                declared: std::sync::Mutex::new(None),
             }
         }
 
@@ -11783,6 +11843,10 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
 
     #[async_trait::async_trait]
     impl CloudStorage for ScriptedStorage {
+        fn note_declared_services(&self, declared: &[Option<String>]) {
+            *self.declared.lock().unwrap() = Some(declared.to_vec());
+        }
+
         fn note_analyzed_files(&self) {
             self.analyzed_noted
                 .store(true, std::sync::atomic::Ordering::Relaxed);

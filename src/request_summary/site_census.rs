@@ -110,7 +110,7 @@ fn census_repo(root: &Path, positions: &Path, sites: &Path, claims: &Path) -> Re
             ),
             None => PositionIndex::missing(&root),
         };
-        let inputs = crate::engine::discover_service_inputs(&root, service, index);
+        let inputs = crate::engine::discover_service_inputs(&root, service, Some(index));
         let files: HashSet<String> = inputs
             .files
             .keys()

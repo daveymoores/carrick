@@ -1596,8 +1596,11 @@ mod tests {
         let service = crate::config::Config::load_services(vec![repo.join("carrick.json")])
             .unwrap()
             .remove(0);
-        let inputs =
-            crate::engine::discover_service_inputs(repo, &service, PositionIndex::missing(repo));
+        let inputs = crate::engine::discover_service_inputs(
+            repo,
+            &service,
+            Some(PositionIndex::missing(repo)),
+        );
         let text = std::fs::read_to_string(fixture.join("sites.expected.json")).unwrap();
         let sites = serde_json::from_str::<DiscoveryFile>(&text).unwrap().sites;
         let answer: serde_json::Value = serde_json::from_str(
