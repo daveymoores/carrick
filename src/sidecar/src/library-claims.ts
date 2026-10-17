@@ -3154,15 +3154,19 @@ class DeclarationReader {
 
   /**
    * What a factory builds says nothing: the type itself, or any branch of a
-   * conditional return type, does.
+   * conditional return type, does. A conditional whose branches lead back to
+   * itself (a recursive alias) is read once: `seen` holds the conditionals
+   * on the way down, and one met again says nothing new.
    */
-  returnSaysNothing(type: ts.Type): boolean {
+  returnSaysNothing(type: ts.Type, seen: Set<ts.Node> = new Set()): boolean {
     if (this.saysNothing(type)) return true;
     return this.parts(type).some(part => {
       if (!(part.flags & ts.TypeFlags.Conditional)) return false;
       const node = (part as ts.ConditionalType).root.node;
+      if (seen.has(node)) return false;
+      seen.add(node);
       return [node.trueType, node.falseType].some(branch =>
-        this.returnSaysNothing(this.checker.getTypeFromTypeNode(branch))
+        this.returnSaysNothing(this.checker.getTypeFromTypeNode(branch), seen)
       );
     });
   }
