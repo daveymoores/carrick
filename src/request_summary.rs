@@ -188,6 +188,16 @@ use alternatives::{Alternation, Alternatives};
 mod guards;
 use guards::{GuardIr, Subject, Tested, WrittenIn};
 
+// Where a discovered call's name is decided (carrick#2433), and the record
+// each decided site carries (carrick#2435): record-only, so only tests and
+// the offline census read them yet.
+#[allow(dead_code)]
+pub mod decided_sites;
+#[cfg(test)]
+mod site_census;
+#[allow(dead_code)]
+pub mod site_record;
+
 // What the compiler's per-position rows say at each lookup the summaries
 // make by name today (carrick#2413): an offline census.
 #[cfg(test)]

@@ -383,10 +383,10 @@ pub(super) struct Tested {
 /// the argument itself).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WrittenIn {
-    site: Site,
+    pub(super) site: Site,
     callee: String,
-    arg: usize,
-    path: Vec<String>,
+    pub(super) arg: usize,
+    pub(super) path: Vec<String>,
     /// The call is a construction (`new X(…)`), kept in
     /// [`FnIr::constructions`].
     constructed: bool,
