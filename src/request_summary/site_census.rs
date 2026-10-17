@@ -208,7 +208,7 @@ fn census_repo(root: &Path, positions: &Path, sites: &Path, claims: &Path) -> Re
 #[ignore = "a census over real repos: set CARRICK_SITE_CENSUS"]
 fn site_census() {
     let Ok(spec) = std::env::var("CARRICK_SITE_CENSUS") else {
-        eprintln!("CARRICK_SITE_CENSUS is not set");
+        crate::errln!("CARRICK_SITE_CENSUS is not set");
         return;
     };
     let mut out: BTreeMap<String, RepoCensus> = BTreeMap::new();
@@ -230,6 +230,6 @@ fn site_census() {
     let text = serde_json::to_string_pretty(&out).expect("the census serialises");
     match std::env::var("CARRICK_SITE_CENSUS_OUT") {
         Ok(path) => std::fs::write(path, &text).expect("the census writes"),
-        Err(_) => eprintln!("{text}"),
+        Err(_) => crate::outln!("{text}"),
     }
 }

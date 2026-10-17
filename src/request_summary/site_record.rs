@@ -1068,13 +1068,10 @@ fn record(
                 .collect(),
         };
         decide(Slot::NameArgument, name_argument, false);
-        match (&label.payload, &site.payload) {
-            (Some(_), Some(PayloadBinding::Arg { arg, .. })) => {
-                decide(Slot::PayloadArgument, vec![arg.to_string()], false);
-            }
-            // Built below the call, no payload at it, or no payload slot
-            // in the label: no argument of this call is stated as one.
-            _ => {}
+        // Built below the call, no payload at it, or no payload slot in the
+        // label: no argument of this call is stated as one.
+        if let (Some(_), Some(PayloadBinding::Arg { arg, .. })) = (&label.payload, &site.payload) {
+            decide(Slot::PayloadArgument, vec![arg.to_string()], false);
         }
     }
     if http {
