@@ -64,7 +64,7 @@ const MAX_SPECIFIERS: usize = 32;
 const PUBLIC_REGISTRIES: [&str; 2] = ["registry.npmjs.org", "registry.yarnpkg.com"];
 
 /// The runtime's types package: a runtime module's version is its version.
-const RUNTIME_TYPES: &str = "@types/node";
+pub(crate) const RUNTIME_TYPES: &str = "@types/node";
 
 /// The lockfiles an install writes.
 const LOCKFILES: [&str; 5] = [

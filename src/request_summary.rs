@@ -829,6 +829,12 @@ struct CallIr {
     /// Each argument as a spread of the callee's parameter puts it in place
     /// (carrick#2411): empty for an element.
     spread_args: Vec<SpreadArg>,
+    /// Each object the callee's member chain is read on, innermost first,
+    /// as its span (discovery numbering) and whether it is a member access
+    /// rather than a name (`this.child` then nothing for
+    /// `this.child.send()`): where a compiler row names the receiver's type
+    /// (carrick#2431). Read by discovery alone.
+    receiver_spans: Vec<(u32, u32, bool)>,
 }
 
 /// What a call's argument puts in place of the callee's spread of that
@@ -5865,6 +5871,10 @@ impl Visit for CallWalker<'_, '_, '_> {
             handed,
             names,
             spread_args,
+            receiver_spans: match &call.callee {
+                Callee::Expr(callee) => discovery::receiver_spans(callee),
+                _ => Vec::new(),
+            },
         });
     }
 
@@ -5928,6 +5938,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 handed: Vec::new(),
                 names: Vec::new(),
                 spread_args: Vec::new(),
+                receiver_spans: Vec::new(),
             });
         }
         element.visit_children_with(self);

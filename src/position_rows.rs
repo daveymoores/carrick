@@ -159,6 +159,9 @@ impl Row {
     pub fn decl_package(&self) -> Option<&str> {
         self.6.as_deref()
     }
+    pub fn type_text(&self) -> Option<&str> {
+        self.7.as_deref()
+    }
     pub fn flags(&self) -> u8 {
         self.8
     }
