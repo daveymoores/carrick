@@ -7780,8 +7780,16 @@ fn discover_with_positions(
         sites: resolution.sites,
         bindings: resolution.bindings,
         positions,
+        links: None,
     }
     .linked();
+    if let Some(links) = &request_inputs.links {
+        debug!(
+            "Position rows for service {}: {}",
+            service.service_name.as_deref().unwrap_or("(root)"),
+            links.describe()
+        );
+    }
 
     debug!(
         "Extracted {} import facts and {} function definitions from {} files",
@@ -7811,20 +7819,21 @@ pub(crate) fn discover_request_inputs(root: &Path) -> crate::request_summary::Re
 }
 
 /// What discovery hands the request summaries for one service of the repo
-/// at `repo`, with `positions` bound as a scan binds them: for the census of
-/// the compiler rows' lookups (carrick#2413).
+/// at `repo`, with `positions` bound as a scan binds them, or with none as a
+/// scan without rows has: for the census of the compiler rows' lookups and
+/// the tests of what the summaries read through them (carrick#2413).
 #[cfg(test)]
 pub(crate) fn discover_service_inputs(
     repo: &Path,
     service: &Config,
-    positions: crate::position_rows::PositionIndex,
+    positions: Option<crate::position_rows::PositionIndex>,
 ) -> crate::request_summary::RequestSummaryInputs {
     let cm: Lrc<SourceMap> = Default::default();
     discover_with_positions(
         &canonical_repo_path(&repo.to_string_lossy()),
         service,
         cm,
-        Some(positions),
+        positions,
     )
     .expect("discovery reads the service")
     .request_inputs

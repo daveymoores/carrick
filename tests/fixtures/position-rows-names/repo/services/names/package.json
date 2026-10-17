@@ -1,0 +1,9 @@
+{
+  "name": "names-api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/bus": "^1.0.0",
+    "@fixture/queue": "^2.0.0"
+  }
+}

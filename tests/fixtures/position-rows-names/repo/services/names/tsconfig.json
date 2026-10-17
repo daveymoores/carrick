@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "allowJs": true,
+    "baseUrl": ".",
+    "paths": { "@lib/*": ["src/lib/*"] },
+    "lib": ["es2022", "dom"],
+    "types": []
+  },
+  "include": ["src/**/*"]
+}

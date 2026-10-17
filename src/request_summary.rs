@@ -188,6 +188,10 @@ use alternatives::{Alternation, Alternatives};
 mod guards;
 use guards::{GuardIr, Subject, Tested, WrittenIn};
 
+// What each import binding reaches, read from the compiler's per-position
+// rows when the run walks them (carrick#2413 slice B).
+mod row_links;
+
 // What the compiler's per-position rows say at each lookup the summaries
 // make by name today (carrick#2413): an offline census.
 #[cfg(test)]
@@ -1140,6 +1144,16 @@ pub struct FileIr {
     /// [`Self::imported`] is, so a name declared again below lands here too,
     /// and its uses then name more than one declaration.
     import_uses: HashMap<String, Vec<(u32, u32)>>,
+    /// Each module-scope binding [`Self::names`], [`Self::module_clients`]
+    /// and [`Self::getters`] may hold, by the name the compiler gives its
+    /// symbol, with the 1-based line its declaration starts on and the name
+    /// those tables key it by ([`module_declarations`]): where a compiler
+    /// row's declaration joins this file (carrick#2413 slice B).
+    declared_at: HashMap<String, (u32, String)>,
+    /// The file loads a module by a specifier it computes (`require(name)`,
+    /// `import(name)`), which may be any module of the service
+    /// ([`module_loads`]).
+    computed_load: bool,
 }
 
 /// Every expression-position identifier among `names`, by name, with its
@@ -1320,11 +1334,14 @@ pub fn extract_file_ir(
     };
     module.visit_with(&mut idents);
     let import_uses = idents.spans;
+    let (loads, computed_load) = module_loads(module, &bound_requires);
     let mut file = FileIr {
         import_uses,
         imported,
         value_specifiers,
-        loads: module_loads(module, &bound_requires),
+        loads,
+        computed_load,
+        declared_at: module_declarations(module, source_map),
         names_commonjs_exports: names_commonjs_exports(module),
         source_start: source_map
             .try_lookup_byte_offset(module.span.lo)
@@ -1601,6 +1618,63 @@ fn module_var_decl(item: &ModuleItem) -> Option<&VarDecl> {
         Decl::Var(var) => Some(var),
         _ => None,
     }
+}
+
+/// Each module-scope binding a file's names, clients and getters may be
+/// keyed by ([`FileIr::declared_at`]), by the name the compiler gives its
+/// symbol: the line its declaration starts on, as the compiler's `getStart`
+/// reads it, and the name the file's tables key it by.
+///
+/// A declarator starts at its name (`export const X` starts at `X`); a
+/// function declaration and an `export default` start at their first
+/// keyword or modifier. A default export's symbol is `default`: a named
+/// function's table key is its name, an expression's is
+/// [`DEFAULT_EXPORT`], and `export default name` keys it by `name`. The
+/// first declaration of a name wins, as an overload's first signature
+/// does.
+fn module_declarations(
+    module: &Module,
+    source_map: &Lrc<SourceMap>,
+) -> HashMap<String, (u32, String)> {
+    let line = |at: swc_common::BytePos| source_map.lookup_char_pos(at).line as u32;
+    let mut declared: HashMap<String, (u32, String)> = HashMap::new();
+    let mut add = |symbol: &str, at: swc_common::BytePos, key: &str| {
+        declared
+            .entry(symbol.to_string())
+            .or_insert_with(|| (line(at), key.to_string()));
+    };
+    for item in &module.body {
+        if let Some(var) = module_var_decl(item) {
+            for declarator in &var.decls {
+                if let Pat::Ident(ident) = &declarator.name {
+                    add(&ident.id.sym, ident.id.span.lo, &ident.id.sym);
+                }
+            }
+        }
+        if let Some(Decl::Fn(fn_decl)) = module_decl(item) {
+            add(&fn_decl.ident.sym, item.span().lo, &fn_decl.ident.sym);
+        }
+        match item {
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => {
+                if let DefaultDecl::Fn(FnExpr {
+                    ident: Some(ident), ..
+                }) = &export.decl
+                {
+                    add(DEFAULT_EXPORT, export.span.lo, &ident.sym);
+                    add(&ident.sym, export.span.lo, &ident.sym);
+                }
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) => {
+                let key = match crate::graphql_document_sites::unwrap_expression(&export.expr) {
+                    Expr::Ident(ident) => ident.sym.to_string(),
+                    _ => DEFAULT_EXPORT.to_string(),
+                };
+                add(DEFAULT_EXPORT, export.span.lo, &key);
+            }
+            _ => {}
+        }
+    }
+    declared
 }
 
 /// What module scope holds for every function in the file: its constants,
@@ -2041,6 +2115,22 @@ impl BindingUse {
                 .entry_reads
                 .iter()
                 .all(|path| !matches!(entries.entry(path), Some(library_sites::NameValue::Map(_))))
+    }
+
+    /// Whether this use may change an object the binding holds, or hand it
+    /// to code that may: written through, handed on (an argument, an
+    /// initialiser, any value use [`Self::other`] counts), returned, spread,
+    /// or called by a key the source does not state. Calling it, calling a
+    /// member, reading, testing and exporting it change nothing
+    /// (carrick#2413 slice B): the use of an import whose declaration no
+    /// row gives that contests every exported object and instance
+    /// ([`row_links::RowLinks::open`]).
+    fn may_change(&self) -> bool {
+        self.written
+            || self.other
+            || self.spread
+            || self.called_computed
+            || !self.returned_at.is_empty()
     }
 
     /// Every member called or constructed through the binding.
@@ -3155,11 +3245,13 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
 /// counts as used in every way.
 ///
 /// A specifier the source computes (`import(name)`, a template with a hole)
-/// names no module and is not here.
-fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<String> {
+/// names no module and is not here: the second value says whether the file
+/// makes such a load with `import()` or `require` (carrick#2413 slice B).
+fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> (BTreeSet<String>, bool) {
     struct Loads<'a> {
         bound_requires: &'a HashSet<u32>,
         found: BTreeSet<String>,
+        computed: bool,
     }
     impl Visit for Loads<'_> {
         fn visit_call_expr(&mut self, call: &CallExpr) {
@@ -3168,9 +3260,12 @@ fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<Stri
                 .first()
                 .filter(|arg| arg.spread.is_none())
                 .and_then(|arg| literal_specifier(&arg.expr));
+            let require = matches!(&call.callee, Callee::Expr(callee)
+                if matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require"));
+            if specifier.is_none() && (require || matches!(call.callee, Callee::Import(_))) {
+                self.computed = true;
+            }
             if let Some(specifier) = specifier {
-                let require = matches!(&call.callee, Callee::Expr(callee)
-                    if matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require"));
                 let bound = require && self.bound_requires.contains(&call.span.lo.0);
                 let relative = specifier.starts_with("./") || specifier.starts_with("../");
                 if !bound && (matches!(call.callee, Callee::Import(_)) || require || relative) {
@@ -3183,9 +3278,10 @@ fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<Stri
     let mut loads = Loads {
         bound_requires,
         found: BTreeSet::new(),
+        computed: false,
     };
     module.visit_with(&mut loads);
-    loads.found
+    (loads.found, loads.computed)
 }
 
 /// Every specifier `module` loads a module by at run time (carrick#1568): a
@@ -6729,8 +6825,14 @@ pub struct RequestSummaryInputs {
     pub bindings: ImportedBindings,
     /// The compiler's rows for the service's positions, bound to the bytes
     /// discovery parsed, when the run walks them (`CARRICK_POSITION_ROWS=1`,
-    /// carrick#2413); `None` otherwise. Nothing reads a row yet.
+    /// carrick#2413); `None` otherwise.
     pub positions: Option<crate::position_rows::PositionIndex>,
+    /// What each import binding reaches, read from [`Self::positions`] by
+    /// [`Self::linked`] (carrick#2413 slice B): where the module-scope
+    /// names, instances and getters another module declares are read from
+    /// when the run walks rows. `None` without rows, and then they are read
+    /// by name through [`Self::bindings`].
+    pub(crate) links: Option<row_links::RowLinks>,
 }
 
 impl RequestSummaryInputs {
@@ -6746,7 +6848,17 @@ impl RequestSummaryInputs {
     /// Reached in the places a request's URL, base and body, a call's
     /// arguments and a client's options are kept. A piece anywhere else
     /// keeps its link unread, which changes nothing.
+    ///
+    /// With rows, what each import reaches is read from them first
+    /// ([`Self::links`]), and the reading follows it.
     pub fn linked(mut self) -> Self {
+        if let Some(positions) = &self.positions {
+            self.links = Some(row_links::RowLinks::of(
+                &self.files,
+                &self.bindings,
+                positions,
+            ));
+        }
         let mut wanted: BTreeSet<(PathBuf, library_sites::NamedRef)> = BTreeSet::new();
         for (path, ir) in &mut self.files {
             ir.visit_pieces(path, &mut |scope, pieces| {
@@ -6764,7 +6876,8 @@ impl RequestSummaryInputs {
             return self;
         }
         let resolved: HashMap<(PathBuf, library_sites::NamedRef), String> = {
-            let names = library_sites::LinkedNames::link(&self.files, &self.bindings);
+            let names =
+                library_sites::LinkedNames::link(&self.files, &self.bindings, self.links.as_ref());
             wanted
                 .into_iter()
                 .filter_map(|(file, named)| {
@@ -6952,7 +7065,16 @@ enum Declared {
 }
 
 impl LinkedClients {
-    fn link(files: &HashMap<PathBuf, FileIr>, bindings: &ImportedBindings) -> Self {
+    /// With rows (`links`, carrick#2413 slice B), an import is the
+    /// declaration its rows name, and one is read through when the declaring
+    /// module publishes nothing through `exports`; instead of a specifier
+    /// that names nothing, a use no row follows that may change what it
+    /// holds takes every imported instance away ([`RowLinks::open`]).
+    fn link(
+        files: &HashMap<PathBuf, FileIr>,
+        bindings: &ImportedBindings,
+        links: Option<&row_links::RowLinks>,
+    ) -> Self {
         let mut linked = LinkedClients::default();
         for (file, ir) in files {
             for (name, client) in &ir.module_clients {
@@ -6963,6 +7085,26 @@ impl LinkedClients {
         }
         for (file, ir) in files {
             for (local, used) in &ir.imported {
+                if let Some(links) = links {
+                    match links.get(file, local) {
+                        Some(row_links::RowLink::Declared(at, name)) => {
+                            if let Some(declaring) = files.get(at)
+                                && declaring.module_clients.contains_key(name)
+                            {
+                                let held = (at.clone(), name.clone());
+                                linked.merge(&held, used);
+                                if !declaring.names_commonjs_exports {
+                                    linked.imports.insert((file.clone(), local.clone()), held);
+                                }
+                            }
+                        }
+                        Some(row_links::RowLink::Module(published)) => {
+                            linked.merge_namespace(files, bindings, published, used);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 match bindings.get(file, local) {
                     Some(ImportedBinding::Binding { file: at, name }) => {
                         match declared_client(files, bindings, at, name) {
@@ -7007,7 +7149,12 @@ impl LinkedClients {
         // A module some file loads by a specifier that names nothing the
         // scan can find may be any module of the service, and may do
         // anything to what it publishes, however the file then uses it.
-        linked.unfollowable |= !bindings.unresolved_in().is_empty();
+        // With rows, such a module matters only where a use no row follows
+        // may change what it holds.
+        linked.unfollowable |= match links {
+            Some(links) => links.open(),
+            None => !bindings.unresolved_in().is_empty(),
+        };
         linked
     }
 
@@ -7492,7 +7639,7 @@ pub fn summarize(
         files,
         sites: &inputs.sites,
         semantics,
-        clients: LinkedClients::link(files, &inputs.bindings),
+        clients: LinkedClients::link(files, &inputs.bindings, inputs.links.as_ref()),
         memo: HashMap::new(),
         in_progress: HashSet::new(),
     };

@@ -453,6 +453,13 @@ impl PositionIndex {
     /// declaration: one with no symbol, or with the error type, is a hole
     /// that says whether the name was an import (`import_local`); a member
     /// or call row typed `any` with no symbol is an untyped receiver.
+    ///
+    /// A row whose symbol is declared in another file than `file` names that
+    /// declaration whatever its type (carrick#2413 slice B): the error type
+    /// then says only that the value's type did not resolve, as when a
+    /// workspace package's own imports do not. One whose declaration is in
+    /// `file` with the error type is the import itself, which reached
+    /// nothing.
     pub fn declaration(
         &self,
         file: &Path,
@@ -467,7 +474,7 @@ impl PositionIndex {
         } else {
             HoleReason::UnresolvedName
         };
-        if row.flags() & FLAG_ERROR_TYPE != 0 {
+        if row.flags() & FLAG_ERROR_TYPE != 0 && !self.declared_elsewhere(file, row) {
             return Err(unresolved);
         }
         if row.symbol().is_none() {
@@ -477,6 +484,29 @@ impl PositionIndex {
             return Err(unresolved);
         }
         Ok(row)
+    }
+
+    /// Whether `row`, looked up in `file`, names a symbol declared in another
+    /// file.
+    fn declared_elsewhere(&self, file: &Path, row: &Row) -> bool {
+        row.symbol().is_some()
+            && row
+                .decl_file()
+                .is_some_and(|declared| self.relative(file).as_deref() != Some(declared))
+    }
+
+    /// The file a row's repo-relative `decl_file` names, under the scan root,
+    /// as discovery walks it.
+    pub fn path_of(&self, decl_file: &str) -> PathBuf {
+        decl_file
+            .split('/')
+            .fold(self.scan_root.clone(), |path, part| path.join(part))
+    }
+
+    /// Why `file` holds no usable rows, if it holds none: absent from the
+    /// rows, not read by discovery, stale, or skipped by the walk.
+    pub fn file_hole(&self, file: &Path) -> Option<HoleReason> {
+        self.file(file).err()
     }
 }
 
