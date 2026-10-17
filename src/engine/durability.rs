@@ -194,11 +194,16 @@ impl OwedWork {
         self.deferred.is_none() && self.losses.is_empty() && self.retry_error.is_none()
     }
 
-    /// Whether what is owed makes the service's index thinner than a complete
-    /// one. Intents are the exception: a function with no intent was never a
-    /// reason to hold an index back, and still is not.
+    /// Whether what is owed is work a re-run can mend, so the service is not
+    /// yet complete. Intents are the exception: a function with no intent was
+    /// never a reason to hold an index back, and still is not. Neither is a
+    /// file whose answer is final (`final_files`): it is missing from the
+    /// index on every scan of those bytes, so it does not make the run
+    /// incomplete or the scan failed (carrick#2488).
     pub fn thins_the_index(&self) -> bool {
-        self.deferred.is_some() || self.losses.files > 0 || self.retry_error.is_some()
+        self.deferred.is_some()
+            || self.losses.files > self.losses.final_files
+            || self.retry_error.is_some()
     }
 
     /// Whether its model stages were deferred because a limit of the cloud's
@@ -228,8 +233,8 @@ impl OwedWork {
 
     /// Whether all this service owes is files whose answer the cloud called
     /// final ([`ServiceLosses::final_files`]). They are still missing from its
-    /// index, so the service is pending and held back like any other that lost
-    /// a file; what changes is that nothing asks for them again.
+    /// index, but no re-run can mend them, so the service is complete
+    /// ([`Self::thins_the_index`]) and nothing asks for them again.
     fn owes_only_final_files(&self) -> bool {
         self.deferred.is_none()
             && self.retry_error.is_none()
@@ -845,22 +850,25 @@ mod tests {
     }
 
     /// carrick#1897: a service that owes only files whose answer is final is
-    /// not retried, because asking again gets that answer again. It is still
-    /// pending and still held back: the files are missing from its index like
-    /// any other lost file. One thing another ask may mend beside them, and
-    /// the service is retried as it always was.
+    /// not retried, because asking again gets that answer again, and it does
+    /// not thin the index in the sense a re-run could mend (carrick#2488):
+    /// it is complete, its files still named in the summary. One thing
+    /// another ask may mend beside them, and the service is pending and
+    /// retried as it always was.
     #[test]
-    fn a_service_that_owes_only_final_files_is_pending_and_not_retried() {
+    fn a_service_that_owes_only_final_files_is_complete_and_not_retried() {
         let only_final = lost_with_final(2, 2);
         assert!(!only_final.is_empty());
         assert!(!only_final.worth_retrying());
-        assert!(only_final.thins_the_index());
+        // Complete: a re-run cannot mend it (carrick#2488).
+        assert!(!only_final.thins_the_index());
         assert!(!only_final.only_refused());
         assert_eq!(only_final.refused_for_capacity(), None);
         assert!(!holds_back(&only_final, true, true, false));
         assert!(!holds_back(&only_final, false, false, false));
         assert!(!holds_back(&only_final, false, true, false));
 
+        assert!(lost_with_final(2, 1).thins_the_index());
         assert!(lost_with_final(2, 1).worth_retrying());
         assert!(lost_with_final(2, 0).worth_retrying());
         let with_intents = OwedWork {

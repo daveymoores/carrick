@@ -1268,8 +1268,9 @@ const REQUESTS_ABOUT_A_FILE_CUT_TO_ITS_LAST_GROUP: usize = 1 + 2 + 4;
 /// answered and the file would read as recovered.
 ///
 /// The file is still missing from the index and is recorded under the
-/// cloud's own code, so its service lands pending on a first index, named on
-/// the final write, exactly as a service with any other lost file does.
+/// cloud's own code, but only work a re-run can mend leaves a service
+/// pending (carrick#2488), so its service is complete: named on no pending
+/// list and no failed-scan marker.
 #[tokio::test]
 #[serial]
 async fn a_file_with_a_final_answer_is_not_asked_again_in_the_run() {
@@ -1313,10 +1314,9 @@ async fn a_file_with_a_final_answer_is_not_asked_again_in_the_run() {
             .any(|path| path.ends_with("server.ts")),
         "the file has no answer in the index"
     );
-    assert_eq!(
-        *storage.pending_named.lock().unwrap(),
-        [vec!["beta".to_string()]],
-        "its service is pending, as with any lost file"
+    assert!(
+        storage.pending_named.lock().unwrap().is_empty(),
+        "a re-run cannot mend a final loss, so its service is complete (carrick#2488)"
     );
     assert!(storage.scan_failed.lock().unwrap().is_empty());
 }
