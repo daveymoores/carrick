@@ -16,6 +16,8 @@ site, sorted by file and span.
 | `callee` | The callee as written |
 | `end` | The labelled call the walk reached: the store `package`, `export`, `member` (`null` for the export itself), `role`, `op` (the claim's op for that member, `null` for a construction), and that call's `file`, `line`, `span_start`, `span_end`. `null` when the walk stopped |
 | `chain` | Each in-repo function the walk entered, outermost first: the definition key, its file and line. `<callback>` is a function written at the call and run by the callee |
-| `stop` | Why a walk that entered code ended with no labelled export: a `HoleReason`, `interface_member`, `injected_callee` or `cycle`. `null` when `end` is set |
+| `stop` | Why a walk that entered code ended with no labelled export: a `HoleReason`, `interface_member`, `injected_callee`, `cycle` or `no_body` (a definition whose body the pass did not read). `null` when `end` is set |
 
 A site that reaches several labelled calls has one record per labelled call.
+Two sites can share one end (`traced-load.ts:4`: the `traced(…)` call and the
+`fetch` it runs). A reader that folds records by their end must dedupe them.

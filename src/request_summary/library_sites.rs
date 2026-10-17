@@ -1270,8 +1270,8 @@ impl SiteReader<'_> {
     /// The function of the service the call at `site` in `file` reaches,
     /// when the call graph resolved it: this call's, never the one before it
     /// in a chain, which starts where it does.
-    fn resolves(&self, file: &Path, site: &Site) -> Option<&(PathBuf, String)> {
-        self.inputs.sites.target_at(file, site.lo, site.hi)
+    fn resolves(&self, file: &Path, site: &Site) -> Option<(PathBuf, String)> {
+        self.inputs.call_target(file, site.lo, site.hi)
     }
 
     /// The instance `client` (held in `file`) holds, where a package's maker
@@ -1318,8 +1318,8 @@ impl SiteReader<'_> {
         let Some(returned) = self
             .inputs
             .files
-            .get(target_file)
-            .and_then(|ir| ir.functions.get(key))
+            .get(&target_file)
+            .and_then(|ir| ir.functions.get(&key))
             .and_then(|function| function.returned.as_ref())
         else {
             return Vec::new();
@@ -1335,7 +1335,7 @@ impl SiteReader<'_> {
         };
         let mut out: Vec<Made> = Vec::new();
         for product in &returned.makers {
-            let mut inner = self.made(target_file, product, depth + 1);
+            let mut inner = self.made(&target_file, product, depth + 1);
             if inner.is_empty() {
                 return Vec::new();
             }
@@ -1832,9 +1832,9 @@ impl<'a> Callers<'a> {
             by_target: &mut HashMap<(PathBuf, String), Vec<Caller<'a>>>,
         ) {
             for call in &ir.calls {
-                if let Some(target) = inputs.sites.target_at(file, call.site.lo, call.site.hi) {
+                if let Some(target) = inputs.call_target(file, call.site.lo, call.site.hi) {
                     by_target
-                        .entry(target.clone())
+                        .entry(target)
                         .or_default()
                         .push(Caller { file, call, key });
                 }

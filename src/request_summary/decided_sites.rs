@@ -1305,11 +1305,8 @@ pub(crate) mod tests {
         let service = crate::config::Config::load_services(vec![repo.join("carrick.json")])
             .unwrap()
             .remove(0);
-        let inputs = crate::engine::discover_service_inputs(
-            &repo,
-            &service,
-            Some(crate::position_rows::PositionIndex::missing(&repo)),
-        );
+        // No walk: every read is the call graph's.
+        let inputs = crate::engine::discover_service_inputs(&repo, &service, None);
         let text = std::fs::read_to_string(fixture.join("sites.expected.json")).unwrap();
         let sites = serde_json::from_str::<DiscoveryFile>(&text).unwrap().sites;
         let answer: serde_json::Value = serde_json::from_str(
