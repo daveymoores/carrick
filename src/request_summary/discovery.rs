@@ -7,7 +7,12 @@
 //! calls in its body, and so on, [`RequestSummaryInputs::reach`]), reaches a
 //! call or `new` on a labelled export: the export itself (`fetch(…)`, `new
 //! Socket(…)`), or a member of something whose row names a labelled export
-//! by its symbol or its type (`this.child.send(…)` on a `ChildProcess`). A
+//! by its symbol or its type (`this.child.send(…)` on a `ChildProcess`). An
+//! export is matched by the name the store keys it by: the name the module
+//! publishes it as (`default`, `export =`, a renamed export) for a call
+//! through an import binding, and for a global of the language's own library
+//! its name under a default-library key, wherever its types declare it. An
+//! optional call (`socket?.emit(…)`) is a call. A
 //! function handed to an in-repo callee that runs it is followed from the
 //! call that hands it over. A function handed to a library export is not:
 //! until the store says which exports run what they are handed, none is
@@ -17,7 +22,8 @@
 //! answer is kept once it does not depend on a definition still being read.
 //!
 //! A walk that enters code and ends with no labelled export records why:
-//! a [`HoleReason`], `interface_member`, `injected_callee` or `cycle`.
+//! a [`HoleReason`], `interface_member`, `injected_callee`, `cycle` or
+//! `no_body` (a definition whose body this pass did not read).
 //!
 //! Record-only: nothing in a scan calls this. Its tests and the offline
 //! census (`discovery_census`) do. Inside request summaries, as ruling D4
@@ -34,6 +40,10 @@ use crate::library_claims::{ExportClaims, runtime_package_of};
 use crate::library_store::RUNTIME_TYPES;
 use crate::position_rows::{FLAG_DECLARATION_UNNAMED, Kind, Row};
 use crate::services::type_sidecar::{LibraryClaim, LibraryOp, LibraryRole};
+
+/// The stop for a walk that reaches a definition the extractor keys and
+/// this pass read no body of.
+const NO_BODY: &str = "no_body";
 
 /// One discovered site, or one walk that entered code and stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,26 +120,68 @@ impl<'a> Labels<'a> {
     fn get(&self, package: &str, export: &str) -> Option<&'a ExportClaims> {
         self.by_name.get(&(package, export)).copied()
     }
+
+    /// The labelled global the language's own library declares as `name`,
+    /// as the store keys one: under a default-library key (`lib.dom`,
+    /// `lib:<file>`), whichever declaration file the compiler read it from.
+    /// The first such key, in order, when several label it.
+    fn global(&self, name: &str) -> Option<&'a ExportClaims> {
+        self.by_name
+            .iter()
+            .filter(|((package, export), _)| *export == name && is_language_key(package))
+            .min_by_key(|((package, _), _)| *package)
+            .map(|(_, claims)| *claims)
+    }
+}
+
+/// Whether a store key names the language's own library.
+fn is_language_key(package: &str) -> bool {
+    package.starts_with("lib.") || package.starts_with("lib:")
+}
+
+/// The store's keys for the package a specifier imports: the runtime's
+/// module (`node:<module>`) for a `node:` specifier, and for a bare one both
+/// the runtime's module of that name and the package, as the store asks a
+/// specifier ([`crate::library_store::request`]).
+fn specifier_keys(specifier: &str) -> Vec<String> {
+    if specifier.starts_with("node:") {
+        return vec![specifier.to_string()];
+    }
+    let package = super::library_sites::package_name(specifier);
+    let mut keys = vec![package.to_string()];
+    if !specifier.starts_with('.') && !specifier.contains('/') {
+        keys.push(format!("node:{specifier}"));
+    }
+    keys
 }
 
 /// Each object the callee's member chain is read on, innermost first: its
-/// span (discovery numbering) and whether it is a member access. The walk
-/// stops at anything but a name or a member access (`this`, a call).
+/// span (discovery numbering) and whether it is a member access. An
+/// optional member (`socket?.emit`) is read as a member. The walk stops at
+/// anything but a name or a member access (`this`, a call).
 pub(crate) fn receiver_spans(callee: &Expr) -> Vec<(u32, u32, bool)> {
+    fn member_of(expr: &Expr) -> Option<&MemberExpr> {
+        match crate::graphql_document_sites::unwrap_expression(expr) {
+            Expr::Member(member) => Some(member),
+            Expr::OptChain(OptChainExpr { base, .. }) => match &**base {
+                OptChainBase::Member(member) => Some(member),
+                OptChainBase::Call(_) => None,
+            },
+            _ => None,
+        }
+    }
     let mut out = Vec::new();
-    let mut at = crate::graphql_document_sites::unwrap_expression(callee);
-    while let Expr::Member(member) = at {
+    let mut at = member_of(callee);
+    while let Some(member) = at {
         let object = crate::graphql_document_sites::unwrap_expression(&member.obj);
-        match object {
-            Expr::Ident(ident) => {
-                out.push((ident.span.lo.0, ident.span.hi.0, false));
-                break;
-            }
-            Expr::Member(inner) => {
-                out.push((inner.span.lo.0, inner.span.hi.0, true));
-                at = object;
-            }
-            _ => break,
+        if let Expr::Ident(ident) = object {
+            out.push((ident.span.lo.0, ident.span.hi.0, false));
+            break;
+        }
+        at = member_of(object);
+        if at.is_some() {
+            let span = object.span();
+            out.push((span.lo.0, span.hi.0, true));
         }
     }
     out
@@ -291,16 +343,22 @@ impl Walker<'_> {
             .ok()
     }
 
-    /// The labelled export `call` is made on, when it is one: the callee's
-    /// own symbol, or a receiver's symbol or type in the callee's package.
+    /// The labelled export `call` is made on, when it is one:
+    ///
+    /// - the callee's own symbol in the callee's package;
+    /// - the name the module publishes the binding the callee is read
+    ///   through as (`default`, `io`, `export =`), as the store keys the
+    ///   export: the compiler names the declaration (`axios`, `lookup`);
+    /// - a global of the language's own library, by its name, wherever its
+    ///   types declare it;
+    /// - a receiver's symbol or type in the callee's package.
     fn library_end(&self, file: &Path, call: &CallIr, construction: bool) -> Option<SiteEnd> {
         let row = self.row(file, call)?;
         let symbol = row.symbol()?;
         if in_repo(row) {
             return None;
         }
-        let package = store_key(row, self.labels.exports)?;
-        let end = |export: &str, member: Option<&str>, claims: &ExportClaims| {
+        let end = |package: &str, export: &str, member: Option<&str>, claims: &ExportClaims| {
             let op = (!construction)
                 .then(|| {
                     claims.claims.iter().find_map(|claim| match claim {
@@ -314,7 +372,7 @@ impl Walker<'_> {
                 })
                 .flatten();
             SiteEnd {
-                package: package.clone(),
+                package: package.to_string(),
                 export: export.to_string(),
                 member: member.map(str::to_string),
                 role: claims.role,
@@ -325,11 +383,55 @@ impl Walker<'_> {
                 span_end: call.site.span_end,
             }
         };
-        if let Some(claims) = self.labels.get(&package, symbol) {
-            return Some(end(symbol, None, claims));
+        let package = store_key(row, self.labels.exports);
+        if let Some(package) = &package
+            && let Some(claims) = self.labels.get(package, symbol)
+        {
+            return Some(end(package, symbol, None, claims));
         }
-        let positions = self.inputs.positions.as_ref()?;
         let ir = self.inputs.files.get(file)?;
+        // The binding the callee is read through: the callee itself, or the
+        // name its member chain starts at.
+        let root = match call.receiver_spans.last() {
+            None => Some(call.callee_text.as_str()),
+            Some((_, _, false)) => call.callee_text.split(['.', '?']).next().map(str::trim),
+            Some(_) => None,
+        }
+        .filter(|root| super::row_calls::is_identifier(root));
+        let binding = root.and_then(|root| ir.bindings.get(root));
+        if let Some(binding) = binding {
+            let member = (!call.receiver_spans.is_empty()).then_some(symbol);
+            let (exports, member) = match (binding.namespace, call.receiver_spans.len()) {
+                // `ns.fork()`: the member, as written, is the export.
+                (true, 1) => (vec![call.callee.as_str()], None),
+                (true, _) => (Vec::new(), None),
+                (false, _) if binding.export == "default" => (vec!["default", "export ="], member),
+                (false, _) => (vec![binding.export.as_str()], member),
+            };
+            for key in specifier_keys(&binding.specifier) {
+                for export in &exports {
+                    if let Some(claims) = self.labels.get(&key, export) {
+                        return Some(end(&key, export, member, claims));
+                    }
+                }
+            }
+        }
+        // `fetch(…)`, `new WebSocket(…)`: a name no binding of the file
+        // holds, declared by the language's own library or the runtime's
+        // types, is the language's global.
+        if binding.is_none()
+            && call.receiver_spans.is_empty()
+            && root.is_some()
+            && (row
+                .decl_file()
+                .is_some_and(|declared| declared.starts_with("lib:"))
+                || row.decl_package() == Some(RUNTIME_TYPES))
+            && let Some(claims) = self.labels.global(symbol)
+        {
+            return Some(end(&claims.package, symbol, None, claims));
+        }
+        let package = package?;
+        let positions = self.inputs.positions.as_ref()?;
         for (lo, hi, member) in &call.receiver_spans {
             let kind = if *member { Kind::Member } else { Kind::Ident };
             let Ok(receiver) = positions.lookup(file, ir.swc_start(*lo), ir.swc_start(*hi), kind)
@@ -341,7 +443,7 @@ impl Walker<'_> {
                 .flatten()
             {
                 if let Some(claims) = self.labels.get(&package, name) {
-                    return Some(end(name, Some(symbol), claims));
+                    return Some(end(&package, name, Some(symbol), claims));
                 }
             }
         }
@@ -442,12 +544,15 @@ impl Walker<'_> {
             return known.clone();
         }
         let inputs = self.inputs;
+        // A definition the extractor keys whose body this pass did not read
+        // (an object's method, a function written inside another): what it
+        // calls is not known, so the walk stops there and says so.
         let Some(ir) = inputs
             .files
             .get(&id.0)
             .and_then(|ir| ir.functions.get(&id.1))
         else {
-            return Outcome::default();
+            return Outcome::stopped(NO_BODY);
         };
         if ir.bodyless {
             return Outcome::stopped("interface_member");
@@ -476,12 +581,7 @@ impl Walker<'_> {
     /// What the calls `body` makes reach.
     fn body(&mut self, file: &Path, body: &FnIr) -> Outcome {
         let mut out = Outcome::default();
-        for (call, construction) in body
-            .calls
-            .iter()
-            .map(|call| (call, false))
-            .chain(body.constructions.iter().map(|call| (call, true)))
-        {
+        for (call, construction) in body.read_calls() {
             out.absorb(self.call(file, body, call, construction));
         }
         if !out.ends.is_empty() {
@@ -493,12 +593,7 @@ impl Walker<'_> {
     /// The records for every call `body` and the functions written in it
     /// make.
     fn sites(&mut self, file: &Path, body: &FnIr, discovery: &mut Discovery) {
-        for (call, construction) in body
-            .calls
-            .iter()
-            .map(|call| (call, false))
-            .chain(body.constructions.iter().map(|call| (call, true)))
-        {
+        for (call, construction) in body.read_calls() {
             if call.jsx {
                 continue;
             }
@@ -684,6 +779,220 @@ mod tests {
                 .iter()
                 .any(|site| site.callee == "createStore"),
             "a closure a library only stores is not followed"
+        );
+    }
+
+    /// The store's answer for the packages the published-name and global
+    /// cases add, beside the fixture's own.
+    const PUBLISHED_CLAIMS: &str = r#"{
+  "library_claims": [
+    {
+      "package": "fixture-http", "version": "1.0.0", "status": "answered",
+      "exports": [
+        { "specifier": "fixture-http", "export": "default", "role": "http_client", "side": "client",
+          "makes": [], "scopes": [],
+          "ops": [ { "op": "request", "member": "get", "on": "export", "name": { "arg": 0 }, "picker": "fixture-picker" } ],
+          "reserved": [], "calls": [], "patterns": [] }
+      ]
+    },
+    {
+      "package": "fixture-io", "version": "1.0.0", "status": "answered",
+      "exports": [
+        { "specifier": "fixture-io", "export": "io", "role": "socket", "side": "client",
+          "makes": [ { "form": "call", "member": null, "picker": "fixture-picker" } ], "scopes": [],
+          "ops": [], "reserved": [], "calls": [], "patterns": [] }
+      ]
+    },
+    {
+      "package": "fixture-pipe", "version": "1.0.0", "status": "answered",
+      "exports": [
+        { "specifier": "fixture-pipe", "export": "export =", "role": "socket", "side": "client",
+          "makes": [ { "form": "new", "member": null, "picker": "fixture-picker" } ], "scopes": [],
+          "ops": [], "reserved": [], "calls": [], "patterns": [] }
+      ]
+    }
+  ]
+}"#;
+
+    /// The fixture's store answer and [`PUBLISHED_CLAIMS`].
+    fn all_claims() -> Vec<ExportClaims> {
+        let mut exports = claims();
+        let added = crate::library_store::parse_answer(PUBLISHED_CLAIMS);
+        assert_eq!(added.dropped, 0, "every added claim parses");
+        exports.extend(added.exports);
+        exports
+    }
+
+    /// The records discovery writes for `file` (repo-relative), each as
+    /// `line callee -> package export member` or `line callee stop <reason>`.
+    fn records_in(discovery: &Discovery, file: &str) -> Vec<String> {
+        discovery
+            .sites
+            .iter()
+            .filter(|site| site.file == file)
+            .map(|site| match &site.end {
+                Some(end) => format!(
+                    "{} {} -> {} {} {}",
+                    site.line,
+                    site.callee,
+                    end.package,
+                    end.export,
+                    end.member.as_deref().unwrap_or("-")
+                ),
+                None => format!(
+                    "{} {} stop {}",
+                    site.line,
+                    site.callee,
+                    site.stop.as_deref().unwrap_or("-")
+                ),
+            })
+            .collect()
+    }
+
+    fn texts(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// carrick#2431: the store keys an export by the name the module
+    /// publishes it as (`default`, a renamed `io`, `export =`), and the rows
+    /// name the declaration (`http`, `lookup`, `Pipe`). A call through an
+    /// import binding is matched on what the binding imports.
+    #[test]
+    fn a_call_through_a_binding_matches_the_published_export() {
+        let edit = [
+            (
+                "node_modules/fixture-http/package.json",
+                r#"{ "name": "fixture-http", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/fixture-http/index.d.ts",
+                "export interface HttpStatic {\n  get(url: string): Promise<unknown>;\n}\ndeclare const http: HttpStatic;\nexport default http;\n",
+            ),
+            (
+                "node_modules/fixture-io/package.json",
+                r#"{ "name": "fixture-io", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/fixture-io/index.d.ts",
+                "export interface Channel {\n  emit(name: string, data: unknown): void;\n}\ndeclare function lookup(url: string): Channel;\nexport { lookup as io };\n",
+            ),
+            (
+                "node_modules/fixture-pipe/package.json",
+                r#"{ "name": "fixture-pipe", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/fixture-pipe/index.d.ts",
+                "declare class Pipe {\n  constructor(url: string);\n  write(data: unknown): void;\n}\nexport = Pipe;\n",
+            ),
+            (
+                "src/published.ts",
+                "import http from \"fixture-http\";\nimport { io } from \"fixture-io\";\nimport Pipe from \"fixture-pipe\";\n\nexport function readPublished(): Promise<unknown> {\n  return http.get(\"/published\");\n}\n\nexport function openChannel(): void {\n  io(\"wss://published\");\n}\n\nexport function openPipe(): Pipe {\n  return new Pipe(\"wss://pipe\");\n}\n",
+            ),
+            (
+                "src/published-user.ts",
+                "import { openPipe, readPublished } from \"./published\";\n\nexport function readBoth(): void {\n  readPublished();\n  openPipe();\n}\n",
+            ),
+        ];
+        let Some(on) = walked("discovery", "services/web", "web", &edit, true) else {
+            return;
+        };
+        let exports = all_claims();
+        let discovery = discover(&on.inputs, &Labels::of(&exports), &on.repo);
+        assert_eq!(
+            records_in(&discovery, "services/web/src/published.ts"),
+            texts(&[
+                "6 http.get -> fixture-http default get",
+                "10 io -> fixture-io io -",
+                "14 Pipe -> fixture-pipe export = -",
+            ])
+        );
+        assert_eq!(
+            records_in(&discovery, "services/web/src/published-user.ts"),
+            texts(&[
+                "4 readPublished -> fixture-http default get",
+                "5 openPipe -> fixture-pipe export = -",
+            ])
+        );
+    }
+
+    /// carrick#2431: a global of the language's own library is keyed as the
+    /// store keys the language's globals, wherever the compiler read its
+    /// declaration: without the DOM library, the runtime's types declare
+    /// `fetch` in a file of their own, and the call is the same site.
+    #[test]
+    fn a_global_the_runtime_declares_is_the_language_s() {
+        let edit = [
+            (
+                "tsconfig.json",
+                r#"{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "lib": ["es2022"],
+    "types": ["node"]
+  },
+  "include": ["src/**/*"]
+}
+"#,
+            ),
+            (
+                "node_modules/@types/node/index.d.ts",
+                "/// <reference path=\"child_process.d.ts\" />\n/// <reference path=\"web-globals/fetch.d.ts\" />\n",
+            ),
+            (
+                "node_modules/@types/node/web-globals/fetch.d.ts",
+                "export {};\ndeclare global {\n  function fetch(input: string, init?: unknown): Promise<unknown>;\n}\n",
+            ),
+            (
+                "src/node-fetch.ts",
+                "export function readNodeGlobal(): Promise<unknown> {\n  return fetch(\"/node-global\");\n}\n",
+            ),
+        ];
+        let Some(on) = walked("discovery", "services/web", "web", &edit, true) else {
+            return;
+        };
+        let exports = claims();
+        let discovery = discover(&on.inputs, &Labels::of(&exports), &on.repo);
+        assert_eq!(
+            records_in(&discovery, "services/web/src/node-fetch.ts"),
+            texts(&["2 fetch -> lib.dom fetch -"])
+        );
+    }
+
+    /// carrick#2431: a walk that reaches a definition whose body this pass
+    /// did not read stops there and says so; an optional call is a call.
+    #[test]
+    fn an_unread_body_is_a_stop_and_an_optional_call_is_a_site() {
+        let edit = [
+            (
+                "src/table.ts",
+                "export function readTable(): Promise<Response> {\n  function loadInner(): Promise<Response> {\n    return fetch(\"/table\");\n  }\n  return loadInner();\n}\n\nexport const table = {\n  load(): Promise<Response> {\n    return fetch(\"/entry\");\n  },\n};\n\nexport function readEntry(): Promise<Response> {\n  return table.load();\n}\n",
+            ),
+            (
+                "src/maybe.ts",
+                "import { Socket } from \"fixture-socket\";\n\nexport function maybeSend(socket: Socket | undefined): void {\n  socket?.send(\"ping\", {});\n}\n",
+            ),
+        ];
+        let Some(on) = walked("discovery", "services/web", "web", &edit, true) else {
+            return;
+        };
+        let exports = claims();
+        let discovery = discover(&on.inputs, &Labels::of(&exports), &on.repo);
+        assert_eq!(
+            records_in(&discovery, "services/web/src/table.ts"),
+            texts(&[
+                "3 fetch -> lib.dom fetch -",
+                "5 loadInner stop no_body",
+                "10 fetch -> lib.dom fetch -",
+                "15 table.load stop no_body",
+            ])
+        );
+        assert_eq!(
+            records_in(&discovery, "services/web/src/maybe.ts"),
+            texts(&["4 socket?.send -> fixture-socket Socket send"])
         );
     }
 

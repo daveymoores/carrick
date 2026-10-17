@@ -57,7 +57,7 @@ use crate::binding_scope::{BindingKey, Declarations, ident_key};
 use crate::env_alias::{env_get_call_name, env_member_name};
 use crate::graphql_document_sites::unwrap_expression;
 use crate::swc_scanner::is_producer_route_path;
-use crate::visitor::{FunctionDefinition, FunctionNodeType};
+use crate::visitor::FunctionDefinition;
 use crate::wrapper_request_shape::literal_string;
 
 /// How many caller paths one guard is followed down before the rest are
@@ -1358,6 +1358,47 @@ impl CallWalker<'_, '_, '_> {
         self.ir.constructions.push(construction);
     }
 
+    /// An optional call (`socket?.emit(…)`), read as a call is, for
+    /// discovery and the rows' call targets alone (carrick#2431): its
+    /// callee, where it is written and the objects its member chain reads.
+    /// The summaries compose none of these.
+    pub(super) fn record_optional_call(&mut self, call: &OptCall) {
+        let callee = match unwrap_expression(&call.callee) {
+            Expr::Ident(ident) => ident.sym.to_string(),
+            Expr::Member(member) => member_prop(member).unwrap_or_default(),
+            Expr::OptChain(OptChainExpr { base, .. }) => match &**base {
+                OptChainBase::Member(member) => member_prop(member).unwrap_or_default(),
+                OptChainBase::Call(_) => String::new(),
+            },
+            _ => String::new(),
+        };
+        self.ir.optional_calls.push(CallIr {
+            site: self.reader.site(call.span),
+            callee,
+            args: Vec::new(),
+            request: None,
+            waited: false,
+            inert: false,
+            // `produce?.()`: the body invokes a parameter.
+            invokes_param: match unwrap_expression(&call.callee) {
+                Expr::Ident(ident) => self.scope.param_index(ident),
+                _ => None,
+            },
+            receiver: None,
+            site_args: None,
+            name_line: self.reader.line(call.callee.span()),
+            jsx: false,
+            arg_subjects: Vec::new(),
+            callee_subject: None,
+            callee_text: self.reader.text(call.callee.span()),
+            tested: None,
+            handed: Vec::new(),
+            names: Vec::new(),
+            spread_args: Vec::new(),
+            receiver_spans: super::discovery::receiver_spans(&call.callee),
+        });
+    }
+
     /// The literal one operand states.
     fn guard_literal(&self, expr: &Expr) -> Option<GuardLiteral> {
         match self.plain_literal(expr) {
@@ -1559,19 +1600,15 @@ impl FileIr {
                 .iter()
                 .map(|(key, definition)| (key.as_str(), definition)),
         );
+        self.declaration_lines.place(
+            definitions
+                .iter()
+                .map(|(key, definition)| (key.as_str(), definition)),
+        );
         self.definitions = definitions
             .iter()
             .map(|(key, definition)| {
-                let start = match &definition.node_type {
-                    FunctionNodeType::ArrowFunction(arrow) => Some(arrow.span.lo.0),
-                    FunctionNodeType::FunctionDeclaration(declaration) => {
-                        Some(declaration.function.span.lo.0)
-                    }
-                    FunctionNodeType::FunctionExpression(expression) => {
-                        Some(expression.function.span.lo.0)
-                    }
-                    FunctionNodeType::FromPayload(_) | FunctionNodeType::Placeholder => None,
-                };
+                let start = super::row_calls::node_start(definition);
                 (key.clone(), (start, definition.is_exported))
             })
             .collect();

@@ -7,8 +7,14 @@
 //! a `call` row naming the declaration its callee resolves to, as the
 //! compiler resolves it: the receiver's declared or inferred type, an
 //! override, an overload, a re-export chain. That declaration joins the
-//! definition the extractor keyed where it opens ([`FileIr::definition_lines`]):
-//! the same file and line, and a key whose last part is the row's symbol.
+//! definition the extractor keyed on what the declaration names
+//! ([`FileIr::definition_lines`], [`DeclarationLines`]): the same file, the
+//! line the function node or its holding declaration starts on, and a key
+//! whose last part is the declared name (a named `export default` is
+//! `default` to the compiler); an object entry joins the function its value
+//! names.
+//!
+//! Each call is answered once, when the rows are bound ([`RowCalls`]).
 //!
 //! Two kinds of call stay on the call graph: a JSX element, which the rows
 //! give no kind (carrick#2430), and a bare call of a function the same file
@@ -19,7 +25,7 @@
 
 use super::*;
 use crate::position_rows::{FLAG_ANY, FLAG_ERROR_TYPE, Kind};
-use crate::visitor::FunctionDefinition;
+use crate::visitor::{FunctionDefinition, FunctionNodeType};
 
 /// The declarations of a file no definition the extractor keys opens at,
 /// read once per file.
@@ -34,6 +40,45 @@ pub(crate) struct DeclarationLines {
     /// its line, with its name: no body implements it here (carrick#2431's
     /// `interface_member` stop).
     pub(crate) signatures: HashMap<u32, String>,
+    /// Each named `export default function name()` or `export default class
+    /// Name`, by the line the declaration starts on, with the name it
+    /// declares. The compiler names the symbol by what the module publishes
+    /// it as, `default`; the extractor keys it by the declared name.
+    defaults: HashMap<u32, String>,
+    /// Each object-literal entry whose value is a name (`{ fn }`, `{ name:
+    /// impl }`, a CommonJS export table among them), by the line the entry
+    /// starts on: the entry's name and the name its value reads. The
+    /// compiler names the entry a call through the object reaches; the
+    /// function is the one the value names.
+    entries: HashMap<u32, Vec<(String, String)>>,
+    /// The line each declaration that holds a function starts on, by the
+    /// function node's span start (discovery numbering): a declarator
+    /// (`const x =\n  () =>`), a class property with its decorators
+    /// (`@action\n  load = () =>`), an object entry. The compiler starts the
+    /// declaration there; the extractor places the function node.
+    holders: HashMap<u32, u32>,
+    /// Each definition the extractor keyed whose holder starts on another
+    /// line than the extractor's, by the holder's line ([`Self::place`]).
+    starts: HashMap<u32, Vec<String>>,
+}
+
+/// Where the function an initialiser or a property value is starts, when it
+/// is one: an arrow, or a `function` expression's function.
+fn function_start(expr: &Expr) -> Option<u32> {
+    match crate::graphql_document_sites::unwrap_expression(expr) {
+        Expr::Arrow(arrow) => Some(arrow.span.lo.0),
+        Expr::Fn(expression) => Some(expression.function.span.lo.0),
+        _ => None,
+    }
+}
+
+/// An object entry's name, when it is written as a name or a string.
+fn prop_name(name: &PropName) -> Option<String> {
+    match name {
+        PropName::Ident(ident) => Some(ident.sym.to_string()),
+        PropName::Str(text) => Some(text.value.to_string_lossy().into_owned()),
+        _ => None,
+    }
 }
 
 impl DeclarationLines {
@@ -48,6 +93,78 @@ impl DeclarationLines {
             }
         }
         impl Visit for Lines<'_> {
+            fn visit_export_default_decl(&mut self, export: &ExportDefaultDecl) {
+                let declared = match &export.decl {
+                    DefaultDecl::Fn(FnExpr {
+                        ident: Some(ident), ..
+                    })
+                    | DefaultDecl::Class(ClassExpr {
+                        ident: Some(ident), ..
+                    }) => Some(ident.sym.to_string()),
+                    _ => None,
+                };
+                if let Some(name) = declared {
+                    let line = self.line(export.span);
+                    self.out.defaults.insert(line, name);
+                }
+                export.visit_children_with(self);
+            }
+            fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
+                if let Some(start) = declarator.init.as_deref().and_then(function_start) {
+                    let line = self.line(declarator.span);
+                    self.out.holders.insert(start, line);
+                }
+                declarator.visit_children_with(self);
+            }
+            fn visit_class_prop(&mut self, prop: &ClassProp) {
+                if let Some(start) = prop.value.as_deref().and_then(function_start) {
+                    let opens = prop
+                        .decorators
+                        .iter()
+                        .map(|decorator| decorator.span.lo)
+                        .chain([prop.span.lo, prop.key.span().lo])
+                        .min()
+                        .unwrap_or(prop.span.lo);
+                    let line = self.source_map.lookup_char_pos(opens).line as u32;
+                    self.out.holders.insert(start, line);
+                }
+                prop.visit_children_with(self);
+            }
+            fn visit_object_lit(&mut self, object: &ObjectLit) {
+                for prop in &object.props {
+                    let PropOrSpread::Prop(prop) = prop else {
+                        continue;
+                    };
+                    match &**prop {
+                        Prop::Shorthand(ident) => {
+                            let line = self.line(ident.span);
+                            let name = ident.sym.to_string();
+                            self.out
+                                .entries
+                                .entry(line)
+                                .or_default()
+                                .push((name.clone(), name));
+                        }
+                        Prop::KeyValue(entry) => {
+                            let line = self.line(entry.key.span());
+                            if let Some(start) = function_start(&entry.value) {
+                                self.out.holders.insert(start, line);
+                            } else if let (Some(name), Expr::Ident(value)) = (
+                                prop_name(&entry.key),
+                                crate::graphql_document_sites::unwrap_expression(&entry.value),
+                            ) {
+                                self.out
+                                    .entries
+                                    .entry(line)
+                                    .or_default()
+                                    .push((name, value.sym.to_string()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                object.visit_children_with(self);
+            }
             fn visit_fn_decl(&mut self, declaration: &FnDecl) {
                 if declaration.function.body.is_none() {
                     let line = self.line(declaration.function.span);
@@ -86,6 +203,40 @@ impl DeclarationLines {
         };
         module.visit_with(&mut lines);
         lines.out
+    }
+
+    /// Place each definition the extractor keyed at the line its holder
+    /// starts on, joined by the function node's span: what a compiler row's
+    /// declaration line names where the extractor's line differs.
+    pub(crate) fn place<'d>(
+        &mut self,
+        definitions: impl Iterator<Item = (&'d str, &'d FunctionDefinition)>,
+    ) {
+        self.starts.clear();
+        for (key, definition) in definitions {
+            let Some(line) = node_start(definition).and_then(|start| self.holders.get(&start))
+            else {
+                continue;
+            };
+            if *line != definition.line_number {
+                self.starts.entry(*line).or_default().push(key.to_string());
+            }
+        }
+        for keys in self.starts.values_mut() {
+            keys.sort();
+            keys.dedup();
+        }
+    }
+}
+
+/// Where a definition's function node starts (discovery numbering), when it
+/// has one.
+pub(crate) fn node_start(definition: &FunctionDefinition) -> Option<u32> {
+    match &definition.node_type {
+        FunctionNodeType::ArrowFunction(arrow) => Some(arrow.span.lo.0),
+        FunctionNodeType::FunctionDeclaration(declaration) => Some(declaration.function.span.lo.0),
+        FunctionNodeType::FunctionExpression(expression) => Some(expression.function.span.lo.0),
+        FunctionNodeType::FromPayload(_) | FunctionNodeType::Placeholder => None,
     }
 }
 
@@ -150,6 +301,9 @@ impl Reach {
 pub(crate) struct RowCalls {
     /// (file, span start, span end), discovery numbering.
     kept: HashSet<(PathBuf, u32, u32)>,
+    /// What the rows say each other call reaches, by (file, span start, span
+    /// end), read once: a lookup converts positions from the file's start.
+    answers: HashMap<(PathBuf, u32, u32), Reach>,
     counts: BTreeMap<String, usize>,
 }
 
@@ -167,8 +321,10 @@ pub(crate) fn every_call<'a>(
     files: &'a HashMap<PathBuf, FileIr>,
 ) -> Vec<(&'a Path, &'a CallIr, bool)> {
     fn walk<'a>(file: &'a Path, ir: &'a FnIr, out: &mut Vec<(&'a Path, &'a CallIr, bool)>) {
-        out.extend(ir.calls.iter().map(|call| (file, call, false)));
-        out.extend(ir.constructions.iter().map(|call| (file, call, true)));
+        out.extend(
+            ir.read_calls()
+                .map(|(call, construction)| (file, call, construction)),
+        );
         for inner in ir.nested.iter().chain(&ir.detached) {
             walk(file, inner, out);
         }
@@ -188,7 +344,7 @@ pub(crate) fn every_call<'a>(
     out
 }
 
-fn is_identifier(text: &str) -> bool {
+pub(crate) fn is_identifier(text: &str) -> bool {
     !text.is_empty()
         && text
             .chars()
@@ -224,6 +380,8 @@ impl RequestSummaryInputs {
                 },
             };
             *out.counts.entry(key).or_default() += 1;
+            out.answers
+                .insert((file.to_path_buf(), call.site.lo, call.site.hi), reach);
         }
         out
     }
@@ -239,10 +397,16 @@ impl RequestSummaryInputs {
             Some((target, key)) => Reach::OutsideService(target.clone(), key.clone()),
             None => Reach::NoFunction,
         };
-        match &self.row_calls {
-            None => graph(),
-            Some(row_calls) if row_calls.kept.contains(&(file.to_path_buf(), lo, hi)) => graph(),
-            Some(_) => self.row_reach(file, lo, hi),
+        let Some(row_calls) = &self.row_calls else {
+            return graph();
+        };
+        let at = (file.to_path_buf(), lo, hi);
+        if row_calls.kept.contains(&at) {
+            return graph();
+        }
+        match row_calls.answers.get(&at) {
+            Some(reach) => reach.clone(),
+            None => self.row_reach(file, lo, hi),
         }
     }
 
@@ -289,6 +453,7 @@ impl RequestSummaryInputs {
         match joined {
             Join::One(key) => Reach::Function(declaring, key),
             Join::Several => Reach::Unknown(HoleReason::RowsMissing),
+            Join::Unfollowed => Reach::Unknown(HoleReason::UnreadExpression),
             // A call whose result did not resolve, at a declaration that is
             // no definition: an import of nothing, as the import line is.
             Join::None if unresolved => Reach::Unknown(if declaring == file {
@@ -305,27 +470,58 @@ enum Join {
     One(String),
     Several,
     None,
+    /// An object entry whose value names no definition of the file: an
+    /// import, or a binding this pass does not follow.
+    Unfollowed,
 }
 
 /// The definition of `declared` the compiler's declaration of `symbol` at
-/// `line` is: the one opening there whose key names the symbol, or, for an
-/// overload's signature, the first definition of that name after it, which
-/// is the overloads' body.
+/// `line` is, joined on what the declaration names:
+///
+/// - the one opening there whose key names the symbol, where the extractor
+///   places its function node or where the declaration holding it starts
+///   (a declarator, a decorated property); a named `export default`
+///   declaration names its own name, not `default`;
+/// - for an object entry (`{ fn }`, `{ name: impl }`), the function its
+///   value names;
+/// - for an overload's signature, the first definition of that name after
+///   it, which is the overloads' body.
 fn join(declared: &FileIr, line: Option<u32>, symbol: &str) -> Join {
     let Some(line) = line else {
         return Join::None;
     };
-    let at: Vec<&String> = declared
+    let lines = &declared.declaration_lines;
+    let symbol = match lines.defaults.get(&line) {
+        Some(name) if symbol == "default" => name.as_str(),
+        _ => symbol,
+    };
+    let mut at: Vec<&String> = declared
         .definition_lines
         .get(&line)
         .into_iter()
         .flatten()
+        .chain(lines.starts.get(&line).into_iter().flatten())
         .filter(|key| names(key, symbol))
         .collect();
+    at.sort();
+    at.dedup();
     match at.as_slice() {
         [one] => return Join::One((*one).clone()),
         [_, _, ..] => return Join::Several,
         [] => {}
+    }
+    if let Some((_, value)) = lines
+        .entries
+        .get(&line)
+        .into_iter()
+        .flatten()
+        .find(|(name, _)| name == symbol)
+    {
+        return if declared.definitions.contains_key(value) {
+            Join::One(value.clone())
+        } else {
+            Join::Unfollowed
+        };
     }
     if declared
         .declaration_lines
@@ -371,10 +567,18 @@ mod tests {
         )
     }
 
+    const CALLERS: &str = "services/calls/src/callers.ts";
+
     /// The URLs each line of `callers.ts` states a summary row for.
     fn stated(walked: &Walked) -> BTreeMap<u32, Vec<String>> {
+        stated_in(walked, CALLERS)
+    }
+
+    /// The URLs each line of `file` (repo-relative) states a summary row
+    /// for.
+    fn stated_in(walked: &Walked, file: &str) -> BTreeMap<u32, Vec<String>> {
         let index = summarize(&walked.inputs, &LibrarySemantics::default());
-        let path = walked.path("services/calls/src/callers.ts");
+        let path = walked.path(file);
         let mut out: BTreeMap<u32, Vec<String>> = BTreeMap::new();
         for rows in index.rows(&path).into_iter().flat_map(BTreeMap::values) {
             for row in rows {
@@ -390,7 +594,12 @@ mod tests {
     /// What each call written in `callers.ts` reaches, by line, as
     /// `file:key` or the outcome's name.
     fn reached(walked: &Walked) -> BTreeMap<u32, Vec<String>> {
-        let path = walked.path("services/calls/src/callers.ts");
+        reached_in(walked, CALLERS)
+    }
+
+    /// What each call written in `file` (repo-relative) reaches, by line.
+    fn reached_in(walked: &Walked, file: &str) -> BTreeMap<u32, Vec<String>> {
+        let path = walked.path(file);
         let mut out: BTreeMap<u32, Vec<String>> = BTreeMap::new();
         for (file, call, _) in every_call(&walked.inputs.files) {
             if file != path {
@@ -533,5 +742,169 @@ mod tests {
                 line(33, "/reports"),
             ])
         );
+    }
+
+    fn texts(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// The calls service with `allowJs`, so its CommonJS files are in the
+    /// program.
+    const ALLOW_JS: &str = r#"{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "experimentalDecorators": true,
+    "allowJs": true,
+    "baseUrl": ".",
+    "paths": {
+      "@calls/remote": ["../../packages/remote/src/index.ts"],
+      "http-kit": ["src/vendor/http-kit.ts"]
+    },
+    "lib": ["es2022", "dom"],
+    "types": []
+  },
+  "include": ["src/**/*"]
+}
+"#;
+
+    /// Declarations whose compiler row names another thing than the key the
+    /// extractor gives the definition, each written apart from the calls.
+    const SHAPES: &[(&str, &str)] = &[
+        ("tsconfig.json", ALLOW_JS),
+        (
+            "src/load-users.ts",
+            "export default async function loadUsers(): Promise<Response> {\n  return fetch(\"/users-default\");\n}\n",
+        ),
+        (
+            "src/books.ts",
+            "export const loadBooks =\n  async (): Promise<Response> => fetch(\"/books\");\n",
+        ),
+        (
+            "src/store.ts",
+            "function action(_target: unknown, _key: string): void {}\n\nexport class Store {\n  @action\n  load = async (): Promise<Response> => fetch(\"/store\");\n\n  refresh(): Promise<Response> {\n    return this.load();\n  }\n}\n",
+        ),
+        (
+            "src/api.ts",
+            "function list(): Promise<Response> {\n  return fetch(\"/list\");\n}\n\nexport default {\n  list,\n};\n",
+        ),
+        (
+            "src/shapes.ts",
+            "import loadUsers from \"./load-users\";\nimport { loadBooks } from \"./books\";\nimport { Store } from \"./store\";\nimport api from \"./api\";\n\nexport function viaDefault(): Promise<Response> {\n  return loadUsers();\n}\n\nexport function viaDeclarator(): Promise<Response> {\n  return loadBooks();\n}\n\nexport function viaDecorated(store: Store): Promise<Response> {\n  return store.load();\n}\n\nexport function viaEntry(): Promise<Response> {\n  return api.list();\n}\n",
+        ),
+        (
+            "src/totals.js",
+            "function computeTotal(items) {\n  return fetch(\"/total\");\n}\n\nfunction otherImpl() {\n  return fetch(\"/other\");\n}\n\nmodule.exports = {\n  computeTotal,\n  other: otherImpl,\n};\n",
+        ),
+        (
+            "src/orders.js",
+            "const totals = require(\"./totals\");\nconst { other: renamed } = require(\"./totals\");\n\nfunction readTotal() {\n  return totals.computeTotal([]);\n}\n\nfunction readOther() {\n  return renamed();\n}\n\nmodule.exports = { readTotal, readOther };\n",
+        ),
+    ];
+
+    /// The compiler names a declaration by what the module publishes it as,
+    /// or where the declaration holding the function starts; the join reads
+    /// what that declaration names. A named `export default function` is
+    /// `default` to the compiler and its name to the extractor. A CommonJS
+    /// export table entry (`{ fn }`, `{ name: impl }`) and an object
+    /// literal's entry name the entry, and the function is the one its value
+    /// names. A declarator split over two lines and a decorated arrow
+    /// property start a line above the arrow the extractor places.
+    #[test]
+    fn with_rows_a_call_reaches_what_its_declaration_names() {
+        let Some(on) = calls(SHAPES, true) else {
+            return;
+        };
+        assert_eq!(
+            reached_in(&on, "services/calls/src/shapes.ts"),
+            BTreeMap::from([
+                (7, texts(&["load-users.ts:loadUsers"])),
+                (11, texts(&["books.ts:loadBooks"])),
+                (15, texts(&["store.ts:Store.load"])),
+                (19, texts(&["api.ts:list"])),
+            ])
+        );
+        assert_eq!(
+            reached_in(&on, "services/calls/src/store.ts"),
+            BTreeMap::from([
+                (5, texts(&["no_function"])),
+                (8, texts(&["store.ts:Store.load"])),
+            ])
+        );
+        assert_eq!(
+            reached_in(&on, "services/calls/src/orders.js"),
+            BTreeMap::from([
+                (1, texts(&["no_function"])),
+                (2, texts(&["no_function"])),
+                (5, texts(&["totals.js:computeTotal"])),
+                (9, texts(&["totals.js:otherImpl"])),
+            ])
+        );
+        assert_eq!(
+            stated_in(&on, "services/calls/src/shapes.ts"),
+            BTreeMap::from([
+                line(7, "/users-default"),
+                line(11, "/books"),
+                line(15, "/store"),
+                line(19, "/list"),
+            ])
+        );
+    }
+
+    /// A call the rows cannot say the callee of (an `any` receiver, a
+    /// `require` the compiler does not resolve) is not composed through the
+    /// rows, and is still the request its shape states, as without rows.
+    #[test]
+    fn with_rows_an_unreadable_call_is_still_a_request() {
+        let untyped = [
+            (
+                "src/untyped.ts",
+                "const kit = require(\"untyped-kit\");\n\nexport function readUntyped(client: any): Promise<unknown> {\n  return client.get(\"/untyped\");\n}\n\nexport function readRequired(): Promise<unknown> {\n  return kit.get(\"/required\");\n}\n",
+            ),
+            (
+                "src/untyped-user.ts",
+                "import { readRequired, readUntyped } from \"./untyped\";\n\nexport function loadUntyped(): Promise<unknown> {\n  return readUntyped({});\n}\n\nexport function loadRequired(): Promise<unknown> {\n  return readRequired();\n}\n",
+            ),
+        ];
+        let Some(on) = calls(&untyped, true) else {
+            return;
+        };
+        let off = calls(&untyped, false).unwrap();
+        let reached = reached_in(&on, "services/calls/src/untyped.ts");
+        for line in [4, 8] {
+            assert!(
+                reached[&line]
+                    .iter()
+                    .all(|text| text.starts_with("unknown")),
+                "line {line}: {reached:?}"
+            );
+        }
+        let user = "services/calls/src/untyped-user.ts";
+        let stated = stated_in(&on, user);
+        assert_eq!(stated, stated_in(&off, user));
+        assert_eq!(
+            stated,
+            BTreeMap::from([line(4, "/untyped"), line(8, "/required")])
+        );
+    }
+
+    /// Each call's target is read from the rows once: asking again looks no
+    /// row up.
+    #[test]
+    fn with_rows_each_call_is_looked_up_once() {
+        let Some(on) = calls(&[], true) else {
+            return;
+        };
+        let positions = on.inputs.positions.as_ref().unwrap();
+        let before = positions.lookups();
+        for _ in 0..3 {
+            for (file, call, _) in every_call(&on.inputs.files) {
+                on.inputs.reach(file, call.site.lo, call.site.hi);
+            }
+        }
+        assert_eq!(positions.lookups(), before);
     }
 }
