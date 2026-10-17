@@ -225,6 +225,16 @@ pub const CAPACITY_REFUSAL_CODE: &str = "model_error";
 /// is counted or named, and it is not one of the run's requests.
 pub const NOT_ASKED_CODE: &str = "model_busy_not_asked";
 
+/// The smallest `details.max_prompt_bytes` the scanner cuts a file under
+/// (carrick#2310): half of one part's window of source (`PART_WINDOW_BYTES`
+/// in `agents::file_orchestrator`). The cloud's line is set at the scale of
+/// the scanner's own, 250,000 bytes. A limit under half a window would refuse
+/// the parts the scanner cuts by design, so it reads as a misconfigured cloud
+/// and is ignored: the refused request is then cut under its own size, as
+/// when no limit is stated, and a file is never made final by that number
+/// alone. Low enough not to ignore a real limit set for a smaller model.
+const MIN_STATED_PROMPT_BYTES: usize = 32_000;
+
 /// Whether a call that ended under `code` is owed for capacity: the model
 /// refused it ([`CAPACITY_REFUSAL_CODE`]), or refused the request ahead of it
 /// on a route that had stopped answering ([`NOT_ASKED_CODE`]). Either way a
@@ -370,10 +380,14 @@ impl AgentCallError {
     /// carrick-cloud#2267), and the file is cut smaller under it.
     ///
     /// Read as [`Self::max_part_candidates`] is: absent, zero, negative, a
-    /// fraction or not a number at all reads as `None`.
+    /// fraction or not a number at all reads as `None`. So does a limit under
+    /// [`MIN_STATED_PROMPT_BYTES`]: no real deployment states one, and a file
+    /// cut under it would be lost for good, every part of it too large.
     pub fn max_prompt_bytes(&self) -> Option<usize> {
         let stated = self.detail("max_prompt_bytes")?.as_u64()?;
-        usize::try_from(stated).ok().filter(|bytes| *bytes > 0)
+        usize::try_from(stated)
+            .ok()
+            .filter(|bytes| *bytes >= MIN_STATED_PROMPT_BYTES)
     }
 
     /// Whether the model was deliberately not asked, rather than asked and
@@ -5821,10 +5835,10 @@ pub(crate) mod tests {
         assert!(!cut.cloud_stated);
     }
 
-    /// carrick#2310: the size limit the cloud states on its size verdict is a
-    /// positive integer or nothing, read as the part size is.
+    /// carrick#2310: the size limit the cloud states on its size verdict is an
+    /// integer of at least [`MIN_STATED_PROMPT_BYTES`] or nothing.
     #[test]
-    fn max_prompt_bytes_is_a_positive_integer_or_nothing() {
+    fn max_prompt_bytes_is_an_integer_over_the_floor_or_nothing() {
         let call = |details: &str| {
             call_error_from_envelope(envelope_error(&format!(
                 r#"{{"success":false,"error":{{"code":"prompt_too_large","message":"x","retriable":false,"details":{details}}}}}"#
@@ -5834,11 +5848,15 @@ pub(crate) mod tests {
         assert_eq!(stated.max_prompt_bytes(), Some(300_000));
         assert!(stated.is_final_answer());
         assert_eq!(
-            call(r#"{"max_prompt_bytes":1}"#).max_prompt_bytes(),
-            Some(1)
+            call(r#"{"max_prompt_bytes":32000}"#).max_prompt_bytes(),
+            Some(MIN_STATED_PROMPT_BYTES)
         );
         for no_limit in [
             "{}",
+            // A misconfigured cloud: a limit no part could meet.
+            r#"{"max_prompt_bytes":1}"#,
+            r#"{"max_prompt_bytes":1000}"#,
+            r#"{"max_prompt_bytes":31999}"#,
             r#"{"max_prompt_bytes":0}"#,
             r#"{"max_prompt_bytes":-300000}"#,
             r#"{"max_prompt_bytes":300000.5}"#,

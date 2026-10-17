@@ -1967,6 +1967,36 @@ async fn a_whole_request_refused_for_size_is_asked_in_parts() {
     assert_eq!(lost_reason(&fx.table), None, "the file's rows are stored");
 }
 
+/// carrick#2310: a limit no part could meet, stated by a misconfigured cloud,
+/// is read as no limit. The refused request is cut into its windows and the
+/// file's rows are stored, rather than every part being cut down to one item
+/// over the line and the file lost for good.
+#[tokio::test]
+#[serial]
+async fn a_stated_limit_no_part_could_meet_is_ignored() {
+    offline();
+    let tag = "tinylimit";
+    let shape = shapes::flat_module(tag, 150);
+    let subject = format!("src/{tag}_client.ts");
+    let fx = Fixture::of(&[(subject.clone(), shape.source.clone())], &subject);
+    let whole = fx.whole_prompt().await;
+    agent_service::inject_mock_envelope(
+        ROUTE,
+        &fx.whole_marker(),
+        1,
+        &too_large(json!({ "max_prompt_bytes": 1000, "user_message_bytes": whole.len() })),
+    );
+    let (dumps, sent) = fx.dumped_run().await;
+    assert!(
+        dumps.whole.is_none(),
+        "the refused request is not sent again"
+    );
+    assert!(dumps.parts.len() > 1, "{} part(s)", dumps.parts.len());
+    assert_eq!(sent, 1 + dumps.parts.len());
+    assert_eq!(listed_in_parts(&dumps.parts).len(), 150);
+    assert_eq!(lost_reason(&fx.table), None, "the file's rows are stored");
+}
+
 /// carrick#2310: a part the cloud refuses as too large is halved by its
 /// bytes and its halves asked; the refused part is never sent again.
 #[tokio::test]
