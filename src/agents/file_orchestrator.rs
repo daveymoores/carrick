@@ -134,18 +134,11 @@ pub const FILE_TOO_LARGE_CODE: &str = "file_too_large";
 /// Decided before any request about it is sent, or when the cloud's size
 /// verdict refuses a part that cannot be cut again (carrick#2310).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileTooLarge {
-    /// The line the file could not be cut under.
-    pub max_prompt_bytes: usize,
-}
+pub struct FileTooLarge;
 
 impl std::fmt::Display for FileTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the file cannot be cut into requests of at most {} bytes",
-            self.max_prompt_bytes
-        )
+        f.write_str("the file is too large for Carrick to analyse, even split into parts")
     }
 }
 
@@ -1752,9 +1745,7 @@ impl FileOrchestrator {
         guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
         line: usize,
     ) -> Result<PartPlan, FileTooLarge> {
-        let too_large = FileTooLarge {
-            max_prompt_bytes: line,
-        };
+        let too_large = FileTooLarge;
         let cut = SourceCut::of(Path::new(file.prompt_path), file.content, file.listed)
             .ok_or_else(|| too_large.clone())?;
         let limits = Limits {
@@ -1826,9 +1817,7 @@ impl FileOrchestrator {
                     plan.line
                 ),
                 None => {
-                    return Err(FileTooLarge {
-                        max_prompt_bytes: plan.line,
-                    });
+                    return Err(FileTooLarge);
                 }
             }
         }
@@ -1986,11 +1975,7 @@ impl FileOrchestrator {
                         // One item with no list, holding no candidate: it
                         // states nothing the model is asked about.
                         None if part.candidates.is_empty() => {}
-                        None => {
-                            lost = Some(Box::new(FileTooLarge {
-                                max_prompt_bytes: plan.line,
-                            }))
-                        }
+                        None => lost = Some(Box::new(FileTooLarge)),
                     }
                 } else {
                     lost = Some(error);
@@ -12008,6 +11993,16 @@ impl FileOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The warning for a file that cannot be asked says it in these words.
+    #[test]
+    fn a_file_too_large_reads_as_the_approved_sentence() {
+        let lost = FileTooLarge;
+        assert_eq!(
+            lost.to_string(),
+            "the file is too large for Carrick to analyse, even split into parts"
+        );
+    }
     use crate::agents::file_analyzer_agent::{DataCallResult, EndpointResult, MountResult};
     use crate::dispatch::{Dispatch, DispatchLocation};
 

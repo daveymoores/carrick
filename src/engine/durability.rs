@@ -435,23 +435,36 @@ pub fn pending_summary(
     pending: &[(String, OwedWork)],
     laptop: bool,
 ) -> String {
-    let complete_line = if complete.is_empty() {
+    // A service whose only owed work is final files is complete: a re-run
+    // cannot mend it (carrick#2488). It is listed with what it lost.
+    let (final_only, pending): (Vec<_>, Vec<_>) = pending
+        .iter()
+        .partition(|(_, owed)| owed.owes_only_final_files());
+    let complete_items: Vec<String> = complete
+        .iter()
+        .cloned()
+        .chain(
+            final_only
+                .iter()
+                .map(|(service, owed)| format!("{service} ({})", owed.describe())),
+        )
+        .collect();
+    let complete_line = if complete_items.is_empty() {
         "Complete: none.".to_string()
     } else {
-        format!("Complete: {}.", complete.join(", "))
+        format!("Complete: {}.", complete_items.join(", "))
     };
     let pending_line = pending
         .iter()
         .map(|(service, owed)| format!("{service} ({})", owed.describe()))
         .collect::<Vec<_>>()
         .join(", ");
-    let final_files: usize = pending
+    let final_files: usize = final_only
         .iter()
+        .chain(pending.iter())
         .map(|(_, owed)| owed.losses.final_files)
         .sum();
-    let a_rerun_finishes_some = pending
-        .iter()
-        .any(|(_, owed)| !owed.owes_only_final_files());
+    let a_rerun_finishes_some = !pending.is_empty();
     let what = if final_files > 0 { "the rest" } else { "them" };
     let rerun = a_rerun_finishes_some.then(|| {
         if laptop {
@@ -472,10 +485,12 @@ pub fn pending_summary(
     .into_iter()
     .flatten()
     .collect();
-    format!(
-        "{complete_line} Pending model analysis: {pending_line}. {}",
-        closing.join(" ")
-    )
+    let pending_part = if pending.is_empty() {
+        String::new()
+    } else {
+        format!(" Pending model analysis: {pending_line}.")
+    };
+    format!("{complete_line}{pending_part} {}", closing.join(" "))
 }
 
 #[cfg(test)]
@@ -910,11 +925,47 @@ mod tests {
             assert_eq!(
                 pending_summary(&["api".to_string()], &pending, laptop),
                 format!(
-                    "Complete: api. Pending model analysis: billing (1 file(s) Carrick cannot \
-                     analyse). {FINAL_ANSWER_FOR_ONE}"
+                    "Complete: api, billing (1 file(s) Carrick cannot analyse). \
+                     {FINAL_ANSWER_FOR_ONE}"
                 )
             );
         }
+    }
+
+    /// carrick#2488: a service whose only owed work is final files is listed
+    /// under Complete with its parenthesis, and no pending part is written
+    /// when nothing else is pending.
+    #[test]
+    fn a_final_only_service_is_listed_as_complete_with_its_parenthesis() {
+        let owed = [("billing".to_string(), lost_with_final(2, 2))];
+        assert_eq!(
+            pending_summary(&["api".to_string()], &owed, true),
+            "Complete: api, billing (2 file(s) Carrick cannot analyse). The answer for 2 \
+             file(s) is final: a re-run gives the same result until the file changes or \
+             Carrick is updated."
+        );
+        let only = pending_summary(&[], &owed, false);
+        assert!(only.starts_with("Complete: billing (2 file(s)"), "{only}");
+        assert!(!only.contains("Pending model analysis"), "{only}");
+    }
+
+    /// A final-only service moves to Complete; a service beside it with work
+    /// a re-run can mend stays pending with today's wording.
+    #[test]
+    fn a_final_only_service_beside_a_mendable_one_moves_and_the_other_stays() {
+        let owed = [
+            ("billing".to_string(), lost_with_final(1, 1)),
+            ("worker".to_string(), lost_with_final(1, 0)),
+        ];
+        assert_eq!(
+            pending_summary(&["api".to_string()], &owed, false),
+            format!(
+                "Complete: api, billing (1 file(s) Carrick cannot analyse). Pending model \
+                 analysis: worker (1 file(s) not analysed). The next scan asks the model only \
+                 for the pending work and replays everything else from cache. \
+                 {FINAL_ANSWER_FOR_ONE}"
+            )
+        );
     }
 
     /// Beside work a re-run does finish, the advice covers that work and the
