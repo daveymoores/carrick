@@ -2140,7 +2140,8 @@ export class TypeInferrer {
    * Returns `undefined` when this does not apply, which leaves the caller's
    * own reading of the located expression untouched:
    *  - the row's line is neither a route registration nor a line inside the
-   *    handler the located send sits in;
+   *    handler the located send sits in, unless the located send states an
+   *    error or redirect status and the handler keeps another send (carrick#2463);
    *  - the located expression is neither a send nor the argument of one;
    *  - that send is neither one the handler returns nor a statement of it;
    *  - it is a success send the handler does not return (a statement send
@@ -2166,16 +2167,13 @@ export class TypeInferrer {
     // The row's line is a registration, or a line inside the handler the
     // located send sits in (carrick#2005: a file-based route's row names the
     // send's own line, and a send's line is no registration). A row whose
-    // line is outside that function says nothing about it.
-    if (
-      !this.registrationAtLine(sourceFile, request.line_number) &&
-      !(
-        func.getStartLineNumber() <= request.line_number &&
-        request.line_number <= func.getEndLineNumber()
-      )
-    ) {
-      return undefined;
-    }
+    // line is outside that function says nothing about the function, so it
+    // is "untied" (carrick#2463): only a located error or redirect send is
+    // walked then, and only when a send survives the drop.
+    const tied =
+      !!this.registrationAtLine(sourceFile, request.line_number) ||
+      (func.getStartLineNumber() <= request.line_number &&
+        request.line_number <= func.getEndLineNumber());
 
     const returnedBranches = this.responseReturnedExpressions(func).flatMap((expression) =>
       this.expandResponseBranches(expression, 0)
@@ -2206,6 +2204,7 @@ export class TypeInferrer {
     const dropped = (status: ResponseSiteStatus): boolean =>
       status === 'error' || status === 'redirect';
     const siteStatus = this.responseSiteStatus(site, true);
+    if (!tied && !dropped(siteStatus)) return undefined;
     let branches: Node[];
     if (dropped(siteStatus)) {
       branches = [
@@ -2232,6 +2231,9 @@ export class TypeInferrer {
       survivors.push(branch);
     }
 
+    // carrick#2463 (D2): an untied row claims "no success payload" only when
+    // the function it reads keeps a send after the error sends are dropped.
+    if (!tied && survivors.length === 0) return undefined;
     const locatedDropped = dropped(siteStatus);
     if (!locatedDropped && survivors.length <= 1) return undefined;
 
