@@ -55,6 +55,9 @@ use super::decided_sites::{
     Decided, DecidedSite, HandlerAt, MethodValue, PayloadBinding, SiteLabel,
 };
 use crate::position_rows::{Kind, PositionIndex};
+use crate::site_questions::{
+    Place, PlaceFrom, Point, SiteCall, SiteState, Slot, Stated, StatedValue,
+};
 use crate::type_manifest::is_http_method;
 
 /// The most characters of an in-repo declaration's text a name carries.
@@ -76,99 +79,9 @@ const CONTEXT_BEFORE: u32 = 3;
 const CONTEXT_AFTER: u32 = 2;
 
 // ---------------------------------------------------------------------------
-// The wire shapes. TEMPORARY copy (carrick#2437): lane 2's
-// `src/site_questions.rs` owns `SiteState`, `Stated`, `StatedValue`, `Place`,
-// `PlaceFrom`, `Slot`, `Point` and `SiteCall`; these serialise to the same
-// JSON (the round-trip test reads its `contract.json`). Whichever of the two
-// PRs merges second deletes these and uses lane 2's types.
-
-/// A slot the record can ask or state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Slot {
-    Kind,
-    Role,
-    Name,
-    NameArgument,
-    PayloadArgument,
-    Method,
-    Namespace,
-}
-
-/// Where the site is: a repo-relative `file:line`, and the source around
-/// it with line numbers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Point {
-    pub at: String,
-    pub code: String,
-}
-
-/// The call at the site: its source, and its arguments' source in order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SiteCall {
-    pub text: String,
-    pub at: String,
-    pub args: Vec<String>,
-}
-
-/// Where a value is stated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlaceFrom {
-    Checker,
-    StringLiteral,
-    TemplateLiteral,
-    ObjectKey,
-    LabelMethod,
-    LabelMethodDefault,
-}
-
-/// One place a value is stated.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Place {
-    pub from: PlaceFrom,
-    pub at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub via: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub export: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub member: Option<String>,
-}
-
-/// One value the code states, with every place it is stated.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StatedValue {
-    pub text: String,
-    pub places: Vec<Place>,
-}
-
-/// The stated values.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Stated {
-    pub names: Vec<StatedValue>,
-    pub methods: Vec<StatedValue>,
-}
-
-/// The site record as the wire carries it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SiteState {
-    pub point: Point,
-    pub compiler: Compiler,
-    pub syntax: Vec<SyntaxNode>,
-    pub libraries: Vec<Library>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub package_network_roles: Option<Vec<RoleFiles>>,
-    pub call: Option<SiteCall>,
-    pub stated: Stated,
-    pub asked: Vec<Slot>,
-    pub forced: BTreeMap<Slot, String>,
-}
-
-// ---------------------------------------------------------------------------
-// The record's own parts (lane 2 carries them as JSON values).
+// The record's own parts (the wire carries them as JSON values: `compiler`,
+// `syntax`, `libraries` and `package_network_roles` of
+// [`crate::site_questions::SiteState`]).
 
 /// What the compiler says at the site.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -492,7 +405,7 @@ fn stated_whole(
     exprs: &[&Expr],
     literals: &dyn Fn(&str) -> Vec<String>,
 ) -> Option<BTreeSet<String>> {
-    if let Some(text) = literal_text(pieces) {
+    if let Some(text) = literal_text(pieces).or_else(|| env_based_text(pieces)) {
         return Some(BTreeSet::from([text]));
     }
     match pieces {
@@ -513,6 +426,29 @@ fn literal_text(pieces: &[super::Piece]) -> Option<String> {
         })
         .collect::<Option<String>>()?;
     (!text.is_empty()).then_some(text)
+}
+
+/// The text of `pieces` when they are text the code writes and environment
+/// reads, with at least one read: an environment base is stated, as the
+/// request rows write it, a named piece (`${process.env.API}/items`). Any
+/// other piece (a parameter, a value nothing reads) leaves it unstated.
+fn env_based_text(pieces: &[super::Piece]) -> Option<String> {
+    let mut reads = 0;
+    let text: String = pieces
+        .iter()
+        .map(|piece| match piece {
+            super::Piece::Lit(text) => Some(text.clone()),
+            super::Piece::Opaque {
+                end: super::Root::Env { written, .. },
+                ..
+            } => {
+                reads += 1;
+                Some(format!("${{{written}}}"))
+            }
+            _ => None,
+        })
+        .collect::<Option<String>>()?;
+    (reads > 0).then_some(text)
 }
 
 /// A declaration file as the record names it: an installed package outside
@@ -541,6 +477,11 @@ impl Sources<'_> {
     }
 }
 
+/// A part of the record as the wire carries it: a JSON value.
+fn wire_value<T: Serialize + ?Sized>(part: &T) -> serde_json::Value {
+    serde_json::to_value(part).unwrap_or(serde_json::Value::Null)
+}
+
 /// What one call expression holds, as the record reads it.
 #[derive(Default)]
 struct CallParts {
@@ -555,20 +496,203 @@ struct CallParts {
     enclosing: Option<(String, u32)>,
     /// The arguments as written.
     arg_exprs: Vec<Expr>,
-    /// Every object entry written in the arguments: its key and span.
-    props: Vec<(String, Span)>,
+    /// The call's span.
+    span: Span,
 }
 
-/// The object entries an expression writes, in source order.
-#[derive(Default)]
-struct Props(Vec<(String, Span)>);
+/// The syntax nodes that start on the site's lines (the call's line and the
+/// three after it): the kinds the concept test kept (carrick#2441), each with
+/// its type, line and text; calls and constructions carry their callee and
+/// argument texts, an object entry its key. The call itself is not repeated
+/// here: it leads the list.
+struct SyntaxNodes<'p> {
+    parsed: &'p Parsed,
+    from: u32,
+    to: u32,
+    call: Span,
+    nodes: Vec<SyntaxNode>,
+}
 
-impl Visit for Props {
+/// Lines after the call's own that a node may start on.
+const SYNTAX_LINES_AFTER: u32 = 3;
+
+impl<'p> SyntaxNodes<'p> {
+    fn of(parsed: &'p Parsed, file: &str, call: Span) -> Vec<SyntaxNode> {
+        let from = parsed.line(call.lo.0);
+        let mut found = Self {
+            parsed,
+            from,
+            to: from + SYNTAX_LINES_AFTER,
+            call,
+            nodes: Vec::new(),
+        };
+        parsed.module.visit_with(&mut found);
+        found
+            .nodes
+            .into_iter()
+            .map(|mut node| {
+                node.at = format!("{file}:{}", node.at);
+                node
+            })
+            .collect()
+    }
+
+    /// Whether the span lies wholly outside the window, so nothing inside
+    /// it can start there.
+    fn outside(&self, span: Span) -> bool {
+        self.parsed.line(span.hi.0) < self.from || self.parsed.line(span.lo.0) > self.to
+    }
+
+    fn keep(&self, span: Span) -> bool {
+        let line = self.parsed.line(span.lo.0);
+        line >= self.from && line <= self.to && span != self.call
+    }
+
+    fn push(&mut self, node: &str, span: Span) {
+        if self.keep(span) {
+            self.push_with(node, span, None, None, None);
+        }
+    }
+
+    fn push_with(
+        &mut self,
+        node: &str,
+        span: Span,
+        callee: Option<String>,
+        args: Option<Vec<String>>,
+        key: Option<String>,
+    ) {
+        self.nodes.push(SyntaxNode {
+            node: node.to_string(),
+            at: self.parsed.line(span.lo.0).to_string(),
+            text: self.parsed.text_of(span),
+            callee,
+            args,
+            key,
+        });
+    }
+
+    fn call(&mut self, node: &str, span: Span, callee: &Expr, args: &[ExprOrSpread]) {
+        if self.keep(span) {
+            let callee = self.parsed.text_of(callee.span());
+            let args = args
+                .iter()
+                .map(|arg| self.parsed.text_of(arg.span()))
+                .collect();
+            self.push_with(node, span, Some(callee), Some(args), None);
+        }
+    }
+}
+
+impl Visit for SyntaxNodes<'_> {
+    fn visit_module_item(&mut self, item: &ModuleItem) {
+        if !self.outside(item.span()) {
+            item.visit_children_with(self);
+        }
+    }
+
+    fn visit_stmt(&mut self, stmt: &Stmt) {
+        if !self.outside(stmt.span()) {
+            stmt.visit_children_with(self);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        if !self.outside(expr.span()) {
+            expr.visit_children_with(self);
+        }
+    }
+
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Callee::Expr(callee) = &call.callee {
+            self.call("CallExpression", call.span, callee, &call.args);
+        } else {
+            self.push("CallExpression", call.span);
+        }
+        call.visit_children_with(self);
+    }
+
+    fn visit_new_expr(&mut self, new: &NewExpr) {
+        self.call(
+            "NewExpression",
+            new.span,
+            &new.callee,
+            new.args.as_deref().unwrap_or_default(),
+        );
+        new.visit_children_with(self);
+    }
+
     fn visit_key_value_prop(&mut self, entry: &KeyValueProp) {
-        if let Some(key) = super::prop_name(&entry.key) {
-            self.0.push((key, entry.span()));
+        if self.keep(entry.span()) {
+            let key = super::prop_name(&entry.key)
+                .unwrap_or_else(|| self.parsed.text_of(entry.key.span()));
+            self.push_with("KeyValueProperty", entry.span(), None, None, Some(key));
         }
         entry.visit_children_with(self);
+    }
+
+    fn visit_member_expr(&mut self, node: &MemberExpr) {
+        self.push("MemberExpression", node.span);
+        node.visit_children_with(self);
+    }
+
+    fn visit_str(&mut self, node: &Str) {
+        self.push("StringLiteral", node.span);
+    }
+
+    fn visit_tpl(&mut self, node: &Tpl) {
+        self.push("TemplateLiteral", node.span);
+        node.visit_children_with(self);
+    }
+
+    fn visit_bin_expr(&mut self, node: &BinExpr) {
+        self.push("BinaryExpression", node.span);
+        node.visit_children_with(self);
+    }
+
+    fn visit_object_lit(&mut self, node: &ObjectLit) {
+        self.push("ObjectExpression", node.span);
+        node.visit_children_with(self);
+    }
+
+    fn visit_arrow_expr(&mut self, node: &ArrowExpr) {
+        self.push("ArrowFunctionExpression", node.span);
+        node.visit_children_with(self);
+    }
+
+    fn visit_fn_expr(&mut self, node: &FnExpr) {
+        self.push("FunctionExpression", node.function.span);
+        node.visit_children_with(self);
+    }
+
+    fn visit_if_stmt(&mut self, node: &IfStmt) {
+        self.push("IfStatement", node.span);
+        node.visit_children_with(self);
+    }
+
+    fn visit_switch_case(&mut self, node: &SwitchCase) {
+        self.push("SwitchCase", node.span);
+        node.visit_children_with(self);
+    }
+
+    fn visit_cond_expr(&mut self, node: &CondExpr) {
+        self.push("ConditionalExpression", node.span);
+        node.visit_children_with(self);
+    }
+
+    fn visit_assign_expr(&mut self, node: &AssignExpr) {
+        self.push("AssignmentExpression", node.span);
+        node.visit_children_with(self);
+    }
+
+    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
+        self.push("VariableDeclarator", node.span);
+        node.visit_children_with(self);
+    }
+
+    fn visit_opt_chain_expr(&mut self, node: &OptChainExpr) {
+        self.push("OptionalChainingExpression", node.span);
+        node.visit_children_with(self);
     }
 }
 
@@ -645,13 +769,9 @@ impl CallFinder<'_> {
         if let Some(callee) = callee {
             callee.visit_with(&mut in_callee);
         }
-        let mut props = Props::default();
-        for arg in args {
-            arg.expr.visit_with(&mut props);
-        }
         self.found = Some(CallParts {
             arg_exprs: args.iter().map(|arg| (*arg.expr).clone()).collect(),
-            props: props.0,
+            span,
             text: self.parsed.text_of(span),
             callee: callee
                 .map(|callee| self.parsed.text_of(callee.span()))
@@ -1170,6 +1290,8 @@ fn record(
         (None, Some(_)) => {
             if let Some(text) = literal_text(&site.name) {
                 stated.value(&text, place(PlaceFrom::StringLiteral, &at));
+            } else if let Some(text) = env_based_text(&site.name) {
+                stated.value(&text, place(PlaceFrom::TemplateLiteral, &at));
             }
             stated_whole(sources.get(file), &site.name, &name_exprs, &literals)
         }
@@ -1354,16 +1476,8 @@ fn record(
         key: None,
     }];
     if let Some(parsed) = sources.get(file) {
-        for (key, span) in parts.props.iter().take(MAX_SYNTAX_NODES - 1) {
-            syntax.push(SyntaxNode {
-                node: "KeyValueProperty".to_string(),
-                at: format!("{file}:{}", parsed.line(span.lo.0)),
-                text: parsed.text_of(*span),
-                callee: None,
-                args: None,
-                key: Some(key.clone()),
-            });
-        }
+        let found = SyntaxNodes::of(parsed, file, parts.span);
+        syntax.extend(found.into_iter().take(MAX_SYNTAX_NODES - 1));
     }
     // Every op the store labels on the site's export.
     let argument_labels: Vec<ArgumentLabel> = labels
@@ -1383,7 +1497,7 @@ fn record(
         .collect();
     let state = SiteState {
         point,
-        compiler: Compiler {
+        compiler: wire_value(&Compiler {
             names,
             callees,
             enclosing: parts.enclosing.map(|(text, line)| Enclosing {
@@ -1391,9 +1505,9 @@ fn record(
                 at: format!("{file}:{line}"),
             }),
             reached,
-        },
-        syntax,
-        libraries: vec![Library {
+        }),
+        syntax: wire_value(&syntax),
+        libraries: wire_value(&[Library {
             package: label.package.clone(),
             labels: vec![LibraryLabel {
                 export: label.export.clone(),
@@ -1412,8 +1526,9 @@ fn record(
             }],
             argument_labels,
             in_store: true,
-        }],
-        package_network_roles: (!package_network_roles.is_empty()).then_some(package_network_roles),
+        }]),
+        package_network_roles: (!package_network_roles.is_empty())
+            .then(|| wire_value(&package_network_roles)),
         call: Some(SiteCall {
             text: call_text,
             at: call_at,
@@ -1633,6 +1748,11 @@ mod tests {
         std::fs::canonicalize(manifest().join("tests/fixtures/discovery/repo")).unwrap()
     }
 
+    /// The state's `compiler` part, read back from the wire value.
+    fn compiler_of(record: &SiteRecord) -> Compiler {
+        serde_json::from_value(record.state.compiler.clone()).unwrap()
+    }
+
     fn record<'r>(records: &'r [SiteRecord], at: &str) -> &'r SiteRecord {
         records
             .iter()
@@ -1756,11 +1876,9 @@ mod tests {
     fn a_name_carries_its_declaration_and_literal() {
         let (records, _) = records_with_rows(&repo());
         let report = record(&records, "choices.ts:14");
-        let v2 = report
-            .state
-            .compiler
+        let v2 = compiler_of(report)
             .names
-            .iter()
+            .into_iter()
             .find(|name| name.text == "PATH_V2")
             .unwrap();
         assert_eq!(
@@ -1776,9 +1894,8 @@ mod tests {
         // The bodies the site's calls run, two levels down, each entered by
         // the callee the level above writes.
         let things = record(&records, "pages/things.ts:4");
-        let reached: Vec<(u8, &str, &str)> = things
-            .state
-            .compiler
+        let things_compiler = compiler_of(things);
+        let reached: Vec<(u8, &str, &str)> = things_compiler
             .reached
             .iter()
             .map(|body| (body.level, body.via.as_str(), body.function.as_str()))
@@ -1790,7 +1907,7 @@ mod tests {
                 (2, "api", "services/web/src/api.ts:1")
             ]
         );
-        assert_eq!(things.state.compiler.reached[0].strings, vec!["/v1"]);
+        assert_eq!(things_compiler.reached[0].strings, vec!["/v1"]);
         assert_eq!(
             things.state.forced.get(&Slot::Name).map(String::as_str),
             Some("/v1/things")
@@ -1934,8 +2051,10 @@ mod tests {
     // `decided-sites/src/slots/rooms.ts`, each call its own discovery site.
 
     use super::super::decided_sites::tests::{
-        ROOMS, decided_fixture, line_of, rooms_sites, span_of,
+        ROOMS, bottom, decided_fixture, end_for, fetch_label, line_of, rooms_sites, span_of,
     };
+
+    const ENV: &str = "src/slots/env.ts";
 
     /// The records of `rooms.ts`, with or without the compiler's rows: the
     /// local `topic` typed as a union of two literals, and the call it is
@@ -2006,6 +2125,126 @@ mod tests {
             .iter()
             .find(|record| record.state.point.at == at)
             .unwrap_or_else(|| panic!("{at}"))
+    }
+
+    /// The records of `env.ts`: each call its own discovery site.
+    fn env_records() -> (Vec<SiteRecord>, String) {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let text = std::fs::read_to_string(root.join(ENV)).unwrap();
+        let label = fetch_label();
+        let sites: Vec<_> = [
+            "fetch(`${process.env.API}/items`)",
+            "fetch(`${API}/things`)",
+            "fetch(`${process.env.API}/items/${suffix}`)",
+            "fetch(\"/api\" + path)",
+        ]
+        .iter()
+        .map(|call| bottom(&end_for(&label, ENV, &text, call), "fetch"))
+        .collect();
+        let labels = vec![label];
+        let decided = decided_sites(&inputs, &root, &sites, &labels);
+        (site_records(&inputs, &root, &decided, &labels), text)
+    }
+
+    fn env_record<'r>(records: &'r [SiteRecord], text: &str, needle: &str) -> &'r SiteRecord {
+        let at = format!("{ENV}:{}", line_of(text, needle));
+        records
+            .iter()
+            .find(|record| record.state.point.at == at)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{at} in {:?}",
+                    records
+                        .iter()
+                        .map(|r| &r.state.point.at)
+                        .collect::<Vec<_>>()
+                )
+            })
+    }
+
+    /// An environment read leading a name is a stated value, as the request
+    /// rows write an env base as a named piece: `${process.env.API}/items`
+    /// is whole and forces the name, directly or through a module constant.
+    /// A suffix the code does not state leaves a lead, and a wrapper prefix
+    /// over an unread argument stays out of the records.
+    #[test]
+    fn an_environment_base_is_a_stated_value() {
+        let (records, text) = env_records();
+        for (needle, stated) in [
+            (
+                "fetch(`${process.env.API}/items`)",
+                "${process.env.API}/items",
+            ),
+            ("fetch(`${API}/things`)", "${process.env.API}/things"),
+        ] {
+            let site = env_record(&records, &text, needle);
+            assert_eq!(site.bucket, Bucket::Forced, "{needle}: {:?}", site.state);
+            assert_eq!(
+                site.state.forced.get(&Slot::Name).map(String::as_str),
+                Some(stated),
+                "{needle}"
+            );
+            assert!(
+                site.state.stated.names.iter().any(|v| v.text == stated),
+                "{needle}: {:?}",
+                site.state.stated
+            );
+        }
+        let site = env_record(
+            &records,
+            &text,
+            "fetch(`${process.env.API}/items/${suffix}`)",
+        );
+        assert_eq!(site.bucket, Bucket::Lead, "{:?}", site.state);
+        assert_eq!(site.state.forced.get(&Slot::Name), None);
+        // A prefix over an argument nothing reads is no site's record.
+        let at = format!("{ENV}:{}", line_of(&text, "fetch(\"/api\" + path)"));
+        assert!(records.iter().all(|record| record.state.point.at != at));
+    }
+
+    /// The syntax carries the kinds the concept test kept, not only object
+    /// entries: a callback, the call inside it, a member read, a template.
+    #[test]
+    fn the_syntax_carries_the_concepts_node_kinds() {
+        let (records, text) = rooms_records(false);
+        let listen = rooms_record(&records, &text, "wire.on(\"user.joined\"");
+        let kinds: BTreeSet<&str> = listen
+            .state
+            .syntax
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["type"].as_str().unwrap())
+            .collect();
+        for kind in [
+            "CallExpression",
+            "StringLiteral",
+            "ArrowFunctionExpression",
+            "MemberExpression",
+        ] {
+            assert!(kinds.contains(kind), "{kind} in {kinds:?}");
+        }
+        let nodes = listen.state.syntax.as_array().unwrap();
+        let log = nodes
+            .iter()
+            .find(|node| node["callee"] == "console.log")
+            .expect("the call inside the callback");
+        assert_eq!(log["args"], serde_json::json!(["data"]));
+        let (records, text) = env_records();
+        let items = env_record(&records, &text, "fetch(`${process.env.API}/items`)");
+        let kinds: BTreeSet<&str> = items
+            .state
+            .syntax
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["type"].as_str().unwrap())
+            .collect();
+        assert!(
+            kinds.contains("TemplateLiteral") && kinds.contains("MemberExpression"),
+            "{kinds:?}"
+        );
     }
 
     /// A name built from a literal and a value the code does not state is
@@ -2082,11 +2321,9 @@ mod tests {
                 "{stated:?}"
             );
         }
-        let topic = settle
-            .state
-            .compiler
+        let topic = compiler_of(settle)
             .names
-            .iter()
+            .into_iter()
             .find(|name| name.text == "topic")
             .unwrap();
         assert_eq!(topic.literal, None);
@@ -2154,7 +2391,7 @@ mod tests {
         let create = rooms_record(&records, &text, "fetch(\"/items\",");
         let line = line_of(&text, "fetch(\"/items\",");
         assert_eq!(
-            serde_json::to_value(&create.state.syntax).unwrap(),
+            create.state.syntax.clone(),
             serde_json::json!([
                 {
                     "type": "CallExpression",
@@ -2164,20 +2401,35 @@ mod tests {
                     "args": ["\"/items\"", "{ method: \"POST\" }"]
                 },
                 {
+                    "type": "StringLiteral",
+                    "at": format!("{ROOMS}:{line}"),
+                    "text": "\"/items\""
+                },
+                {
+                    "type": "ObjectExpression",
+                    "at": format!("{ROOMS}:{line}"),
+                    "text": "{ method: \"POST\" }"
+                },
+                {
                     "type": "KeyValueProperty",
                     "at": format!("{ROOMS}:{line}"),
                     "text": "method: \"POST\"",
                     "key": "method"
+                },
+                {
+                    "type": "StringLiteral",
+                    "at": format!("{ROOMS}:{line}"),
+                    "text": "\"POST\""
                 }
             ])
         );
         let settle = rooms_record(&records, &text, "wire.emit(topic");
         assert_eq!(
-            settle.state.compiler.callees[0].declaration.as_deref(),
+            compiler_of(settle).callees[0].declaration.as_deref(),
             Some("node_modules/@fixture/wire/index.d.ts:2")
         );
         assert_eq!(
-            serde_json::to_value(&settle.state.libraries[0].argument_labels).unwrap(),
+            settle.state.libraries[0]["argument_labels"].clone(),
             serde_json::json!([
                 {
                     "export": "connect",
