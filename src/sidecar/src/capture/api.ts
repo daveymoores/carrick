@@ -467,6 +467,12 @@ export interface CheckPairSpec {
   type_kind: ProbeTypeKind;
   producer: CheckPairEndpoint;
   consumer: CheckPairEndpoint;
+  /**
+   * The topic of a pub/sub pair (carrick#1979), and only of one. The probe
+   * tests each side for a member typed as this literal, to tell a side that
+   * is the whole message from a side that is its payload.
+   */
+  topic?: string;
 }
 
 /**

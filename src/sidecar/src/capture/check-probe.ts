@@ -108,7 +108,9 @@ export type GateName =
   | 'expected:unknown'
   | 'expected:never'
   | 'expected:void'
-  | 'expected:bytes';
+  | 'expected:bytes'
+  | 'sent:envelope'
+  | 'expected:envelope';
 
 export interface ProbePlan {
   pairId: string;
@@ -296,6 +298,40 @@ export function buildProbe(
     gateLines.set(
       push(`type _G_expected_bytes = Assert<Not<IsByteBody<Expected>>>;`),
       'expected:bytes'
+    );
+  }
+  // carrick#1979: a pub/sub subscriber is typed as the whole message (a routing
+  // key naming the topic, a tag, the payload, the fields the wrapper stamps)
+  // where a publisher is typed as the payload it passes in, or as a batch of
+  // messages. A side "states the topic" when it is no array, no top or bottom
+  // type, and every union member has a required member typed exactly as this
+  // topic's literal. When exactly one side states it the two are different
+  // levels of one message, and the shapes are not compared.
+  //   - the array test comes first: a mapped type over an array maps its
+  //     elements, so a batch would read as stating the topic;
+  //   - `PsJudged` keeps both gates silent when either side is any, unknown,
+  //     never or void, so a pair the decay gates decide gains no stray code.
+  if (spec.protocol === 'pubsub' && spec.topic !== undefined) {
+    push(`type PsTopic = ${JSON.stringify(spec.topic)};`);
+    push(
+      `type PsTopicKeys<T> = { [K in keyof T]-?: [T[K]] extends [PsTopic] ? ([PsTopic] extends [T[K]] ? K : never) : never }[keyof T];`
+    );
+    push(
+      `type PsStatesTopic<T> = 0 extends 1 & T ? false : [T] extends [never] ? false : [T extends readonly unknown[] ? false : T extends object ? ([PsTopicKeys<T>] extends [never] ? false : true) : false] extends [true] ? true : false;`
+    );
+    push(
+      `type PsJudged<T> = 0 extends 1 & T ? false : unknown extends T ? false : [T] extends [never] ? false : [T] extends [void] ? false : true;`
+    );
+    push(
+      `type PsOnly<A, B> = [PsJudged<A>, PsJudged<B>, PsStatesTopic<A>, PsStatesTopic<B>] extends [true, true, true, false] ? true : false;`
+    );
+    gateLines.set(
+      push(`type _G_sent_envelope = Assert<Not<PsOnly<Sent, Expected>>>;`),
+      'sent:envelope'
+    );
+    gateLines.set(
+      push(`type _G_expected_envelope = Assert<Not<PsOnly<Expected, Sent>>>;`),
+      'expected:envelope'
     );
   }
   push(`declare const sent: Sent;`);

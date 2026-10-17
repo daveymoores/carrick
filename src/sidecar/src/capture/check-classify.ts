@@ -299,6 +299,32 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
     };
   }
 
+  // 4e. Pub/sub, one side the whole message and the other not (carrick#1979):
+  //     a subscriber's type is the message (topic key, tag, payload, stamped
+  //     fields) while a publisher's is the payload or a batch, so comparing
+  //     them reads every stamped field as missing. Not a fact either way, and
+  //     no side to retype: the pair is not compared.
+  const envelopeGate: GateName | undefined = firedGates.has('sent:envelope')
+    ? 'sent:envelope'
+    : firedGates.has('expected:envelope')
+      ? 'expected:envelope'
+      : undefined;
+  if (envelopeGate) {
+    // The gate names the side that states the topic: the whole message. On a
+    // pub/sub pair the producer is the subscriber and the consumer the publisher.
+    const { side: wholeSide } = sideForGate(envelopeGate, plan);
+    const role = (s: Side) => (s === 'producer' ? 'subscriber' : 'publisher');
+    const other: Side = wholeSide === 'producer' ? 'consumer' : 'producer';
+    const reason = `the ${role(wholeSide)}'s type is the whole message and the ${role(other)}'s type is not, so the two are not compared`;
+    return {
+      ...base,
+      bucket: 'unverifiable',
+      gate: `${wholeSide}:envelope`,
+      diagnostic: reason,
+      ...notAFact(reason),
+    };
+  }
+
   // 5. Assignment-class error on the DECISIVE assignment line -> incompatible.
   //
   // On an `http` pair that line is the JSON wire assignment, not the declared

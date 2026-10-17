@@ -345,6 +345,10 @@ pub struct CheckPairSpec {
     pub type_kind: ProbeTypeKind,
     pub producer: CheckPairEndpoint,
     pub consumer: CheckPairEndpoint,
+    /// The topic of a pub/sub pair (carrick#1979): the probe tests each side
+    /// for a member typed as this literal. Set on pub/sub only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 /// Per-alias capture record (serialization tier + self-check outcome).
@@ -4803,6 +4807,7 @@ mod tests {
                 service_name: "web".into(),
                 alias: "B".into(),
             },
+            topic: (protocol == ProbeProtocol::Pubsub).then(|| "orders".to_string()),
         };
         vec![
             SidecarRequest::Init {
@@ -5186,10 +5191,18 @@ mod tests {
                 service_name: "b".into(),
                 alias: "B".into(),
             },
+            topic: Some("orders".into()),
         };
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains(r#""protocol":"pubsub""#));
         assert!(json.contains(r#""type_kind":"both""#));
+        assert!(json.contains(r#""topic":"orders""#));
+        let http = CheckPairSpec {
+            protocol: ProbeProtocol::Http,
+            topic: None,
+            ..spec.clone()
+        };
+        assert!(!serde_json::to_string(&http).unwrap().contains("topic"));
 
         for (wire, bucket) in [
             ("compatible", VerdictBucket::Compatible),

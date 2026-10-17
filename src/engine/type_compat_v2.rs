@@ -2011,6 +2011,10 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
                 service_name: consumer.service_id.to_string(),
                 alias: consumer.entry.type_alias.clone(),
             },
+            topic: match &producer.entry.key {
+                OperationKey::Pubsub { topic } => Some(topic.clone()),
+                _ => None,
+            },
         },
         pseudo_method,
         identity,
@@ -6411,6 +6415,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         assert_eq!(pair.consumer_line, 12);
         assert!(pair.pre_verdict.is_none());
         assert_eq!(pair.spec.protocol, ProbeProtocol::Http);
+        assert_eq!(pair.spec.topic, None);
         assert_eq!(pair.spec.type_kind, ProbeTypeKind::Response);
 
         // The caller's own route is the literal one: the pair is same-service.
@@ -7057,6 +7062,12 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         assert_eq!(pairs[0].identity, "order.placed");
         assert_eq!(pairs[0].spec.protocol, ProbeProtocol::Pubsub);
         assert_eq!(pairs[0].spec.type_kind, ProbeTypeKind::Both);
+        assert_eq!(pairs[0].spec.topic.as_deref(), Some("order.placed"));
+        assert!(
+            serde_json::to_string(&pairs[0].spec)
+                .unwrap()
+                .contains(r#""topic":"order.placed""#)
+        );
         assert_eq!(pairs[0].producer_service, "billing");
         assert_eq!(pairs[0].consumer_service, "orders-engine");
     }
