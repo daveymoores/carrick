@@ -1,0 +1,25 @@
+{
+  "library_claims": [
+    {
+      "package": "@fixture/wire",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@fixture/wire",
+          "export": "connect",
+          "role": "socket",
+          "side": "client",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            { "op": "send", "member": "emit", "on": "instance", "name": { "arg": 0 }, "payload": { "arg": 1 }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}
