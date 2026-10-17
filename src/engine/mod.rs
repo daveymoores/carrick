@@ -21409,7 +21409,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             enabled: false,
             rows: vec![site_row(
                 "svc/src/orders.ts",
-                OperationKey::pubsub("orders.paid"),
+                OperationKey::pubsub("orders.settled"),
                 crate::site_rows::RowSide::Call,
                 true,
             )],
@@ -21461,7 +21461,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 rows: vec![
                     site_row(
                         "svc/src/orders.ts",
-                        OperationKey::pubsub("orders.paid"),
+                        OperationKey::pubsub("orders.settled"),
                         crate::site_rows::RowSide::Call,
                         true,
                     ),
@@ -21498,7 +21498,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(
             at_site,
             vec![(
-                "pubsub|orders.paid".to_string(),
+                "pubsub|orders.settled".to_string(),
                 Some(ResolutionSource::Model),
                 true
             )]
@@ -21563,13 +21563,13 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         use crate::site_rows::RowSide;
         let publish = site_row(
             "src/orders.ts",
-            OperationKey::pubsub("orders.paid"),
+            OperationKey::pubsub("orders.settled"),
             RowSide::Call,
             true,
         );
         let subscriber = site_row(
             "src/jobs.ts",
-            OperationKey::pubsub("orders.paid"),
+            OperationKey::pubsub("orders.settled"),
             RowSide::Endpoint,
             true,
         );
@@ -21607,12 +21607,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert!(!keyed.iter().any(|(key, ..)| key == "pubsub|orders"));
         for wanted in [
             (
-                "pubsub|orders.paid",
+                "pubsub|orders.settled",
                 ManifestRole::Consumer,
                 ManifestTypeKind::Response,
             ),
             (
-                "pubsub|orders.paid",
+                "pubsub|orders.settled",
                 ManifestRole::Producer,
                 ManifestTypeKind::Response,
             ),

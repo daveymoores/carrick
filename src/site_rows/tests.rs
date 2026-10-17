@@ -232,7 +232,7 @@ fn each_kind_names_its_key_and_scope() {
     );
     assert_eq!(
         key("src/topic.ts"),
-        Some((OperationKey::pubsub("order.paid"), RowSide::Call))
+        Some((OperationKey::pubsub("order.settled"), RowSide::Call))
     );
     assert_eq!(row(&rows, "src/topic.ts").unwrap().name_scope, None);
     assert_eq!(
@@ -486,7 +486,7 @@ fn an_answer_in_the_band_replaces_the_readers_row() {
     let fold = fold_one(file, &mut calls, &mut Vec::new());
     let site = at_site(&calls, file);
     assert_eq!(site.len(), 1);
-    assert_eq!(site[0].0, OperationKey::pubsub("order.paid"));
+    assert_eq!(site[0].0, OperationKey::pubsub("order.settled"));
     assert_eq!(site[0].1, Some(ResolutionSource::Model));
     assert_eq!(
         site[0]

@@ -8,7 +8,7 @@
     {"site_id": "src/topic.ts:100-130", "ok": true,
      "kind": {"value": "topic", "confidence": 0.95, "orders_agree": true},
      "role": {"value": "sends", "confidence": 0.97, "orders_agree": true},
-     "name": {"value": "order.paid", "confidence": 0.9, "orders_agree": true},
+     "name": {"value": "order.settled", "confidence": 0.9, "orders_agree": true},
      "method": null, "namespace": null, "name_argument": null, "payload_argument": null},
     {"site_id": "src/message.ts:100-130", "ok": true,
      "kind": {"value": "message", "confidence": 0.9, "orders_agree": true},
