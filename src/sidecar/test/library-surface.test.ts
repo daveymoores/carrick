@@ -286,6 +286,8 @@ function installed(socket = SOCKET): Record<string, string> {
     'node_modules/@fixture/typed-emitter/index.d.ts': TYPED_EMITTER,
     'node_modules/fixture-typed-socket/package.json': packageJson('fixture-typed-socket', '4.0.0'),
     'node_modules/fixture-typed-socket/index.d.ts': TYPED_SOCKET,
+    'node_modules/fixture-recursive/package.json': packageJson('fixture-recursive', '1.0.0'),
+    'node_modules/fixture-recursive/index.d.ts': RECURSIVE,
     'node_modules/fixture-slots/package.json': packageJson('fixture-slots', '1.0.0'),
     'node_modules/fixture-slots/index.d.ts': SLOTS,
     'node_modules/@fixture/mapped-core/package.json': packageJson('@fixture/mapped-core', '2.0.0'),
@@ -294,6 +296,23 @@ function installed(socket = SOCKET): Record<string, string> {
     'node_modules/fixture-mapped/index.d.ts': "export * from '@fixture/mapped-core';\n",
   };
 }
+
+// Return types that lead back to themselves: a conditional alias naming
+// itself in a branch, and two aliases naming each other.
+const RECURSIVE = `export type Unwrap<T> = T extends object & { then(onfulfilled: infer F, ...rest: infer _): any }
+  ? F extends (value: infer V, ...rest: infer _) => any ? Unwrap<V> : never
+  : T;
+export type Ping<T> = T extends string ? Pong<T> : { ping: T };
+export type Pong<T> = T extends number ? Ping<T> : Ping<T[]>;
+export interface Handle {
+  close(): void;
+}
+export declare function unwrap<T>(value: T): Unwrap<T>;
+export declare function ping<T>(value: T): Ping<T>;
+export declare function open(): Handle;
+export declare function accept<T>(value: Unwrap<T>): void;
+export declare function acceptPing<T>(value: Ping<T>): void;
+`;
 
 function service(files: Record<string, string>): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-surface-'));
@@ -424,6 +443,15 @@ describe('list_library_surface (carrick#1660)', () => {
     assert.deepStrictEqual(own, { publishLocal: true, emit: false, on: false });
     assert.strictEqual(missing.reason, 'module_unresolved');
     assert.deepStrictEqual(missing.exports, []);
+  });
+
+  it('ends the walk of a return type that leads back to itself (carrick#2499)', async () => {
+    const response = await surface(['fixture-recursive']);
+    const listed = response.surfaces[0];
+    assert.deepStrictEqual(listed.exports.map(e => e.export), ['accept', 'acceptPing', 'open', 'ping', 'unwrap']);
+    // A plain return type lists as before.
+    const open = listed.exports.find(e => e.export === 'open')!;
+    assert.deepStrictEqual(open.receivers.map(r => r.receiver), ['export', 'instance:()']);
   });
 
   it('lists the option keys of a maker with their optional flag, and only the exports asked for', async () => {
