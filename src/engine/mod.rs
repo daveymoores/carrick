@@ -7780,7 +7780,8 @@ fn discover_with_positions(
         sites: resolution.sites,
         bindings: resolution.bindings,
         positions,
-    };
+    }
+    .linked();
 
     debug!(
         "Extracted {} import facts and {} function definitions from {} files",
@@ -15752,9 +15753,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     /// carrick#1562: a call to a module-scope builder is what the builder
     /// returns, with the call's arguments in its parameters: an arrow, a
     /// function declaration, and one held in a constant object. A function
-    /// that does more than return, a builder in an object the module writes
-    /// through, and one that picks its return by a `switch` (alternatives,
-    /// carrick#1694) state nothing.
+    /// that declares a local `const` first is the same (carrick#2447); a
+    /// builder in an object the module writes through, and one that picks its
+    /// return by a `switch` (alternatives, carrick#1694) state nothing.
     #[test]
     fn a_builder_s_return_is_the_request_s_url() {
         let (dir, discovery) = discover_sources(&[(
@@ -15792,6 +15793,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     "${process.env.API_BASE}/api/orders/${id}".to_string()
                 ),
                 (16, "DELETE".to_string(), "/api/teams/core".to_string()),
+                // A local `const` before the `return` is inlined
+                // (carrick#2447).
+                (17, "GET".to_string(), "/api/x/${x}".to_string()),
             ]
         );
     }
@@ -17565,6 +17569,20 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 "import { api } from \"./api\";\n\
                  export function r() { return api.get(\"/read\"); }\n",
             ),
+            ("src/q01b/config.ts", "export const BASE = \"/q01right\";\n"),
+            (
+                "src/q01b/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 import { BASE } from \"./config\";\n\
+                 export const api = http.create({ baseURL: BASE });\n",
+            ),
+            (
+                "src/q01b/reader.ts",
+                "import { api } from \"./api\";\n\
+                 const BASE = \"/q01wrong\";\n\
+                 export const b = BASE;\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
             (
                 "src/q04/api.ts",
                 "import http from \"@fixture/http\";\n\
@@ -17587,10 +17605,20 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                  export function r() { return api.get(\"/read\"); }\n",
             ),
         ]);
-        for file in ["src/q06/reader.ts", "src/q01/reader.ts"] {
-            let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
-            assert!(rows.is_empty(), "{file}: {rows:#?}");
-        }
+        let rows = library_rows_of(&dir, &discovery, "src/q06/reader.ts", &verified_sample());
+        assert!(rows.is_empty(), "{rows:#?}");
+        // An imported constant that holds text states that text (carrick#2447),
+        // the same as a constant written beside the client (q04).
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/q01/reader.ts"),
+            stated(&[(2, "GET", "/q01right/read")])
+        );
+        // The importer's own `BASE` is another binding: the base is read where
+        // the client is built, never by name in the importer.
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/q01b/reader.ts"),
+            stated(&[(4, "GET", "/q01right/read")])
+        );
         assert_eq!(
             library_rows_of(&dir, &discovery, "src/q06/api.ts", &verified_sample())
                 .iter()

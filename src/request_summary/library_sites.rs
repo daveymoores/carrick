@@ -249,7 +249,7 @@ fn fill_pieces(pieces: &[TextPiece], passed: &[SiteArg]) -> Option<Vec<TextPiece
 /// the name is written in, by position, or what a module-scope binding holds
 /// (carrick#1562).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(super) enum TextPiece {
+pub enum TextPiece {
     Lit(String),
     Param(usize),
     /// A constant, an entry of a constant object (`TOPICS.orders`), or what
@@ -261,14 +261,14 @@ pub(super) enum TextPiece {
 
 /// A module-scope binding a name is read through (carrick#1562).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(super) struct NamedRef {
+pub struct NamedRef {
     /// The file's own name for the binding: a module-scope `const` or
     /// function of the file, or an import binding.
-    pub(super) binding: String,
+    pub binding: String,
     /// The entries walked into it (`["users", "byId"]`).
-    pub(super) path: Vec<String>,
+    pub path: Vec<String>,
     /// The builder's arguments, each as text pieces, when it is called.
-    pub(super) args: Option<Vec<Vec<TextPiece>>>,
+    pub args: Option<Vec<Vec<TextPiece>>>,
 }
 
 /// What a module-scope binding holds, as a name reads it (carrick#1562): a
@@ -5829,7 +5829,11 @@ mod tests {
         assert_eq!(name(13), None, "an object another module writes through");
         assert_eq!(name(14), None, "an object whose inner object is aliased");
         assert_eq!(name(15), None, "a builder handed a parameter");
-        assert_eq!(name(16), None, "a function that does more than return");
+        assert_eq!(
+            name(16).as_deref(),
+            Some("two.z"),
+            "a function that declares a constant before its return (carrick#2447)"
+        );
         assert_eq!(name(17).as_deref(), Some("users"));
         let filled = site(&sites, "src/caller.ts", 2, Some("publish"));
         assert_eq!(filled.literal(0, None), Some("svc.filled"));

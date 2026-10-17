@@ -249,7 +249,18 @@ pub enum Piece {
     /// from as the receive side reads it (carrick#2406): an environment
     /// read, an import, a global, or the hole reading stopped at. The text
     /// alone decides how a target renders.
-    Opaque { text: String, end: Root },
+    ///
+    /// `link` names the module-scope binding the value reads through when it
+    /// is one a call graph can follow (an imported constant, an entry of an
+    /// imported constant object, a call of an imported builder with text
+    /// arguments: carrick#2447). Once every module is read, text the link
+    /// resolves to takes the piece's place ([`RequestSummaryInputs::linked`]);
+    /// a link that resolves to nothing changes nothing.
+    Opaque {
+        text: String,
+        end: Root,
+        link: Option<Box<library_sites::NamedRef>>,
+    },
     /// A query one of the service's own functions builds (carrick#1950):
     /// nothing, or text that starts with `?`. It ends the path and states
     /// nothing about the route, so it is read only as the last piece of a URL.
@@ -383,7 +394,11 @@ impl ObjValue {
 
 impl Value {
     fn opaque(text: String, end: Root) -> Self {
-        Value::Str(vec![Piece::Opaque { text, end }])
+        Value::Str(vec![Piece::Opaque {
+            text,
+            end,
+            link: None,
+        }])
     }
 
     /// An opaque value that ends at the hole `reason` names.
@@ -1703,7 +1718,7 @@ impl Builder {
                 params: arrow.params.iter().map(pat_key).collect(),
                 returned: Box::new(match &*arrow.body {
                     ArrowFunctionBody::Expr(expr) => (**expr).clone(),
-                    ArrowFunctionBody::FunctionBody(block) => only_return(&block.stmts)?.clone(),
+                    ArrowFunctionBody::FunctionBody(block) => returned_value(&block.stmts)?,
                 }),
             }),
             Expr::Fn(function) => Self::of_function(&function.function),
@@ -1712,13 +1727,16 @@ impl Builder {
     }
 
     fn of_function(function: &Function) -> Option<Self> {
+        if function.is_generator {
+            return None;
+        }
         Some(Builder {
             params: function
                 .params
                 .iter()
                 .map(|param| pat_key(&param.pat))
                 .collect(),
-            returned: Box::new(only_return(&function.body.as_ref()?.stmts)?.clone()),
+            returned: Box::new(returned_value(&function.body.as_ref()?.stmts)?),
         })
     }
 
@@ -1752,12 +1770,102 @@ impl Builder {
     }
 }
 
-/// The expression a body of exactly one `return <expr>;` returns.
-fn only_return(stmts: &[Stmt]) -> Option<&Expr> {
-    match stmts {
-        [Stmt::Return(ReturnStmt { arg: Some(arg), .. })] => Some(arg),
-        _ => None,
+/// The one expression every `return` of a function body writes
+/// (carrick#2447), with each local `const` it names replaced by its
+/// initialiser, so the builder reads it as `return root + "/v1"` for
+/// `const root = "/api"; return root + "/v1"`.
+///
+/// The body may hold only `const name = <expr>` declarations, `return <expr>`,
+/// `throw`, blocks and `if` / `else`, and every path through it must end in a
+/// `return` or a `throw`. Several returns count only when they write the same
+/// expression: a body returning two different values states none (the
+/// call stays a hole), as does any other statement (a loop, a `let`, a call
+/// that may change what a later line reads). A local is replaced by its
+/// binding ([`ident_key`]), never by name, and a `const` a block or a branch
+/// declares is read only inside it, so a block that declares the name again
+/// keeps its own and the lines after the block read the outer one.
+fn returned_value(stmts: &[Stmt]) -> Option<Expr> {
+    fn ends(stmts: &[Stmt]) -> bool {
+        stmts.iter().any(|stmt| match stmt {
+            Stmt::Return(_) | Stmt::Throw(_) => true,
+            Stmt::Block(block) => ends(&block.stmts),
+            Stmt::If(branch) => branch.alt.as_ref().is_some_and(|alt| {
+                ends(std::slice::from_ref(&branch.cons)) && ends(std::slice::from_ref(alt))
+            }),
+            _ => false,
+        })
     }
+
+    /// Replaces each local `const`'s identifier by its initialiser.
+    struct Inline<'a>(&'a HashMap<BindingKey, Expr>);
+    impl swc_ecma_visit::VisitMut for Inline<'_> {
+        fn visit_mut_expr(&mut self, expr: &mut Expr) {
+            if let Expr::Ident(ident) = expr
+                && let Some(init) = self.0.get(&ident_key(ident))
+            {
+                *expr = init.clone();
+                return;
+            }
+            swc_ecma_visit::VisitMutWith::visit_mut_children_with(expr, self);
+        }
+    }
+
+    fn walk(
+        stmts: &[Stmt],
+        locals: &mut HashMap<BindingKey, Expr>,
+        returns: &mut Vec<Expr>,
+    ) -> Option<()> {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Decl(Decl::Var(var)) if var.kind == VarDeclKind::Const => {
+                    for declarator in &var.decls {
+                        let (Pat::Ident(name), Some(init)) = (&declarator.name, &declarator.init)
+                        else {
+                            return None;
+                        };
+                        let mut init = (**init).clone();
+                        swc_ecma_visit::VisitMutWith::visit_mut_with(
+                            &mut init,
+                            &mut Inline(locals),
+                        );
+                        locals.insert(ident_key(&name.id), init);
+                    }
+                }
+                Stmt::Return(ReturnStmt { arg: Some(arg), .. }) => {
+                    let mut value = (**arg).clone();
+                    swc_ecma_visit::VisitMutWith::visit_mut_with(&mut value, &mut Inline(locals));
+                    returns.push(value);
+                }
+                Stmt::Throw(_) => {}
+                // A block's or a branch's `const` is visible only inside it:
+                // each walks its own copy of the locals declared so far.
+                Stmt::Block(block) => walk(&block.stmts, &mut locals.clone(), returns)?,
+                Stmt::If(branch) => {
+                    walk(
+                        std::slice::from_ref(&branch.cons),
+                        &mut locals.clone(),
+                        returns,
+                    )?;
+                    if let Some(alt) = &branch.alt {
+                        walk(std::slice::from_ref(alt), &mut locals.clone(), returns)?;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+
+    if !ends(stmts) {
+        return None;
+    }
+    let mut returns = Vec::new();
+    walk(stmts, &mut HashMap::new(), &mut returns)?;
+    let first = returns.first()?.clone();
+    returns
+        .iter()
+        .all(|other| swc_common::EqIgnoreSpan::eq_ignore_span(other, &first))
+        .then_some(first)
 }
 
 /// How one binding is used beyond its own declaration: an identifier, or a
@@ -4270,6 +4378,7 @@ impl Reader<'_> {
                                     Piece::ParamKey(_, _, name) => Piece::Opaque {
                                         text: name,
                                         end: Root::Hole(HoleReason::CallerArgMissing),
+                                        link: None,
                                     },
                                     other => other,
                                 })
@@ -4327,9 +4436,13 @@ impl Reader<'_> {
                     }
                     return value.clone();
                 }
-                Value::opaque(name.to_string(), self.ident_end(ident, scope))
+                self.linked(
+                    Value::opaque(name.to_string(), self.ident_end(ident, scope)),
+                    expr,
+                    scope,
+                )
             }
-            Expr::Member(member) => self.member(member, scope),
+            Expr::Member(member) => self.member(expr, member, scope),
             Expr::Object(obj) => Value::Obj(self.object(obj, scope)),
             Expr::Call(call) => {
                 // `JSON.stringify(body)` is the body it serialises.
@@ -4378,7 +4491,9 @@ impl Reader<'_> {
                             fallback: None,
                         },
                     ),
-                    None => Value::hole(text, HoleReason::UnreadExpression),
+                    None => {
+                        self.linked(Value::hole(text, HoleReason::UnreadExpression), expr, scope)
+                    }
                 }
             }
             Expr::New(new) => self.new_url(new, scope),
@@ -4409,7 +4524,7 @@ impl Reader<'_> {
         concat(parts)
     }
 
-    fn member(&self, member: &MemberExpr, scope: &Scope<'_>) -> Value {
+    fn member(&self, expr: &Expr, member: &MemberExpr, scope: &Scope<'_>) -> Value {
         // `this.field`, read through the class's field table.
         if let Expr::This(_) = &*member.obj {
             let name = match &member.prop {
@@ -4460,7 +4575,29 @@ impl Reader<'_> {
         }
         // Where it comes from is the receive side's reading, environment
         // reads included (carrick#2406).
-        Value::opaque(self.text(member.span), self.member_end(member, scope))
+        self.linked(
+            Value::opaque(self.text(member.span), self.member_end(member, scope)),
+            expr,
+            scope,
+        )
+    }
+
+    /// `value`, the opaque piece `expr` reads as, with the module-scope
+    /// binding it reads through (carrick#2447): an imported constant, an
+    /// entry of an imported constant object, or a call of an imported
+    /// builder whose arguments are text. The names are the ones the
+    /// message-role readers follow ([`library_sites::text_pieces`]), so one
+    /// reader decides what a name is, and [`RequestSummaryInputs::linked`]
+    /// reads its value once every module is known.
+    fn linked(&self, mut value: Value, expr: &Expr, scope: &Scope<'_>) -> Value {
+        if let Some(pieces) = library_sites::text_pieces(expr, scope)
+            && let [library_sites::TextPiece::Named(named)] = pieces.as_slice()
+            && let Value::Str(inner) = &mut value
+            && let [Piece::Opaque { link, .. }] = inner.as_mut_slice()
+        {
+            *link = Some(named.clone());
+        }
+        value
     }
 
     /// Whether `call` is a call of a query builder the enclosing class or
@@ -6170,6 +6307,7 @@ impl Effect {
                     Piece::ParamKey(_, _, name) => Piece::Opaque {
                         text: name.clone(),
                         end: Root::Hole(HoleReason::CallerArgMissing),
+                        link: None,
                     },
                     other => other.clone(),
                 })
@@ -6204,6 +6342,7 @@ impl Effect {
                     Piece::Outer(..) => Piece::Opaque {
                         text: piece.parameter_name().unwrap_or_default().to_string(),
                         end: Root::Hole(HoleReason::CallerArgMissing),
+                        link: None,
                     },
                     other => other.clone(),
                 })
@@ -6288,6 +6427,7 @@ impl Effect {
             [Piece::Opaque { end, .. }] if position > 0 => vec![Piece::Opaque {
                 text: name.to_string(),
                 end: end.clone(),
+                link: None,
             }],
             _ => arg.to_vec(),
         };
@@ -6329,6 +6469,7 @@ impl Effect {
                             vec![Piece::Opaque {
                                 text: name.clone(),
                                 end: arg_end(piece),
+                                link: None,
                             }]
                         }
                         Piece::Param(index, name) => match args.get(*index) {
@@ -6590,6 +6731,180 @@ pub struct RequestSummaryInputs {
     /// discovery parsed, when the run walks them (`CARRICK_POSITION_ROWS=1`,
     /// carrick#2413); `None` otherwise. Nothing reads a row yet.
     pub positions: Option<crate::position_rows::PositionIndex>,
+}
+
+impl RequestSummaryInputs {
+    /// The inputs with every value that reads through a module-scope binding
+    /// another module declares replaced by the text it holds (carrick#2447):
+    /// an imported constant, an entry of an imported constant object
+    /// (`PATHS.users`), a call of an imported builder handed text
+    /// (`apiBase()`). The reading is the message roles' ([`LinkedNames`]), so
+    /// a constant object some module may change, a builder called with a
+    /// value no module states, and an import the scan cannot follow all stay
+    /// the opaque value they were: nothing is guessed.
+    ///
+    /// Reached in the places a request's URL, base and body, a call's
+    /// arguments and a client's options are kept. A piece anywhere else
+    /// keeps its link unread, which changes nothing.
+    pub fn linked(mut self) -> Self {
+        let mut wanted: BTreeSet<(PathBuf, library_sites::NamedRef)> = BTreeSet::new();
+        for (path, ir) in &mut self.files {
+            ir.visit_pieces(path, &mut |scope, pieces| {
+                for piece in pieces.iter() {
+                    if let Piece::Opaque {
+                        link: Some(named), ..
+                    } = piece
+                    {
+                        wanted.insert((scope.to_path_buf(), (**named).clone()));
+                    }
+                }
+            });
+        }
+        if wanted.is_empty() {
+            return self;
+        }
+        let resolved: HashMap<(PathBuf, library_sites::NamedRef), String> = {
+            let names = library_sites::LinkedNames::link(&self.files, &self.bindings);
+            wanted
+                .into_iter()
+                .filter_map(|(file, named)| {
+                    let piece = library_sites::TextPiece::Named(Box::new(named.clone()));
+                    let text = names.text(&file, &[piece])?;
+                    Some(((file, named), text))
+                })
+                .collect()
+        };
+        if resolved.is_empty() {
+            return self;
+        }
+        for (path, ir) in &mut self.files {
+            ir.visit_pieces(path, &mut |scope, pieces| {
+                let read = |piece: &Piece| match piece {
+                    Piece::Opaque {
+                        link: Some(named), ..
+                    } => resolved.get(&(scope.to_path_buf(), (**named).clone())),
+                    _ => None,
+                };
+                if pieces.iter().any(|piece| read(piece).is_some()) {
+                    let parts: Vec<Vec<Piece>> = pieces
+                        .drain(..)
+                        .map(|piece| match read(&piece) {
+                            Some(text) => vec![Piece::Lit(text.clone())],
+                            None => vec![piece],
+                        })
+                        .collect();
+                    *pieces = concat(parts);
+                }
+            });
+        }
+        self
+    }
+}
+
+/// Calls `visit` with each list of pieces among `value`, read in `scope`.
+fn visit_value_pieces(
+    scope: &Path,
+    value: &mut Value,
+    visit: &mut dyn FnMut(&Path, &mut Vec<Piece>),
+) {
+    match value {
+        Value::Str(pieces) => visit(scope, pieces),
+        Value::Obj(object) => visit_object_pieces(scope, object, visit),
+        Value::Callback(_) => {}
+    }
+}
+
+fn visit_object_pieces(
+    scope: &Path,
+    object: &mut ObjValue,
+    visit: &mut dyn FnMut(&Path, &mut Vec<Piece>),
+) {
+    for value in object.fields.values_mut() {
+        visit_value_pieces(scope, value, visit);
+    }
+    if let Some((_, held)) = &mut object.under_param {
+        for value in held.values_mut() {
+            visit_value_pieces(scope, value, visit);
+        }
+    }
+}
+
+fn visit_client_pieces(
+    scope: &Path,
+    client: &mut ClientRef,
+    visit: &mut dyn FnMut(&Path, &mut Vec<Piece>),
+) {
+    if let Some(options) = client
+        .instance
+        .as_mut()
+        .and_then(|instance| instance.options.as_mut())
+    {
+        visit_object_pieces(scope, options, visit);
+    }
+}
+
+impl FnIr {
+    /// Calls `visit` with each list of pieces this body's calls keep, read in
+    /// `scope`, nested functions included.
+    fn visit_pieces(&mut self, scope: &Path, visit: &mut dyn FnMut(&Path, &mut Vec<Piece>)) {
+        for call in &mut self.calls {
+            for arg in &mut call.args {
+                visit_value_pieces(scope, arg, visit);
+            }
+            for spread in &mut call.spread_args {
+                if let SpreadArg::Keys(objects) = spread {
+                    for object in objects {
+                        visit_object_pieces(scope, object, visit);
+                    }
+                }
+            }
+            if let Some(receiver) = &mut call.receiver {
+                match &mut receiver.client {
+                    ClientBinding::Own(client) => visit_client_pieces(scope, client, visit),
+                    ClientBinding::Imported {
+                        package: Some(client),
+                        ..
+                    } => visit_client_pieces(scope, client, visit),
+                    ClientBinding::Module(_) | ClientBinding::Imported { package: None, .. } => {}
+                }
+            }
+            if let Some(request) = &mut call.request {
+                visit(scope, &mut request.url);
+                // A client's base was read in the module that declares it.
+                let base_scope = request.base_scope.clone();
+                visit(base_scope.as_deref().unwrap_or(scope), &mut request.base);
+                if let BodyValue::Fields(object) = &mut request.body {
+                    visit_object_pieces(scope, object, visit);
+                }
+                if let Alternation::Rows(rows) = &mut request.alternation {
+                    for (_, url) in rows {
+                        visit(scope, url);
+                    }
+                }
+            }
+        }
+        for nested in self.nested.iter_mut().chain(&mut self.detached) {
+            nested.visit_pieces(scope, visit);
+        }
+    }
+}
+
+impl FileIr {
+    /// Calls `visit` with each list of pieces the file keeps, with the file
+    /// they were read in.
+    fn visit_pieces(&mut self, path: &Path, visit: &mut dyn FnMut(&Path, &mut Vec<Piece>)) {
+        for ir in self.functions.values_mut() {
+            ir.visit_pieces(path, visit);
+        }
+        self.module_level.visit_pieces(path, visit);
+        for client in self
+            .module_clients
+            .values_mut()
+            .chain(self.field_receivers.values_mut())
+        {
+            visit_client_pieces(path, client, visit);
+        }
+    }
 }
 
 /// How many modules re-exporting a binding they import are followed to the
@@ -7595,6 +7910,7 @@ fn base_reads_the_same_in(effect: &Effect, file: &Path) -> bool {
             Piece::Opaque {
                 text,
                 end: Root::Env { written, .. },
+                ..
             } => text == written,
             Piece::Opaque { .. }
             | Piece::Param(..)
@@ -7953,6 +8269,7 @@ mod tests {
         Piece::Opaque {
             text: text.to_string(),
             end: Root::Hole(HoleReason::UnreadExpression),
+            link: None,
         }
     }
 
@@ -8130,6 +8447,7 @@ mod tests {
         let unfilled = |text: &str| Piece::Opaque {
             text: text.to_string(),
             end: Root::Hole(HoleReason::CallerArgMissing),
+            link: None,
         };
         assert_eq!(
             based.url,
@@ -8900,6 +9218,85 @@ function build() { return {}; }
             .unwrap_or_else(|| panic!("{function} makes no request"))
     }
 
+    /// carrick#2447: a builder with locals before its `return`, a `throw`
+    /// path, or several returns that write one expression is the value it
+    /// returns; a local a block declares again keeps its own value.
+    #[test]
+    fn a_builder_with_locals_and_one_returned_value_composes() {
+        for body in [
+            "const root = \"/api\"; return root + \"/v1\";",
+            "const root = \"/api\"; if (!root) { throw new Error(\"x\"); } return root + \"/v1\";",
+            "if (flag()) { return \"/api\" + \"/v1\"; } else { const v = \"/v1\"; return \"/api\" + v; }",
+        ] {
+            let url = request_url(
+                &format!(
+                    "function base() {{ {body} }}\n\
+                     export function f() {{ return fetch(base() + \"/x\"); }}\n"
+                ),
+                "f",
+            );
+            assert_eq!(url, vec![lit("/api/v1/x")], "{body}");
+        }
+        let shadowed = request_url(
+            "function base() { const v = \"/outer\"; { const v = \"/inner\"; } return v; }\n\
+             export function f() { return fetch(base() + \"/x\"); }\n",
+            "f",
+        );
+        assert_eq!(shadowed, vec![lit("/outer/x")]);
+    }
+
+    /// carrick#2447: a `const` an `if` branch declares is visible only in
+    /// that branch, so the `return` after it reads the outer binding.
+    #[test]
+    fn a_branch_scoped_constant_is_not_read_after_its_branch() {
+        let url = request_url(
+            "function base() { const p = \"/x\"; if (flag()) { const p = \"/y\"; throw new Error(p); } return p; }\n\
+             export function f() { return fetch(base() + \"/r\"); }\n",
+            "f",
+        );
+        assert_eq!(url, vec![lit("/x/r")]);
+        // The scope holds without the resolver's contexts too: unresolved,
+        // both `p` share one key, and only the block scoping keeps them apart.
+        let (_, module) = crate::swc_scanner::parse_standalone_module(
+            Path::new("input.ts"),
+            "function base() { const p = \"/x\"; if (flag()) { const p = \"/y\"; throw new Error(p); } return p; }\n",
+        )
+        .expect("parsed module");
+        let Some(ModuleItem::Stmt(Stmt::Decl(Decl::Fn(base)))) = module.body.first() else {
+            panic!("the module declares base first");
+        };
+        let returned = returned_value(&base.function.body.as_ref().expect("body").stmts);
+        assert!(
+            matches!(&returned, Some(Expr::Lit(Lit::Str(text))) if text.value.to_string_lossy() == "/x"),
+            "{returned:?}"
+        );
+    }
+
+    /// carrick#2447: a body that returns different values, can fall off its
+    /// end, or does anything but declare constants states no value.
+    #[test]
+    fn a_builder_that_states_no_one_value_stays_a_hole() {
+        for body in [
+            "if (flag()) { return \"/a\"; } return \"/b\";",
+            "if (flag()) { return \"/a\"; }",
+            "let v = \"/a\"; return v;",
+            "for (;;) { } return \"/a\";",
+            "const v = \"/a\"; sideEffect(); return v;",
+        ] {
+            let url = request_url(
+                &format!(
+                    "function base() {{ {body} }}\n\
+                     export function f() {{ return fetch(base() + \"/x\"); }}\n"
+                ),
+                "f",
+            );
+            assert!(
+                matches!(url.first(), Some(Piece::Opaque { text, .. }) if text == "base()"),
+                "{body}: {url:?}"
+            );
+        }
+    }
+
     /// The end of the URL's first piece, which must be opaque, and the
     /// target the URL renders.
     fn first_end(url: &[Piece]) -> (&Root, Option<String>) {
@@ -9168,6 +9565,7 @@ function build() { return {}; }
                 vec![Piece::Opaque {
                     text: "userId".to_string(),
                     end: imported.clone(),
+                    link: None,
                 }],
                 imported,
             ),
@@ -9186,7 +9584,8 @@ function build() { return {}; }
                 filled.url.last(),
                 Some(&Piece::Opaque {
                     text: "id".to_string(),
-                    end
+                    end,
+                    link: None,
                 })
             );
             assert_eq!(render_target(&filled.url).as_deref(), Some("/users/${id}"));
@@ -9294,6 +9693,7 @@ function build() { return {}; }
         let renamed = Piece::Opaque {
             text: "API".to_string(),
             end: env("process.env[\"MY-VAR\"]", "MY-VAR", None),
+            link: None,
         };
         assert!(!base_in_another_file(vec![renamed]));
     }
