@@ -35,7 +35,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { ts, type Project } from 'ts-morph';
-import { WriteGuard, installedPackageDirectory, isDeclarationFileName } from './capture/index.js';
+import { WriteGuard, installedPackageDirectory, isDeclarationFileName, moduleExport } from './capture/index.js';
 import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
 import { typeToStringAsDeclared } from './print-type.js';
 import type { ProjectLoader } from './project-loader.js';
@@ -391,6 +391,15 @@ function toSlashes(p: string): string {
   return p.split(path.sep).join('/');
 }
 
+/** What a name bound by `require()` refers to: the whole module, or one export. */
+interface RequireBinding {
+  specifier: string;
+  /** The file holding the `require` call, which resolves the specifier. */
+  from: ts.SourceFile;
+  /** `undefined` for the whole module. */
+  exportName?: string;
+}
+
 /** The rows of one program's files. */
 class PositionWalker {
   private readonly checker: ts.TypeChecker;
@@ -487,6 +496,9 @@ class PositionWalker {
     } else {
       const named = nameNodeOf(kind, node);
       symbol = named ? this.checker.getSymbolAtLocation(named) : undefined;
+      if (named && /\.[cm]?tsx?$/.test(node.getSourceFile().fileName)) {
+        symbol = this.requiredExport(named, symbol) ?? symbol;
+      }
     }
     if (symbol && symbol.flags & ts.SymbolFlags.Alias) {
       const target = this.checker.getAliasedSymbol(symbol);
@@ -495,6 +507,113 @@ class PositionWalker {
       if (target.declarations && target.declarations.length > 0) symbol = target;
     }
     return symbol;
+  }
+
+  /**
+   * In a TypeScript file `const { a } = require("m")` binds `a` as `any` with
+   * the binding as its only declaration (TypeScript resolves `require` itself
+   * only in JavaScript files), so a trace stops there. Name the export the
+   * call resolves to instead (carrick#2454): for the binding itself, and for
+   * `m.x` where `m` is a whole-module binding. `undefined` when the name is
+   * not such a binding, the specifier is not a literal or does not resolve,
+   * or the module has no such export.
+   */
+  private requiredExport(named: ts.Node, symbol: ts.Symbol | undefined): ts.Symbol | undefined {
+    try {
+      const binding = symbol ? this.requireBinding(symbol) : undefined;
+      if (binding) return this.exportOfRequired(binding);
+      // `m.x` / `m["x"]`: the symbol of `x` is unknown on an `any` object.
+      const access = named.parent;
+      let member: string | undefined;
+      let object: ts.Expression | undefined;
+      if (ts.isPropertyAccessExpression(access) && access.name === named) {
+        member = access.name.text;
+        object = access.expression;
+      } else if (
+        ts.isElementAccessExpression(access) &&
+        access.argumentExpression === named &&
+        ts.isStringLiteral(named)
+      ) {
+        member = named.text;
+        object = access.expression;
+      }
+      if (member === undefined || !object || !ts.isIdentifier(object)) return undefined;
+      const objectSymbol = this.checker.getSymbolAtLocation(object);
+      const whole = objectSymbol ? this.requireBinding(objectSymbol) : undefined;
+      if (!whole || whole.exportName !== undefined) return undefined;
+      return this.exportOfRequired({ ...whole, exportName: member });
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The `require` binding a symbol is, when its only declaration is one. */
+  private requireBinding(symbol: ts.Symbol): RequireBinding | undefined {
+    const declarations = symbol.declarations ?? [];
+    if (declarations.length !== 1) return undefined;
+    const declaration = declarations[0];
+    let initializer: ts.Expression | undefined;
+    let exportName: string | undefined;
+    if (ts.isVariableDeclaration(declaration) && ts.isIdentifier(declaration.name)) {
+      initializer = declaration.initializer;
+      if (initializer && ts.isPropertyAccessExpression(initializer) && ts.isIdentifier(initializer.name)) {
+        exportName = initializer.name.text;
+        initializer = initializer.expression;
+      }
+    } else if (
+      ts.isBindingElement(declaration) &&
+      ts.isIdentifier(declaration.name) &&
+      !declaration.dotDotDotToken &&
+      !declaration.initializer &&
+      ts.isObjectBindingPattern(declaration.parent) &&
+      ts.isVariableDeclaration(declaration.parent.parent)
+    ) {
+      const key = declaration.propertyName;
+      if (key && !ts.isIdentifier(key) && !ts.isStringLiteral(key)) return undefined;
+      exportName = key ? key.text : declaration.name.text;
+      initializer = declaration.parent.parent.initializer;
+    }
+    const specifier = initializer ? this.requireSpecifier(initializer) : undefined;
+    if (specifier === undefined) return undefined;
+    const from = declaration.getSourceFile();
+    return exportName === undefined ? { specifier, from } : { specifier, from, exportName };
+  }
+
+  /** `"m"` of a call `require("m")` to the global `require`, else `undefined`. */
+  private requireSpecifier(expression: ts.Expression): string | undefined {
+    if (!ts.isCallExpression(expression) || expression.arguments.length !== 1) return undefined;
+    const callee = expression.expression;
+    const argument = expression.arguments[0];
+    if (!ts.isIdentifier(callee) || callee.text !== 'require' || !ts.isStringLiteral(argument)) return undefined;
+    // The global `require` is declared in a declaration file (or nowhere); a
+    // `require` the service writes is a declaration in its own source.
+    const own = (this.checker.getSymbolAtLocation(callee)?.declarations ?? []).some(
+      (d) => !d.getSourceFile().isDeclarationFile
+    );
+    return own ? undefined : argument.text;
+  }
+
+  private exportOfRequired(binding: RequireBinding): ts.Symbol | undefined {
+    const resolved = ts.resolveModuleName(
+      binding.specifier,
+      binding.from.fileName,
+      this.program.getCompilerOptions(),
+      this.resolutionHost(),
+      undefined,
+      undefined,
+      ts.ModuleKind.CommonJS
+    ).resolvedModule;
+    const target = resolved ? this.program.getSourceFile(resolved.resolvedFileName) : undefined;
+    if (!target) return undefined;
+    if (binding.exportName === undefined) return this.checker.getSymbolAtLocation(target);
+    return moduleExport(this.checker, target, binding.exportName);
+  }
+
+  private host: ts.ModuleResolutionHost | undefined;
+
+  private resolutionHost(): ts.ModuleResolutionHost {
+    this.host ??= ts.createCompilerHost(this.program.getCompilerOptions());
+    return this.host;
   }
 }
 

@@ -110,7 +110,7 @@ export function entryRelativeSpecifier(
   return kind ? from(`${target.slice(0, kind.index)}.${kind[1]}js`) : bare;
 }
 
-function moduleExport(
+export function moduleExport(
   checker: ts.TypeChecker,
   sourceFile: ts.SourceFile,
   name: string
