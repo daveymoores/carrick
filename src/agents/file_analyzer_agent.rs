@@ -13,6 +13,7 @@
 //! - Alias resolution: Import sources are tracked for cross-file linking
 //! - Flat schema: Avoids recursion errors and ensures deterministic parsing
 
+use crate::agents::source_parts::ShownLines;
 use crate::{
     agent_service::{AgentService, GuidanceRef},
     agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
@@ -797,56 +798,6 @@ impl FileAnalyzerAgent {
         Self { agent_service }
     }
 
-    /// Analyze a single file with the given framework patterns.
-    ///
-    /// # Arguments
-    /// * `file_path` - Path to the file being analyzed (for context)
-    /// * `file_content` - Full content of the file
-    /// * `guidance` - Framework-specific patterns to use for matching
-    ///
-    /// # Returns
-    /// A `FileAnalysisResult` containing all detected mounts, endpoints, and data calls.
-    /// Analyze a single file with the given framework patterns (legacy method without candidates).
-    ///
-    /// This method is kept for backward compatibility. Prefer `analyze_file_with_candidates`
-    /// for the AST-gated architecture.
-    pub async fn analyze_file(
-        &self,
-        file_path: &str,
-        file_content: &str,
-        guidance: &FrameworkGuidance,
-    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
-        // Delegate to the new method with empty candidates
-        self.analyze_file_with_candidates(
-            file_path,
-            file_content,
-            guidance,
-            &[],
-            &[],
-            &HashMap::new(),
-            &[],
-            &[],
-            &[],
-        )
-        .await
-    }
-
-    /// Analyze a single file with AST-detected candidate targets.
-    ///
-    /// This is the primary method for the AST-Gated architecture:
-    /// 1. SWC Scanner has already found candidate lines
-    /// 2. We send Full File + Patterns + Candidate Hints to the LLM
-    /// 3. The LLM uses candidates as "Focused Targets" to ensure 100% recall
-    ///
-    /// # Arguments
-    /// * `file_path` - Path to the file being analyzed (for context)
-    /// * `file_content` - Full content of the file
-    /// * `guidance` - Framework-specific patterns to use for matching
-    /// * `candidate_hints` - AST-detected candidate lines (formatted hints from SWC Scanner)
-    /// * `candidate_contexts` - Structured candidate details (JSON strings)
-    ///
-    /// # Returns
-    /// A `FileAnalysisResult` containing all detected mounts, endpoints, and data calls.
     /// Eval-harness diagnostics (off in normal runs). When `CARRICK_EVAL_DUMP_DIR`
     /// is set, write the file-analyzer's input (`request_user_message` — which
     /// embeds the framework guidance + candidates the model received) and its
@@ -890,36 +841,6 @@ impl FileAnalyzerAgent {
         if let Ok(s) = serde_json::to_string_pretty(&payload) {
             let _ = std::fs::write(dir.join(name), s);
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn analyze_file_with_candidates(
-        &self,
-        file_path: &str,
-        file_content: &str,
-        guidance: &FrameworkGuidance,
-        candidate_hints: &[String],
-        candidate_contexts: &[String],
-        imported_symbols: &HashMap<String, ImportedSymbol>,
-        graphql_producer_hints: &[String],
-        graphql_consumer_hints: &[String],
-        wrapper_context: &[String],
-    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
-        // Skip empty files
-        let Some(prompt) = self.prompt_for(
-            file_path,
-            file_content,
-            guidance,
-            candidate_hints,
-            candidate_contexts,
-            imported_symbols,
-            graphql_producer_hints,
-            graphql_consumer_hints,
-            wrapper_context,
-        ) else {
-            return Ok(FileAnalysisResult::default());
-        };
-        self.analyze_prompt(file_path, &prompt, guidance).await
     }
 
     /// This file's prompt, built and not sent.
@@ -1385,6 +1306,140 @@ impl FileAnalyzerAgent {
         graphql_consumer_hints: &[String],
         wrapper_context: &[String],
     ) -> AnalysisPrompt {
+        // Add line-number prefixes to file content so Gemini can read line numbers directly
+        let mut numbered_content =
+            String::with_capacity(file_content.len() + file_content.lines().count() * 7);
+        for (i, line) in file_content.lines().enumerate() {
+            use std::fmt::Write;
+            if i > 0 {
+                numbered_content.push('\n');
+            }
+            let _ = write!(numbered_content, "{:4}| {}", i + 1, line);
+        }
+        self.render_user_message(
+            file_path,
+            &numbered_content,
+            "",
+            guidance,
+            candidate_hints,
+            candidate_contexts,
+            imported_symbols,
+            graphql_producer_hints,
+            graphql_consumer_hints,
+            wrapper_context,
+        )
+    }
+
+    /// The sentence a part's prompt carries under the FILE CONTENT header,
+    /// with the newline that ends it (carrick#2308).
+    ///
+    /// It is the only place a part says it is a part. The header line above
+    /// it is the whole file's, byte for byte, because the cloud reads the
+    /// path off that line (carrick-cloud#2266). The cloud's own instruction
+    /// calls the file content complete, so this says what is not shown and
+    /// that nothing is owed for it.
+    fn window_sentence((first, last): (u32, u32)) -> String {
+        format!(
+            "This request covers lines {first} to {last} of the file. Return entries only for \
+             what lines {first} to {last} hold. Every other line shown is there only because \
+             lines {first} to {last} use it, the rest of the file is not shown, and no entry is \
+             owed for anything outside lines {first} to {last}.\n"
+        )
+    }
+
+    /// The lines a part shows, each under its number in the whole file, as
+    /// the whole prompt numbers them (carrick#2308).
+    ///
+    /// Between two runs, when the part writes such lines at all
+    /// ([`ShownLines::markers`]), one line with an empty number column says
+    /// which lines are not shown. It carries no number, so nothing that
+    /// strips the numbers reads it as a line of the file.
+    fn numbered_lines(file_content: &str, shown: &ShownLines) -> String {
+        use std::fmt::Write;
+        let lines: Vec<&str> = file_content.lines().collect();
+        let mut numbered = String::new();
+        let mut shown_to: Option<u32> = None;
+        for (first, last) in &shown.runs {
+            if let Some(before) = shown_to
+                && shown.markers
+            {
+                let _ = writeln!(
+                    numbered,
+                    "    | lines {} to {} are not shown",
+                    before + 1,
+                    first - 1
+                );
+            }
+            for number in *first..=*last {
+                let Some(line) = lines.get(number as usize - 1) else {
+                    break;
+                };
+                let _ = writeln!(numbered, "{number:4}| {line}");
+            }
+            shown_to = Some(*last);
+        }
+        // The fence's own newline follows, as it follows a whole file.
+        numbered.truncate(numbered.trim_end_matches('\n').len());
+        numbered
+    }
+
+    /// The prompt of one part of a file (carrick#2308): the whole prompt's
+    /// template, showing `shown` of the file's lines in place of the file.
+    ///
+    /// The caller hands over what belongs to the part: its candidates' hints
+    /// and contexts, the imports its shown lines name, and the modules its
+    /// candidates name. `None` for a file with nothing in it, as
+    /// [`Self::prompt_for`] answers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prompt_for_part(
+        &self,
+        file_path: &str,
+        file_content: &str,
+        shown: &ShownLines,
+        guidance: &FrameworkGuidance,
+        candidate_hints: &[String],
+        candidate_contexts: &[String],
+        imported_symbols: &HashMap<String, ImportedSymbol>,
+        graphql_producer_hints: &[String],
+        graphql_consumer_hints: &[String],
+        wrapper_context: &[String],
+    ) -> Option<AnalysisPrompt> {
+        if file_content.trim().is_empty() {
+            return None;
+        }
+        Some(self.render_user_message(
+            file_path,
+            &Self::numbered_lines(file_content, shown),
+            &Self::window_sentence(shown.window),
+            guidance,
+            candidate_hints,
+            candidate_contexts,
+            imported_symbols,
+            graphql_producer_hints,
+            graphql_consumer_hints,
+            wrapper_context,
+        ))
+    }
+
+    /// The one template of an analyze-file user message.
+    ///
+    /// `numbered_content` is what the fence holds. `window_sentence` is
+    /// empty for a whole file, which makes the message byte for byte what it
+    /// always was, and a part's sentence for a part.
+    #[allow(clippy::too_many_arguments)]
+    fn render_user_message(
+        &self,
+        file_path: &str,
+        numbered_content: &str,
+        window_sentence: &str,
+        guidance: &FrameworkGuidance,
+        candidate_hints: &[String],
+        candidate_contexts: &[String],
+        imported_symbols: &HashMap<String, ImportedSymbol>,
+        graphql_producer_hints: &[String],
+        graphql_consumer_hints: &[String],
+        wrapper_context: &[String],
+    ) -> AnalysisPrompt {
         let mount_patterns = self.format_patterns(&guidance.mount_patterns);
         let endpoint_patterns = self.format_patterns(&guidance.endpoint_patterns);
         let data_patterns = self.format_patterns(&guidance.data_fetching_patterns);
@@ -1539,17 +1594,6 @@ impl FileAnalyzerAgent {
                 .to_string()
         };
 
-        // Add line-number prefixes to file content so Gemini can read line numbers directly
-        let mut numbered_content =
-            String::with_capacity(file_content.len() + file_content.lines().count() * 7);
-        for (i, line) in file_content.lines().enumerate() {
-            use std::fmt::Write;
-            if i > 0 {
-                numbered_content.push('\n');
-            }
-            let _ = write!(numbered_content, "{:4}| {}", i + 1, line);
-        }
-
         // The guidance-derived front block, built on its own so the analyzer can
         // say how many leading bytes of the message it occupies. The cloud's
         // analysis cache keys those bytes as the guidance's ID rather than as
@@ -1610,7 +1654,7 @@ These notes are generated per-scan by the framework guidance layer and describe 
 {}{}
 ### FILE CONTENT (Path: {})
 Lines are prefixed with line numbers. Use these numbers for *_expression_line fields.
-```
+{}```
 {}
 ```
 
@@ -1659,6 +1703,7 @@ Return ONLY the JSON object, no explanations."#,
             wrapper_context_section,
             postmessage_section,
             file_path,
+            window_sentence,
             numbered_content
         );
 
@@ -3330,5 +3375,151 @@ const data = await fetch('/api/users').then(resp => resp.json());
                  defends the placeholder rather than the rendered section"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The prompt of one part of a file (carrick#2308)
+    // -----------------------------------------------------------------------
+
+    /// Twelve lines, each naming its own number.
+    fn twelve_lines() -> String {
+        (1..=12)
+            .map(|n| format!("const line{n} = {n};\n"))
+            .collect()
+    }
+
+    /// The part prompt of `twelve_lines` showing `runs` around the window
+    /// 6 to 8, and the whole prompt of the same file with the same inputs.
+    fn part_and_whole(runs: &[(u32, u32)], markers: bool) -> (String, String) {
+        let agent = FileAnalyzerAgent::new(AgentService::new());
+        let source = twelve_lines();
+        let hints = vec!["- Candidate span:1-9: Line 6 (span 1-9) app.get".to_string()];
+        let contexts = vec![r#"{"candidate_id":"span:1-9"}"#.to_string()];
+        let shown = ShownLines {
+            window: (6, 8),
+            runs: runs.to_vec(),
+            markers,
+        };
+        let part = agent
+            .prompt_for_part(
+                "src/routes/(group)/orders.ts",
+                &source,
+                &shown,
+                &sentinel_guidance(),
+                &hints,
+                &contexts,
+                &HashMap::new(),
+                &[],
+                &[],
+                &[],
+            )
+            .expect("a part prompt");
+        let whole = agent
+            .prompt_for(
+                "src/routes/(group)/orders.ts",
+                &source,
+                &sentinel_guidance(),
+                &hints,
+                &contexts,
+                &HashMap::new(),
+                &[],
+                &[],
+                &[],
+            )
+            .expect("a whole prompt");
+        assert_eq!(part.guidance_prefix_bytes, whole.guidance_prefix_bytes);
+        (part.text, whole.text)
+    }
+
+    /// The lines of a prompt from its FILE CONTENT header to the fence's
+    /// close, and the text on either side of them.
+    fn around_the_fence(prompt: &str) -> (&str, Vec<&str>, &str) {
+        let header = prompt.find("### FILE CONTENT").expect("the header");
+        let close = prompt
+            .find("\n```\n\nAnalyze this file")
+            .expect("the close");
+        (
+            &prompt[..header],
+            prompt[header..close].lines().collect(),
+            &prompt[close..],
+        )
+    }
+
+    /// What the cloud's pre-call gate strips off a line of the fence before
+    /// it reads the source (carrick-cloud#2266).
+    fn carries_a_line_number(line: &str) -> bool {
+        regex::Regex::new(r"^\s*\d+[:|] ?").unwrap().is_match(line)
+    }
+
+    #[test]
+    fn a_part_prompt_is_the_whole_prompt_around_its_own_lines() {
+        let (part, whole) = part_and_whole(&[(2, 2), (6, 8), (11, 12)], true);
+        let (part_before, part_lines, part_after) = around_the_fence(&part);
+        let (whole_before, whole_lines, whole_after) = around_the_fence(&whole);
+        assert_eq!(part_before, whole_before, "every section above the file");
+        assert_eq!(
+            part_after, whole_after,
+            "the fence's close and the instructions"
+        );
+
+        // The header and the line under it are the whole prompt's, byte for
+        // byte: the cloud reads the path off the header.
+        assert_eq!(
+            part_lines[0],
+            "### FILE CONTENT (Path: src/routes/(group)/orders.ts)"
+        );
+        assert_eq!(part_lines[..2], whole_lines[..2]);
+        assert_eq!(whole_lines[2], "```", "a whole prompt says nothing more");
+
+        // One sentence, on a line of its own between that line and the fence.
+        assert_eq!(
+            part_lines[2],
+            "This request covers lines 6 to 8 of the file. Return entries only for what lines \
+             6 to 8 hold. Every other line shown is there only because lines 6 to 8 use it, the \
+             rest of the file is not shown, and no entry is owed for anything outside lines 6 \
+             to 8."
+        );
+        assert_eq!(part_lines[3], "```");
+
+        // The shown lines under their numbers in the whole file, written as
+        // the whole prompt writes them, with one line between two runs.
+        assert_eq!(
+            part_lines[4..],
+            [
+                "   2| const line2 = 2;",
+                "    | lines 3 to 5 are not shown",
+                "   6| const line6 = 6;",
+                "   7| const line7 = 7;",
+                "   8| const line8 = 8;",
+                "    | lines 9 to 10 are not shown",
+                "  11| const line11 = 11;",
+                "  12| const line12 = 12;",
+            ]
+        );
+        for line in &part_lines[4..] {
+            assert_eq!(
+                carries_a_line_number(line),
+                !line.contains("are not shown"),
+                "{line}"
+            );
+            if carries_a_line_number(line) {
+                assert!(whole_lines.contains(line), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_part_that_writes_no_marker_shows_only_numbered_lines() {
+        let (part, _) = part_and_whole(&[(2, 2), (6, 8)], false);
+        let (_, lines, _) = around_the_fence(&part);
+        assert_eq!(
+            lines[4..],
+            [
+                "   2| const line2 = 2;",
+                "   6| const line6 = 6;",
+                "   7| const line7 = 7;",
+                "   8| const line8 = 8;",
+            ]
+        );
     }
 }

@@ -297,6 +297,182 @@ async fn a_dispatched_scan_names_every_prompt_by_its_body_and_a_resume_joins_the
     }
 }
 
+/// A service of one generated module whose whole prompt is over the line
+/// (carrick#2309): 400 one-request functions under a long import line.
+fn large_file_root(into: &Path) -> (PathBuf, Vec<PathBuf>) {
+    let mut source = String::from("import { ");
+    for i in 0..600 {
+        source.push_str(&format!("GeneratedShapeNumber{i:04}, "));
+    }
+    source.push_str("} from \"./shapes\";\ndeclare const client: any;\n\n");
+    for i in 0..400 {
+        source.push_str(&format!(
+            "export function readItem{i}(id: string): Promise<GeneratedShapeNumber{:04}> {{\n  return client.get({{ url: \"/dispatched/items/{i}\", params: {{ id }} }});\n}}\n\n",
+            i % 600
+        ));
+    }
+    let root = into.canonicalize().expect("a canonical temp dir");
+    let file = root.join("src/large_client.ts");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, source).unwrap();
+    (root, vec![file])
+}
+
+async fn analyze_files(
+    root: &Path,
+    files: &[PathBuf],
+) -> carrick::agents::file_orchestrator::FileCentricAnalysisResult {
+    FileOrchestrator::new(AgentService::new())
+        .analyze_files(
+            files,
+            &std::collections::HashMap::new(),
+            &ProtocolGuidance::from([(Protocol::Http, guidance())]),
+            &detection(),
+            root,
+            root,
+            &[],
+            &Default::default(),
+            &Default::default(),
+            &carrick::url_normalizer::UrlNormalizer::default_permissive(),
+            &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(root, None),
+            None,
+        )
+        .await
+        .expect("the analysis ran")
+}
+
+fn analyze_file_requests() -> usize {
+    carrick::agent_service::request_counts()
+        .get("/analyze-file")
+        .copied()
+        .unwrap_or(0)
+}
+
+/// carrick#2309: a dispatched file over the line records one prompt a part,
+/// each a window of the file and none of them its whole prompt.
+#[tokio::test]
+#[serial]
+async fn a_dispatched_file_over_the_line_records_a_prompt_a_part() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (root, files) = large_file_root(temp.path());
+    // SAFETY: serial test; env vars are process-global.
+    unsafe {
+        std::env::set_var("CARRICK_MOCK_ALL", "1");
+        std::env::remove_var(analysis_channel::ANSWERS_ENV);
+    }
+    analysis_channel::begin_dispatch();
+    analyze_files(&root, &files).await;
+    let collected = analysis_channel::take().expect("the run was dispatching");
+    let line = carrick::agents::file_orchestrator::WHOLE_PROMPT_MAX_BYTES;
+
+    assert!(
+        collected.rows.len() > 1,
+        "one row a part, got {}",
+        collected.rows.len()
+    );
+    let mut windows: Vec<&str> = Vec::new();
+    for row in &collected.rows {
+        assert!(
+            row.body
+                .contains("### FILE CONTENT (Path: src/large_client.ts)"),
+            "every row is the file's"
+        );
+        let window = row
+            .body
+            .lines()
+            .find(|line| line.starts_with("This request covers lines "))
+            .expect("every row is a part");
+        windows.push(window);
+        assert!(row.body.len() <= line, "a row of {} bytes", row.body.len());
+    }
+    windows.dedup();
+    assert_eq!(windows.len(), collected.rows.len(), "each part once");
+    let listed: usize = collected
+        .rows
+        .iter()
+        .map(|row| row.body.matches("- Candidate ").count())
+        .sum();
+    assert_eq!(listed, 400, "every candidate is listed by one part");
+
+    // SAFETY: serial test.
+    unsafe { std::env::remove_var("CARRICK_MOCK_ALL") };
+}
+
+/// carrick#2309: a resume answers a file asked in parts from the bundle only
+/// when every part has an answer; missing one, it asks the file's parts.
+#[tokio::test]
+#[serial]
+async fn a_resume_missing_one_part_asks_the_file() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let tree = temp.path().join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let (root, files) = large_file_root(&tree);
+    // SAFETY: serial test; env vars are process-global.
+    unsafe {
+        std::env::set_var("CARRICK_MOCK_ALL", "1");
+        std::env::remove_var(analysis_channel::ANSWERS_ENV);
+    }
+    analysis_channel::begin_dispatch();
+    analyze_files(&root, &files).await;
+    let collected = analysis_channel::take().expect("the run was dispatching");
+    let parts = collected.rows.len();
+    assert!(parts > 1);
+    let answers: Vec<(String, String)> = collected
+        .rows
+        .iter()
+        .map(|row| {
+            let (line, candidate_id) = first_candidate(&row.body);
+            (row.id.clone(), collected_answer(line, &candidate_id))
+        })
+        .collect();
+
+    // Every part answered: the file is answered from the bundle.
+    let every = temp.path().join("every");
+    std::fs::create_dir_all(&every).unwrap();
+    // SAFETY: serial test.
+    unsafe {
+        std::env::set_var(
+            analysis_channel::ANSWERS_ENV,
+            answer_bundle(&answers, &every),
+        )
+    };
+    let before = analyze_file_requests();
+    let resumed = analyze_files(&root, &files).await;
+    assert_eq!(analyze_file_requests() - before, 0, "nothing is asked");
+    assert_eq!(resumed.stats.files_model_dispatched, 0);
+    let raw = &resumed.raw_model_results[&files[0].to_string_lossy().to_string()];
+    assert_eq!(
+        raw.endpoints.len(),
+        parts,
+        "the parts' answers, merged into the file's one"
+    );
+
+    // One part missing: the file's parts are asked live.
+    let short = temp.path().join("short");
+    std::fs::create_dir_all(&short).unwrap();
+    // SAFETY: serial test.
+    unsafe {
+        std::env::set_var(
+            analysis_channel::ANSWERS_ENV,
+            answer_bundle(&answers[1..], &short),
+        )
+    };
+    let before = analyze_file_requests();
+    let asked = analyze_files(&root, &files).await;
+    assert_eq!(asked.stats.files_model_dispatched, 1, "the file is asked");
+    assert_eq!(
+        analyze_file_requests() - before,
+        parts,
+        "every part of it, live"
+    );
+
+    // SAFETY: serial test; leave the process as it was found.
+    unsafe {
+        std::env::remove_var(analysis_channel::ANSWERS_ENV);
+        std::env::remove_var("CARRICK_MOCK_ALL");
+    }
+}
+
 /// The first candidate the prompt names, as `(line, candidate_id)`.
 ///
 /// The prompt lists them as `- Candidate <id>: Line N (span a-b) …`, which is

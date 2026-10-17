@@ -20,10 +20,11 @@ use crate::{
     agent_service::AgentService,
     agents::{
         file_analyzer_agent::{
-            DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent,
-            MountResult, PubsubOperation, ResolutionSource,
+            AnalysisPrompt, DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult,
+            FileAnalyzerAgent, MountResult, PubsubOperation, ResolutionSource,
         },
         framework_guidance_agent::ProtocolGuidance,
+        source_parts::{Limits, ShownLines, SourceCut, SourcePart},
     },
     call_base::{resolve_call_base, stated_base, written_base},
     cloud_storage::{ManifestRole, ManifestTypeKind},
@@ -105,6 +106,78 @@ pub const MAX_PART_CANDIDATES: usize = 32;
 /// The cloud's error code for an answer that ended at the response's limit.
 const OUTPUT_TRUNCATED_CODE: &str = "output_truncated";
 
+/// The most bytes of user message ([`crate::agents::file_analyzer_agent::AnalysisPrompt`]'s
+/// `text`) a file is asked in whole, and the most any one request carries
+/// (carrick#2309). A file whose whole prompt is over it is asked in parts
+/// from its first request.
+///
+/// Measured on one first index (carrick#2299): every request under 300 KB of
+/// user message was answered, and every refusal for capacity and every
+/// request that ran to the cloud's 120 s limit was on 395 KB or more. Bytes,
+/// because the scanner has no tokenizer: on that run's prompts of 100 KB and
+/// more a prompt token was 2.2 to 3.3 bytes (median 2.6), so this is about
+/// 96,000 tokens and at most about 115,000. No prompt of 128,000 tokens or
+/// under failed, and failures began at 150,000.
+pub const WHOLE_PROMPT_MAX_BYTES: usize = 250_000;
+
+/// The cloud's error code for a request too large to ask the model
+/// (carrick-cloud#2267). Its `details.max_prompt_bytes` states the limit.
+const PROMPT_TOO_LARGE_CODE: &str = "prompt_too_large";
+
+/// The reason a file is recorded as not analysed under when it cannot be cut
+/// into requests under the line: an item with no list to cut, holding a
+/// candidate, is over it on its own, or the file does not parse for the cut
+/// (carrick#2309). Final: the same bytes are cut the same way on every scan.
+pub const FILE_TOO_LARGE_CODE: &str = "file_too_large";
+
+/// A file that cannot be asked in requests under the line (carrick#2309).
+/// Decided before any request about it is sent, or when the cloud's size
+/// verdict refuses a part that cannot be cut again (carrick#2310).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTooLarge {
+    /// The line the file could not be cut under.
+    pub max_prompt_bytes: usize,
+}
+
+impl std::fmt::Display for FileTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the file cannot be cut into requests of at most {} bytes",
+            self.max_prompt_bytes
+        )
+    }
+}
+
+impl std::error::Error for FileTooLarge {}
+
+/// The cloud's final verdict that a request is too large to ask, when `error`
+/// is one (carrick#2310): the code, on an answer the cloud called final. A
+/// cloud that sends no such verdict never reaches the code that reads it.
+fn size_verdict<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a crate::agent_service::AgentCallError> {
+    error
+        .downcast_ref::<crate::agent_service::AgentCallError>()
+        .filter(|e| e.code == PROMPT_TOO_LARGE_CODE && e.is_final_answer())
+}
+
+/// The line a request refused for size is cut under: the cloud's stated limit
+/// when it states one, and never the refused request's own size or more, so
+/// that request is never sent again as it was.
+fn line_after_size_verdict(
+    verdict: &crate::agent_service::AgentCallError,
+    line: usize,
+    refused_bytes: usize,
+) -> usize {
+    let refused_under = refused_bytes.saturating_sub(1);
+    verdict
+        .max_prompt_bytes()
+        .unwrap_or(refused_under)
+        .min(line)
+        .min(refused_under)
+}
+
 /// The cloud's final verdict that an answer does not fit one response, when
 /// `error` is one: the code, on an answer the cloud itself called final
 /// ([`crate::agent_service::AgentCallError::is_final_answer`]).
@@ -132,54 +205,24 @@ pub struct ListedCandidate {
     pub span_end: u32,
 }
 
-/// A run of consecutive candidate groups of one file, asked about in one
-/// request (carrick#1898).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CandidatePart {
-    /// Where the part's first group sits among the file's groups in source
-    /// order. It orders a file's parts and names one.
-    pub first_group: usize,
-    /// The part's groups, in source order. A group is the candidates that
-    /// share a start, each given as its position in the prompt's listing.
-    pub groups: Vec<Vec<usize>>,
-}
+/// The most bytes of source one part's window holds, and the most bytes of
+/// declarations shown beside it (carrick#2308). See
+/// [`crate::agents::source_parts`] for how a file is cut under them.
+pub const PART_WINDOW_BYTES: usize = 64_000;
+pub const PART_CONTEXT_BYTES: usize = 16_000;
 
-impl CandidatePart {
-    /// The part's candidates as positions in the prompt's listing, in the
-    /// order the prompt lists them.
-    pub fn candidates(&self) -> Vec<usize> {
-        let mut positions: Vec<usize> = self.groups.iter().flatten().copied().collect();
-        positions.sort_unstable();
-        positions
-    }
+/// The most bytes of another module's source a prompt carries: an attached
+/// wrapper module is cut to this, and a declaration shown beside a part's
+/// window is shown by its first line when it is over it (carrick#2308).
+pub const WRAPPER_SNIPPET_MAX: usize = 4_000;
 
-    /// The two halves of a part of several groups, split at its middle group.
-    /// `None` for a single group: its candidates are never separated.
-    pub fn halves(&self) -> Option<(Self, Self)> {
-        if self.groups.len() < 2 {
-            return None;
-        }
-        let middle = self.groups.len() / 2;
-        Some((
-            Self {
-                first_group: self.first_group,
-                groups: self.groups[..middle].to_vec(),
-            },
-            Self {
-                first_group: self.first_group + middle,
-                groups: self.groups[middle..].to_vec(),
-            },
-        ))
-    }
-
-    /// The part's name in a log line and a dump: its first and last group.
-    pub fn label(&self) -> String {
-        format!(
-            "{:04}-{:04}",
-            self.first_group,
-            self.first_group + self.groups.len().saturating_sub(1)
-        )
-    }
+/// One part's answer, beside the window of the file the part was asked about
+/// (carrick#2308).
+#[derive(Debug, Clone)]
+pub struct PartAnswer {
+    /// The part's window: its first and last line.
+    pub window: (u32, u32),
+    pub answer: FileAnalysisResult,
 }
 
 /// A file's candidates as groups in source order: the candidates that share a
@@ -196,126 +239,174 @@ fn candidate_groups(listed: &[ListedCandidate]) -> Vec<Vec<usize>> {
     by_start.into_values().collect()
 }
 
-/// The parts a file is asked in: runs of consecutive groups in source order,
-/// each holding at most `max_candidates` (carrick#1898).
+/// The rows of one kind that echo no listed candidate, as a set keyed by what
+/// each states and its line (carrick#2308).
 ///
-/// A function of the file's candidates and nothing else, so the same file is
-/// asked in the same parts on every scan. A group that alone holds more than
-/// the limit is a part on its own.
-pub fn candidate_parts(listed: &[ListedCandidate], max_candidates: usize) -> Vec<CandidatePart> {
-    let mut parts: Vec<CandidatePart> = Vec::new();
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut held = 0;
-    let mut first_group = 0;
-    for (index, group) in candidate_groups(listed).into_iter().enumerate() {
-        if !groups.is_empty() && held + group.len() > max_candidates {
-            parts.push(CandidatePart {
-                first_group,
-                groups: std::mem::take(&mut groups),
-            });
-            first_group = index;
-            held = 0;
-        }
-        held += group.len();
-        groups.push(group);
-    }
-    if !groups.is_empty() {
-        parts.push(CandidatePart {
-            first_group,
-            groups,
-        });
-    }
-    parts
+/// A row keeps the place it was first stated in. Where a later part states
+/// the same key, its row takes that place only when it ranks higher.
+struct KeyedRows<T> {
+    rows: Vec<(T, u8)>,
+    place: HashMap<String, usize>,
 }
 
-/// Append the rows of `more` that `rows` does not hold already, byte for
-/// byte as they serialize.
-fn append_unseen_rows<T: serde::Serialize>(
-    rows: &mut Vec<T>,
-    seen: &mut HashSet<String>,
-    more: Vec<T>,
-) {
-    for row in more {
-        match serde_json::to_string(&row) {
-            Ok(key) => {
-                if seen.insert(key) {
-                    rows.push(row);
+impl<T> KeyedRows<T> {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            place: HashMap::new(),
+        }
+    }
+
+    /// Keep `row` under `key`, which is what the row states as JSON. A row
+    /// whose key cannot be written is kept: nothing says it repeats.
+    fn keep(&mut self, key: serde_json::Result<String>, row: T, rank: u8) {
+        let Ok(key) = key else {
+            self.rows.push((row, rank));
+            return;
+        };
+        match self.place.get(&key) {
+            Some(place) => {
+                if rank > self.rows[*place].1 {
+                    self.rows[*place] = (row, rank);
                 }
             }
-            // A row that cannot be compared is kept: nothing says it repeats.
-            Err(_) => rows.push(row),
+            None => {
+                self.place.insert(key, self.rows.len());
+                self.rows.push((row, rank));
+            }
         }
+    }
+
+    fn into_rows(self) -> Vec<T> {
+        self.rows.into_iter().map(|(row, _)| row).collect()
     }
 }
 
-/// The one answer a file asked in parts stores (carrick#1898).
+/// The one answer a file asked in parts stores (carrick#1898, carrick#2308).
 ///
-/// `answers` holds each part's answer beside the part's `first_group`, in
-/// whatever order the parts completed. The result does not depend on that
-/// order:
+/// `answers` holds each part's answer beside the part's window, in whatever
+/// order the parts completed. The result does not depend on that order:
 ///
-/// - route and call rows are every part's rows, ordered by where their
-///   candidate sits in the source; rows of one candidate keep the order their
-///   part gave them, and a row whose id names no listed candidate follows the
-///   rows that do, in part order;
-/// - the rows that carry no candidate id (mounts, pub/sub and GraphQL
-///   operations, dispatch tables) are a set: every part reads the whole file
-///   and may state the same one, so a row is kept the first time it is
-///   stated, parts taken in source order, and an exact repeat is dropped.
+/// - route and call rows that echo a listed candidate id are every part's
+///   rows, ordered by where their candidate sits in the source; rows of one
+///   candidate keep the order their part gave them;
+/// - every other row (a mount, a pub/sub or GraphQL operation, a consumer
+///   locate, a dispatch table, and a route or call row that echoes no listed
+///   id) is one of a set keyed by what it states and its line. Where two
+///   parts state the same key, the row from the part whose window holds that
+///   line is kept, and where no such part states it, the first in source
+///   order. A row is never dropped only because its line is outside the
+///   window of the part that stated it;
+/// - for a GraphQL field, a row that names a resolver function is kept over a
+///   row that names none.
 pub fn merge_part_answers(
     listed: &[ListedCandidate],
-    mut answers: Vec<(usize, FileAnalysisResult)>,
+    mut answers: Vec<PartAnswer>,
 ) -> FileAnalysisResult {
-    answers.sort_by_key(|(first_group, _)| *first_group);
+    answers.sort_by_key(|part| part.window);
     let place_in_source: HashMap<&str, usize> = candidate_groups(listed)
         .into_iter()
         .flatten()
         .enumerate()
         .map(|(place, position)| (listed[position].candidate_id.as_str(), place))
         .collect();
-    let place = |candidate_id: &str| {
-        place_in_source
-            .get(candidate_id)
-            .copied()
-            .unwrap_or(usize::MAX)
-    };
 
     let mut merged = FileAnalysisResult::default();
-    let mut mounts = HashSet::new();
-    let mut graphql_operations = HashSet::new();
-    let mut pubsub_operations = HashSet::new();
-    let mut graphql_consumer_locates = HashSet::new();
-    let mut dispatch_tables = HashSet::new();
-    for (_, part) in answers {
-        merged.endpoints.extend(part.endpoints);
-        merged.data_calls.extend(part.data_calls);
-        append_unseen_rows(&mut merged.mounts, &mut mounts, part.mounts);
-        append_unseen_rows(
-            &mut merged.graphql_operations,
-            &mut graphql_operations,
-            part.graphql_operations,
-        );
-        append_unseen_rows(
-            &mut merged.pubsub_operations,
-            &mut pubsub_operations,
-            part.pubsub_operations,
-        );
-        append_unseen_rows(
-            &mut merged.graphql_consumer_locates,
-            &mut graphql_consumer_locates,
-            part.graphql_consumer_locates,
-        );
-        append_unseen_rows(
-            &mut merged.dispatch_tables,
-            &mut dispatch_tables,
-            part.dispatch_tables,
-        );
+    let mut unlisted_endpoints = KeyedRows::new();
+    let mut unlisted_calls = KeyedRows::new();
+    let mut mounts = KeyedRows::new();
+    let mut graphql_operations = KeyedRows::new();
+    let mut pubsub_operations = KeyedRows::new();
+    let mut graphql_consumer_locates = KeyedRows::new();
+    let mut dispatch_tables = KeyedRows::new();
+    for PartAnswer { window, answer } in answers {
+        // Whether the part that states a row at `line` is the one whose
+        // window holds that line.
+        let held = |line: i64| -> u8 {
+            u8::from((i64::from(window.0)..=i64::from(window.1)).contains(&line))
+        };
+        for row in answer.endpoints {
+            if place_in_source.contains_key(row.candidate_id.as_str()) {
+                merged.endpoints.push(row);
+                continue;
+            }
+            let key = serde_json::to_string(&(
+                &row.candidate_id,
+                row.line_number,
+                &row.method,
+                &row.path,
+            ));
+            let rank = held(row.line_number.into());
+            unlisted_endpoints.keep(key, row, rank);
+        }
+        for row in answer.data_calls {
+            if place_in_source.contains_key(row.candidate_id.as_str()) {
+                merged.data_calls.push(row);
+                continue;
+            }
+            let key = serde_json::to_string(&(
+                &row.candidate_id,
+                row.line_number,
+                &row.method,
+                &row.target,
+            ));
+            let rank = held(row.line_number.into());
+            unlisted_calls.keep(key, row, rank);
+        }
+        for row in answer.mounts {
+            let key = serde_json::to_string(&(
+                row.line_number,
+                &row.parent_node,
+                &row.child_node,
+                &row.mount_path,
+            ));
+            let rank = held(row.line_number.into());
+            mounts.keep(key, row, rank);
+        }
+        for row in answer.pubsub_operations {
+            let key = serde_json::to_string(&(row.line_number, &row.topic, &row.role));
+            let rank = held(row.line_number.into());
+            pubsub_operations.keep(key, row, rank);
+        }
+        for row in answer.graphql_operations {
+            // A field has one row. One that names its resolver outranks one
+            // that names none, whichever window stated it.
+            let key = serde_json::to_string(&(&row.kind, &row.field));
+            let rank = 2 * u8::from(row.resolver_function.is_some())
+                + row.resolver_line.map_or(0, |line| held(line.into()));
+            graphql_operations.keep(key, row, rank);
+        }
+        for row in answer.graphql_consumer_locates {
+            // A locate states no line, and two parts that name different
+            // types for one document are two statements.
+            let key = serde_json::to_string(&row);
+            graphql_consumer_locates.keep(key, row, 0);
+        }
+        for row in answer.dispatch_tables {
+            let key = serde_json::to_string(&(
+                row.location,
+                &row.field,
+                &row.handler_name,
+                row.line_number,
+            ));
+            let rank = row.line_number.map_or(0, |line| held(line.into()));
+            dispatch_tables.keep(key, row, rank);
+        }
     }
     // Stable, so the rows of one candidate stay in the order their part gave.
-    merged.endpoints.sort_by_key(|row| place(&row.candidate_id));
+    merged
+        .endpoints
+        .sort_by_key(|row| place_in_source[row.candidate_id.as_str()]);
     merged
         .data_calls
-        .sort_by_key(|row| place(&row.candidate_id));
+        .sort_by_key(|row| place_in_source[row.candidate_id.as_str()]);
+    merged.endpoints.extend(unlisted_endpoints.into_rows());
+    merged.data_calls.extend(unlisted_calls.into_rows());
+    merged.mounts = mounts.into_rows();
+    merged.graphql_operations = graphql_operations.into_rows();
+    merged.pubsub_operations = pubsub_operations.into_rows();
+    merged.graphql_consumer_locates = graphql_consumer_locates.into_rows();
+    merged.dispatch_tables = dispatch_tables.into_rows();
     merged
 }
 
@@ -333,6 +424,37 @@ struct PartedFile<'a> {
     graphql_consumer_hints: &'a [String],
     wrapper_context: &'a [String],
     wrapper_imports: &'a BTreeMap<String, Vec<usize>>,
+}
+
+impl PartedFile<'_> {
+    /// Whether the file's prompt carries a GraphQL section, where a type can
+    /// be the thing a row locates.
+    fn has_graphql_section(&self) -> bool {
+        !self.graphql_producer_hints.is_empty() || !self.graphql_consumer_hints.is_empty()
+    }
+}
+
+/// How a file is asked, decided before its first request (carrick#2309).
+enum Asking {
+    /// In one request: its whole prompt is at or under the line.
+    Whole(AnalysisPrompt),
+    /// In parts, each prompt at or under the line.
+    Parts(Box<PartPlan>),
+    /// Not at all: the file has nothing in it.
+    Nothing,
+}
+
+/// The parts a file is asked in, each with its prompt, and what cutting a
+/// part again reads.
+struct PartPlan {
+    cut: SourceCut,
+    limits: Limits,
+    /// The most bytes one request may carry.
+    line: usize,
+    /// The attached modules each listed candidate names
+    /// ([`modules_named_by_candidates`]).
+    named: Option<Vec<BTreeSet<usize>>>,
+    parts: Vec<(SourcePart, AnalysisPrompt)>,
 }
 
 /// Every place a file's source names one of `imports`, as (where the name
@@ -1578,37 +1700,19 @@ impl FileOrchestrator {
         self
     }
 
-    /// Ask about a file in parts, after the cloud's verdict that its whole
-    /// answer does not fit one response (carrick#1898).
+    /// How `file` is asked, decided before its first request (carrick#2309).
     ///
-    /// The file's candidates are split into parts ([`candidate_parts`]) of at
-    /// most the number the verdict states, or [`MAX_PART_CANDIDATES`] when it
-    /// states none. Each part is asked on its own, and the answers are merged
-    /// into the one answer the file stores ([`merge_part_answers`]). A part whose own
-    /// answer is cut is halved by groups and its halves asked, down to a
-    /// single group; a single group that is cut loses the file with that
-    /// verdict. A part that fails any other way loses the file with that
-    /// failure. Either way nothing of the file's answer is kept, and when
-    /// several parts fail it is the first in source order that is reported.
-    ///
-    /// A file with no candidate has nothing to be split by, and is lost with
-    /// the verdict it was given.
-    async fn ask_in_parts(
+    /// A file whose whole prompt is at or under [`WHOLE_PROMPT_MAX_BYTES`] is
+    /// asked in one request, in the bytes it was always asked in. A file over
+    /// it is never sent whole: it is cut into parts ([`Self::plan_parts`])
+    /// under that line, and a file that cannot be cut under it is
+    /// [`FileTooLarge`].
+    fn asking(
         &self,
         file: &PartedFile<'_>,
         guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
-        verdict: crate::agent_service::AgentCallError,
-    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
-        // The verdict's own limit when it states one, read once: a part that
-        // is cut in its turn is halved, whatever its verdict states.
-        let limit = verdict.max_part_candidates().unwrap_or(MAX_PART_CANDIDATES);
-        let mut wave = candidate_parts(file.listed, limit);
-        if wave.is_empty() {
-            return Err(Box::new(verdict));
-        }
-        let named = modules_named_by_candidates(file);
-        // The request that was cut, to tell a part that would repeat it.
-        let whole = self.file_analyzer.prompt_for(
+    ) -> Result<Asking, FileTooLarge> {
+        let Some(whole) = self.file_analyzer.prompt_for(
             file.prompt_path,
             file.content,
             guidance,
@@ -1618,53 +1722,289 @@ impl FileOrchestrator {
             file.graphql_producer_hints,
             file.graphql_consumer_hints,
             file.wrapper_context,
+        ) else {
+            return Ok(Asking::Nothing);
+        };
+        if whole.text.len() <= WHOLE_PROMPT_MAX_BYTES {
+            return Ok(Asking::Whole(whole));
+        }
+        debug!(
+            "{}: its whole prompt is {} bytes, over the line of {}; asking it in parts",
+            file.prompt_path,
+            whole.text.len(),
+            WHOLE_PROMPT_MAX_BYTES
         );
+        self.plan_parts(file, guidance, WHOLE_PROMPT_MAX_BYTES)
+            .map(|plan| Asking::Parts(Box::new(plan)))
+    }
+
+    /// The parts `file` is asked in so that no request carries more than
+    /// `line` bytes (carrick#2309, carrick#2310).
+    ///
+    /// The file is cut into windows of its lines
+    /// ([`crate::agents::source_parts`]), each of at most
+    /// [`PART_WINDOW_BYTES`] and [`MAX_PART_CANDIDATES`] candidates, and each
+    /// part's prompt is fitted under the line ([`Self::fit`]). A file that
+    /// does not parse for the cut cannot be asked under the line.
+    fn plan_parts(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        line: usize,
+    ) -> Result<PartPlan, FileTooLarge> {
+        let too_large = FileTooLarge {
+            max_prompt_bytes: line,
+        };
+        let cut = SourceCut::of(Path::new(file.prompt_path), file.content, file.listed)
+            .ok_or_else(|| too_large.clone())?;
+        let limits = Limits {
+            window_bytes: PART_WINDOW_BYTES,
+            context_bytes: PART_CONTEXT_BYTES,
+            candidates: MAX_PART_CANDIDATES,
+        };
+        let wave = cut.parts(&limits);
+        let mut plan = PartPlan {
+            named: modules_named_by_candidates(file),
+            cut,
+            limits,
+            line,
+            parts: Vec::new(),
+        };
+        for part in wave {
+            plan.parts.extend(self.fit(file, guidance, &plan, part)?);
+        }
+        Ok(plan)
+    }
+
+    /// `part` as the requests it is asked in under `plan.line`, in source
+    /// order (carrick#2309).
+    ///
+    /// - A window that holds no candidate and whose items are all
+    ///   declarations that run nothing (imports, re-exports, type aliases,
+    ///   interfaces, ambient declarations) states nothing the model is asked
+    ///   about, and is not sent. The exception is a file whose prompt carries
+    ///   a GraphQL section, where a type can be the thing located.
+    /// - A part whose prompt is at or under the line is one request.
+    /// - A part over it is halved by its bytes
+    ///   ([`SourceCut::halves_by_size`]) and each half fitted in turn.
+    /// - A part over it that cannot be halved, one item with no list to cut,
+    ///   is not sent when it holds no candidate: it states nothing the model
+    ///   is asked about, which is the rule that already skips a file with no
+    ///   candidate. When it holds one, the file is [`FileTooLarge`].
+    fn fit(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        plan: &PartPlan,
+        part: SourcePart,
+    ) -> Result<Vec<(SourcePart, AnalysisPrompt)>, FileTooLarge> {
+        let mut fitted = Vec::new();
+        let mut pending = vec![part];
+        // Last first, so the halves come off in source order.
+        while let Some(part) = pending.pop() {
+            if part.candidates.is_empty()
+                && !file.has_graphql_section()
+                && plan.cut.states_nothing(&part)
+            {
+                continue;
+            }
+            let Some(prompt) =
+                self.part_prompt(file, guidance, &plan.cut, &part, plan.named.as_deref())
+            else {
+                continue;
+            };
+            if prompt.text.len() <= plan.line {
+                fitted.push((part, prompt));
+                continue;
+            }
+            match plan.cut.halves_by_size(&part, &plan.limits) {
+                Some((front, back)) => pending.extend([back, front]),
+                None if part.candidates.is_empty() => debug!(
+                    "{}: lines {} are one item over the line of {} bytes and hold no candidate; not asked",
+                    file.prompt_path,
+                    part.label(),
+                    plan.line
+                ),
+                None => {
+                    return Err(FileTooLarge {
+                        max_prompt_bytes: plan.line,
+                    });
+                }
+            }
+        }
+        Ok(fitted)
+    }
+
+    /// Ask about a file in parts, after the cloud's verdict that its whole
+    /// answer does not fit one response (carrick#1898).
+    ///
+    /// The file is cut as [`Self::plan_parts`] cuts it, at most the
+    /// candidates the verdict states a part, or [`MAX_PART_CANDIDATES`] when
+    /// it states none, and asked as [`Self::ask_parts`] asks it. A file with
+    /// no candidate is cut by size alone.
+    ///
+    /// A file that is one window is the request that was cut. It is not sent
+    /// again: it is halved first. A file that does not parse here cannot be
+    /// cut, and is lost with the verdict it was given.
+    async fn ask_in_parts(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        verdict: crate::agent_service::AgentCallError,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        let Some(cut) = SourceCut::of(Path::new(file.prompt_path), file.content, file.listed)
+        else {
+            return Err(Box::new(verdict));
+        };
+        let limits = Limits {
+            window_bytes: PART_WINDOW_BYTES,
+            context_bytes: PART_CONTEXT_BYTES,
+            // The verdict's own limit when it states one, read once: a part
+            // that is cut in its turn is halved, whatever its verdict states.
+            candidates: verdict.max_part_candidates().unwrap_or(MAX_PART_CANDIDATES),
+        };
+        let mut wave = cut.parts(&limits);
+        if let [whole] = wave.as_slice() {
+            let Some((front, back)) = cut.halves(whole, &limits) else {
+                return Err(Box::new(verdict));
+            };
+            wave = vec![front, back];
+        }
+        let mut plan = PartPlan {
+            named: modules_named_by_candidates(file),
+            cut,
+            limits,
+            line: WHOLE_PROMPT_MAX_BYTES,
+            parts: Vec::new(),
+        };
+        for part in wave {
+            plan.parts.extend(self.fit(file, guidance, &plan, part)?);
+        }
         debug!(
             "{}: the answer does not fit one response; asking about its {} candidate(s) in {} part(s)",
             file.prompt_path,
             file.listed.len(),
-            wave.len()
+            plan.parts.len()
         );
+        self.ask_parts(file, guidance, plan).await
+    }
 
-        let mut answers: Vec<(usize, FileAnalysisResult)> = Vec::new();
+    /// Ask about a file in parts after the cloud's final verdict that its
+    /// whole request is too large to ask (carrick#2310): cut as a file over
+    /// the line is cut, under the limit the verdict states, and never under
+    /// the refused request's own size or more.
+    async fn ask_smaller(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        verdict: &crate::agent_service::AgentCallError,
+        refused_bytes: usize,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        let line = line_after_size_verdict(verdict, WHOLE_PROMPT_MAX_BYTES, refused_bytes);
+        debug!(
+            "{}: its whole request of {} bytes is too large to ask; asking it in parts of at most {} bytes",
+            file.prompt_path, refused_bytes, line
+        );
+        let plan = self.plan_parts(file, guidance, line)?;
+        self.ask_parts(file, guidance, plan).await
+    }
+
+    /// Ask every part of `plan` and merge the answers into the one answer the
+    /// file stores ([`merge_part_answers`], carrick#1898, carrick#2308).
+    ///
+    /// Each part shows its window and the declarations the window uses, and
+    /// not the file. A part whose own answer is cut is halved between its
+    /// items ([`SourceCut::halves`]) and its halves asked, down to a single
+    /// group of candidates; a part that cannot be halved loses the file with
+    /// that verdict. A part the cloud refuses as too large to ask is halved
+    /// by its bytes under the limit the refusal states (carrick#2310), and a
+    /// part that cannot be cut again loses the file as [`FileTooLarge`]. A
+    /// part that fails any other way loses the file with that failure. Either
+    /// way nothing of the file's answer is kept, and when several parts fail
+    /// it is the first in source order that is reported.
+    async fn ask_parts(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        mut plan: PartPlan,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        let mut answers: Vec<PartAnswer> = Vec::new();
+        let mut wave = std::mem::take(&mut plan.parts);
         while !wave.is_empty() {
-            let outcomes = futures::future::join_all(wave.iter().map(|part| {
-                self.ask_part(
-                    file,
-                    guidance,
-                    part,
-                    named.as_deref(),
-                    whole.as_ref(),
-                    &verdict,
-                )
-            }))
-            .await;
+            let labels: Vec<String> = wave.iter().map(|(part, _)| part.label()).collect();
+            let outcomes =
+                futures::future::join_all(wave.iter().zip(&labels).map(|((_, prompt), label)| {
+                    self.file_analyzer.analyze_part_prompt(
+                        file.prompt_path,
+                        label,
+                        prompt,
+                        guidance,
+                    )
+                }))
+                .await;
             // `join_all` answers in the order it was given the parts, which is
             // source order, so the failure kept is the first in the source
             // whichever request came back first.
-            let mut halves: Vec<CandidatePart> = Vec::new();
+            let mut again: Vec<SourcePart> = Vec::new();
             let mut lost: Option<Box<dyn std::error::Error>> = None;
-            for (part, outcome) in wave.iter().zip(outcomes) {
-                match outcome {
-                    Ok(answer) => answers.push((part.first_group, answer)),
-                    Err(error) if lost.is_some() => drop(error),
-                    Err(error) => match (cut_verdict(error.as_ref()).is_some(), part.halves()) {
-                        (true, Some((front, back))) => {
+            for ((part, prompt), outcome) in wave.into_iter().zip(outcomes) {
+                let error = match outcome {
+                    Ok(answer) => {
+                        answers.push(PartAnswer {
+                            window: part.window(),
+                            answer,
+                        });
+                        continue;
+                    }
+                    Err(_) if lost.is_some() => continue,
+                    Err(error) => error,
+                };
+                if cut_verdict(error.as_ref()).is_some() {
+                    match plan.cut.halves(&part, &plan.limits) {
+                        Some((front, back)) => {
                             debug!(
                                 "{}: the answer for part {} does not fit either; asking its halves",
                                 file.prompt_path,
                                 part.label()
                             );
-                            halves.extend([front, back]);
+                            again.extend([front, back]);
                         }
-                        _ => lost = Some(error),
-                    },
+                        None => lost = Some(error),
+                    }
+                } else if let Some(verdict) = size_verdict(error.as_ref()) {
+                    plan.line = line_after_size_verdict(verdict, plan.line, prompt.text.len());
+                    match plan.cut.halves_by_size(&part, &plan.limits) {
+                        Some((front, back)) => {
+                            debug!(
+                                "{}: part {} is too large to ask; asking its halves under {} bytes",
+                                file.prompt_path,
+                                part.label(),
+                                plan.line
+                            );
+                            again.extend([front, back]);
+                        }
+                        // One item with no list, holding no candidate: it
+                        // states nothing the model is asked about.
+                        None if part.candidates.is_empty() => {}
+                        None => {
+                            lost = Some(Box::new(FileTooLarge {
+                                max_prompt_bytes: plan.line,
+                            }))
+                        }
+                    }
+                } else {
+                    lost = Some(error);
                 }
             }
             if let Some(error) = lost {
                 return Err(error);
             }
-            wave = halves;
+            // Fitted once every refusal of this wave is read, so each half is
+            // held to the smallest limit the cloud has stated.
+            wave = Vec::new();
+            for part in again {
+                wave.extend(self.fit(file, guidance, &plan, part)?);
+            }
         }
         debug!(
             "{}: answered in {} part(s)",
@@ -1674,22 +2014,25 @@ impl FileOrchestrator {
         Ok(merge_part_answers(file.listed, answers))
     }
 
-    /// Ask about one part of a file: the file's own prompt, listing only the
-    /// part's candidates and carrying only the modules those candidates name
-    /// through an import (carrick#1898).
+    /// The prompt of one part of a file (carrick#1898, carrick#2308): the
+    /// file's own prompt, showing the part's window and what the window uses
+    /// in place of the file, listing only the part's candidates and only the
+    /// imports its shown lines name, and carrying only the modules its
+    /// candidates name through an import.
     ///
-    /// A part whose prompt is byte for byte the request that was cut is not
-    /// sent: its verdict is the one already given.
-    async fn ask_part(
+    /// A part that lists no candidate carries the modules its window names
+    /// through an import, and every part of a file with no candidate at all
+    /// carries every module the file imports: such a file is asked about
+    /// because it imports one.
+    fn part_prompt(
         &self,
         file: &PartedFile<'_>,
         guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
-        part: &CandidatePart,
+        cut: &SourceCut,
+        part: &SourcePart,
         named: Option<&[BTreeSet<usize>]>,
-        whole: Option<&crate::agents::file_analyzer_agent::AnalysisPrompt>,
-        verdict: &crate::agent_service::AgentCallError,
-    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
-        let positions = part.candidates();
+    ) -> Option<AnalysisPrompt> {
+        let positions = &part.candidates;
         let hints: Vec<String> = positions
             .iter()
             .map(|position| file.candidate_hints[*position].clone())
@@ -1698,37 +2041,60 @@ impl FileOrchestrator {
             .iter()
             .map(|position| file.candidate_contexts[*position].clone())
             .collect();
+        let shown = part.shown();
+        let shown_names = cut.names_on(&shown);
+        let places: Option<BTreeSet<usize>> = if file.listed.is_empty() {
+            // A file with no candidate records no name for its modules, and a
+            // module that cannot be shown to be unnamed is not left out.
+            None
+        } else if positions.is_empty() {
+            let window = ShownLines {
+                window: part.window(),
+                runs: vec![part.window()],
+                markers: false,
+            };
+            let window_names = cut.names_on(&window);
+            Some(
+                file.wrapper_imports
+                    .iter()
+                    .filter(|(name, _)| window_names.contains(name.as_str()))
+                    .flat_map(|(_, modules)| modules.iter().copied())
+                    .collect(),
+            )
+        } else {
+            named.map(|named| {
+                positions
+                    .iter()
+                    .flat_map(|position| named[*position].iter().copied())
+                    .collect()
+            })
+        };
         // In the context's own order, which is the modules' sorted order.
-        let modules: Vec<String> = match named {
-            Some(named) => positions
-                .iter()
-                .flat_map(|position| named[*position].iter().copied())
-                .collect::<BTreeSet<usize>>()
+        let modules: Vec<String> = match places {
+            Some(places) => places
                 .into_iter()
                 .map(|place| file.wrapper_context[place].clone())
                 .collect(),
             None => file.wrapper_context.to_vec(),
         };
-        let prompt = self.file_analyzer.prompt_for(
+        let imported_symbols: HashMap<String, ImportedSymbol> = file
+            .imported_symbols
+            .iter()
+            .filter(|(local, _)| shown_names.contains(local.as_str()))
+            .map(|(local, symbol)| (local.clone(), symbol.clone()))
+            .collect();
+        self.file_analyzer.prompt_for_part(
             file.prompt_path,
             file.content,
+            &shown,
             guidance,
             &hints,
             &contexts,
-            file.imported_symbols,
+            &imported_symbols,
             file.graphql_producer_hints,
             file.graphql_consumer_hints,
             &modules,
-        );
-        let Some(prompt) = prompt else {
-            return Err(Box::new(verdict.clone()));
-        };
-        if whole.is_some_and(|whole| whole.text == prompt.text) {
-            return Err(Box::new(verdict.clone()));
-        }
-        self.file_analyzer
-            .analyze_part_prompt(file.prompt_path, &part.label(), &prompt, guidance)
-            .await
+        )
     }
 
     /// Run AST-gated file-centric analysis on all provided files.
@@ -1975,6 +2341,24 @@ impl FileOrchestrator {
             /// Calls in this file that hand an inline function the instance
             /// it registers routes on (carrick#2092).
             registration_sites: Vec<crate::registration_scope::RegistrationSite>,
+        }
+
+        impl PendingFile {
+            /// What asking the file, whole or in parts, reads of it.
+            fn parted(&self) -> PartedFile<'_> {
+                PartedFile {
+                    prompt_path: &self.prompt_path,
+                    content: &self.content,
+                    listed: &self.listed,
+                    candidate_hints: &self.candidate_hints,
+                    candidate_contexts: &self.candidate_contexts,
+                    imported_symbols: &self.symbol_table.imported_symbols,
+                    graphql_producer_hints: &self.graphql_producer_hints,
+                    graphql_consumer_hints: &self.graphql_consumer_hints,
+                    wrapper_context: &self.wrapper_context,
+                    wrapper_imports: &self.wrapper_imports,
+                }
+            }
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -2641,7 +3025,6 @@ impl FileOrchestrator {
         // another file would import. Keyed by canonical file path. The whole
         // (size-capped) file is the context snippet: wrappers are small client
         // modules, and slicing exact function spans buys little over the cap.
-        const WRAPPER_SNIPPET_MAX: usize = 4_000;
         let mut wrapper_map: HashMap<PathBuf, WrapperModule> = HashMap::new();
         for pf in &pending {
             // Rescued files (graphql/messaging fall-throughs) carry no HTTP
@@ -3048,7 +3431,8 @@ impl FileOrchestrator {
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: ctx,
-                // No candidate, so the file is never asked in parts and
+                // No candidate, so a part of the file, when it is over the
+                // line and asked in parts, names no module through one, and
                 // nothing reads which name reaches which module.
                 wrapper_imports: BTreeMap::new(),
                 wrapper_request_shape: rescued_shape,
@@ -3220,18 +3604,19 @@ impl FileOrchestrator {
                     crate::analysis_channel::degrade(service.as_deref().unwrap_or("this service"));
                     break;
                 };
-                if let Some(prompt) = self.file_analyzer.prompt_for(
-                    &pf.prompt_path,
-                    &pf.content,
-                    guidance,
-                    &pf.candidate_hints,
-                    &pf.candidate_contexts,
-                    &pf.symbol_table.imported_symbols,
-                    &pf.graphql_producer_hints,
-                    &pf.graphql_consumer_hints,
-                    &pf.wrapper_context,
-                ) {
-                    crate::analysis_channel::record(service.as_deref(), key, &prompt, &schema);
+                // One prompt a request the file would make: its whole prompt,
+                // or one a part when it is over the line (carrick#2309). A
+                // file that cannot be asked under the line records none, and
+                // the resume that follows decides the same.
+                let prompts: Vec<AnalysisPrompt> = match self.asking(&pf.parted(), guidance) {
+                    Ok(Asking::Whole(prompt)) => vec![prompt],
+                    Ok(Asking::Parts(plan)) => {
+                        plan.parts.into_iter().map(|(_, prompt)| prompt).collect()
+                    }
+                    Ok(Asking::Nothing) | Err(_) => Vec::new(),
+                };
+                for prompt in &prompts {
+                    crate::analysis_channel::record(service.as_deref(), key, prompt, &schema);
                     collecting = true;
                 }
             }
@@ -3239,23 +3624,32 @@ impl FileOrchestrator {
         } else if let Some(answers) = crate::analysis_channel::answers() {
             let mut unanswered: Vec<PendingFile> = Vec::with_capacity(to_dispatch.len());
             for pf in to_dispatch.drain(..) {
-                let replay = self
-                    .file_analyzer
-                    .prompt_for(
-                        &pf.prompt_path,
-                        &pf.content,
-                        guidance,
-                        &pf.candidate_hints,
-                        &pf.candidate_contexts,
-                        &pf.symbol_table.imported_symbols,
-                        &pf.graphql_producer_hints,
-                        &pf.graphql_consumer_hints,
-                        &pf.wrapper_context,
-                    )
-                    .and_then(|prompt| {
-                        answers.text_for(&crate::analysis_job::body_id(prompt.body()))
-                    })
-                    .map(|text| FileAnalyzerAgent::result_from_answer(&pf.prompt_path, text));
+                let answer_to = |prompt: &AnalysisPrompt| {
+                    answers
+                        .text_for(&crate::analysis_job::body_id(prompt.body()))
+                        .map(|text| FileAnalyzerAgent::result_from_answer(&pf.prompt_path, text))
+                };
+                // A file asked in parts is answered from the bundle only when
+                // every part is (carrick#2309); otherwise its parts are asked.
+                let replay = match self.asking(&pf.parted(), guidance) {
+                    Ok(Asking::Whole(prompt)) => answer_to(&prompt),
+                    Ok(Asking::Parts(plan)) => plan
+                        .parts
+                        .iter()
+                        .map(|(part, prompt)| {
+                            answer_to(prompt).map(|answer| {
+                                answer.map(|answer| PartAnswer {
+                                    window: part.window(),
+                                    answer,
+                                })
+                            })
+                        })
+                        .collect::<Option<Result<Vec<PartAnswer>, String>>>()
+                        .map(|answers| {
+                            answers.map(|answers| merge_part_answers(&pf.listed, answers))
+                        }),
+                    Ok(Asking::Nothing) | Err(_) => None,
+                };
                 match replay {
                     Some(Ok(result)) => collected.push((pf, result)),
                     Some(Err(error)) => {
@@ -3340,45 +3734,41 @@ impl FileOrchestrator {
         crate::scan_health::record_files_attempted(to_dispatch.len());
         let dispatched: Vec<(PendingFile, Result<FileAnalysisResult, ModelAnswer>)> =
             futures::stream::iter(to_dispatch.into_iter().map(|pf| async move {
-                let whole = self
-                    .file_analyzer
-                    .analyze_file_with_candidates(
-                        &pf.prompt_path,
-                        &pf.content,
-                        guidance,
-                        &pf.candidate_hints,
-                        &pf.candidate_contexts,
-                        &pf.symbol_table.imported_symbols,
-                        &pf.graphql_producer_hints,
-                        &pf.graphql_consumer_hints,
-                        &pf.wrapper_context,
-                    )
-                    .await;
-                // A file is asked whole, and only the cloud's final verdict
-                // that its answer does not fit one response asks it again, in
-                // parts (carrick#1898). Every other outcome is what it was:
-                // an answer is the file's answer, and any other failure is
-                // the file's failure.
-                let asked = match whole {
-                    Err(error) => match cut_verdict(error.as_ref()).cloned() {
-                        Some(verdict) => {
-                            let file = PartedFile {
-                                prompt_path: &pf.prompt_path,
-                                content: &pf.content,
-                                listed: &pf.listed,
-                                candidate_hints: &pf.candidate_hints,
-                                candidate_contexts: &pf.candidate_contexts,
-                                imported_symbols: &pf.symbol_table.imported_symbols,
-                                graphql_producer_hints: &pf.graphql_producer_hints,
-                                graphql_consumer_hints: &pf.graphql_consumer_hints,
-                                wrapper_context: &pf.wrapper_context,
-                                wrapper_imports: &pf.wrapper_imports,
-                            };
-                            self.ask_in_parts(&file, guidance, verdict).await
+                let file = pf.parted();
+                // A file at or under the line is asked whole, and only the
+                // cloud's final verdict that its answer does not fit one
+                // response (carrick#1898) or that the request is too large to
+                // ask (carrick#2310) asks it again, in parts. A file over the
+                // line is asked in parts from its first request, and one that
+                // cannot be cut under it is not asked (carrick#2309). Every
+                // other outcome is what it was: an answer is the file's
+                // answer, and any other failure is the file's failure.
+                let asked: Result<FileAnalysisResult, Box<dyn std::error::Error>> = match self
+                    .asking(&file, guidance)
+                {
+                    Ok(Asking::Nothing) => Ok(FileAnalysisResult::default()),
+                    Ok(Asking::Parts(plan)) => self.ask_parts(&file, guidance, *plan).await,
+                    Err(too_large) => Err(Box::new(too_large)),
+                    Ok(Asking::Whole(prompt)) => {
+                        match self
+                            .file_analyzer
+                            .analyze_prompt(&pf.prompt_path, &prompt, guidance)
+                            .await
+                        {
+                            Err(error) => {
+                                if let Some(verdict) = cut_verdict(error.as_ref()).cloned() {
+                                    self.ask_in_parts(&file, guidance, verdict).await
+                                } else if let Some(verdict) = size_verdict(error.as_ref()).cloned()
+                                {
+                                    self.ask_smaller(&file, guidance, &verdict, prompt.text.len())
+                                        .await
+                                } else {
+                                    Err(error)
+                                }
+                            }
+                            answered => answered,
                         }
-                        None => Err(error),
-                    },
-                    answered => answered,
+                    }
                 };
                 let result = asked.map_err(|e| {
                     // Recorded here, where the error is still typed: this
@@ -3386,7 +3776,18 @@ impl FileOrchestrator {
                     // not call itself a success. A call a limit refused
                     // is excluded, because the model was never asked
                     // (carrick#555, `counts_as_lost_file`).
-                    if crate::scan_health::counts_as_lost_file(e.as_ref()) {
+                    if e.downcast_ref::<FileTooLarge>().is_some() {
+                        // Decided by the scanner from the file's bytes, so
+                        // the same on every scan of them: final, and never
+                        // described as something a re-run mends.
+                        crate::scan_health::record_unanalysed_file(
+                            &pf.path_str,
+                            &crate::scan_health::LossReason {
+                                code: FILE_TOO_LARGE_CODE.to_string(),
+                                is_final: true,
+                            },
+                        );
+                    } else if crate::scan_health::counts_as_lost_file(e.as_ref()) {
                         crate::scan_health::record_unanalysed_file(
                             &pf.path_str,
                             &crate::scan_health::analysis_failure_reason(e.as_ref()),
@@ -23537,124 +23938,16 @@ export async function POST(request: Request): Promise<Response> {
             .collect()
     }
 
-    /// The candidate ids each part holds, part by part.
-    fn ids_by_part(listed: &[ListedCandidate], parts: &[CandidatePart]) -> Vec<Vec<String>> {
-        parts
-            .iter()
-            .map(|part| {
-                part.candidates()
-                    .into_iter()
-                    .map(|position| listed[position].candidate_id.clone())
-                    .collect()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn candidates_that_share_a_start_stay_in_one_part() {
-        // Two singles, a chain of three links, one single. At three a part,
-        // the chain cannot join the two singles, and it is not cut to fit.
-        let listed = listed_at(&[(10, 20), (30, 40), (50, 90), (50, 80), (50, 70), (100, 110)]);
-        let parts = candidate_parts(&listed, 3);
-        assert_eq!(
-            parts,
-            [
-                CandidatePart {
-                    first_group: 0,
-                    groups: vec![vec![0], vec![1]],
-                },
-                CandidatePart {
-                    first_group: 2,
-                    groups: vec![vec![2, 3, 4]],
-                },
-                CandidatePart {
-                    first_group: 3,
-                    groups: vec![vec![5]],
-                },
-            ]
-        );
-        assert!(
-            parts.iter().all(|part| part.candidates().len() <= 3),
-            "no part holds more than the limit"
-        );
-    }
-
-    #[test]
-    fn a_group_larger_than_the_limit_is_a_part_on_its_own() {
-        let listed = listed_at(&[(1, 5), (10, 90), (10, 80), (10, 70), (10, 60), (95, 99)]);
-        let sizes: Vec<usize> = candidate_parts(&listed, 2)
-            .iter()
-            .map(|part| part.candidates().len())
-            .collect();
-        assert_eq!(sizes, [1, 4, 1]);
-    }
-
-    #[test]
-    fn a_file_with_no_candidates_has_no_parts() {
-        assert!(candidate_parts(&[], MAX_PART_CANDIDATES).is_empty());
-    }
-
-    /// The parts are runs in SOURCE order, whatever order the prompt lists
-    /// the candidates in, and they are the same parts for the same
-    /// candidates listed in any order.
-    #[test]
-    fn the_parts_depend_on_the_candidates_and_not_on_the_order_they_are_listed_in() {
-        let in_source_order = listed_at(&[(10, 20), (30, 40), (30, 35), (50, 60), (70, 80)]);
-        let expected = ids_by_part(&in_source_order, &candidate_parts(&in_source_order, 2));
-        assert_eq!(
-            expected,
-            [
-                vec!["span:10-20"],
-                vec!["span:30-40", "span:30-35"],
-                vec!["span:50-60", "span:70-80"],
-            ]
-        );
-
-        // The same candidates, listed late ones first.
-        let listed = listed_at(&[(70, 80), (30, 40), (10, 20), (50, 60), (30, 35)]);
-        let parts = candidate_parts(&listed, 2);
-        let mut by_part = ids_by_part(&listed, &parts);
-        let mut expected_sets = expected.clone();
-        for ids in by_part.iter_mut().chain(expected_sets.iter_mut()) {
-            ids.sort();
-        }
-        assert_eq!(by_part, expected_sets, "the same candidates in each part");
-        // Within a part, the prompt's own listing order is kept.
-        assert_eq!(parts[2].candidates(), [0, 3]);
-        assert_eq!(
-            candidate_parts(&listed, 2),
-            parts,
-            "and the same on every call"
-        );
-    }
-
-    #[test]
-    fn a_part_is_halved_at_its_middle_group_down_to_one_group() {
-        let listed = listed_at(&[(1, 2), (3, 9), (3, 8), (10, 11), (12, 13), (14, 15)]);
-        let whole = candidate_parts(&listed, MAX_PART_CANDIDATES);
-        assert_eq!(whole.len(), 1);
-        assert_eq!(whole[0].label(), "0000-0004");
-
-        let (front, back) = whole[0].halves().expect("five groups halve");
-        assert_eq!(front.groups, [vec![0], vec![1, 2]]);
-        assert_eq!(back.groups, [vec![3], vec![4], vec![5]]);
-        assert_eq!((front.first_group, back.first_group), (0, 2));
-        assert_eq!(
-            (front.label(), back.label()),
-            ("0000-0001".into(), "0002-0004".into())
-        );
-
-        let (single, chain) = front.halves().expect("two groups halve");
-        assert_eq!((single.groups.len(), chain.groups.len()), (1, 1));
-        assert!(single.halves().is_none(), "one group is not halved");
-        assert!(
-            chain.halves().is_none(),
-            "a group of two candidates is one group, and is not separated"
-        );
-    }
-
     fn part_answer(value: serde_json::Value) -> FileAnalysisResult {
         serde_json::from_value(value).expect("a part answer")
+    }
+
+    /// `answer` as the part whose window is `window` gave it.
+    fn answered(window: (u32, u32), answer: &FileAnalysisResult) -> PartAnswer {
+        PartAnswer {
+            window,
+            answer: answer.clone(),
+        }
     }
 
     fn route_row(candidate_id: &str, path: &str) -> serde_json::Value {
@@ -23713,8 +24006,8 @@ export async function POST(request: Request): Promise<Response> {
             "/unlisted-by-second",
         ];
         for answers in [
-            vec![(0, first.clone()), (2, second.clone())],
-            vec![(2, second), (0, first)],
+            vec![answered((1, 4), &first), answered((5, 9), &second)],
+            vec![answered((5, 9), &second), answered((1, 4), &first)],
         ] {
             let merged = merge_part_answers(&listed, answers);
             let paths: Vec<&str> = merged
@@ -23743,8 +24036,8 @@ export async function POST(request: Request): Promise<Response> {
             ],
         }));
         for answers in [
-            vec![(0, first.clone()), (1, second.clone())],
-            vec![(1, second), (0, first)],
+            vec![answered((1, 4), &first), answered((5, 9), &second)],
+            vec![answered((5, 9), &second), answered((1, 4), &first)],
         ] {
             let merged = merge_part_answers(&listed, answers);
             let children: Vec<&str> = merged
@@ -23755,14 +24048,182 @@ export async function POST(request: Request): Promise<Response> {
             assert_eq!(
                 children,
                 ["shared", "only-first", "only-second"],
-                "each exact row once, in the order the parts state them in source order"
+                "each row once, in the order the parts state them in source order"
             );
             assert_eq!(
                 merged.pubsub_operations.len(),
                 2,
-                "a row that differs in any field is a row of its own"
+                "a row that states another role is a row of its own"
             );
         }
+    }
+
+    /// carrick#2308: two parts that state the same row disagree only in what
+    /// they could see. The part whose window holds the row's line saw the
+    /// row itself; another part saw it as a declaration its window uses.
+    #[test]
+    fn of_two_parts_that_state_a_row_the_one_whose_window_holds_its_line_is_kept() {
+        let mount = |line: i32, seen_by: &str| {
+            serde_json::json!({
+                "line_number": line,
+                "parent_node": "table",
+                "child_node": "child",
+                "mount_path": "/",
+                "import_source": null,
+                "pattern_matched": seen_by,
+            })
+        };
+        let topic = |line: i32, seen_by: &str| {
+            serde_json::json!({
+                "topic": "ready", "role": "publisher", "line_number": line, "broker": seen_by,
+            })
+        };
+        // Line 7 is in the second part's window. Line 40 is in neither.
+        let first = part_answer(serde_json::json!({
+            "mounts": [mount(7, "first"), mount(40, "first")],
+            "endpoints": [], "data_calls": [],
+            "pubsub_operations": [topic(7, "first"), topic(40, "first")],
+            "dispatch_tables": [
+                { "location": "body", "field": "action", "values": ["a"], "line_number": 7 },
+            ],
+        }));
+        let second = part_answer(serde_json::json!({
+            "mounts": [mount(40, "second"), mount(7, "second")],
+            "endpoints": [], "data_calls": [],
+            "pubsub_operations": [topic(40, "second"), topic(7, "second")],
+            "dispatch_tables": [
+                { "location": "body", "field": "action", "values": ["a", "b"], "line_number": 7 },
+            ],
+        }));
+        for answers in [
+            vec![answered((1, 4), &first), answered((5, 9), &second)],
+            vec![answered((5, 9), &second), answered((1, 4), &first)],
+        ] {
+            let merged = merge_part_answers(&[], answers);
+            let mounts: Vec<(i32, &str)> = merged
+                .mounts
+                .iter()
+                .map(|row| (row.line_number, row.pattern_matched.as_str()))
+                .collect();
+            assert_eq!(
+                mounts,
+                [(7, "second"), (40, "first")],
+                "the window that holds the line, else the first part in source order"
+            );
+            let topics: Vec<(i32, Option<&str>)> = merged
+                .pubsub_operations
+                .iter()
+                .map(|row| (row.line_number, row.broker.as_deref()))
+                .collect();
+            assert_eq!(topics, [(7, Some("second")), (40, Some("first"))]);
+            let [table] = merged.dispatch_tables.as_slice() else {
+                panic!("one table: {:?}", merged.dispatch_tables);
+            };
+            assert_eq!(table.values, ["a", "b"]);
+        }
+    }
+
+    /// A row is never dropped only because its line is outside the window of
+    /// the one part that stated it.
+    #[test]
+    fn a_row_stated_once_is_kept_wherever_its_line_is() {
+        let only = part_answer(serde_json::json!({
+            "mounts": [{
+                "line_number": 900, "parent_node": "table", "child_node": "far",
+                "mount_path": "/far", "import_source": null, "pattern_matched": ".use(",
+            }],
+            "endpoints": [route_row("line:900", "/far")],
+            "data_calls": [],
+            "pubsub_operations": [{ "topic": "far", "role": "subscriber", "line_number": 900 }],
+        }));
+        let merged = merge_part_answers(&[], vec![answered((1, 4), &only)]);
+        assert_eq!(
+            (
+                merged.mounts.len(),
+                merged.endpoints.len(),
+                merged.pubsub_operations.len()
+            ),
+            (1, 1, 1)
+        );
+    }
+
+    /// A route or call row that echoes no listed candidate is one of a set
+    /// too: two parts that state the same one state it once.
+    #[test]
+    fn a_route_row_that_echoes_no_listed_candidate_is_kept_once() {
+        let listed = listed_at(&[(10, 20)]);
+        let first = part_answer(serde_json::json!({
+            "mounts": [], "data_calls": [],
+            "endpoints": [route_row("span:10-20", "/a"), route_row("line:99", "/unlisted")],
+        }));
+        let second = part_answer(serde_json::json!({
+            "mounts": [], "data_calls": [],
+            "endpoints": [route_row("line:99", "/unlisted"), route_row("line:99", "/other")],
+        }));
+        let merged = merge_part_answers(
+            &listed,
+            vec![answered((5, 9), &second), answered((1, 4), &first)],
+        );
+        let paths: Vec<&str> = merged
+            .endpoints
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        assert_eq!(paths, ["/a", "/unlisted", "/other"]);
+    }
+
+    #[test]
+    fn a_graphql_row_that_names_a_resolver_is_kept_over_one_that_names_none() {
+        let located = serde_json::json!({
+            "kind": "query", "field": "order",
+            "resolver_function": null, "resolver_line": null,
+            "primary_type_symbol": null, "type_import_source": null,
+            "backing_type_symbol": "Order",
+        });
+        let resolved = |line: i32, name: &str| {
+            serde_json::json!({
+                "kind": "query", "field": "order",
+                "resolver_function": name, "resolver_line": line,
+                "primary_type_symbol": "Order", "type_import_source": null,
+            })
+        };
+        let graphql = |rows: Vec<serde_json::Value>| {
+            part_answer(serde_json::json!({
+                "mounts": [], "endpoints": [], "data_calls": [], "graphql_operations": rows,
+            }))
+        };
+        // The first part saw no function return the field. The second holds
+        // the resolver. A third saw the resolver as a declaration it uses.
+        let first = graphql(vec![located]);
+        let second = graphql(vec![resolved(7, "resolveOrder")]);
+        let third = graphql(vec![resolved(7, "seenFromAfar")]);
+        for answers in [
+            vec![
+                answered((1, 4), &first),
+                answered((5, 9), &second),
+                answered((10, 12), &third),
+            ],
+            vec![
+                answered((10, 12), &third),
+                answered((5, 9), &second),
+                answered((1, 4), &first),
+            ],
+        ] {
+            let merged = merge_part_answers(&[], answers);
+            let [row] = merged.graphql_operations.as_slice() else {
+                panic!("one row a field: {:?}", merged.graphql_operations);
+            };
+            assert_eq!(row.resolver_function.as_deref(), Some("resolveOrder"));
+        }
+        // With no window holding the resolver, the first part that names one.
+        let merged = merge_part_answers(
+            &[],
+            vec![answered((1, 4), &first), answered((10, 12), &third)],
+        );
+        assert_eq!(
+            merged.graphql_operations[0].resolver_function.as_deref(),
+            Some("seenFromAfar")
+        );
     }
 
     /// The spans of the calls in `source` that start with `callee`, one a

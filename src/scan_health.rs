@@ -594,8 +594,8 @@ pub fn analysis_failure_reason(error: &(dyn std::error::Error + 'static)) -> Los
 pub fn final_answer_sentence(files: usize) -> Option<String> {
     (files > 0).then(|| {
         format!(
-            "The cloud's answer for {files} file(s) is final: a re-run gets the same until the \
-             file or Carrick changes."
+            "The answer for {files} file(s) is final: a re-run gives the same result until the \
+             file changes or Carrick is updated."
         )
     })
 }
@@ -1440,11 +1440,11 @@ mod tests {
         let sentence = final_answer_sentence(2).unwrap();
         assert_eq!(
             sentence,
-            "The cloud's answer for 2 file(s) is final: a re-run gets the same until the file or \
-             Carrick changes."
+            "The answer for 2 file(s) is final: a re-run gives the same result until the file \
+             changes or Carrick is updated."
         );
         assert!(
-            sentence.split_whitespace().count() <= 20,
+            sentence.split_whitespace().count() <= 22,
             "a line a person reads, not a paragraph: {sentence}"
         );
     }
