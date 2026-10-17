@@ -1781,8 +1781,9 @@ impl Builder {
 /// expression: a body returning two different values states none (the
 /// call stays a hole), as does any other statement (a loop, a `let`, a call
 /// that may change what a later line reads). A local is replaced by its
-/// binding ([`ident_key`]), never by name, so a block that declares the
-/// name again keeps its own.
+/// binding ([`ident_key`]), never by name, and a `const` a block or a branch
+/// declares is read only inside it, so a block that declares the name again
+/// keeps its own and the lines after the block read the outer one.
 fn returned_value(stmts: &[Stmt]) -> Option<Expr> {
     fn ends(stmts: &[Stmt]) -> bool {
         stmts.iter().any(|stmt| match stmt {
@@ -1836,11 +1837,17 @@ fn returned_value(stmts: &[Stmt]) -> Option<Expr> {
                     returns.push(value);
                 }
                 Stmt::Throw(_) => {}
-                Stmt::Block(block) => walk(&block.stmts, locals, returns)?,
+                // A block's or a branch's `const` is visible only inside it:
+                // each walks its own copy of the locals declared so far.
+                Stmt::Block(block) => walk(&block.stmts, &mut locals.clone(), returns)?,
                 Stmt::If(branch) => {
-                    walk(std::slice::from_ref(&branch.cons), locals, returns)?;
+                    walk(
+                        std::slice::from_ref(&branch.cons),
+                        &mut locals.clone(),
+                        returns,
+                    )?;
                     if let Some(alt) = &branch.alt {
-                        walk(std::slice::from_ref(alt), locals, returns)?;
+                        walk(std::slice::from_ref(alt), &mut locals.clone(), returns)?;
                     }
                 }
                 _ => return None,
@@ -9236,6 +9243,33 @@ function build() { return {}; }
             "f",
         );
         assert_eq!(shadowed, vec![lit("/outer/x")]);
+    }
+
+    /// carrick#2447: a `const` an `if` branch declares is visible only in
+    /// that branch, so the `return` after it reads the outer binding.
+    #[test]
+    fn a_branch_scoped_constant_is_not_read_after_its_branch() {
+        let url = request_url(
+            "function base() { const p = \"/x\"; if (flag()) { const p = \"/y\"; throw new Error(p); } return p; }\n\
+             export function f() { return fetch(base() + \"/r\"); }\n",
+            "f",
+        );
+        assert_eq!(url, vec![lit("/x/r")]);
+        // The scope holds without the resolver's contexts too: unresolved,
+        // both `p` share one key, and only the block scoping keeps them apart.
+        let (_, module) = crate::swc_scanner::parse_standalone_module(
+            Path::new("input.ts"),
+            "function base() { const p = \"/x\"; if (flag()) { const p = \"/y\"; throw new Error(p); } return p; }\n",
+        )
+        .expect("parsed module");
+        let Some(ModuleItem::Stmt(Stmt::Decl(Decl::Fn(base)))) = module.body.first() else {
+            panic!("the module declares base first");
+        };
+        let returned = returned_value(&base.function.body.as_ref().expect("body").stmts);
+        assert!(
+            matches!(&returned, Some(Expr::Lit(Lit::Str(text))) if text.value.to_string_lossy() == "/x"),
+            "{returned:?}"
+        );
     }
 
     /// carrick#2447: a body that returns different values, can fall off its

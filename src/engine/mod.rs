@@ -17569,6 +17569,20 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 "import { api } from \"./api\";\n\
                  export function r() { return api.get(\"/read\"); }\n",
             ),
+            ("src/q01b/config.ts", "export const BASE = \"/q01right\";\n"),
+            (
+                "src/q01b/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 import { BASE } from \"./config\";\n\
+                 export const api = http.create({ baseURL: BASE });\n",
+            ),
+            (
+                "src/q01b/reader.ts",
+                "import { api } from \"./api\";\n\
+                 const BASE = \"/q01wrong\";\n\
+                 export const b = BASE;\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
             (
                 "src/q04/api.ts",
                 "import http from \"@fixture/http\";\n\
@@ -17598,6 +17612,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(
             library_stated(&dir, &discovery, "src/q01/reader.ts"),
             stated(&[(2, "GET", "/q01right/read")])
+        );
+        // The importer's own `BASE` is another binding: the base is read where
+        // the client is built, never by name in the importer.
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/q01b/reader.ts"),
+            stated(&[(4, "GET", "/q01right/read")])
         );
         assert_eq!(
             library_rows_of(&dir, &discovery, "src/q06/api.ts", &verified_sample())
