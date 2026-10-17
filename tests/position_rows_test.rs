@@ -307,13 +307,19 @@ fn the_committed_rows_parse_with_the_format_types() {
     assert_eq!(file.header.v, carrick::position_rows::FORMAT_VERSION);
     assert_eq!(file.header.service, "api");
     let rows: Vec<_> = file.files.iter().flat_map(|line| &line.r).collect();
-    assert!(rows.iter().all(|row| row.flags() & !15 == 0));
+    assert!(rows.iter().all(|row| row.flags() & !31 == 0));
     assert!(rows.iter().any(|row| row.flags() & FLAG_ERROR_TYPE != 0));
     assert!(
         rows.iter()
             .all(|row| row.flags() & FLAG_ANY == 0 || row.flags() & FLAG_ERROR_TYPE == 0)
     );
-    for kind in [Kind::Call, Kind::Member, Kind::Compare, Kind::Ident] {
+    for kind in [
+        Kind::Call,
+        Kind::Member,
+        Kind::Compare,
+        Kind::Ident,
+        Kind::Jsx,
+    ] {
         assert!(rows.iter().any(|row| row.kind() == kind), "no {kind:?} row");
     }
 }

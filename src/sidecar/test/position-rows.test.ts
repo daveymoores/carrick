@@ -23,7 +23,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
-import { SidecarClient } from './helpers.js';
+import { SidecarClient, asVersion1Rows } from './helpers.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = path.join(__dirname, '..', '..', '..', '..', 'tests', 'fixtures', 'position-rows');
@@ -121,6 +121,12 @@ describe('position_rows (carrick#2405)', () => {
   it('writes the committed rows, exactly', () => {
     const expected = fs.readFileSync(path.join(FIXTURE, 'api.expected.jsonl'), 'utf8');
     assert.strictEqual(first.text, expected);
+  });
+
+  // `api.v1-kinds.jsonl` is what the version-1 walk wrote (carrick#2430).
+  it('leaves every row of a version-1 kind byte-identical', () => {
+    const expected = fs.readFileSync(path.join(FIXTURE, 'api.v1-kinds.jsonl'), 'utf8');
+    assert.strictEqual(asVersion1Rows(first.text), expected);
   });
 
   it('writes the same bytes on a second walk', () => {
