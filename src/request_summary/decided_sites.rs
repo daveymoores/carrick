@@ -343,6 +343,11 @@ pub enum Undecided {
 pub struct DecidedLead {
     pub file: String,
     pub line: u32,
+    pub span_start: u32,
+    pub span_end: u32,
+    /// Functions the walk entered from this call (0 when it is at the call
+    /// that holds the open name).
+    pub depth: u32,
     pub end: LabelledEnd,
     pub reason: Undecided,
 }
@@ -839,6 +844,9 @@ impl<'a> Walk<'a, '_> {
         let lead = DecidedLead {
             file: relative(self.root, placed.file),
             line: placed.call.site.line,
+            span_start: placed.call.site.span_start,
+            span_end: placed.call.site.span_end,
+            depth: u32::from(placed.depth),
             end: end.clone(),
             reason: why,
         };
@@ -1443,6 +1451,25 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             vec![("api.ts".to_string(), 10, Undecided::NameNeverBound)]
         );
+    }
+
+    /// A call whose name only an entry point fills is one possible call,
+    /// at the call that holds the open name (carrick#2438).
+    #[test]
+    fn a_name_nothing_binds_is_a_possible_call() {
+        let decided = decided();
+        let found = crate::possible_calls::from_sites(&decided, &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let call = &found[0];
+        assert_eq!(call.file_path.trim_start_matches(WEB), "api.ts");
+        assert_eq!(call.line_number, 10);
+        assert!(call.span_end > call.span_start, "{call:?}");
+        assert!(!call.file_path.starts_with('/'), "{call:?}");
+        assert_eq!(
+            call.unread.reason,
+            crate::possible_calls::UnreadReason::NameNeverBound
+        );
+        assert!(call.labelled_end.is_some(), "{call:?}");
     }
 
     /// Each request is one site at the call that decides it, every protocol:

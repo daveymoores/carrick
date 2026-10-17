@@ -6803,6 +6803,8 @@ fn build_cloud_data_from_mount_graph(
         scanner_build: crate::cloud_storage::ScannerBuild::current(),
         boundary: None,
         dispatch_tables: None,
+        possible_calls: None,
+        possible_calls_omitted: None,
     }
 }
 
@@ -11761,6 +11763,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }
     }
 
@@ -12726,6 +12730,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         relativize_cloud_paths(
@@ -12941,6 +12947,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -12993,6 +13001,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }];
 
         // Test Config merging
@@ -13089,6 +13099,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -13827,6 +13839,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         // Staging unavailable: the request body has to carry the payload, so
@@ -13884,6 +13898,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         let stripped = strip_ast_nodes(data, true);
@@ -13954,6 +13970,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 scanner_build: None,
                 boundary: None,
                 dispatch_tables: None,
+                possible_calls: None,
+                possible_calls_omitted: None,
             }
         }
 
@@ -14033,6 +14051,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -14254,6 +14274,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -14402,6 +14424,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         attach_external_call_candidates(
@@ -14527,6 +14551,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         attach_external_call_candidates(
@@ -14646,6 +14672,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -24324,6 +24352,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }
     }
 }
