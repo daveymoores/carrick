@@ -1,0 +1,812 @@
+{
+  "contract": "POST /site-questions (carrick#2437, carrick-cloud#2380), version 1",
+  "about": "The one example both repos test against: carrick tests/fixtures/site_questions/contract.json, vendored byte for byte as carrick-cloud lambdas/site-questions/fixtures/contract.json. `request` is what the scanner sends; `jev` is what a recorded Jev answers each request for the site at that point (a status alone is a failed request); `response` is what the cloud answers, with `{question_set}` standing for the cloud's current question-set id. Sites: s-0001 the slots the code decides are forced and only the name and arguments are asked; s-0002 every slot asked, the name's two orders disagree; s-0003 Jev fails and the site is retriable; s-0004 Jev's answer names no option and the site is not retriable.",
+  "request": {
+    "repo": "example-org/shop",
+    "service": "orders-api",
+    "question_set": null,
+    "sites": [
+      {
+        "site_id": "s-0001",
+        "state": {
+          "point": {
+            "at": "src/orders/client.ts:14",
+            "code": "10: import { http } from './http';\n11: import { ORDERS, ARCHIVE } from './paths';\n12: \n13: export function listOrders(archived: boolean) {\n14:   return http.get(archived ? ARCHIVE : ORDERS);\n15: }"
+          },
+          "compiler": {
+            "names": [
+              {
+                "text": "http",
+                "at": "src/orders/client.ts:14",
+                "declaration": "src/orders/http.ts:3",
+                "declaration_text": "http = createClient({ baseUrl: process.env.ORDERS_URL })",
+                "package": null,
+                "type": "Client",
+                "literal": null
+              },
+              {
+                "text": "ARCHIVE",
+                "at": "src/orders/client.ts:14",
+                "declaration": "src/orders/paths.ts:2",
+                "declaration_text": "ARCHIVE = '/v1/orders/archive'",
+                "package": null,
+                "type": "\"/v1/orders/archive\"",
+                "literal": "/v1/orders/archive"
+              },
+              {
+                "text": "ORDERS",
+                "at": "src/orders/client.ts:14",
+                "declaration": "src/orders/paths.ts:1",
+                "declaration_text": "ORDERS = '/v1/orders'",
+                "package": null,
+                "type": "\"/v1/orders\"",
+                "literal": "/v1/orders"
+              }
+            ],
+            "callees": [
+              {
+                "text": "http.get",
+                "declaration": "node_modules/@example/http-client/index.d.ts:20",
+                "package": "@example/http-client",
+                "code": null
+              }
+            ],
+            "enclosing": null
+          },
+          "syntax": [
+            {
+              "type": "CallExpression",
+              "at": "src/orders/client.ts:14",
+              "text": "http.get(archived ? ARCHIVE : ORDERS)",
+              "callee": "http.get",
+              "args": [
+                "archived ? ARCHIVE : ORDERS"
+              ]
+            }
+          ],
+          "libraries": [
+            {
+              "package": "@example/http-client",
+              "labels": [
+                {
+                  "export": "createClient",
+                  "role": "http_client",
+                  "side": null,
+                  "http": [
+                    {
+                      "member": "get",
+                      "method": "GET",
+                      "path_from": {
+                        "arg": 0
+                      }
+                    }
+                  ]
+                }
+              ],
+              "argument_labels": [],
+              "in_store": true
+            }
+          ],
+          "call": {
+            "text": "http.get(archived ? ARCHIVE : ORDERS)",
+            "at": "src/orders/client.ts:14",
+            "args": [
+              "archived ? ARCHIVE : ORDERS"
+            ]
+          },
+          "stated": {
+            "names": [
+              {
+                "text": "/v1/orders/archive",
+                "places": [
+                  {
+                    "from": "checker",
+                    "name": "ARCHIVE",
+                    "at": "src/orders/client.ts:14"
+                  }
+                ]
+              },
+              {
+                "text": "/v1/orders",
+                "places": [
+                  {
+                    "from": "checker",
+                    "name": "ORDERS",
+                    "at": "src/orders/client.ts:14"
+                  }
+                ]
+              }
+            ],
+            "methods": [
+              {
+                "text": "GET",
+                "places": [
+                  {
+                    "from": "label_method",
+                    "export": "createClient",
+                    "member": "get",
+                    "at": "@example/http-client"
+                  }
+                ]
+              }
+            ]
+          },
+          "asked": [
+            "name",
+            "name_argument",
+            "payload_argument"
+          ],
+          "forced": {
+            "kind": "http",
+            "role": "sends",
+            "method": "GET"
+          }
+        }
+      },
+      {
+        "site_id": "s-0002",
+        "state": {
+          "point": {
+            "at": "src/orders/events.ts:31",
+            "code": "29: export async function settle(order: Order) {\n30:   const topic = order.paid ? ORDER_PAID : ORDER_CANCELLED;\n31:   await bus.publish(topic, { id: order.id });\n32: }"
+          },
+          "compiler": {
+            "names": [
+              {
+                "text": "bus",
+                "at": "src/orders/events.ts:31",
+                "declaration": "src/orders/bus.ts:8",
+                "declaration_text": "bus = new Bus(connect())",
+                "package": null,
+                "type": "Bus",
+                "literal": null
+              },
+              {
+                "text": "topic",
+                "at": "src/orders/events.ts:31",
+                "declaration": "src/orders/events.ts:30",
+                "declaration_text": "topic = order.paid ? ORDER_PAID : ORDER_CANCELLED",
+                "package": null,
+                "type": "\"order.paid\" | \"order.cancelled\"",
+                "literal": null
+              }
+            ],
+            "callees": [
+              {
+                "text": "bus.publish",
+                "declaration": "src/orders/bus.ts:14",
+                "package": null,
+                "code": "14:   publish(topic: string, body: unknown) {\n15:     return this.conn.send(topic, JSON.stringify(body));\n16:   }"
+              }
+            ],
+            "enclosing": null,
+            "reached": [
+              {
+                "level": 1,
+                "via": "bus.publish",
+                "function": "src/orders/bus.ts:14",
+                "code": "14:   publish(topic: string, body: unknown) {\n15:     return this.conn.send(topic, JSON.stringify(body));\n16:   }",
+                "names": [],
+                "strings": []
+              }
+            ]
+          },
+          "syntax": [
+            {
+              "type": "CallExpression",
+              "at": "src/orders/events.ts:31",
+              "text": "bus.publish(topic, { id: order.id })",
+              "callee": "bus.publish",
+              "args": [
+                "topic",
+                "{ id: order.id }"
+              ]
+            },
+            {
+              "type": "KeyValueProperty",
+              "at": "src/orders/events.ts:31",
+              "text": "id: order.id",
+              "key": "id"
+            }
+          ],
+          "libraries": [],
+          "package_network_roles": [
+            {
+              "role": "broker",
+              "files": 3
+            }
+          ],
+          "call": {
+            "text": "bus.publish(topic, { id: order.id })",
+            "at": "src/orders/events.ts:31",
+            "args": [
+              "topic",
+              "{ id: order.id }"
+            ]
+          },
+          "stated": {
+            "names": [
+              {
+                "text": "order.paid",
+                "places": [
+                  {
+                    "from": "checker",
+                    "name": "ORDER_PAID",
+                    "at": "src/orders/events.ts:30"
+                  }
+                ]
+              },
+              {
+                "text": "order.cancelled",
+                "places": [
+                  {
+                    "from": "checker",
+                    "name": "ORDER_CANCELLED",
+                    "at": "src/orders/events.ts:30"
+                  }
+                ]
+              },
+              {
+                "text": "id",
+                "places": [
+                  {
+                    "from": "object_key",
+                    "at": "src/orders/events.ts:31"
+                  }
+                ]
+              }
+            ],
+            "methods": []
+          },
+          "asked": [
+            "kind",
+            "role",
+            "name",
+            "name_argument",
+            "payload_argument",
+            "namespace"
+          ],
+          "forced": {}
+        }
+      },
+      {
+        "site_id": "s-0003",
+        "state": {
+          "point": {
+            "at": "src/orders/client.ts:40",
+            "code": "10: import { http } from './http';\n11: import { ORDERS, ARCHIVE } from './paths';\n12: \n13: export function listOrders(archived: boolean) {\n14:   return http.get(archived ? ARCHIVE : ORDERS);\n15: }"
+          },
+          "compiler": {
+            "names": [
+              {
+                "text": "http",
+                "at": "src/orders/client.ts:40",
+                "declaration": "src/orders/http.ts:3",
+                "declaration_text": "http = createClient({ baseUrl: process.env.ORDERS_URL })",
+                "package": null,
+                "type": "Client",
+                "literal": null
+              },
+              {
+                "text": "ARCHIVE",
+                "at": "src/orders/client.ts:40",
+                "declaration": "src/orders/paths.ts:2",
+                "declaration_text": "ARCHIVE = '/v1/orders/archive'",
+                "package": null,
+                "type": "\"/v1/orders/archive\"",
+                "literal": "/v1/orders/archive"
+              },
+              {
+                "text": "ORDERS",
+                "at": "src/orders/client.ts:40",
+                "declaration": "src/orders/paths.ts:1",
+                "declaration_text": "ORDERS = '/v1/orders'",
+                "package": null,
+                "type": "\"/v1/orders\"",
+                "literal": "/v1/orders"
+              }
+            ],
+            "callees": [
+              {
+                "text": "http.get",
+                "declaration": "node_modules/@example/http-client/index.d.ts:20",
+                "package": "@example/http-client",
+                "code": null
+              }
+            ],
+            "enclosing": null
+          },
+          "syntax": [
+            {
+              "type": "CallExpression",
+              "at": "src/orders/client.ts:40",
+              "text": "http.get(archived ? ARCHIVE : ORDERS)",
+              "callee": "http.get",
+              "args": [
+                "archived ? ARCHIVE : ORDERS"
+              ]
+            }
+          ],
+          "libraries": [
+            {
+              "package": "@example/http-client",
+              "labels": [
+                {
+                  "export": "createClient",
+                  "role": "http_client",
+                  "side": null,
+                  "http": [
+                    {
+                      "member": "get",
+                      "method": "GET",
+                      "path_from": {
+                        "arg": 0
+                      }
+                    }
+                  ]
+                }
+              ],
+              "argument_labels": [],
+              "in_store": true
+            }
+          ],
+          "call": {
+            "text": "http.get(archived ? ARCHIVE : ORDERS)",
+            "at": "src/orders/client.ts:40",
+            "args": [
+              "archived ? ARCHIVE : ORDERS"
+            ]
+          },
+          "stated": {
+            "names": [
+              {
+                "text": "/v1/orders/archive",
+                "places": [
+                  {
+                    "from": "checker",
+                    "name": "ARCHIVE",
+                    "at": "src/orders/client.ts:40"
+                  }
+                ]
+              },
+              {
+                "text": "/v1/orders",
+                "places": [
+                  {
+                    "from": "checker",
+                    "name": "ORDERS",
+                    "at": "src/orders/client.ts:40"
+                  }
+                ]
+              }
+            ],
+            "methods": [
+              {
+                "text": "GET",
+                "places": [
+                  {
+                    "from": "label_method",
+                    "export": "createClient",
+                    "member": "get",
+                    "at": "@example/http-client"
+                  }
+                ]
+              }
+            ]
+          },
+          "asked": [
+            "name",
+            "name_argument",
+            "payload_argument"
+          ],
+          "forced": {
+            "kind": "http",
+            "role": "sends",
+            "method": "GET"
+          }
+        }
+      },
+      {
+        "site_id": "s-0004",
+        "state": {
+          "point": {
+            "at": "src/orders/client.ts:55",
+            "code": "10: import { http } from './http';\n11: import { ORDERS, ARCHIVE } from './paths';\n12: \n13: export function listOrders(archived: boolean) {\n14:   return http.get(archived ? ARCHIVE : ORDERS);\n15: }"
+          },
+          "compiler": {
+            "names": [
+              {
+                "text": "http",
+                "at": "src/orders/client.ts:55",
+                "declaration": "src/orders/http.ts:3",
+                "declaration_text": "http = createClient({ baseUrl: process.env.ORDERS_URL })",
+                "package": null,
+                "type": "Client",
+                "literal": null
+              },
+              {
+                "text": "ARCHIVE",
+                "at": "src/orders/client.ts:55",
+                "declaration": "src/orders/paths.ts:2",
+                "declaration_text": "ARCHIVE = '/v1/orders/archive'",
+                "package": null,
+                "type": "\"/v1/orders/archive\"",
+                "literal": "/v1/orders/archive"
+              },
+              {
+                "text": "ORDERS",
+                "at": "src/orders/client.ts:55",
+                "declaration": "src/orders/paths.ts:1",
+                "declaration_text": "ORDERS = '/v1/orders'",
+                "package": null,
+                "type": "\"/v1/orders\"",
+                "literal": "/v1/orders"
+              }
+            ],
+            "callees": [
+              {
+                "text": "http.get",
+                "declaration": "node_modules/@example/http-client/index.d.ts:20",
+                "package": "@example/http-client",
+                "code": null
+              }
+            ],
+            "enclosing": null
+          },
+          "syntax": [
+            {
+              "type": "CallExpression",
+              "at": "src/orders/client.ts:55",
+              "text": "http.get(archived ? ARCHIVE : ORDERS)",
+              "callee": "http.get",
+              "args": [
+                "archived ? ARCHIVE : ORDERS"
+              ]
+            }
+          ],
+          "libraries": [
+            {
+              "package": "@example/http-client",
+              "labels": [
+                {
+                  "export": "createClient",
+                  "role": "http_client",
+                  "side": null,
+                  "http": [
+                    {
+                      "member": "get",
+                      "method": "GET",
+                      "path_from": {
+                        "arg": 0
+                      }
+                    }
+                  ]
+                }
+              ],
+              "argument_labels": [],
+              "in_store": true
+            }
+          ],
+          "call": {
+            "text": "http.get(archived ? ARCHIVE : ORDERS)",
+            "at": "src/orders/client.ts:55",
+            "args": [
+              "archived ? ARCHIVE : ORDERS"
+            ]
+          },
+          "stated": {
+            "names": [
+              {
+                "text": "/v1/orders/archive",
+                "places": [
+                  {
+                    "from": "checker",
+                    "name": "ARCHIVE",
+                    "at": "src/orders/client.ts:55"
+                  }
+                ]
+              },
+              {
+                "text": "/v1/orders",
+                "places": [
+                  {
+                    "from": "checker",
+                    "name": "ORDERS",
+                    "at": "src/orders/client.ts:55"
+                  }
+                ]
+              }
+            ],
+            "methods": [
+              {
+                "text": "GET",
+                "places": [
+                  {
+                    "from": "label_method",
+                    "export": "createClient",
+                    "member": "get",
+                    "at": "@example/http-client"
+                  }
+                ]
+              }
+            ]
+          },
+          "asked": [
+            "name",
+            "name_argument",
+            "payload_argument"
+          ],
+          "forced": {
+            "kind": "http",
+            "role": "sends",
+            "method": "GET"
+          }
+        }
+      }
+    ]
+  },
+  "jev": {
+    "src/orders/client.ts:14": {
+      "name": {
+        "type": "choice",
+        "choice": "v2",
+        "confidence": 0.62,
+        "probabilities": {
+          "none_of_these": 0.05,
+          "v1": 0.33,
+          "v2": 0.62
+        }
+      },
+      "name_reversed": {
+        "type": "choice",
+        "choice": "v2",
+        "confidence": 0.58,
+        "probabilities": {
+          "v2": 0.58,
+          "v1": 0.38,
+          "none_of_these": 0.04
+        }
+      },
+      "name_argument": {
+        "type": "choice",
+        "choice": "arg_1",
+        "confidence": 0.97,
+        "probabilities": {
+          "none_of_these": 0.03,
+          "arg_1": 0.97
+        }
+      },
+      "name_argument_reversed": {
+        "type": "choice",
+        "choice": "arg_1",
+        "confidence": 0.97,
+        "probabilities": {
+          "none_of_these": 0.03,
+          "arg_1": 0.97
+        }
+      },
+      "payload_argument": {
+        "type": "choice",
+        "choice": "none_of_these",
+        "confidence": 0.9,
+        "probabilities": {
+          "none_of_these": 0.9,
+          "arg_1": 0.1
+        }
+      },
+      "payload_argument_reversed": {
+        "type": "choice",
+        "choice": "none_of_these",
+        "confidence": 0.88,
+        "probabilities": {
+          "arg_1": 0.12,
+          "none_of_these": 0.88
+        }
+      }
+    },
+    "src/orders/events.ts:31": {
+      "kind": {
+        "type": "choice",
+        "choice": "topic",
+        "confidence": 0.93,
+        "probabilities": {
+          "none": 0.01,
+          "http": 0,
+          "topic": 0.93,
+          "message": 0.04,
+          "socket_event": 0.01,
+          "event": 0.01
+        }
+      },
+      "kind_reversed": {
+        "type": "choice",
+        "choice": "topic",
+        "confidence": 0.93,
+        "probabilities": {
+          "none": 0.01,
+          "http": 0,
+          "topic": 0.93,
+          "message": 0.04,
+          "socket_event": 0.01,
+          "event": 0.01
+        }
+      },
+      "role": {
+        "type": "choice",
+        "choice": "sends",
+        "confidence": 0.98,
+        "probabilities": {
+          "neither": 0.01,
+          "sends": 0.98,
+          "handles": 0.01
+        }
+      },
+      "role_reversed": {
+        "type": "choice",
+        "choice": "sends",
+        "confidence": 0.98,
+        "probabilities": {
+          "neither": 0.01,
+          "sends": 0.98,
+          "handles": 0.01
+        }
+      },
+      "name": {
+        "type": "choice",
+        "choice": "v1",
+        "confidence": 0.51,
+        "probabilities": {
+          "none_of_these": 0.08,
+          "v1": 0.51,
+          "v2": 0.4,
+          "v3": 0.01
+        }
+      },
+      "name_reversed": {
+        "type": "choice",
+        "choice": "v2",
+        "confidence": 0.47,
+        "probabilities": {
+          "v3": 0.01,
+          "v2": 0.47,
+          "v1": 0.44,
+          "none_of_these": 0.08
+        }
+      },
+      "name_argument": {
+        "type": "choice",
+        "choice": "arg_1",
+        "confidence": 0.95,
+        "probabilities": {
+          "none_of_these": 0.02,
+          "arg_1": 0.95,
+          "arg_2": 0.03
+        }
+      },
+      "name_argument_reversed": {
+        "type": "choice",
+        "choice": "arg_1",
+        "confidence": 0.95,
+        "probabilities": {
+          "none_of_these": 0.02,
+          "arg_1": 0.95,
+          "arg_2": 0.03
+        }
+      },
+      "payload_argument": {
+        "type": "choice",
+        "choice": "arg_2",
+        "confidence": 0.96,
+        "probabilities": {
+          "none_of_these": 0.01,
+          "arg_1": 0.03,
+          "arg_2": 0.96
+        }
+      },
+      "payload_argument_reversed": {
+        "type": "choice",
+        "choice": "arg_2",
+        "confidence": 0.96,
+        "probabilities": {
+          "none_of_these": 0.01,
+          "arg_1": 0.03,
+          "arg_2": 0.96
+        }
+      }
+    },
+    "src/orders/client.ts:40": {
+      "status": 503
+    },
+    "src/orders/client.ts:55": {
+      "name": {
+        "type": "choice",
+        "choice": "v9",
+        "confidence": 0.7,
+        "probabilities": {
+          "v9": 0.7,
+          "v1": 0.3
+        }
+      },
+      "name_reversed": {
+        "type": "choice",
+        "choice": "v9",
+        "confidence": 0.7,
+        "probabilities": {
+          "v9": 0.7,
+          "v1": 0.3
+        }
+      }
+    }
+  },
+  "response": {
+    "question_set": "{question_set}",
+    "answers": [
+      {
+        "site_id": "s-0001",
+        "ok": true,
+        "kind": null,
+        "role": null,
+        "name": {
+          "value": "/v1/orders",
+          "confidence": 0.58,
+          "orders_agree": true
+        },
+        "method": null,
+        "namespace": null,
+        "name_argument": {
+          "value": 0,
+          "confidence": 0.97,
+          "orders_agree": true
+        },
+        "payload_argument": {
+          "value": null,
+          "confidence": 0.88,
+          "orders_agree": true
+        }
+      },
+      {
+        "site_id": "s-0002",
+        "ok": true,
+        "kind": {
+          "value": "topic",
+          "confidence": 0.93,
+          "orders_agree": true
+        },
+        "role": {
+          "value": "sends",
+          "confidence": 0.98,
+          "orders_agree": true
+        },
+        "name": {
+          "value": "order.paid",
+          "confidence": 0.47,
+          "orders_agree": false
+        },
+        "method": null,
+        "namespace": null,
+        "name_argument": {
+          "value": 0,
+          "confidence": 0.95,
+          "orders_agree": true
+        },
+        "payload_argument": {
+          "value": 1,
+          "confidence": 0.96,
+          "orders_agree": true
+        }
+      },
+      {
+        "site_id": "s-0003",
+        "ok": false,
+        "code": "model_error",
+        "retriable": true
+      },
+      {
+        "site_id": "s-0004",
+        "ok": false,
+        "code": "answer_malformed",
+        "retriable": false
+      }
+    ]
+  }
+}

@@ -2297,15 +2297,16 @@ pub enum SuccessBody {
     Envelope,
     /// The answer itself, which must be JSON: `POST /library-claims`, whose
     /// 200 is the store's answer in the shape carrick#1564 section 2 pins
-    /// (ruled on carrick#1664, 2026-10-02).
+    /// (ruled on carrick#1664, 2026-10-02), and `POST /site-questions`, whose
+    /// 200 is the site answers (carrick#2437).
     Json,
 }
 
 impl SuccessBody {
-    /// How `path`'s 2xx body is read: the store's route answers raw, every
-    /// other route in the envelope.
+    /// How `path`'s 2xx body is read: the store's and the site questions'
+    /// routes answer raw, every other route in the envelope.
     pub fn of(path: &str) -> Self {
-        if path == crate::library_store::ROUTE {
+        if path == crate::library_store::ROUTE || path == crate::site_questions::ROUTE {
             Self::Json
         } else {
             Self::Envelope
@@ -2403,6 +2404,8 @@ fn generate_mock_for_task<B: Serialize + ?Sized>(
         "/generate-intent" => mock_intent_answer(body),
         // The store knows nothing offline: no claims, no library rows.
         crate::library_store::ROUTE => r#"{"library_claims":[]}"#.to_string(),
+        // Offline, no site is answered: every site reads as unanswered.
+        crate::site_questions::ROUTE => r#"{"question_set":null,"answers":[]}"#.to_string(),
         _ => {
             // Tasks that send a schema (file-analyzer, framework-guidance)
             // dispatch by inspecting the schema shape. Tasks that don't but
@@ -7459,6 +7462,10 @@ pub(crate) mod tests {
     fn each_route_reads_its_own_2xx_body() {
         assert_eq!(
             SuccessBody::of(crate::library_store::ROUTE),
+            SuccessBody::Json
+        );
+        assert_eq!(
+            SuccessBody::of(crate::site_questions::ROUTE),
             SuccessBody::Json
         );
         for prompt in [
