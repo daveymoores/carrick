@@ -169,7 +169,8 @@ pub struct Stated {
 /// absent when there are none, never null; `call` is null when the site has
 /// none, never absent. `asked` is never empty: a record with nothing to ask is
 /// not sent. A slot is in `asked` or in `forced`, never both, and no path in
-/// any field is absolute.
+/// any field is absolute. A forced `role` is `neither`, `sends`, `handles`, or
+/// `scope` for a scope site (#2474), whose open prefix is asked in `name`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SiteState {
     pub point: Point,
@@ -241,10 +242,11 @@ pub struct Unanswered {
     pub retriable: bool,
 }
 
-/// One element of a response's `answers`.
+/// One element of a response's `answers`. The answered side is boxed: it is
+/// seven slots against a failure's code and flag.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SiteAnswer {
-    Answered(Answered),
+    Answered(Box<Answered>),
     Failed(Unanswered),
 }
 
@@ -299,7 +301,7 @@ pub fn parse_answer(element: &Value) -> Option<SiteAnswer> {
     match element.get("ok")?.as_bool()? {
         true => serde_json::from_value::<Answered>(element.clone())
             .ok()
-            .map(SiteAnswer::Answered),
+            .map(|answered| SiteAnswer::Answered(Box::new(answered))),
         false => Some(SiteAnswer::Failed(Unanswered {
             code: element.get("code")?.as_str()?.to_string(),
             retriable: element.get("retriable")?.as_bool()?,
@@ -447,7 +449,7 @@ where
                 match answers.remove(&site.site_id) {
                     Some(SiteAnswer::Answered(answered)) => {
                         out.unanswered.remove(&site.site_id);
-                        out.answered.insert(site.site_id, answered);
+                        out.answered.insert(site.site_id, *answered);
                     }
                     Some(SiteAnswer::Failed(failed)) if failed.retriable && attempt == 0 => {
                         out.unanswered.insert(site.site_id.clone(), failed);

@@ -81,23 +81,23 @@ fn the_response_reads_as_two_answers_a_retriable_failure_and_a_final_one() {
     assert_eq!(question_set.as_deref(), Some("qs-1"));
     assert_eq!(
         answers["s-0001"],
-        SiteAnswer::Answered(Answered {
+        SiteAnswer::Answered(Box::new(Answered {
             name: slot(Some(SlotValue::Text("/v1/orders".into())), 0.58, true),
             name_argument: slot(Some(SlotValue::Index(0)), 0.97, true),
             payload_argument: slot(None, 0.88, true),
             ..Answered::default()
-        })
+        }))
     );
     assert_eq!(
         answers["s-0002"],
-        SiteAnswer::Answered(Answered {
+        SiteAnswer::Answered(Box::new(Answered {
             kind: slot(Some(SlotValue::Text("topic".into())), 0.93, true),
             role: slot(Some(SlotValue::Text("sends".into())), 0.98, true),
             name: slot(Some(SlotValue::Text("order.paid".into())), 0.47, false),
             name_argument: slot(Some(SlotValue::Index(0)), 0.95, true),
             payload_argument: slot(Some(SlotValue::Index(1)), 0.96, true),
             ..Answered::default()
-        })
+        }))
     );
     assert_eq!(
         answers["s-0003"],
@@ -125,13 +125,15 @@ fn an_unreadable_answer_costs_only_its_site() {
     assert_eq!(parse_response("not json").1.len(), 0);
 }
 
+/// Every request a fake transport was handed.
+type Sent = Arc<Mutex<Vec<SiteQuestionsRequest>>>;
+/// What one fake request answers.
+type Reply = std::future::Ready<Result<String, AgentCallError>>;
+
 /// A fake transport: each request is recorded and answered by `reply`.
 fn recorder(
     reply: impl Fn(usize, &SiteQuestionsRequest) -> Result<String, AgentCallError> + Clone,
-) -> (
-    Arc<Mutex<Vec<SiteQuestionsRequest>>>,
-    impl Fn(SiteQuestionsRequest) -> std::future::Ready<Result<String, AgentCallError>>,
-) {
+) -> (Sent, impl Fn(SiteQuestionsRequest) -> Reply) {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&sent);
     let send = move |request: SiteQuestionsRequest| {
