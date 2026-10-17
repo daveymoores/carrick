@@ -317,9 +317,8 @@ fn forced_rows_are_facts_and_asked_rows_are_candidates() {
     );
 }
 
-/// The band reads every asked slot the key depends on: at 0.8 or above with both orders agreeing
-/// a row is in band, below it or with the orders split it is not. A forced
-/// kind reads the asked name instead.
+/// The band reads every asked slot the row depends on: a row is in band
+/// only when each is at 0.8 or above with both orders agreeing.
 #[test]
 fn the_band_reads_every_asked_slot_the_row_depends_on() {
     let rows = rows();
