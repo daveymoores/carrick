@@ -7082,6 +7082,10 @@ struct LinkedClients {
     /// (importer, local) -> the client it reads, for an import that reaches
     /// one only through modules that publish nothing through `exports`.
     imports: HashMap<(PathBuf, String), (PathBuf, String)>,
+    /// (importer, local) for each import its rows name a declaration of the
+    /// repository for (carrick#2413 slice E): whatever its specifier says,
+    /// it is no package's client.
+    in_repo: HashSet<(PathBuf, String)>,
     /// Some use could not be followed to what it names.
     unfollowable: bool,
 }
@@ -7122,7 +7126,11 @@ impl LinkedClients {
         for (file, ir) in files {
             for (local, used) in &ir.imported {
                 if let Some(links) = links {
-                    match links.get(file, local) {
+                    let link = links.get(file, local);
+                    if link.is_some_and(row_links::RowLink::in_repo) {
+                        linked.in_repo.insert((file.clone(), local.clone()));
+                    }
+                    match link {
                         Some(row_links::RowLink::Declared(at, name)) => {
                             if let Some(declaring) = files.get(at)
                                 && declaring.module_clients.contains_key(name)
@@ -7282,6 +7290,7 @@ impl LinkedClients {
                         .clients
                         .get(held)
                         .map(|client| (client, held.0.as_path())),
+                    None if self.in_repo.contains(&(file.to_path_buf(), local.clone())) => None,
                     None => package.as_ref().map(|client| (client, file)),
                 }
             }

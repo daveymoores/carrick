@@ -1681,6 +1681,11 @@ pub enum ChainEnd {
         specifier: String,
         export: String,
         steps: Vec<String>,
+        /// With rows, the package the compiler says the export is declared
+        /// in (carrick#2413 slice E), which a type re-export or an alias
+        /// can make another than the specifier's.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        package: Option<String>,
     },
     Hole {
         reason: HoleReason,
@@ -2139,13 +2144,33 @@ impl<'a> Chains<'a> {
     /// import hole for a module of this service, its own reason for a
     /// specifier nothing resolves, and `None` for a package the manifests
     /// declare, which is an external import.
+    ///
+    /// With rows (carrick#2413 slice E), the declaration the import's rows
+    /// name decides: one of the repository is the in-repo import hole, and
+    /// one the rows do not give is its own reason.
     fn import_hole(&self, file: &Path, local: &str) -> Option<HoleReason> {
         use crate::call_graph::ImportedBinding;
+        if let Some(links) = &self.inputs.links {
+            return match links.get(file, local)? {
+                super::row_links::RowLink::Hole(reason) => Some(*reason),
+                link if link.in_repo() => Some(HoleReason::InRepoValueImport),
+                _ => None,
+            };
+        }
         match self.inputs.bindings.get(file, local)? {
             ImportedBinding::Unresolved => Some(HoleReason::UnresolvedImport),
             ImportedBinding::Binding { .. }
             | ImportedBinding::Module(_)
             | ImportedBinding::Unfollowable => Some(HoleReason::InRepoValueImport),
+        }
+    }
+
+    /// The package the rows say an external import's export is declared in
+    /// (carrick#2413 slice E). `None` without rows.
+    fn import_package(&self, file: &Path, local: &str) -> Option<String> {
+        match self.inputs.links.as_ref()?.get(file, local)? {
+            super::row_links::RowLink::Outside(package) => package.clone(),
+            _ => None,
         }
     }
 
@@ -2167,6 +2192,7 @@ impl<'a> Chains<'a> {
                 let end = match self.import_hole(self.nodes[node].file, &local) {
                     Some(reason) => self.hole(reason, node),
                     None => ChainEnd::ExternalImport {
+                        package: self.import_package(self.nodes[node].file, &local),
                         specifier,
                         export,
                         steps,
@@ -2363,6 +2389,7 @@ impl<'a> Chains<'a> {
                         specifier: specifier.clone(),
                         export: export.clone(),
                         steps,
+                        package: self.import_package(file, local),
                     },
                 };
                 ends.push(trace, end);
@@ -2741,6 +2768,7 @@ impl<'a> Chains<'a> {
                     specifier: specifier.clone(),
                     export: export.clone(),
                     steps,
+                    package: self.import_package(file, local),
                 },
             },
             Root::Global(name) => ChainEnd::Global {
