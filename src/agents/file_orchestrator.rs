@@ -439,7 +439,7 @@ enum Asking {
     /// In one request: its whole prompt is at or under the line.
     Whole(AnalysisPrompt),
     /// In parts, each prompt at or under the line.
-    Parts(PartPlan),
+    Parts(Box<PartPlan>),
     /// Not at all: the file has nothing in it.
     Nothing,
 }
@@ -1735,7 +1735,7 @@ impl FileOrchestrator {
             WHOLE_PROMPT_MAX_BYTES
         );
         self.plan_parts(file, guidance, WHOLE_PROMPT_MAX_BYTES)
-            .map(Asking::Parts)
+            .map(|plan| Asking::Parts(Box::new(plan)))
     }
 
     /// The parts `file` is asked in so that no request carries more than
@@ -3746,7 +3746,7 @@ impl FileOrchestrator {
                     .asking(&file, guidance)
                 {
                     Ok(Asking::Nothing) => Ok(FileAnalysisResult::default()),
-                    Ok(Asking::Parts(plan)) => self.ask_parts(&file, guidance, plan).await,
+                    Ok(Asking::Parts(plan)) => self.ask_parts(&file, guidance, *plan).await,
                     Err(too_large) => Err(Box::new(too_large)),
                     Ok(Asking::Whole(prompt)) => {
                         match self
