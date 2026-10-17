@@ -144,6 +144,26 @@ pub struct Asked {
 }
 
 impl Asked {
+    /// A request naming `packages` at 1.0.0, for tests that drive the wait
+    /// without an install.
+    #[cfg(test)]
+    pub(crate) fn naming(packages: &[&str]) -> Self {
+        Self {
+            request: LibraryClaimsRequest {
+                roles: ROLES.to_vec(),
+                packages: packages
+                    .iter()
+                    .map(|name| RegistryPackage {
+                        package: name.to_string(),
+                        version: "1.0.0".to_string(),
+                        specifiers: vec![name.to_string()],
+                    })
+                    .collect(),
+            },
+            spellings: BTreeMap::new(),
+        }
+    }
+
     /// The request for only `packages`, or `None` when it names none of
     /// them.
     fn only(&self, packages: &BTreeSet<String>) -> Option<LibraryClaimsRequest> {
@@ -770,6 +790,9 @@ pub struct LibraryAnswer {
     pub pending: BTreeSet<String>,
     /// The part of `pending` a wait can end ([`WAITED_REASONS`]).
     pub building: BTreeSet<String>,
+    /// The packages answered `skipped` with `build_failed`: named, never
+    /// waited on (carrick#2496).
+    pub build_failed: BTreeSet<String>,
     /// Entries answered, for the log.
     pub answered: usize,
     /// Entries skipped, for the log.
@@ -810,6 +833,9 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
             other => {
                 answer.skipped += 1;
                 let reason = entry.get("reason").and_then(|reason| reason.as_str());
+                if let (Some(package), Some("build_failed")) = (package, reason) {
+                    answer.build_failed.insert(package.to_string());
+                }
                 debug!(
                     package = package.unwrap_or("?"),
                     status = other,
@@ -996,6 +1022,8 @@ pub struct Settled {
     /// The packages the scan ends without: pending at the last answer, or
     /// still being built when the wait ran out or the store stopped answering.
     pub pending: BTreeSet<String>,
+    /// The packages the store answered `skipped` with `build_failed`.
+    pub build_failed: BTreeSet<String>,
     /// Whether the store was asked at all.
     pub asked: bool,
 }
@@ -1028,6 +1056,7 @@ where
     let mut pending: BTreeSet<String> =
         first.pending.difference(&first.building).cloned().collect();
     let mut building = first.building;
+    let mut build_failed = first.build_failed;
     let mut polls = 0usize;
     while !building.is_empty() {
         let next = tokio::time::Instant::now() + POLL_INTERVAL;
@@ -1045,6 +1074,7 @@ where
         };
         exports.extend(second.exports);
         pending.extend(second.pending.difference(&second.building).cloned());
+        build_failed.extend(second.build_failed);
         building = second.building;
     }
     pending.extend(building);
@@ -1060,6 +1090,7 @@ where
     Settled {
         exports: asked.claims(exports),
         pending,
+        build_failed,
         asked: true,
     }
 }
@@ -2284,6 +2315,10 @@ mod tests {
             "a failed build due a retry later is not waited for"
         );
         assert!(settled.pending.is_empty(), "and it is skipped, not pending");
+        assert_eq!(settled.build_failed, specifiers(&["lib"]), "but named");
+        let invalid = r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"skipped","reason":"invalid_package"}]}"#;
+        let settled = FakeStore::new(vec![invalid.to_string()]).run(&asked).await;
+        assert!(settled.build_failed.is_empty(), "no other skipped reason");
     }
 
     #[tokio::test(start_paused = true)]

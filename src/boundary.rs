@@ -209,6 +209,11 @@ pub struct ServiceBoundary {
     /// blob from a scanner that did not count it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library_packages_pending: Option<usize>,
+    /// Library packages the store answered `skipped` with `build_failed`
+    /// (carrick#2496): named in the summary, not waited on. Counted beside
+    /// `library_packages_pending`, with the same `None` and `Some(0)` reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_packages_failed: Option<usize>,
 }
 
 impl ServiceBoundary {
@@ -250,6 +255,7 @@ impl ServiceBoundary {
             .iter()
             .map(|site| site.replace(&prefix, ""))
             .collect();
+        let library_counts = crate::scan_health::library_packages_for(data.service_name.as_deref());
         Self {
             candidates_withheld_changed_files: None,
             commit_hash: data.commit_hash.clone(),
@@ -284,9 +290,8 @@ impl ServiceBoundary {
             // Known once the cross-service check has run; see
             // `fold_time_limits`.
             time_limits_run_out: None,
-            library_packages_pending: crate::scan_health::library_packages_pending_for(
-                data.service_name.as_deref(),
-            ),
+            library_packages_pending: library_counts.map(|(pending, _)| pending),
+            library_packages_failed: library_counts.map(|(_, failed)| failed),
         }
     }
 
@@ -1438,15 +1443,19 @@ mod tests {
     fn library_packages_pending_is_additive_and_absent_is_not_zero() {
         let old = serde_json::to_value(ServiceBoundary::default()).unwrap();
         assert!(old.get("library_packages_pending").is_none());
+        assert!(old.get("library_packages_failed").is_none());
         let read: ServiceBoundary = serde_json::from_value(old).unwrap();
         assert_eq!(read.library_packages_pending, None);
+        assert_eq!(read.library_packages_failed, None);
         for count in [0usize, 3] {
             let boundary = ServiceBoundary {
                 library_packages_pending: Some(count),
+                library_packages_failed: Some(count + 1),
                 ..Default::default()
             };
             let value = serde_json::to_value(&boundary).unwrap();
             assert_eq!(value["library_packages_pending"], count);
+            assert_eq!(value["library_packages_failed"], count + 1);
             let read: ServiceBoundary = serde_json::from_value(value).unwrap();
             assert_eq!(read, boundary);
         }

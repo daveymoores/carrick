@@ -115,7 +115,7 @@ struct Registry {
     /// and ended without nothing keeps an empty set, so "asked, none left"
     /// reads differently from "never asked". Not a loss: the file reader's
     /// rows stand, the library rows are missing and are asked again next scan.
-    library_pending: BTreeMap<Scope, std::collections::BTreeSet<String>>,
+    library_pending: BTreeMap<Scope, LibraryUnready>,
     /// What the time limits that ran out while each service was analysed
     /// cost it, by kind (carrick#2021). The cross-service check's are read
     /// off its outcomes instead ([`crate::time_limits::from_check_outcomes`]),
@@ -442,45 +442,52 @@ impl Registry {
     }
 
     /// Records the packages `scope` ended without (carrick#2496). Replaces
-    /// the service's earlier set, so a service analysed again is not counted
+    /// the service's earlier sets, so a service analysed again is not counted
     /// twice.
-    fn record_library_packages_pending(
-        &mut self,
-        scope: &Scope,
-        packages: std::collections::BTreeSet<String>,
-    ) {
-        self.library_pending.insert(scope.clone(), packages);
+    fn record_library_packages(&mut self, scope: &Scope, unready: LibraryUnready) {
+        self.library_pending.insert(scope.clone(), unready);
     }
 
-    /// How many packages `scope` ended without, or `None` when it never asked
-    /// the store.
-    fn library_packages_pending_for(&self, scope: &Scope) -> Option<usize> {
-        self.library_pending.get(scope).map(|set| set.len())
+    /// How many packages `scope` ended without, still pending and build-failed
+    /// in that order, or `None` when it never asked the store.
+    fn library_packages_for(&self, scope: &Scope) -> Option<(usize, usize)> {
+        self.library_pending
+            .get(scope)
+            .map(|unready| (unready.pending.len(), unready.failed.len()))
     }
 
-    /// One sentence naming the packages the run ended without, or `None`.
-    fn library_pending_line(&self) -> Option<String> {
-        let names: std::collections::BTreeSet<&String> =
-            self.library_pending.values().flatten().collect();
-        if names.is_empty() {
-            return None;
-        }
-        let shown: Vec<&str> = names
-            .iter()
-            .take(LIBRARY_PENDING_NAMED)
-            .map(|name| name.as_str())
+    /// The sentences naming the packages the run ended without: first those
+    /// still pending when the wait ended, then those the store could not
+    /// build. Empty when there are none.
+    fn library_pending_lines(&self) -> Vec<String> {
+        let pending: std::collections::BTreeSet<&String> = self
+            .library_pending
+            .values()
+            .flat_map(|unready| &unready.pending)
             .collect();
-        let more = names.len() - shown.len();
-        let more = if more > 0 {
-            format!(" and {more} more")
-        } else {
-            String::new()
-        };
-        Some(format!(
-            "{} library package(s) were not ready in the library store, so calls made through them may be missing from this index: {}{more}. They are asked again on the next scan.",
-            names.len(),
-            shown.join(", "),
-        ))
+        let failed: std::collections::BTreeSet<&String> = self
+            .library_pending
+            .values()
+            .flat_map(|unready| &unready.failed)
+            .collect();
+        let mut lines = Vec::new();
+        if !pending.is_empty() {
+            let (n, names) = (pending.len(), named_packages(&pending));
+            lines.push(if n == 1 {
+                format!("1 library was not ready in time, so calls through it may be missing from this index: {names}. The next scan adds it.")
+            } else {
+                format!("{n} libraries were not ready in time, so calls through them may be missing from this index: {names}. The next scan adds them.")
+            });
+        }
+        if !failed.is_empty() {
+            let (n, names) = (failed.len(), named_packages(&failed));
+            lines.push(if n == 1 {
+                format!("Carrick could not read 1 library yet, so calls through it are missing from this index: {names}.")
+            } else {
+                format!("Carrick could not read {n} libraries yet, so calls through them are missing from this index: {names}.")
+            });
+        }
+        lines
     }
 
     /// One line saying how many pub/sub calls were left out, or `None`.
@@ -697,30 +704,54 @@ pub fn unanalysed_files_for(service: Option<&str>) -> Vec<crate::cloud_storage::
 /// How many package names the library-pending sentence spells out.
 const LIBRARY_PENDING_NAMED: usize = 5;
 
+/// The library packages one service's scan ended without (carrick#2496).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibraryUnready {
+    /// Still pending when the wait ended, whatever the pending reason.
+    pub pending: std::collections::BTreeSet<String>,
+    /// Answered `skipped` with `build_failed`: named, never waited on.
+    pub failed: std::collections::BTreeSet<String>,
+}
+
+/// At most [`LIBRARY_PENDING_NAMED`] names, then "and N more".
+fn named_packages(names: &std::collections::BTreeSet<&String>) -> String {
+    let shown: Vec<&str> = names
+        .iter()
+        .take(LIBRARY_PENDING_NAMED)
+        .map(|name| name.as_str())
+        .collect();
+    let more = names.len() - shown.len();
+    if more > 0 {
+        format!("{} and {more} more", shown.join(", "))
+    } else {
+        shown.join(", ")
+    }
+}
+
 /// Records the library packages the current service's scan ended without
-/// (carrick#2496), empty when it asked the store and ended without none.
-pub fn record_library_packages_pending(packages: std::collections::BTreeSet<String>) {
+/// (carrick#2496), empty sets when it asked the store and ended without none.
+pub fn record_library_packages(unready: LibraryUnready) {
     registry()
         .lock()
         .expect("scan health lock")
-        .record_library_packages_pending(&crate::current_service::name(), packages);
+        .record_library_packages(&crate::current_service::name(), unready);
 }
 
-/// How many library packages `service` ended without, or `None` when it did
-/// not ask the store.
-pub fn library_packages_pending_for(service: Option<&str>) -> Option<usize> {
+/// How many library packages `service` ended without (pending, build-failed),
+/// or `None` when it did not ask the store.
+pub fn library_packages_for(service: Option<&str>) -> Option<(usize, usize)> {
     registry()
         .lock()
         .expect("scan health lock")
-        .library_packages_pending_for(&service.map(str::to_string))
+        .library_packages_for(&service.map(str::to_string))
 }
 
-/// One sentence naming the library packages the run ended without, or `None`.
-pub fn library_pending_line() -> Option<String> {
+/// The sentences naming the library packages the run ended without.
+pub fn library_pending_lines() -> Vec<String> {
     registry()
         .lock()
         .expect("scan health lock")
-        .library_pending_line()
+        .library_pending_lines()
 }
 
 /// Records how many pub/sub rows the current service left out as in-process
@@ -1102,38 +1133,65 @@ mod tests {
     }
 
     /// carrick#2496: the packages a scan ended without are named in one
-    /// sentence, are not a loss, and a service that asked and ended without
-    /// none counts zero while one that never asked counts nothing.
+    /// sentence each (still pending, could not be built), are not a loss, and
+    /// a service that asked and ended without none counts zero while one that
+    /// never asked counts nothing.
     #[test]
     fn packages_the_scan_ended_without_are_named_and_counted_not_lost() {
         let mut run = run();
-        assert_eq!(run.library_pending_line(), None);
+        assert!(run.library_pending_lines().is_empty());
         let api = Some("api".to_string());
         let web = Some("web".to_string());
-        run.record_library_packages_pending(&api, ["b", "a"].map(String::from).into());
-        run.record_library_packages_pending(&web, Default::default());
-        assert_eq!(run.library_packages_pending_for(&api), Some(2));
-        assert_eq!(run.library_packages_pending_for(&web), Some(0));
-        assert_eq!(
-            run.library_packages_pending_for(&Some("other".to_string())),
-            None
+        let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect();
+        run.record_library_packages(
+            &api,
+            LibraryUnready {
+                pending: names(&["b", "a"]),
+                failed: names(&["z"]),
+            },
         );
+        run.record_library_packages(&web, Default::default());
+        assert_eq!(run.library_packages_for(&api), Some((2, 1)));
+        assert_eq!(run.library_packages_for(&web), Some((0, 0)));
+        assert_eq!(run.library_packages_for(&Some("other".to_string())), None);
         assert_eq!(
-            run.library_pending_line().as_deref(),
-            Some(
-                "2 library package(s) were not ready in the library store, so calls made through them may be missing from this index: a, b. They are asked again on the next scan."
-            )
+            run.library_pending_lines(),
+            [
+                "2 libraries were not ready in time, so calls through them may be missing from this index: a, b. The next scan adds them.",
+                "Carrick could not read 1 library yet, so calls through it are missing from this index: z.",
+            ]
         );
         assert_eq!(run.summary_line(), None);
         assert!(run.service_losses(&api).is_empty());
-        run.record_library_packages_pending(&api, (0..7).map(|n| format!("p{n}")).collect());
-        assert!(
-            run.library_pending_line()
-                .unwrap()
-                .contains("p0, p1, p2, p3, p4 and 2 more.")
+        run.record_library_packages(
+            &api,
+            LibraryUnready {
+                pending: (0..7).map(|n| format!("p{n}")).collect(),
+                failed: (0..6).map(|n| format!("f{n}")).collect(),
+            },
+        );
+        assert_eq!(
+            run.library_pending_lines(),
+            [
+                "7 libraries were not ready in time, so calls through them may be missing from this index: p0, p1, p2, p3, p4 and 2 more. The next scan adds them.",
+                "Carrick could not read 6 libraries yet, so calls through them are missing from this index: f0, f1, f2, f3, f4 and 1 more.",
+            ]
+        );
+        run.record_library_packages(
+            &api,
+            LibraryUnready {
+                pending: names(&["only"]),
+                failed: Default::default(),
+            },
+        );
+        assert_eq!(
+            run.library_pending_lines(),
+            [
+                "1 library was not ready in time, so calls through it may be missing from this index: only. The next scan adds it."
+            ]
         );
         run.forget_service_losses(&api);
-        assert_eq!(run.library_pending_line(), None);
+        assert!(run.library_pending_lines().is_empty());
     }
 
     /// The regression: one lost file must reach the summary AND its service's

@@ -1440,7 +1440,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     }
     // Library packages the store had not built by the end of the wait
     // (carrick#2496): named, so a gap in the library rows is not silent.
-    if let Some(line) = crate::scan_health::library_pending_line() {
+    for line in crate::scan_health::library_pending_lines() {
         crate::progress::announce(&line);
     }
     if let Some(summary) = crate::scan_health::summary_line() {
@@ -4755,7 +4755,7 @@ async fn settled_library_answer(ask: Option<&LibraryAsk>) -> crate::library_stor
 /// The service's library rows: its library sites read through the claims
 /// the store answered, each verified by the sidecar from `from_dir`. The
 /// packages the scan ends without are recorded for the summary and the
-/// upload ([`crate::scan_health::record_library_packages_pending`]). Nothing
+/// upload ([`crate::scan_health::record_library_packages`]). Nothing
 /// asked reads nothing.
 fn library_rows(
     ask: Option<&LibraryAsk>,
@@ -4769,7 +4769,10 @@ fn library_rows(
     let Some(ask) = ask else {
         return Default::default();
     };
-    crate::scan_health::record_library_packages_pending(settled.pending);
+    crate::scan_health::record_library_packages(crate::scan_health::LibraryUnready {
+        pending: settled.pending,
+        failed: settled.build_failed,
+    });
     (
         read_library_rows(&ask.sites, &settled.exports, sidecar, from_dir),
         settled.exports,
@@ -10378,6 +10381,49 @@ mod tests {
     fn modules_without_config() -> crate::workspace_resolver::WorkspaceIndex {
         let empty = tempfile::tempdir().expect("tempdir");
         crate::workspace_resolver::WorkspaceIndex::build_with_aliases(empty.path(), None)
+    }
+
+    /// carrick#2496. The hand-off from the settled store answer into the scan
+    /// health: one package still building when the wait ends and one the store
+    /// could not build are each counted for the service and each named once,
+    /// in their own sentence.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_with_a_pending_and_a_failed_package_prints_both_sentences_once() {
+        let asked = crate::library_store::Asked::naming(&["hand-off-a", "hand-off-b"]);
+        let body = r#"{"library_claims":[
+            {"package":"hand-off-a","version":"1.0.0","status":"pending","reason":"in_flight"},
+            {"package":"hand-off-b","version":"1.0.0","status":"skipped","reason":"build_failed"}]}"#;
+        let ask = super::LibraryAsk {
+            sites: Default::default(),
+            asked,
+            turns: Default::default(),
+        };
+        let service = Some("hand-off-service".to_string());
+        crate::current_service::scope(service.clone(), async {
+            let settled = crate::library_store::ask_until_settled(
+                &ask.asked,
+                |_| async {},
+                |_| async { Ok(body.to_string()) },
+            )
+            .await;
+            super::library_rows(Some(&ask), settled, None, std::path::Path::new("."));
+        })
+        .await;
+        assert_eq!(
+            crate::scan_health::library_packages_for(service.as_deref()),
+            Some((1, 1))
+        );
+        let lines: Vec<String> = crate::scan_health::library_pending_lines()
+            .into_iter()
+            .filter(|line| line.contains("hand-off-"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "1 library was not ready in time, so calls through it may be missing from this index: hand-off-a. The next scan adds it.",
+                "Carrick could not read 1 library yet, so calls through it are missing from this index: hand-off-b.",
+            ]
+        );
     }
 
     /// carrick#1490: "ran" is what the check did. A check that panics is
