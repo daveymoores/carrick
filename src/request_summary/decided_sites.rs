@@ -1356,6 +1356,71 @@ fn loop_key(stmt: &ForOfStmt) -> Option<(String, String)> {
 pub(crate) mod tests {
     use super::*;
 
+    /// carrick#2439: the scan's settled claims give one label per op, with
+    /// its slots, method fields, role and side, as the store's raw answer
+    /// does; a maker labels no op, and a bound name no name slot.
+    #[test]
+    fn labels_read_from_the_settled_claims() {
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([{
+                "package": "@fixture/http",
+                "version": "1.0.0",
+                "specifier": "@fixture/http",
+                "export": "createClient",
+                "role": "http_client",
+                "side": "client",
+                "claims": [
+                    { "kind": "op", "op": "request", "member": "post", "name": { "arg": 0 },
+                      "payload": { "arg": 1 }, "method": "POST" },
+                    { "kind": "op", "op": "request", "member": "send", "name": { "bound": "maker" },
+                      "method_key": { "arg": 1, "key": "method" }, "method_default": "GET" },
+                    { "kind": "make", "form": "call", "member": null }
+                ]
+            }]))
+            .unwrap();
+        let labels = SiteLabel::from_exports(&exports);
+        assert_eq!(
+            labels,
+            vec![
+                SiteLabel {
+                    package: "@fixture/http".into(),
+                    export: "createClient".into(),
+                    member: Some("post".into()),
+                    role: "http_client".into(),
+                    op: Some("request".into()),
+                    side: Some("client".into()),
+                    name: Some(ArgSlot { arg: 0, key: None }),
+                    payload: Some(ArgSlot { arg: 1, key: None }),
+                    handler: None,
+                    method: Some(MethodLabel {
+                        from: None,
+                        default: None,
+                        literal: Some("POST".into()),
+                    }),
+                },
+                SiteLabel {
+                    package: "@fixture/http".into(),
+                    export: "createClient".into(),
+                    member: Some("send".into()),
+                    role: "http_client".into(),
+                    op: Some("request".into()),
+                    side: Some("client".into()),
+                    name: None,
+                    payload: None,
+                    handler: None,
+                    method: Some(MethodLabel {
+                        from: Some(ArgSlot {
+                            arg: 1,
+                            key: Some("method".into()),
+                        }),
+                        default: Some("GET".into()),
+                        literal: None,
+                    }),
+                },
+            ]
+        );
+    }
+
     pub(crate) fn manifest() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }

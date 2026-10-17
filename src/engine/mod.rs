@@ -21288,6 +21288,339 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         }
     }
 
+    /// One site row for the engine tests (carrick#2439): at `file`:7, span
+    /// 100..130, its payload at 112..118 and its handler at 120..129.
+    fn site_row(
+        file: &str,
+        key: OperationKey,
+        side: crate::site_rows::RowSide,
+        in_band: bool,
+    ) -> crate::site_rows::SiteRow {
+        use crate::request_summary::site_record::{AnchorAt, HandlerAnchor, TypeAnchors};
+        let at = |span_start: u32, span_end: u32| AnchorAt {
+            file: file.to_string(),
+            line: 7,
+            span_start,
+            span_end,
+        };
+        crate::site_rows::SiteRow {
+            file: file.to_string(),
+            line: 7,
+            key,
+            side,
+            source: crate::agents::file_analyzer_agent::ResolutionSource::Model,
+            inference: Some(crate::site_rows::SiteInference {
+                by: crate::site_rows::InferenceBy::SiteQuestion,
+                question_set: Some("qs".to_string()),
+                confidence: if in_band { 0.9 } else { 0.5 },
+                orders_agree: true,
+            }),
+            in_band,
+            name_scope: None,
+            anchors: TypeAnchors {
+                call: at(100, 130),
+                payload: None,
+                payload_at: Some(at(112, 118)),
+                handler: Some(HandlerAnchor {
+                    at: at(120, 129),
+                    param: 0,
+                    param_name: Some("message".to_string()),
+                }),
+            },
+            lead: crate::possible_calls::PossibleCall {
+                file_path: file.to_string(),
+                line_number: 7,
+                span_start: 100,
+                span_end: 130,
+                kind: Some("pubsub".to_string()),
+                role: None,
+                labelled_end: None,
+                unread: crate::possible_calls::Unread {
+                    slot: "name".to_string(),
+                    reason: crate::possible_calls::UnreadReason::BelowBand,
+                },
+                trace_depth: 0,
+            },
+        }
+    }
+
+    /// carrick#2439: with the switch off the site pass reads nothing and the
+    /// blob is byte for byte the one the scan wrote before it, with no
+    /// `possible_calls` and no `inference` on any row.
+    #[tokio::test]
+    async fn site_rows_off_leave_the_blob_byte_identical() {
+        let inputs = crate::engine::discover_request_inputs(
+            &crate::request_summary::decided_sites::tests::decided_fixture(),
+        );
+        let off = site_rows_of(false, &inputs, ".", &Config::default(), &[]).await;
+        assert!(!off.enabled && off.rows.is_empty() && off.leads.is_empty());
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "svc/src/orders.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "orders.created",
+                    crate::operation::PubsubRole::Publisher,
+                    None,
+                    None,
+                )],
+                ..Default::default()
+            },
+        );
+        let base = repo_with_bundle("svc", None, "");
+        let blob = |site: crate::site_rows::SiteRows| {
+            let extractions = ProtocolExtractions {
+                site,
+                ..ProtocolExtractions::default()
+            };
+            let mut cloud_data = base.clone();
+            append_deterministic_protocol_operations(
+                &mut cloud_data,
+                &extractions,
+                &file_results,
+                &crate::in_process_pubsub::InProcessPubsub::default(),
+                ".",
+                &Config::default(),
+            );
+            serde_json::to_string(&cloud_data).unwrap()
+        };
+        let before = blob(crate::site_rows::SiteRows::default());
+        // A pass that was off holds rows only by mistake; none of them
+        // reaches the blob.
+        let stray = crate::site_rows::SiteRows {
+            enabled: false,
+            rows: vec![site_row(
+                "svc/src/orders.ts",
+                OperationKey::pubsub("orders.paid"),
+                crate::site_rows::RowSide::Call,
+                true,
+            )],
+            leads: Vec::new(),
+        };
+        assert_eq!(blob(off), before);
+        assert_eq!(blob(stray), before);
+        assert!(!before.contains("possible_calls") && !before.contains("inference"));
+    }
+
+    /// carrick#2439: on, an answer in the band replaces the model's pub/sub
+    /// row at its site and carries its answer, and the sites that state no
+    /// row are written as possible calls.
+    #[test]
+    fn site_rows_on_fold_into_the_blob_and_write_possible_calls() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut model = pubsub_op(
+            "orders.created",
+            crate::operation::PubsubRole::Publisher,
+            None,
+            None,
+        );
+        model.line_number = 7;
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "svc/src/orders.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![model],
+                ..Default::default()
+            },
+        );
+        let below = site_row(
+            "svc/src/other.ts",
+            OperationKey::pubsub("maybe"),
+            crate::site_rows::RowSide::Call,
+            false,
+        );
+        let extractions = ProtocolExtractions {
+            site: crate::site_rows::SiteRows {
+                enabled: true,
+                rows: vec![
+                    site_row(
+                        "svc/src/orders.ts",
+                        OperationKey::pubsub("orders.paid"),
+                        crate::site_rows::RowSide::Call,
+                        true,
+                    ),
+                    below,
+                ],
+                leads: Vec::new(),
+            },
+            ..ProtocolExtractions::default()
+        };
+        let mut cloud_data = repo_with_bundle("svc", None, "");
+        let fold = append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &file_results,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            ".",
+            &Config::default(),
+        );
+        let at_site: Vec<(String, Option<ResolutionSource>, bool)> = cloud_data
+            .calls
+            .iter()
+            .filter(|row| row.file_path == PathBuf::from("svc/src/orders.ts:7"))
+            .map(|row| {
+                (
+                    row.key.canonical(),
+                    row.resolution_source,
+                    row.inference.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            at_site,
+            vec![(
+                "pubsub|orders.paid".to_string(),
+                Some(ResolutionSource::Model),
+                true
+            )]
+        );
+        assert_eq!(fold.withdrawn.len(), 1);
+        let leads = cloud_data.possible_calls.expect("written when on");
+        assert_eq!(
+            leads
+                .iter()
+                .map(|lead| lead.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["svc/src/other.ts"]
+        );
+    }
+
+    /// carrick#2439 / carrick#2472 C3: a reader row the fold replaced leaves
+    /// no manifest entry, and each site row stated is anchored where its
+    /// record says: a send's payload expression, an HTTP request's result at
+    /// its call, and a handler's first parameter, each by span and under the
+    /// alias its manifest entry carries.
+    #[test]
+    fn the_site_fold_anchors_its_rows_in_the_manifest() {
+        use crate::site_rows::RowSide;
+        let publish = site_row(
+            "src/orders.ts",
+            OperationKey::pubsub("orders.paid"),
+            RowSide::Call,
+            true,
+        );
+        let subscriber = site_row(
+            "src/jobs.ts",
+            OperationKey::pubsub("orders.paid"),
+            RowSide::Endpoint,
+            true,
+        );
+        let request = site_row(
+            "src/client.ts",
+            OperationKey::http("POST", "/v1/orders"),
+            RowSide::Call,
+            true,
+        );
+        let fold = crate::site_rows::SiteFold {
+            stated: vec![publish, subscriber, request],
+            withdrawn: vec![(
+                "src/orders.ts".to_string(),
+                7,
+                OperationKey::pubsub("orders"),
+                RowSide::Call,
+            )],
+            leads: Vec::new(),
+        };
+        let mut entries = Vec::new();
+        add_protocol_manifest_entry(
+            &mut entries,
+            &OperationKey::pubsub("orders"),
+            ManifestRole::Consumer,
+            "src/orders.ts",
+            7,
+            None,
+            Some("x"),
+        );
+        apply_site_fold_to_manifest(&mut entries, &fold, "/repo");
+        let keyed: Vec<(String, ManifestRole, ManifestTypeKind)> = entries
+            .iter()
+            .map(|entry| (entry.key.canonical(), entry.role, entry.type_kind))
+            .collect();
+        assert!(!keyed.iter().any(|(key, ..)| key == "pubsub|orders"));
+        for wanted in [
+            (
+                "pubsub|orders.paid",
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+            ),
+            (
+                "pubsub|orders.paid",
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+            ),
+            (
+                "http|POST|/v1/orders",
+                ManifestRole::Consumer,
+                ManifestTypeKind::Request,
+            ),
+            (
+                "http|POST|/v1/orders",
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+            ),
+        ] {
+            assert!(
+                entries.iter().any(|entry| entry.key.canonical() == wanted.0
+                    && entry.role == wanted.1
+                    && entry.type_kind == wanted.2),
+                "{wanted:?} in {keyed:?}"
+            );
+        }
+
+        let requests = site_infer_requests(&fold, "/repo");
+        let aliases: HashSet<&str> = entries
+            .iter()
+            .map(|entry| entry.type_alias.as_str())
+            .collect();
+        for request in &requests {
+            assert!(
+                aliases.contains(request.alias.as_deref().unwrap()),
+                "{request:?}"
+            );
+        }
+        let asked: Vec<(&str, InferKind, Option<u32>, Option<&str>)> = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.file_path.as_str(),
+                    request.infer_kind.clone(),
+                    request.span_start,
+                    request.param_name.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                (
+                    "/repo/src/orders.ts",
+                    InferKind::Expression,
+                    Some(112),
+                    None
+                ),
+                (
+                    "/repo/src/jobs.ts",
+                    InferKind::FunctionParam,
+                    Some(120),
+                    Some("message")
+                ),
+                (
+                    "/repo/src/client.ts",
+                    InferKind::Expression,
+                    Some(112),
+                    None
+                ),
+                (
+                    "/repo/src/client.ts",
+                    InferKind::CallResult,
+                    Some(100),
+                    None
+                ),
+            ]
+        );
+    }
+
     /// carrick#1662: a library row is a `library_claim` fact carrying its
     /// name's scope and its claim ids, on the producer side for a subscriber
     /// or a listener and the call side for a publisher or an emitter. A row
