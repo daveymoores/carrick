@@ -12,7 +12,7 @@ use carrick::agent_service::{AgentCallError, AgentService};
 use carrick::site_questions::{
     self, Answered, MAX_REQUEST_BYTES, MAX_SITES_PER_REQUEST, NO_ANSWER_CODE, ROUTE, SiteAnswer,
     SiteQuestion, SiteQuestionsRequest, SlotAnswer, SlotValue, TOO_LARGE_CODE, Unanswered, ask,
-    ask_service, batches, enabled_from, parse_response,
+    ask_service, ask_within, batches, enabled_from, parse_response,
 };
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -193,6 +193,24 @@ async fn a_site_still_failing_after_its_second_ask_is_unanswered() {
         2,
         "asked again once, never a third time"
     );
+    assert_eq!(
+        out.unanswered["s-0003"],
+        Unanswered {
+            code: "model_error".into(),
+            retriable: true
+        }
+    );
+    assert_eq!(out.answered.len(), 2);
+}
+
+/// carrick#2439: the second round draws on the run's retry budget. With it
+/// spent, a retriable site is asked once and stays unanswered.
+#[tokio::test]
+async fn a_spent_retry_budget_asks_each_site_once() {
+    let (sent, send) = recorder(|_, _| Ok(response_text("qs-1")));
+    let req = request();
+    let out = ask_within(&req.repo, req.service.as_deref(), req.sites, send, || false).await;
+    assert_eq!(sent.lock().unwrap().len(), 1, "no second round");
     assert_eq!(
         out.unanswered["s-0003"],
         Unanswered {

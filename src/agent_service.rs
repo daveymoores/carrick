@@ -543,6 +543,16 @@ impl RetryPolicy {
         refusal_budget: Duration::ZERO,
     };
 
+    /// A call a scan can go without, whose retries count against the run's
+    /// retry budget rather than a budget of their own: the attempts of
+    /// [`Self::BRIEF`], every sleep drawn from [`crate::retry_budget`], and
+    /// once that is spent the first attempt only. Site questions are one
+    /// (carrick#2439).
+    pub const RUN_BUDGETED: Self = Self {
+        run_budgeted: true,
+        ..Self::BRIEF
+    };
+
     /// A best-effort call whose failure costs nothing: one HTTP attempt, no
     /// retry, and no re-send after a lease wait or a capacity refusal either.
     /// The re-ask for library semantics is one (carrick#1564): a failure keeps

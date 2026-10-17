@@ -224,6 +224,66 @@ impl SiteLabel {
         labels
     }
 
+    /// Every op the claims the scan settled label (carrick#2439), one label
+    /// each, as [`Self::from_store_answer`] reads them off the store's raw
+    /// answer: the scan holds the claims, already read and grouped by export.
+    /// A maker, a scope and a reserved name label no op.
+    pub fn from_exports(exports: &[crate::library_claims::ExportClaims]) -> Vec<SiteLabel> {
+        use crate::services::type_sidecar::{LibraryClaim, OpName};
+        let word = |value: serde_json::Result<serde_json::Value>| -> Option<String> {
+            value.ok()?.as_str().map(str::to_string)
+        };
+        let slot = |slot: &crate::services::type_sidecar::ClaimSlot| ArgSlot {
+            arg: slot.arg as usize,
+            key: slot.key.clone(),
+        };
+        let mut labels = Vec::new();
+        for export in exports {
+            let role = word(serde_json::to_value(export.role)).unwrap_or_default();
+            let side = export
+                .side
+                .and_then(|side| word(serde_json::to_value(side)));
+            for claim in &export.claims {
+                let LibraryClaim::Op {
+                    op,
+                    member,
+                    name,
+                    payload,
+                    handler,
+                    method,
+                    method_key,
+                    method_default,
+                    ..
+                } = claim
+                else {
+                    continue;
+                };
+                let method = (method.is_some() || method_key.is_some() || method_default.is_some())
+                    .then(|| MethodLabel {
+                        from: method_key.as_ref().map(slot),
+                        default: method_default.clone(),
+                        literal: method.clone(),
+                    });
+                labels.push(SiteLabel {
+                    package: export.package.clone(),
+                    export: export.export.clone(),
+                    member: member.clone(),
+                    role: role.clone(),
+                    op: word(serde_json::to_value(op)),
+                    side: side.clone(),
+                    name: match name {
+                        Some(OpName::Slot(name)) => Some(slot(name)),
+                        _ => None,
+                    },
+                    payload: payload.as_ref().map(slot),
+                    handler: handler.as_ref().map(slot),
+                    method,
+                });
+            }
+        }
+        labels
+    }
+
     /// The label for `end` among `labels`: the same package, export and
     /// member.
     pub fn find<'l>(labels: &'l [SiteLabel], end: &LabelledEnd) -> Option<&'l SiteLabel> {
@@ -1295,6 +1355,71 @@ fn loop_key(stmt: &ForOfStmt) -> Option<(String, String)> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// carrick#2439: the scan's settled claims give one label per op, with
+    /// its slots, method fields, role and side, as the store's raw answer
+    /// does; a maker labels no op, and a bound name no name slot.
+    #[test]
+    fn labels_read_from_the_settled_claims() {
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([{
+                "package": "@fixture/http",
+                "version": "1.0.0",
+                "specifier": "@fixture/http",
+                "export": "createClient",
+                "role": "http_client",
+                "side": "client",
+                "claims": [
+                    { "kind": "op", "op": "request", "member": "post", "name": { "arg": 0 },
+                      "payload": { "arg": 1 }, "method": "POST" },
+                    { "kind": "op", "op": "request", "member": "send", "name": { "bound": "maker" },
+                      "method_key": { "arg": 1, "key": "method" }, "method_default": "GET" },
+                    { "kind": "make", "form": "call", "member": null }
+                ]
+            }]))
+            .unwrap();
+        let labels = SiteLabel::from_exports(&exports);
+        assert_eq!(
+            labels,
+            vec![
+                SiteLabel {
+                    package: "@fixture/http".into(),
+                    export: "createClient".into(),
+                    member: Some("post".into()),
+                    role: "http_client".into(),
+                    op: Some("request".into()),
+                    side: Some("client".into()),
+                    name: Some(ArgSlot { arg: 0, key: None }),
+                    payload: Some(ArgSlot { arg: 1, key: None }),
+                    handler: None,
+                    method: Some(MethodLabel {
+                        from: None,
+                        default: None,
+                        literal: Some("POST".into()),
+                    }),
+                },
+                SiteLabel {
+                    package: "@fixture/http".into(),
+                    export: "createClient".into(),
+                    member: Some("send".into()),
+                    role: "http_client".into(),
+                    op: Some("request".into()),
+                    side: Some("client".into()),
+                    name: None,
+                    payload: None,
+                    handler: None,
+                    method: Some(MethodLabel {
+                        from: Some(ArgSlot {
+                            arg: 1,
+                            key: Some("method".into()),
+                        }),
+                        default: Some("GET".into()),
+                        literal: None,
+                    }),
+                },
+            ]
+        );
+    }
 
     pub(crate) fn manifest() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))

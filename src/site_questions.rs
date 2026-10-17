@@ -74,6 +74,13 @@ pub const ASK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Requests in flight at once.
 const IN_FLIGHT: usize = 4;
 
+/// The agent service site questions are sent through: its retries sleep on
+/// the run's retry budget ([`crate::retry_budget`]), never a budget of
+/// their own.
+pub fn agent() -> AgentService {
+    AgentService::new().with_retry_policy(crate::agent_service::RetryPolicy::RUN_BUDGETED)
+}
+
 /// Whether the switch is on in this process.
 pub fn enabled() -> bool {
     enabled_from(std::env::var(SWITCH).ok().as_deref())
@@ -410,6 +417,28 @@ where
     S: Fn(SiteQuestionsRequest) -> Fut,
     Fut: Future<Output = Result<String, AgentCallError>>,
 {
+    ask_within(repo, service, sites, send, || {
+        !crate::retry_budget::remaining().is_zero()
+    })
+    .await
+}
+
+/// [`ask`], with the second round asked only while `may_retry` says so
+/// (carrick#2439): the round of retriable sites draws on the run's retry
+/// budget ([`crate::retry_budget`]), the one a scan's patient calls share,
+/// so a run that has spent it asks each site once.
+pub async fn ask_within<S, Fut, R>(
+    repo: &str,
+    service: Option<&str>,
+    sites: Vec<SiteQuestion>,
+    send: S,
+    may_retry: R,
+) -> SiteAnswers
+where
+    S: Fn(SiteQuestionsRequest) -> Fut,
+    Fut: Future<Output = Result<String, AgentCallError>>,
+    R: Fn() -> bool,
+{
     let mut out = SiteAnswers::default();
     let mut seen = BTreeSet::new();
     let mut pending: Vec<SiteQuestion> = sites
@@ -417,7 +446,7 @@ where
         .filter(|site| seen.insert(site.site_id.clone()))
         .collect();
     for attempt in 0..2 {
-        if pending.is_empty() {
+        if pending.is_empty() || (attempt > 0 && !may_retry()) {
             break;
         }
         let (requests, too_large) = batches(repo, service, out.question_set.as_deref(), pending);
@@ -482,7 +511,9 @@ where
 }
 
 /// [`ask`] through the agent service, when the switch is on. Off, nothing is
-/// sent and nothing is answered.
+/// sent and nothing is answered. `agent` should retry under
+/// [`crate::agent_service::RetryPolicy::RUN_BUDGETED`] ([`agent`]), so the
+/// requests' own retries draw on the run's budget too.
 pub async fn ask_service(
     agent: &AgentService,
     repo: &str,

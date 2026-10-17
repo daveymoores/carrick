@@ -3928,11 +3928,20 @@ async fn analyze_current_repo_incremental(
                 service,
                 graphql_schemas,
             );
-            protocol_extractions.library = library_rows(
+            let (library, claims) = library_rows(
                 library_ask.as_ref(),
                 library_answer,
                 sidecar,
                 &semantics_root,
+            )
+            .await;
+            protocol_extractions.library = library;
+            protocol_extractions.site = site_rows_of(
+                crate::site_questions::enabled(),
+                &request_inputs,
+                repo_path,
+                service,
+                &claims,
             )
             .await;
             let withdrawn = withdraw_model_routes_at_definitions(
@@ -3986,7 +3995,7 @@ async fn analyze_current_repo_incremental(
                 &setup.detection,
                 &protocol_extractions.event_bus,
             );
-            append_deterministic_protocol_operations(
+            let site_fold = append_deterministic_protocol_operations(
                 &mut cloud_data,
                 &protocol_extractions,
                 &merged_results,
@@ -4063,6 +4072,7 @@ async fn analyze_current_repo_incremental(
                 &library_sites,
                 repo_path,
             );
+            apply_site_fold_to_manifest(&mut manifest_entries, &site_fold, repo_path);
             if !manifest_entries.is_empty() {
                 cloud_data.type_manifest = Some(manifest_entries);
             }
@@ -4113,6 +4123,7 @@ async fn analyze_current_repo_incremental(
                 file_orchestrator
                     .collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
             );
+            protocol_infer.extend(site_infer_requests(&site_fold, repo_path));
 
             crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -4548,6 +4559,9 @@ struct ProtocolExtractions {
     /// claims (carrick#1662, [`library_rows`]). Read once the request inputs
     /// and the sidecar are at hand, after the scan above.
     library: crate::library_claims::LibraryRows,
+    /// The rows and possible calls the decided sites come to (carrick#2439,
+    /// [`site_rows_of`]). Empty, and off, unless `CARRICK_SITE_QUESTIONS=1`.
+    site: crate::site_rows::SiteRows,
 }
 
 /// The directories to walk for a service's own GraphQL SDL files: its
@@ -4628,6 +4642,7 @@ fn scan_protocol_extractions(
             sockets,
             event_bus,
             library: crate::library_claims::LibraryRows::default(),
+            site: crate::site_rows::SiteRows::default(),
         },
         document_sites,
     )
@@ -4738,9 +4753,12 @@ async fn library_rows(
     first: crate::library_store::LibraryAnswer,
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
-) -> crate::library_claims::LibraryRows {
+) -> (
+    crate::library_claims::LibraryRows,
+    Vec<crate::library_claims::ExportClaims>,
+) {
     let Some(ask) = ask else {
-        return crate::library_claims::LibraryRows::default();
+        return Default::default();
     };
     let claims = crate::library_store::settle(
         &ask.asked,
@@ -4749,7 +4767,69 @@ async fn library_rows(
         send_to_library_store,
     )
     .await;
-    read_library_rows(&ask.sites, &claims, sidecar, from_dir)
+    (
+        read_library_rows(&ask.sites, &claims, sidecar, from_dir),
+        claims,
+    )
+}
+
+/// The service's site rows (carrick#2439): every call discovery finds that
+/// reaches an export the settled `claims` label, reported where its name is
+/// decided, its record built, the records that ask a slot asked, and the
+/// answers read into rows and possible calls ([`crate::site_rows`]). Off
+/// unless `enabled` (`CARRICK_SITE_QUESTIONS=1`); with no compiler rows
+/// (`CARRICK_POSITION_ROWS=1`) discovery finds nothing. A row in a mock or
+/// test tree of the service states nothing.
+async fn site_rows_of(
+    enabled: bool,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    repo_path: &str,
+    service: &Config,
+    claims: &[crate::library_claims::ExportClaims],
+) -> crate::site_rows::SiteRows {
+    if !enabled {
+        return crate::site_rows::SiteRows::default();
+    }
+    let root = Path::new(repo_path);
+    let labels = crate::request_summary::discovery::Labels::of(claims);
+    let discovered: Vec<crate::request_summary::decided_sites::DiscoverySite> =
+        crate::request_summary::discovery::discover(inputs, &labels, root)
+            .sites
+            .iter()
+            .filter_map(|site| {
+                serde_json::to_value(site)
+                    .and_then(serde_json::from_value)
+                    .ok()
+            })
+            .collect();
+    let site_labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
+    let decided = crate::request_summary::decided_sites::decided_sites(
+        inputs,
+        root,
+        &discovered,
+        &site_labels,
+    );
+    let records =
+        crate::request_summary::site_record::site_records(inputs, root, &decided, &site_labels);
+    let answers = crate::site_questions::ask_service(
+        &crate::site_questions::agent(),
+        &get_repository_name(repo_path),
+        service.service_name.as_deref(),
+        crate::site_rows::questions(&records),
+    )
+    .await;
+    let mut rows = crate::site_rows::of(&decided, &records, &site_labels, &answers);
+    rows.rows.retain(|row| {
+        !protocol_producer_provenance(&root.join(&row.file), repo_path, service).is_mock()
+    });
+    key_site_requests_canonically(&mut rows, &UrlNormalizer::new(service));
+    debug!(
+        sites = decided.sites.len(),
+        rows = rows.rows.len(),
+        possible_calls = rows.leads.len(),
+        "site questions: rows"
+    );
+    rows
 }
 
 /// `sites` read through `claims`, each verified by the sidecar against the
@@ -5059,7 +5139,7 @@ fn append_deterministic_protocol_operations(
     in_process: &crate::in_process_pubsub::InProcessPubsub,
     repo_path: &str,
     service: &Config,
-) {
+) -> crate::site_rows::SiteFold {
     // Same "{file}:{line}" convention the mount-graph conversions use. A
     // call's row; a producer's is `to_producer` below.
     let to_call = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
@@ -5094,6 +5174,7 @@ fn append_deterministic_protocol_operations(
         handler_span: None,
         name_scope: None,
         library_semantics: Vec::new(),
+        inference: None,
     };
     // A producer's row: tagged when its file sits in a mock or test-support
     // tree of the service, as an HTTP route is (#380, carrick#1626).
@@ -5189,6 +5270,20 @@ fn append_deterministic_protocol_operations(
         &to_producer,
         &to_call,
     );
+
+    // Site answers fold last, against every row a reader stated
+    // (carrick#2439), and the sites that state no row are possible calls.
+    let site = crate::site_rows::fold(
+        cloud_data,
+        &extractions.site,
+        Path::new(repo_path),
+        |key, file, line, side| match side {
+            crate::site_rows::RowSide::Call => to_call(key, file, line),
+            crate::site_rows::RowSide::Endpoint => to_producer(key, file, line),
+        },
+    );
+    crate::possible_calls::attach_when(extractions.site.enabled, cloud_data, site.leads.clone());
+    site
 }
 
 /// Where library rows were stated (carrick#1662), by normalized file and
@@ -6301,6 +6396,166 @@ fn add_graphql_request_entry(
         stated_values: Default::default(),
         v1_state_before_demotion: None,
     });
+}
+
+/// Key every HTTP request a site row states as every consumer row is keyed:
+/// on its canonical call path ([`UrlNormalizer::consumer_call_path`]), never
+/// the target as written.
+fn key_site_requests_canonically(
+    rows: &mut crate::site_rows::SiteRows,
+    normalizer: &UrlNormalizer,
+) {
+    for row in &mut rows.rows {
+        if row.side == crate::site_rows::RowSide::Call
+            && let OperationKey::Http { path, .. } = &mut row.key
+        {
+            *path = normalizer.consumer_call_path(path);
+        }
+    }
+}
+
+/// The manifest role a site row's side takes.
+fn site_manifest_role(side: crate::site_rows::RowSide) -> ManifestRole {
+    match side {
+        crate::site_rows::RowSide::Call => ManifestRole::Consumer,
+        crate::site_rows::RowSide::Endpoint => ManifestRole::Producer,
+    }
+}
+
+/// The per-site id a site row's consumer aliases carry, as every consumer
+/// row's do; `None` for a producer that is not HTTP (key-only aliases).
+fn site_row_site_id(row: &crate::site_rows::SiteRow, repo_path: &str) -> Option<String> {
+    let http = matches!(row.key, OperationKey::Http { .. });
+    (row.side == crate::site_rows::RowSide::Call || http)
+        .then(|| build_site_id(&row.file, row.line, &row.key, repo_path))
+}
+
+/// The manifest after the site fold (carrick#2439): a reader row the fold
+/// replaced leaves no entry, and every site row stated is anchored where its
+/// record says, so the type check reads it like any row (carrick#2472 C3).
+/// An HTTP row whose path is not a bare route gets none, as a reader's
+/// would not.
+fn apply_site_fold_to_manifest(
+    entries: &mut Vec<TypeManifestEntry>,
+    fold: &crate::site_rows::SiteFold,
+    repo_path: &str,
+) {
+    let root = Path::new(repo_path);
+    entries.retain(|entry| {
+        !fold.withdrawn.iter().any(|(file, line, key, side)| {
+            crate::site_rows::relative(root, &entry.file_path) == *file
+                && entry.line_number == *line
+                && entry.key == *key
+                && entry.role == site_manifest_role(*side)
+        })
+    });
+    for row in &fold.stated {
+        let role = site_manifest_role(row.side);
+        let site_id = site_row_site_id(row, repo_path);
+        match &row.key {
+            OperationKey::Http { path, .. } => {
+                if path.starts_with('/') {
+                    add_manifest_pair(
+                        entries,
+                        row.key.clone(),
+                        role,
+                        &row.file,
+                        row.line,
+                        site_id.as_deref(),
+                    );
+                }
+            }
+            _ => add_protocol_manifest_entry(
+                entries,
+                &row.key,
+                role,
+                &row.file,
+                row.line,
+                None,
+                site_id.as_deref(),
+            ),
+        }
+    }
+}
+
+/// The type requests for the site rows the fold stated (carrick#2472 C3),
+/// each at its record's anchor by span: a send's payload expression, an
+/// HTTP request's result at its call, and a handler's first parameter. A
+/// row whose record has no such anchor asks nothing for that type; an HTTP
+/// route's handler is not asked (its request and response are read off the
+/// route, not the parameter).
+fn site_infer_requests(
+    fold: &crate::site_rows::SiteFold,
+    repo_path: &str,
+) -> Vec<crate::services::type_sidecar::InferRequestItem> {
+    use crate::services::type_sidecar::InferRequestItem;
+    use crate::site_rows::RowSide;
+    let root = Path::new(repo_path);
+    let at = |anchor: &crate::request_summary::site_record::AnchorAt,
+              infer_kind: InferKind,
+              alias: String,
+              param_name: Option<String>| InferRequestItem {
+        file_path: root.join(&anchor.file).to_string_lossy().into_owned(),
+        line_number: anchor.line,
+        span_start: Some(anchor.span_start),
+        span_end: Some(anchor.span_end),
+        expression_text: None,
+        expression_line: None,
+        infer_kind,
+        alias: Some(alias),
+        param_name,
+    };
+    let mut requests = Vec::new();
+    for row in &fold.stated {
+        let role = site_manifest_role(row.side);
+        let site_id = site_row_site_id(row, repo_path);
+        let alias = |kind: ManifestTypeKind| {
+            build_manifest_type_alias_with_site_id(&row.key, role, kind, site_id.as_deref())
+        };
+        let anchors = &row.anchors;
+        match (&row.key, row.side) {
+            (OperationKey::Http { path, .. }, RowSide::Call) if path.starts_with('/') => {
+                if let Some(payload) = &anchors.payload_at {
+                    requests.push(at(
+                        payload,
+                        InferKind::Expression,
+                        alias(ManifestTypeKind::Request),
+                        None,
+                    ));
+                }
+                requests.push(at(
+                    &anchors.call,
+                    InferKind::CallResult,
+                    alias(ManifestTypeKind::Response),
+                    None,
+                ));
+            }
+            (OperationKey::Http { .. }, _) => {}
+            (_, RowSide::Call) => {
+                if let Some(payload) = &anchors.payload_at {
+                    requests.push(at(
+                        payload,
+                        InferKind::Expression,
+                        alias(ManifestTypeKind::Response),
+                        None,
+                    ));
+                }
+            }
+            (_, RowSide::Endpoint) => {
+                if let Some(handler) = &anchors.handler
+                    && let Some(param) = &handler.param_name
+                {
+                    requests.push(at(
+                        &handler.at,
+                        InferKind::FunctionParam,
+                        alias(ManifestTypeKind::Response),
+                        Some(param.clone()),
+                    ));
+                }
+            }
+        }
+    }
+    requests
 }
 
 /// Add a single Response-kind manifest entry for a non-HTTP operation. Shared
@@ -9612,8 +9867,17 @@ async fn analyze_current_repo(
         service,
         graphql_schemas,
     );
-    protocol_extractions.library =
+    let (library, claims) =
         library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root).await;
+    protocol_extractions.library = library;
+    protocol_extractions.site = site_rows_of(
+        crate::site_questions::enabled(),
+        &request_inputs,
+        repo_path,
+        service,
+        &claims,
+    )
+    .await;
     let withdrawn = withdraw_model_routes_at_definitions(
         &mut analysis_result.mount_graph,
         &analysis_result.file_results,
@@ -9663,7 +9927,7 @@ async fn analyze_current_repo(
         &setup.detection,
         &protocol_extractions.event_bus,
     );
-    append_deterministic_protocol_operations(
+    let site_fold = append_deterministic_protocol_operations(
         &mut cloud_data,
         &protocol_extractions,
         &analysis_result.file_results,
@@ -9701,6 +9965,7 @@ async fn analyze_current_repo(
         &library_sites,
         repo_path,
     );
+    apply_site_fold_to_manifest(&mut manifest_entries, &site_fold, repo_path);
     if !manifest_entries.is_empty() {
         cloud_data.type_manifest = Some(manifest_entries);
     }
@@ -9753,6 +10018,7 @@ async fn analyze_current_repo(
     protocol_infer.extend(
         file_orchestrator.collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
     );
+    protocol_infer.extend(site_infer_requests(&site_fold, repo_path));
 
     crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -12478,6 +12744,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
 
         let mut graph = MountGraph::new();
@@ -12909,6 +13176,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
 
         let test_data = CloudRepoData {
@@ -13061,6 +13329,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
 
         let test_data = vec![CloudRepoData {
@@ -21036,6 +21305,389 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         }
     }
 
+    /// One site row for the engine tests (carrick#2439): at `file`:7, span
+    /// 100..130, its payload at 112..118 and its handler at 120..129.
+    fn site_row(
+        file: &str,
+        key: OperationKey,
+        side: crate::site_rows::RowSide,
+        in_band: bool,
+    ) -> crate::site_rows::SiteRow {
+        use crate::request_summary::site_record::{AnchorAt, HandlerAnchor, TypeAnchors};
+        let at = |span_start: u32, span_end: u32| AnchorAt {
+            file: file.to_string(),
+            line: 7,
+            span_start,
+            span_end,
+        };
+        crate::site_rows::SiteRow {
+            file: file.to_string(),
+            line: 7,
+            key,
+            side,
+            source: crate::agents::file_analyzer_agent::ResolutionSource::Model,
+            inference: Some(crate::site_rows::SiteInference {
+                by: crate::site_rows::InferenceBy::SiteQuestion,
+                question_set: Some("qs".to_string()),
+                confidence: if in_band { 0.9 } else { 0.5 },
+                orders_agree: true,
+            }),
+            in_band,
+            name_scope: None,
+            anchors: TypeAnchors {
+                call: at(100, 130),
+                payload: None,
+                payload_at: Some(at(112, 118)),
+                handler: Some(HandlerAnchor {
+                    at: at(120, 129),
+                    param: 0,
+                    param_name: Some("message".to_string()),
+                }),
+            },
+            lead: crate::possible_calls::PossibleCall {
+                file_path: file.to_string(),
+                line_number: 7,
+                span_start: 100,
+                span_end: 130,
+                kind: Some("pubsub".to_string()),
+                role: None,
+                labelled_end: None,
+                unread: crate::possible_calls::Unread {
+                    slot: "name".to_string(),
+                    reason: crate::possible_calls::UnreadReason::BelowBand,
+                },
+                trace_depth: 0,
+            },
+        }
+    }
+
+    /// carrick#2439: with the switch off the site pass reads nothing and the
+    /// blob is byte for byte the one the scan wrote before it, with no
+    /// `possible_calls` and no `inference` on any row.
+    #[tokio::test]
+    async fn site_rows_off_leave_the_blob_byte_identical() {
+        let inputs = crate::engine::discover_request_inputs(
+            &crate::request_summary::decided_sites::tests::decided_fixture(),
+        );
+        let off = site_rows_of(false, &inputs, ".", &Config::default(), &[]).await;
+        assert!(!off.enabled && off.rows.is_empty() && off.leads.is_empty());
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "svc/src/orders.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "orders.created",
+                    crate::operation::PubsubRole::Publisher,
+                    None,
+                    None,
+                )],
+                ..Default::default()
+            },
+        );
+        let base = repo_with_bundle("svc", None, "");
+        let blob = |site: crate::site_rows::SiteRows| {
+            let extractions = ProtocolExtractions {
+                site,
+                ..ProtocolExtractions::default()
+            };
+            let mut cloud_data = base.clone();
+            append_deterministic_protocol_operations(
+                &mut cloud_data,
+                &extractions,
+                &file_results,
+                &crate::in_process_pubsub::InProcessPubsub::default(),
+                ".",
+                &Config::default(),
+            );
+            serde_json::to_string(&cloud_data).unwrap()
+        };
+        let before = blob(crate::site_rows::SiteRows::default());
+        // A pass that was off holds rows only by mistake; none of them
+        // reaches the blob.
+        let stray = crate::site_rows::SiteRows {
+            enabled: false,
+            rows: vec![site_row(
+                "svc/src/orders.ts",
+                OperationKey::pubsub("orders.settled"),
+                crate::site_rows::RowSide::Call,
+                true,
+            )],
+            leads: Vec::new(),
+        };
+        assert_eq!(blob(off), before);
+        assert_eq!(blob(stray), before);
+        assert!(!before.contains("possible_calls") && !before.contains("inference"));
+    }
+
+    /// carrick#2439: on, an answer in the band replaces the model's pub/sub
+    /// row at its site and carries its answer, and the sites that state no
+    /// row are written as possible calls.
+    #[test]
+    fn site_rows_on_fold_into_the_blob_and_write_possible_calls() {
+        // The full scan path keys its rows by the walked, absolute path; the
+        // incremental path repo-relative. The fold meets both.
+        for (repo_path, prefix) in [(".", ""), ("/repo", "/repo/")] {
+            site_rows_fold_at(repo_path, prefix);
+        }
+    }
+
+    fn site_rows_fold_at(repo_path: &str, prefix: &str) {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut model = pubsub_op(
+            "orders.created",
+            crate::operation::PubsubRole::Publisher,
+            None,
+            None,
+        );
+        model.line_number = 7;
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            format!("{prefix}svc/src/orders.ts"),
+            FileAnalysisResult {
+                pubsub_operations: vec![model],
+                ..Default::default()
+            },
+        );
+        let below = site_row(
+            "svc/src/other.ts",
+            OperationKey::pubsub("maybe"),
+            crate::site_rows::RowSide::Call,
+            false,
+        );
+        let extractions = ProtocolExtractions {
+            site: crate::site_rows::SiteRows {
+                enabled: true,
+                rows: vec![
+                    site_row(
+                        "svc/src/orders.ts",
+                        OperationKey::pubsub("orders.settled"),
+                        crate::site_rows::RowSide::Call,
+                        true,
+                    ),
+                    below,
+                ],
+                leads: Vec::new(),
+            },
+            ..ProtocolExtractions::default()
+        };
+        let mut cloud_data = repo_with_bundle("svc", None, "");
+        let fold = append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &file_results,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            repo_path,
+            &Config::default(),
+        );
+        let at_site: Vec<(String, Option<ResolutionSource>, bool)> = cloud_data
+            .calls
+            .iter()
+            .filter(|row| {
+                crate::site_rows::relative(Path::new(repo_path), &row.file_path.to_string_lossy())
+                    == "svc/src/orders.ts:7"
+            })
+            .map(|row| {
+                (
+                    row.key.canonical(),
+                    row.resolution_source,
+                    row.inference.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            at_site,
+            vec![(
+                "pubsub|orders.settled".to_string(),
+                Some(ResolutionSource::Model),
+                true
+            )]
+        );
+        assert_eq!(fold.withdrawn.len(), 1, "{repo_path}");
+        let leads = cloud_data.possible_calls.expect("written when on");
+        assert_eq!(
+            leads
+                .iter()
+                .map(|lead| lead.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["svc/src/other.ts"]
+        );
+    }
+
+    /// carrick#2439: an HTTP request a site states is keyed on its canonical
+    /// call path, as the reader's rows are: a full URL on a declared internal
+    /// domain becomes its bare route; a route registration keeps its path.
+    #[test]
+    fn site_requests_are_keyed_on_the_canonical_call_path() {
+        use crate::site_rows::RowSide;
+        let config = Config {
+            internal_domains: BTreeSet::from(["api.internal.test".to_string()]),
+            ..Config::default()
+        };
+        let mut rows = crate::site_rows::SiteRows {
+            enabled: true,
+            rows: vec![
+                site_row(
+                    "src/client.ts",
+                    OperationKey::http("GET", "https://api.internal.test/v1/orders"),
+                    RowSide::Call,
+                    true,
+                ),
+                site_row(
+                    "src/routes.ts",
+                    OperationKey::http("GET", "https://api.internal.test/v1/orders"),
+                    RowSide::Endpoint,
+                    true,
+                ),
+            ],
+            leads: Vec::new(),
+        };
+        key_site_requests_canonically(&mut rows, &UrlNormalizer::new(&config));
+        let keys: Vec<String> = rows.rows.iter().map(|row| row.key.canonical()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "http|GET|/v1/orders".to_string(),
+                "http|GET|https://api.internal.test/v1/orders".to_string(),
+            ]
+        );
+    }
+
+    /// carrick#2439 / carrick#2472 C3: a reader row the fold replaced leaves
+    /// no manifest entry, and each site row stated is anchored where its
+    /// record says: a send's payload expression, an HTTP request's result at
+    /// its call, and a handler's first parameter, each by span and under the
+    /// alias its manifest entry carries.
+    #[test]
+    fn the_site_fold_anchors_its_rows_in_the_manifest() {
+        use crate::site_rows::RowSide;
+        let publish = site_row(
+            "src/orders.ts",
+            OperationKey::pubsub("orders.settled"),
+            RowSide::Call,
+            true,
+        );
+        let subscriber = site_row(
+            "src/jobs.ts",
+            OperationKey::pubsub("orders.settled"),
+            RowSide::Endpoint,
+            true,
+        );
+        let request = site_row(
+            "src/client.ts",
+            OperationKey::http("POST", "/v1/orders"),
+            RowSide::Call,
+            true,
+        );
+        let fold = crate::site_rows::SiteFold {
+            stated: vec![publish, subscriber, request],
+            withdrawn: vec![(
+                "src/orders.ts".to_string(),
+                7,
+                OperationKey::pubsub("orders"),
+                RowSide::Call,
+            )],
+            leads: Vec::new(),
+        };
+        let mut entries = Vec::new();
+        add_protocol_manifest_entry(
+            &mut entries,
+            &OperationKey::pubsub("orders"),
+            ManifestRole::Consumer,
+            "src/orders.ts",
+            7,
+            None,
+            Some("x"),
+        );
+        apply_site_fold_to_manifest(&mut entries, &fold, "/repo");
+        let keyed: Vec<(String, ManifestRole, ManifestTypeKind)> = entries
+            .iter()
+            .map(|entry| (entry.key.canonical(), entry.role, entry.type_kind))
+            .collect();
+        assert!(!keyed.iter().any(|(key, ..)| key == "pubsub|orders"));
+        for wanted in [
+            (
+                "pubsub|orders.settled",
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+            ),
+            (
+                "pubsub|orders.settled",
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+            ),
+            (
+                "http|POST|/v1/orders",
+                ManifestRole::Consumer,
+                ManifestTypeKind::Request,
+            ),
+            (
+                "http|POST|/v1/orders",
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+            ),
+        ] {
+            assert!(
+                entries.iter().any(|entry| entry.key.canonical() == wanted.0
+                    && entry.role == wanted.1
+                    && entry.type_kind == wanted.2),
+                "{wanted:?} in {keyed:?}"
+            );
+        }
+
+        let requests = site_infer_requests(&fold, "/repo");
+        let aliases: HashSet<&str> = entries
+            .iter()
+            .map(|entry| entry.type_alias.as_str())
+            .collect();
+        for request in &requests {
+            assert!(
+                aliases.contains(request.alias.as_deref().unwrap()),
+                "{request:?}"
+            );
+        }
+        let asked: Vec<(&str, InferKind, Option<u32>, Option<&str>)> = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.file_path.as_str(),
+                    request.infer_kind.clone(),
+                    request.span_start,
+                    request.param_name.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                (
+                    "/repo/src/orders.ts",
+                    InferKind::Expression,
+                    Some(112),
+                    None
+                ),
+                (
+                    "/repo/src/jobs.ts",
+                    InferKind::FunctionParam,
+                    Some(120),
+                    Some("message")
+                ),
+                (
+                    "/repo/src/client.ts",
+                    InferKind::Expression,
+                    Some(112),
+                    None
+                ),
+                (
+                    "/repo/src/client.ts",
+                    InferKind::CallResult,
+                    Some(100),
+                    None
+                ),
+            ]
+        );
+    }
+
     /// carrick#1662: a library row is a `library_claim` fact carrying its
     /// name's scope and its claim ids, on the producer side for a subscriber
     /// or a listener and the call side for a publisher or an emitter. A row
@@ -21866,6 +22518,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 publishers: vec![bus("job.retry", "/repo/apps/api/src/mocks/jobs.ts")],
             },
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         file_results.insert(
@@ -22442,6 +23095,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             graphql,
             sockets: Default::default(),
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
         let mut entries = Vec::new();
         append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
@@ -22917,6 +23571,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 )],
             },
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
 
         let mut entries = Vec::new();
@@ -22991,6 +23646,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             graphql,
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
 
         let mut entries = Vec::new();
@@ -23057,6 +23713,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 emitters: vec![emitter.clone()],
             },
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
 
         let mut entries = Vec::new();
@@ -23494,6 +24151,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
         append_pubsub_operations(
             &mut cloud_data,
@@ -23598,6 +24256,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 }],
             },
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -24016,6 +24675,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
 
         let mut entries = Vec::new();
@@ -24154,6 +24814,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
 
         // The producer manifest entry's alias (Producer, Response).
@@ -24219,6 +24880,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
         assert!(
             orchestrator
@@ -24261,6 +24923,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
+                inference: None,
             })
             .collect();
         repo

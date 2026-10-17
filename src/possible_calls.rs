@@ -29,7 +29,9 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::cloud_storage::CloudRepoData;
-use crate::request_summary::decided_sites::{Decided, DecidedLead, LabelledEnd, Undecided};
+use crate::request_summary::decided_sites::{
+    Decided, DecidedLead, DecidedSite, LabelledEnd, Undecided,
+};
 use crate::request_summary::site_record::{Bucket, SiteRecord};
 
 /// The most possible calls one service's blob carries.
@@ -223,6 +225,25 @@ pub fn from_sites(decided: &Decided, records: &[SiteRecord]) -> Vec<PossibleCall
     }
     out.extend(decided.leads.iter().map(from_undecided));
     out
+}
+
+/// A decided site that states no row, for `reason` (carrick#2439): its
+/// answer fell below the band, or it was not answered.
+pub fn from_site(site: &DecidedSite, reason: UnreadReason) -> PossibleCall {
+    PossibleCall {
+        file_path: site.file.clone(),
+        line_number: site.line,
+        span_start: site.span_start,
+        span_end: site.span_end,
+        kind: kind_of(&site.end.role).map(str::to_string),
+        role: role_of(&site.end.role, site.end.op.as_deref()).map(str::to_string),
+        labelled_end: Some(labelled_end(&site.end)),
+        unread: Unread {
+            slot: slot_of(&site.end.role).to_string(),
+            reason,
+        },
+        trace_depth: site.via.len() as u32,
+    }
 }
 
 /// Order the rows (file, line, span), drop a repeat of one call, and keep

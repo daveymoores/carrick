@@ -1256,6 +1256,7 @@ pub fn mount_graph_to_api_details(
             handler_span: endpoint.handler_span,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         })
         .collect();
 
@@ -1287,6 +1288,7 @@ pub fn mount_graph_to_api_details(
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         })
         .collect();
 
@@ -2025,6 +2027,7 @@ mod tests {
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
+                inference: None,
             }];
             data.mount_graph = Some(graph);
             data
@@ -3138,6 +3141,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
         let mut data = empty_repo("org/web", Some("web"));
         data.calls = vec![
