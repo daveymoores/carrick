@@ -14,7 +14,9 @@
 //! **Where a file can be cut.** Between siblings of a list, and nowhere else:
 //! the items of the module, the statements of a function, method, arrow or
 //! namespace body, the members of a class, the elements of an array literal,
-//! the properties of an object literal. No list is chosen by a name.
+//! the properties of an object literal, the statements of a block, a loop, an
+//! `if` or `else`, a `try`, `catch` or `finally` and a `switch` case, and the
+//! body of a function called where it is written. No list is chosen by a name.
 //!
 //! **Windows are line ranges.** An item runs from the line after the sibling
 //! before it ends to the line it ends on, so a comment travels with the item
@@ -812,6 +814,10 @@ enum Node<'a> {
     Member(&'a ClassMember),
     Expr(&'a Expr),
     Prop(&'a PropOrSpread),
+    /// A block of a `try`: the block tried, the `catch` body, the `finally`.
+    Block(&'a BlockStmt),
+    /// A case of a `switch`.
+    Case(&'a SwitchCase),
 }
 
 /// A list an item holds: the span of what owns it, and its siblings.
@@ -825,13 +831,17 @@ impl<'a> Node<'a> {
             Node::Member(member) => member.span(),
             Node::Expr(expr) => expr.span(),
             Node::Prop(prop) => prop.span(),
+            Node::Block(block) => block.span,
+            Node::Case(case) => case.span,
         }
     }
 
     /// The list of an item: for a declaration with one declarator, its
-    /// initializer's; for a call, that of its largest argument that is an
-    /// array literal, an object literal or a function; for a function or a
-    /// class, its body. `None` for an item with nothing to be cut along.
+    /// initializer's; for a call, that of the largest of its arguments and a
+    /// function it calls where it is written that is an array literal, an
+    /// object literal or a function; for a function or a class, its body; for
+    /// a statement that holds statements, those ([`stmt_list`]). `None` for
+    /// an item with nothing to be cut along.
     fn list(&self) -> Listed<'a> {
         match self {
             Node::ModuleItem(ModuleItem::Stmt(stmt)) => stmt_list(stmt),
@@ -867,6 +877,8 @@ impl<'a> Node<'a> {
                 _ => None,
             },
             Node::Prop(PropOrSpread::Spread(_)) => None,
+            Node::Block(block) => block_list(block),
+            Node::Case(case) => Some((case.span, case.cons.iter().map(Node::Stmt).collect())),
         }
     }
 
@@ -890,7 +902,9 @@ impl<'a> Node<'a> {
             },
             Node::ModuleItem(ModuleItem::Stmt(stmt)) => stmt_states_nothing(stmt),
             Node::Stmt(stmt) => stmt_states_nothing(stmt),
-            Node::Member(_) | Node::Expr(_) | Node::Prop(_) => false,
+            Node::Member(_) | Node::Expr(_) | Node::Prop(_) | Node::Block(_) | Node::Case(_) => {
+                false
+            }
         }
     }
 }
@@ -933,11 +947,43 @@ fn class_list(class: &Class) -> Listed<'_> {
     Some((class.span, class.body.iter().map(Node::Member).collect()))
 }
 
+/// The list of a statement: a declaration's or an expression's as
+/// [`Node::list`] says, and for a statement that holds statements, those
+/// (carrick#2308). A statement with one body (a block, a labelled statement,
+/// a loop) is cut along its body's statements. One with several (`if` and
+/// its `else`, `try` and its `catch` and `finally`, `switch` and its cases)
+/// is cut between them, and each is opened in turn.
 fn stmt_list(stmt: &Stmt) -> Listed<'_> {
     match stmt {
         Stmt::Decl(decl) => decl_list(decl),
         Stmt::Expr(statement) => expr_list(&statement.expr),
         Stmt::Return(statement) => statement.arg.as_deref().and_then(expr_list),
+        Stmt::Block(block) => block_list(block),
+        Stmt::Labeled(statement) => stmt_list(&statement.body),
+        Stmt::For(statement) => stmt_list(&statement.body),
+        Stmt::ForIn(statement) => stmt_list(&statement.body),
+        Stmt::ForOf(statement) => stmt_list(&statement.body),
+        Stmt::While(statement) => stmt_list(&statement.body),
+        Stmt::DoWhile(statement) => stmt_list(&statement.body),
+        Stmt::If(statement) => Some((
+            statement.span,
+            std::iter::once(&*statement.cons)
+                .chain(statement.alt.as_deref())
+                .map(Node::Stmt)
+                .collect(),
+        )),
+        Stmt::Try(statement) => Some((
+            statement.span,
+            std::iter::once(&statement.block)
+                .chain(statement.handler.as_ref().map(|handler| &handler.body))
+                .chain(statement.finalizer.as_ref())
+                .map(Node::Block)
+                .collect(),
+        )),
+        Stmt::Switch(statement) => Some((
+            statement.span,
+            statement.cases.iter().map(Node::Case).collect(),
+        )),
         _ => None,
     }
 }
@@ -1000,20 +1046,34 @@ fn expr_list(expr: &Expr) -> Listed<'_> {
             ArrowFunctionBody::Expr(body) => expr_list(body),
         },
         Expr::Class(class) => class_list(&class.class),
-        Expr::Call(call) => largest_argument_list(&call.args),
-        Expr::New(new) => new.args.as_deref().and_then(largest_argument_list),
+        // A function called where it is written, `(function () { ... })()`,
+        // is one of what the call can be cut along, beside its arguments.
+        Expr::Call(call) => {
+            let callee = match &call.callee {
+                Callee::Expr(callee) => Some(unwrapped(callee))
+                    .filter(|callee| matches!(callee, Expr::Fn(_) | Expr::Arrow(_))),
+                _ => None,
+            };
+            largest_list(callee.into_iter().chain(arguments(&call.args)))
+        }
+        Expr::New(new) => largest_list(new.args.as_deref().into_iter().flat_map(arguments)),
+        // `!function () { ... }()`: the operand is the item's.
+        Expr::Unary(unary) => expr_list(&unary.arg),
         // `module.exports = [ ... ]`: the value assigned is the item's.
         Expr::Assign(assign) => expr_list(&assign.right),
         _ => None,
     }
 }
 
-/// The list of the largest argument that is an array literal, an object
+fn arguments(arguments: &[ExprOrSpread]) -> impl DoubleEndedIterator<Item = &Expr> {
+    arguments.iter().map(|argument| &*argument.expr)
+}
+
+/// The list of the largest of `exprs` that is an array literal, an object
 /// literal or a function.
-fn largest_argument_list(arguments: &[ExprOrSpread]) -> Listed<'_> {
-    arguments
-        .iter()
-        .map(|argument| unwrapped(&argument.expr))
+fn largest_list<'a>(exprs: impl DoubleEndedIterator<Item = &'a Expr>) -> Listed<'a> {
+    exprs
+        .map(unwrapped)
         .filter(|argument| {
             matches!(
                 argument,
@@ -1258,13 +1318,20 @@ mod tests {
     /// Every window but the last ends on a line that closes one sibling, and
     /// every window is cut out of the one construct that holds the list.
     fn assert_cut_between(shape: &Shape, limits: &Limits, closes_a_sibling: &str) {
+        assert_cut_between_at(shape, limits, closes_a_sibling, 1);
+    }
+
+    /// [`assert_cut_between`] for a list `depth` constructs down: a statement
+    /// that holds blocks (`if`, `try`, `switch`) is one construct and the
+    /// block another.
+    fn assert_cut_between_at(shape: &Shape, limits: &Limits, closes_a_sibling: &str, depth: usize) {
         let parts = parts_of(shape, limits);
         assert!(parts.len() > 2, "{} part(s)", parts.len());
         for part in &parts[..parts.len() - 1] {
             assert_eq!(line(&shape.source, part.last_line), closes_a_sibling);
         }
         for part in &parts {
-            assert_eq!(part.enclosing.len(), 1, "{:?}", part.window());
+            assert_eq!(part.enclosing.len(), depth, "{:?}", part.window());
         }
         // The lines the construct opens and closes on, the same for every
         // window cut out of it. The first window holds the opening lines,
@@ -1305,6 +1372,56 @@ mod tests {
     #[test]
     fn a_class_that_is_most_of_a_file_is_cut_between_its_members() {
         assert_cut_between(&shapes::request_class("class", N), &LIMITS, "  }");
+    }
+
+    #[test]
+    fn a_function_called_where_it_is_written_is_cut_between_its_statements() {
+        assert_cut_between(&shapes::called_function("called", N), &LIMITS, "  });");
+    }
+
+    #[test]
+    fn a_try_block_that_is_most_of_a_file_is_cut_between_its_statements() {
+        assert_cut_between_at(&shapes::try_block("tried", N), &LIMITS, "  });", 2);
+    }
+
+    /// Every statement the language defines to hold statements, and every
+    /// way of calling a function where it is written, is cut between the
+    /// statements it holds, each candidate in one window.
+    #[test]
+    fn every_statement_that_holds_statements_is_cut_between_them() {
+        // (opening lines, closing lines, how many constructs down the list
+        // is). An `if` with no `else` opens and closes on its block's lines,
+        // so the two are one construct.
+        let constructs: [(&str, &str, usize); 15] = [
+            ("{", "}", 1),
+            ("outer: {", "}", 1),
+            ("for (let i = 0; i < 1; i++) {", "}", 1),
+            ("for (const key in table) {", "}", 1),
+            ("for (const item of items) {", "}", 1),
+            ("while (running()) {", "}", 1),
+            ("do {", "} while (running());", 1),
+            ("if (ready) {", "}", 1),
+            ("if (ready) {\n  start();\n} else {", "}", 2),
+            ("try {\n  start();\n} catch (error) {", "}", 2),
+            ("try {\n  start();\n} finally {", "}", 2),
+            ("switch (mode) {\n  case \"serve\":", "    break;\n}", 2),
+            ("(() => {", "})();", 1),
+            ("!function () {", "}();", 1),
+            ("await (async () => {", "})();", 1),
+        ];
+        let n = 100;
+        for (opening, closing, depth) in constructs {
+            let shape = shapes::statements_inside("construct", n, opening, closing);
+            assert_cut_between_at(&shape, &LIMITS, "  });", depth);
+            let mut held = vec![0; n];
+            for part in parts_of(&shape, &LIMITS) {
+                assert!(part.candidates.len() <= LIMITS.candidates, "{opening}");
+                for position in part.candidates {
+                    held[position] += 1;
+                }
+            }
+            assert!(held.iter().all(|times| *times == 1), "{opening}: {held:?}");
+        }
     }
 
     const USES: &str = "\

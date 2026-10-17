@@ -1,4 +1,4 @@
-//! Four large source files, generated (carrick#2308).
+//! Large source files, generated (carrick#2308).
 //!
 //! Each is a shape the language defines for holding many requests or routes in
 //! one file, written from that definition and copied from nowhere. The right
@@ -134,6 +134,45 @@ pub fn request_class(tag: &str, n: usize) -> Shape {
     Shape { source, starts }
 }
 
+/// A module whose `n` route registrations sit between `opening` and `closing`,
+/// each line of which is written as given: the statements of whatever
+/// construct those lines open and close, under one declaration above it.
+/// Each registration ends on the line `  });`.
+pub fn statements_inside(tag: &str, n: usize, opening: &str, closing: &str) -> Shape {
+    let mut source = String::from("declare const app: any;\n\n");
+    writeln!(source, "{opening}").unwrap();
+    let mut starts = Vec::with_capacity(n);
+    for i in 0..n {
+        source.push_str("  ");
+        starts.push(source.len());
+        writeln!(
+            source,
+            "app.get(\"/{tag}/inside/{i}\", async (req: any, res: any) => {{"
+        )
+        .unwrap();
+        writeln!(source, "    res.json({{ route: {i} }});").unwrap();
+        source.push_str("  });\n");
+    }
+    writeln!(source, "{closing}").unwrap();
+    Shape { source, starts }
+}
+
+/// A module that is one function expression called where it is written, its
+/// body the `n` registrations.
+pub fn called_function(tag: &str, n: usize) -> Shape {
+    statements_inside(tag, n, "(function () {\n  \"use strict\";", "})();")
+}
+
+/// A module whose `n` registrations are the body of a top-level `try`.
+pub fn try_block(tag: &str, n: usize) -> Shape {
+    statements_inside(
+        tag,
+        n,
+        "try {",
+        "} catch (error) {\n  console.error(error);\n}",
+    )
+}
+
 /// Every shape at `n`, by name.
 pub fn every_shape(tag: &str, n: usize) -> Vec<(&'static str, Shape)> {
     vec![
@@ -141,5 +180,7 @@ pub fn every_shape(tag: &str, n: usize) -> Vec<(&'static str, Shape)> {
         ("route_array", route_array(tag, n)),
         ("registering_function", registering_function(tag, n)),
         ("request_class", request_class(tag, n)),
+        ("called_function", called_function(tag, n)),
+        ("try_block", try_block(tag, n)),
     ]
 }
