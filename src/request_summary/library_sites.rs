@@ -148,6 +148,12 @@ pub struct SiteObject {
     /// The keys whose value is text with a parameter in it, as
     /// [`SiteArg::holes`].
     pub(super) holes: BTreeMap<String, Vec<TextPiece>>,
+    /// Key -> the keys of its value, when the value is an object literal or
+    /// a serialised one (`{ payload: JSON.stringify({ job }) }`,
+    /// carrick#2453). Such a key is in `fields` with no text: a serialised
+    /// object is not a string the source writes. Same drop rules as
+    /// `fields`.
+    pub objects: BTreeMap<String, SiteObject>,
 }
 
 impl SiteArg {
@@ -199,6 +205,7 @@ impl SiteArg {
                 fields: BTreeMap::new(),
                 open: object.open,
                 holes: BTreeMap::new(),
+                objects: object.objects.clone(),
             };
             for (key, value) in &object.fields {
                 let (text, holes) = match object.holes.get(key) {
@@ -2885,10 +2892,59 @@ pub(super) fn site_arg(expr: &Expr, scope: &Scope<'_>) -> SiteArg {
         text,
         object: match expr {
             Expr::Object(object) => Some(site_object(object, scope)),
+            // A payload written as `JSON.stringify({ ... })` states the
+            // keys of the object it serialises (carrick#2453).
+            Expr::Call(call) => serialised_object(call, scope),
             _ => None,
         },
         function: matches!(expr, Expr::Arrow(_) | Expr::Fn(_)),
         holes,
+    }
+}
+
+/// What a serialiser call states: `JSON.stringify(x)`, or with a replacer
+/// and a space, states `x`. A spread first argument states nothing. The one
+/// place the call is read, for the send side's value reader
+/// ([`Reader::eval`]) and for [`site_arg`] (carrick#2453). Until a library
+/// claim carries it, the language global is read the way `fetch` is.
+pub(super) fn serialised_operand(call: &CallExpr) -> Option<&Expr> {
+    if !super::is_member_call(call, "JSON", "stringify") {
+        return None;
+    }
+    let arg = call.args.first()?;
+    arg.spread.is_none().then_some(&*arg.expr)
+}
+
+/// The keys of the object a serialiser call serialises: an object literal,
+/// or a name bound to a module `const` object literal the file never writes
+/// through. A call result, a parameter or any other expression has none.
+fn serialised_object(call: &CallExpr, scope: &Scope<'_>) -> Option<SiteObject> {
+    match unwrap_expression(serialised_operand(call)?) {
+        Expr::Object(object) => Some(site_object(object, scope)),
+        Expr::Call(inner) => serialised_object(inner, scope),
+        Expr::Ident(ident) => {
+            let key = ident_key(ident);
+            // A binding the function or a block declares again is not the
+            // module's.
+            if scope.params.contains(&Some(key.clone()))
+                || scope.locals.contains_key(&key)
+                || scope.texts.contains_key(&key)
+            {
+                return None;
+            }
+            let object = scope.module.object_lits.get(&key)?;
+            Some(site_object(object, &Scope::module(scope.module)))
+        }
+        _ => None,
+    }
+}
+
+/// The keys of `expr` when it is an object literal or a serialised one.
+fn nested_object(expr: &Expr, scope: &Scope<'_>) -> Option<SiteObject> {
+    match unwrap_expression(expr) {
+        Expr::Object(object) => Some(site_object(object, scope)),
+        Expr::Call(call) => serialised_object(call, scope),
+        _ => None,
     }
 }
 
@@ -2926,6 +2982,7 @@ fn site_object(object: &ObjectLit, scope: &Scope<'_>) -> SiteObject {
     let open = |out: &mut SiteObject| {
         out.fields.clear();
         out.holes.clear();
+        out.objects.clear();
         out.open = true;
     };
     let put = |out: &mut SiteObject, key: String, pieces: Option<Vec<TextPiece>>| {
@@ -2934,6 +2991,7 @@ fn site_object(object: &ObjectLit, scope: &Scope<'_>) -> SiteObject {
             Some(holes) => out.holes.insert(key.clone(), holes),
             None => out.holes.remove(&key),
         };
+        out.objects.remove(&key);
         out.fields.insert(key, text);
     };
     for prop in &object.props {
@@ -2946,7 +3004,12 @@ fn site_object(object: &ObjectLit, scope: &Scope<'_>) -> SiteObject {
         };
         match &**prop {
             Prop::KeyValue(kv) => match prop_name(&kv.key) {
-                Some(key) => put(&mut out, key, text_pieces(&kv.value, scope)),
+                Some(key) => {
+                    put(&mut out, key.clone(), text_pieces(&kv.value, scope));
+                    if let Some(nested) = nested_object(&kv.value, scope) {
+                        out.objects.insert(key, nested);
+                    }
+                }
                 None => open(&mut out),
             },
             Prop::Shorthand(ident) => put(
@@ -5991,5 +6054,132 @@ mod tests {
                 .all(|site| !(site.file.ends_with("src/use.ts") && site.line == 4)),
             "{sites:#?}"
         );
+    }
+
+    /// The keys a send's argument states, read at the first send of a
+    /// one-file module.
+    fn payload_arg(source: &str) -> SiteArg {
+        let sites = sites_of(&[("src/send.ts", source)]);
+        let send = sites
+            .iter()
+            .find(|site| site.member.as_deref() == Some("send"))
+            .unwrap_or_else(|| panic!("no send site: {sites:#?}"));
+        send.args[0].clone()
+    }
+
+    /// The nested object under `key`, as the payload states it.
+    fn nested<'a>(arg: &'a SiteArg, key: &str) -> &'a SiteObject {
+        arg.object
+            .as_ref()
+            .and_then(|object| object.objects.get(key))
+            .unwrap_or_else(|| panic!("no nested {key}: {arg:#?}"))
+    }
+
+    /// `{ Payload: JSON.stringify({ job: CONST, id }) }` keeps the payload's
+    /// keys one level down, `job` holding the constant's text, and the
+    /// serialised key is no text (carrick#2453).
+    #[test]
+    fn a_serialised_object_key_keeps_its_keys() {
+        let arg = payload_arg(
+            "import { Client, Invoke } from \"@fixture/rpc\";\n\
+             const client = new Client();\n\
+             const EMBED_JOB = \"embed\";\n\
+             export async function go(id: string) {\n\
+             \x20 await client.send({ Target: \"fn\", Payload: JSON.stringify({ job: EMBED_JOB, id }) });\n\
+             }\n",
+        );
+        let payload = nested(&arg, "Payload");
+        assert_eq!(payload.fields["job"].as_deref(), Some("embed"));
+        assert!(payload.fields.contains_key("id"));
+        assert_eq!(arg.object.as_ref().unwrap().fields["Payload"], None);
+    }
+
+    /// A serialised object as the argument is read as the literal would be,
+    /// with or without a replacer and a space.
+    #[test]
+    fn a_serialised_argument_reads_as_its_object() {
+        for call in [
+            "JSON.stringify({ type: \"join\", room })",
+            "JSON.stringify({ type: \"join\", room }, null, 2)",
+        ] {
+            let arg = payload_arg(&format!(
+                "import {{ Socket }} from \"@fixture/ws\";\n\
+                 const socket = new Socket();\n\
+                 export function join(room: string) {{\n\
+                 \x20 socket.send({call});\n\
+                 }}\n"
+            ));
+            let object = arg.object.expect("the serialised keys");
+            assert_eq!(object.fields["type"].as_deref(), Some("join"), "{call}");
+            assert!(object.fields.contains_key("room"), "{call}");
+            assert_eq!(arg.text, None);
+        }
+    }
+
+    /// A spread inside the serialised object makes it open, and a spread
+    /// argument serialises nothing.
+    #[test]
+    fn a_spread_in_a_serialised_object_opens_it() {
+        let arg = payload_arg(
+            "import { Socket } from \"@fixture/ws\";\n\
+             const socket = new Socket();\n\
+             export function go(rest: object) {\n\
+             \x20 socket.send(JSON.stringify({ type: \"a\", ...rest, room: \"r\" }));\n\
+             }\n",
+        );
+        let object = arg.object.expect("the serialised keys");
+        assert!(object.open);
+        assert!(!object.fields.contains_key("type"));
+        assert_eq!(object.fields["room"].as_deref(), Some("r"));
+
+        let spread = payload_arg(
+            "import { Socket } from \"@fixture/ws\";\n\
+             const socket = new Socket();\n\
+             export function go(args: object[]) {\n\
+             \x20 socket.send(JSON.stringify(...args));\n\
+             }\n",
+        );
+        assert_eq!(spread.object, None);
+    }
+
+    /// A serialised name bound to a `const` object reads its keys; one the
+    /// file writes through, a call result and a parameter read none.
+    #[test]
+    fn a_serialised_name_reads_a_const_object_only_when_nothing_changes_it() {
+        let named = payload_arg(
+            "import { Socket } from \"@fixture/ws\";\n\
+             const socket = new Socket();\n\
+             const event = { type: \"join\" };\n\
+             export function go() {\n\
+             \x20 socket.send(JSON.stringify(event));\n\
+             }\n",
+        );
+        assert_eq!(
+            named.object.expect("keys").fields["type"].as_deref(),
+            Some("join")
+        );
+
+        let written = payload_arg(
+            "import { Socket } from \"@fixture/ws\";\n\
+             const socket = new Socket();\n\
+             const event = { type: \"join\" };\n\
+             export function go() {\n\
+             \x20 event.room = \"r\";\n\
+             \x20 socket.send(JSON.stringify(event));\n\
+             }\n",
+        );
+        assert_eq!(written.object, None);
+
+        for operand in ["build()", "event"] {
+            let arg = payload_arg(&format!(
+                "import {{ Socket }} from \"@fixture/ws\";\n\
+                 const socket = new Socket();\n\
+                 declare function build(): object;\n\
+                 export function go(event: object) {{\n\
+                 \x20 socket.send(JSON.stringify({operand}));\n\
+                 }}\n"
+            ));
+            assert_eq!(arg.object, None, "{operand}");
+        }
     }
 }
