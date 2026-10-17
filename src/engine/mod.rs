@@ -4822,6 +4822,7 @@ async fn site_rows_of(
     rows.rows.retain(|row| {
         !protocol_producer_provenance(&root.join(&row.file), repo_path, service).is_mock()
     });
+    key_site_requests_canonically(&mut rows, &UrlNormalizer::new(service));
     debug!(
         sites = decided.sites.len(),
         rows = rows.rows.len(),
@@ -6395,6 +6396,22 @@ fn add_graphql_request_entry(
         stated_values: Default::default(),
         v1_state_before_demotion: None,
     });
+}
+
+/// Key every HTTP request a site row states as every consumer row is keyed:
+/// on its canonical call path ([`UrlNormalizer::consumer_call_path`]), never
+/// the target as written.
+fn key_site_requests_canonically(
+    rows: &mut crate::site_rows::SiteRows,
+    normalizer: &UrlNormalizer,
+) {
+    for row in &mut rows.rows {
+        if row.side == crate::site_rows::RowSide::Call
+            && let OperationKey::Http { path, .. } = &mut row.key
+        {
+            *path = normalizer.consumer_call_path(path);
+        }
+    }
 }
 
 /// The manifest role a site row's side takes.
@@ -21408,6 +21425,14 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     /// row are written as possible calls.
     #[test]
     fn site_rows_on_fold_into_the_blob_and_write_possible_calls() {
+        // The full scan path keys its rows by the walked, absolute path; the
+        // incremental path repo-relative. The fold meets both.
+        for (repo_path, prefix) in [(".", ""), ("/repo", "/repo/")] {
+            site_rows_fold_at(repo_path, prefix);
+        }
+    }
+
+    fn site_rows_fold_at(repo_path: &str, prefix: &str) {
         use crate::agents::file_analyzer_agent::ResolutionSource;
         let mut model = pubsub_op(
             "orders.created",
@@ -21418,7 +21443,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         model.line_number = 7;
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         file_results.insert(
-            "svc/src/orders.ts".to_string(),
+            format!("{prefix}svc/src/orders.ts"),
             FileAnalysisResult {
                 pubsub_operations: vec![model],
                 ..Default::default()
@@ -21452,13 +21477,16 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &extractions,
             &file_results,
             &crate::in_process_pubsub::InProcessPubsub::default(),
-            ".",
+            repo_path,
             &Config::default(),
         );
         let at_site: Vec<(String, Option<ResolutionSource>, bool)> = cloud_data
             .calls
             .iter()
-            .filter(|row| row.file_path == Path::new("svc/src/orders.ts:7"))
+            .filter(|row| {
+                crate::site_rows::relative(Path::new(repo_path), &row.file_path.to_string_lossy())
+                    == "svc/src/orders.ts:7"
+            })
             .map(|row| {
                 (
                     row.key.canonical(),
@@ -21475,7 +21503,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 true
             )]
         );
-        assert_eq!(fold.withdrawn.len(), 1);
+        assert_eq!(fold.withdrawn.len(), 1, "{repo_path}");
         let leads = cloud_data.possible_calls.expect("written when on");
         assert_eq!(
             leads
@@ -21483,6 +21511,45 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 .map(|lead| lead.file_path.as_str())
                 .collect::<Vec<_>>(),
             vec!["svc/src/other.ts"]
+        );
+    }
+
+    /// carrick#2439: an HTTP request a site states is keyed on its canonical
+    /// call path, as the reader's rows are: a full URL on a declared internal
+    /// domain becomes its bare route; a route registration keeps its path.
+    #[test]
+    fn site_requests_are_keyed_on_the_canonical_call_path() {
+        use crate::site_rows::RowSide;
+        let config = Config {
+            internal_domains: BTreeSet::from(["api.internal.test".to_string()]),
+            ..Config::default()
+        };
+        let mut rows = crate::site_rows::SiteRows {
+            enabled: true,
+            rows: vec![
+                site_row(
+                    "src/client.ts",
+                    OperationKey::http("GET", "https://api.internal.test/v1/orders"),
+                    RowSide::Call,
+                    true,
+                ),
+                site_row(
+                    "src/routes.ts",
+                    OperationKey::http("GET", "https://api.internal.test/v1/orders"),
+                    RowSide::Endpoint,
+                    true,
+                ),
+            ],
+            leads: Vec::new(),
+        };
+        key_site_requests_canonically(&mut rows, &UrlNormalizer::new(&config));
+        let keys: Vec<String> = rows.rows.iter().map(|row| row.key.canonical()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "http|GET|/v1/orders".to_string(),
+                "http|GET|https://api.internal.test/v1/orders".to_string(),
+            ]
         );
     }
 
