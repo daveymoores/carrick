@@ -1453,6 +1453,25 @@ pub(crate) mod tests {
         );
     }
 
+    /// A call whose name only an entry point fills is one possible call,
+    /// at the call that holds the open name (carrick#2438).
+    #[test]
+    fn a_name_nothing_binds_is_a_possible_call() {
+        let decided = decided();
+        let found = crate::possible_calls::from_sites(&decided, &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let call = &found[0];
+        assert_eq!(call.file_path.trim_start_matches(WEB), "api.ts");
+        assert_eq!(call.line_number, 10);
+        assert!(call.span_end > call.span_start, "{call:?}");
+        assert!(!call.file_path.starts_with('/'), "{call:?}");
+        assert_eq!(
+            call.unread.reason,
+            crate::possible_calls::UnreadReason::NameNeverBound
+        );
+        assert!(call.labelled_end.is_some(), "{call:?}");
+    }
+
     /// Each request is one site at the call that decides it, every protocol:
     /// the full list on the fixture.
     #[test]

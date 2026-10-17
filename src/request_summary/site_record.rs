@@ -1768,6 +1768,42 @@ mod tests {
             })
     }
 
+    /// An event name from an import the scan cannot read is one possible
+    /// call, labelled with the library call it reaches, and no row: the
+    /// other sites of the file are not possible calls (carrick#2438).
+    #[test]
+    fn a_name_from_an_unreadable_import_is_one_possible_call_and_no_row() {
+        let (records, decided) = records_with_rows(&repo());
+        let found = crate::possible_calls::from_sites(&decided, &records);
+        let in_choices: Vec<_> = found
+            .iter()
+            .filter(|call| call.file_path.ends_with("choices.ts"))
+            .collect();
+        assert_eq!(in_choices.len(), 1, "{in_choices:?}");
+        let call = in_choices[0];
+        let fire = record(&records, "choices.ts:18");
+        assert_eq!(fire.bucket, Bucket::Lead);
+        assert_eq!(call.line_number, fire.anchors.call.line);
+        assert_eq!(call.span_start, fire.anchors.call.span_start);
+        assert_eq!(call.file_path, format!("{WEB}choices.ts"));
+        assert!(!call.file_path.starts_with('/'), "{call:?}");
+        assert_eq!(
+            call.unread.reason,
+            crate::possible_calls::UnreadReason::UnresolvedImport
+        );
+        assert_eq!(call.unread.slot, "name");
+        assert_eq!(call.kind.as_deref(), Some("socket"), "{call:?}");
+        assert_eq!(call.role.as_deref(), Some("producer"), "{call:?}");
+        assert!(call.labelled_end.is_some(), "{call:?}");
+        // No row: the lead's record states no name, and the forced and
+        // asked sites of the file are not possible calls.
+        assert!(fire.state.forced.get(&Slot::Name).is_none());
+        for bucket_site in ["choices.ts:10", "choices.ts:14"] {
+            let line = record(&records, bucket_site).anchors.call.line;
+            assert!(in_choices.iter().all(|c| c.line_number != line));
+        }
+    }
+
     /// Each bucket: a path constant from a sibling package is one stated
     /// value (forced); a flag choosing between two constants is asked; an
     /// event name from an import that cannot be read is a lead.

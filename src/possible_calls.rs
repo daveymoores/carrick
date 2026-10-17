@@ -246,3 +246,138 @@ pub fn attach_when(on: bool, data: &mut CloudRepoData, rows: Vec<PossibleCall>) 
     data.possible_calls = Some(rows);
     data.possible_calls_omitted = (omitted > 0).then_some(omitted as u32);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(file: &str, line: u32) -> PossibleCall {
+        PossibleCall {
+            file_path: file.to_string(),
+            line_number: line,
+            span_start: line * 10,
+            span_end: line * 10 + 5,
+            kind: None,
+            role: None,
+            labelled_end: None,
+            unread: Unread {
+                slot: "name".into(),
+                reason: UnreadReason::Unanswered,
+            },
+            trace_depth: 0,
+        }
+    }
+
+    fn blob() -> CloudRepoData {
+        serde_json::from_value(serde_json::json!({
+            "repo_name": "r",
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": {},
+            "config_json": null, "package_json": null, "packages": null,
+            "last_updated": "2026-10-17T00:00:00Z", "commit_hash": "abc"
+        }))
+        .unwrap()
+    }
+
+    /// Past the cap the rows kept are the first by file and line, in that
+    /// order, and the rest are counted.
+    #[test]
+    fn past_the_cap_the_rest_are_counted() {
+        let rows: Vec<PossibleCall> = (0..MAX_PER_SERVICE as u32 + 7)
+            .rev()
+            .map(|n| call("a.ts", n + 1))
+            .collect();
+        let (kept, omitted) = cap(rows);
+        assert_eq!(kept.len(), MAX_PER_SERVICE);
+        assert_eq!(omitted, 7);
+        assert_eq!(kept[0].line_number, 1);
+        assert_eq!(
+            kept[MAX_PER_SERVICE - 1].line_number,
+            MAX_PER_SERVICE as u32
+        );
+    }
+
+    /// At the cap nothing is omitted, and one call found twice is kept once.
+    #[test]
+    fn at_the_cap_nothing_is_omitted_and_a_repeat_is_dropped() {
+        let mut rows: Vec<PossibleCall> = (1..=MAX_PER_SERVICE as u32)
+            .map(|n| call("a.ts", n))
+            .collect();
+        rows.push(call("a.ts", 1));
+        let (kept, omitted) = cap(rows);
+        assert_eq!((kept.len(), omitted), (MAX_PER_SERVICE, 0));
+    }
+
+    /// With the switch off the blob is as it was: neither key is written.
+    #[test]
+    fn with_the_switch_off_the_blob_is_unchanged() {
+        let before = serde_json::to_string(&blob()).unwrap();
+        let mut data = blob();
+        attach_when(false, &mut data, vec![call("a.ts", 1)]);
+        assert_eq!(serde_json::to_string(&data).unwrap(), before);
+        assert!(!before.contains("possible_calls"));
+    }
+
+    /// With it on the rows and the omitted count are written; no count when
+    /// none were left out.
+    #[test]
+    fn with_the_switch_on_the_rows_and_the_count_are_written() {
+        let mut data = blob();
+        attach_when(true, &mut data, vec![call("a.ts", 1)]);
+        let wire = serde_json::to_value(&data).unwrap();
+        assert_eq!(wire["possible_calls"].as_array().map(Vec::len), Some(1));
+        assert!(wire.get("possible_calls_omitted").is_none());
+
+        let mut over = blob();
+        let rows = (1..=MAX_PER_SERVICE as u32 + 3)
+            .map(|n| call("a.ts", n))
+            .collect();
+        attach_when(true, &mut over, rows);
+        let wire = serde_json::to_value(&over).unwrap();
+        assert_eq!(
+            wire["possible_calls"].as_array().map(Vec::len),
+            Some(MAX_PER_SERVICE)
+        );
+        assert_eq!(wire["possible_calls_omitted"], 3);
+    }
+
+    /// A blob written before the fields existed reads with neither.
+    #[test]
+    fn an_old_blob_reads_with_neither_field() {
+        let data = blob();
+        assert!(data.possible_calls.is_none() && data.possible_calls_omitted.is_none());
+    }
+
+    /// The rows are the reader's rows: the cloud's ingest fixture
+    /// (`lambdas/check-or-upload/index_blob_unknown_keys.fixture.json`,
+    /// `possible_calls`) reads into the type and writes back as it was.
+    #[test]
+    fn the_rows_are_the_readers_rows() {
+        let reader = serde_json::json!([
+            {"file_path": "src/events.ts", "line_number": 12, "span_start": 240, "span_end": 290,
+             "kind": "pubsub", "role": "producer",
+             "labelled_end": {"package": "a-queue-lib", "export": "Queue", "member": "publish"},
+             "unread": {"slot": "name", "reason": "unresolved_import"}, "trace_depth": 2},
+            {"file_path": "src/client.ts", "line_number": 30, "span_start": 600, "span_end": 640,
+             "kind": null, "role": null, "labelled_end": null,
+             "unread": {"slot": "path", "reason": "injected_callee"}, "trace_depth": 1}
+        ]);
+        let rows: Vec<PossibleCall> = serde_json::from_value(reader.clone()).unwrap();
+        assert_eq!(rows[0].unread.reason, UnreadReason::UnresolvedImport);
+        assert_eq!(serde_json::to_value(&rows).unwrap(), reader);
+        // Every reason the reader names reads.
+        for reason in [
+            "name_never_bound",
+            "several_implementations",
+            "implementations_over_cap",
+            "unresolved_import",
+            "injected_callee",
+            "untyped_receiver",
+            "below_band",
+            "unanswered",
+        ] {
+            let parsed: UnreadReason = serde_json::from_value(serde_json::json!(reason)).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), reason);
+        }
+    }
+}
