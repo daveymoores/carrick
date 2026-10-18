@@ -86,6 +86,22 @@ impl UrlNormalizer {
         }
     }
 
+    /// Drop each env-var alias whose own name the config declares internal
+    /// while the variable it reads is not (carrick#2519). A base is internal
+    /// when either the name the code reads it by or the variable behind it is
+    /// declared: `env.API_URL` with `API_URL` declared stays as written, which
+    /// [`Self::consumer_call_path`] strips, rather than being rewritten to an
+    /// undeclared `${process.env.VITE_API_BASE_URL}` that stays verbatim and
+    /// joins nothing. An alias whose variable is declared, or where neither
+    /// is, is rewritten as before.
+    pub fn keep_declared_alias_names(&self, aliases: &mut crate::env_alias::EnvAliasMap) {
+        aliases.retain(|alias, env_var| {
+            let written = alias.rsplit('.').next().unwrap_or(alias);
+            self.internal_env_vars.contains(env_var.as_str())
+                || !self.internal_env_vars.contains(written)
+        });
+    }
+
     /// Create a URL normalizer with no configured domains (normalizes all URLs)
     pub fn default_permissive() -> Self {
         Self {
@@ -775,6 +791,38 @@ impl Default for UrlNormalizer {
 
 #[cfg(test)]
 mod tests {
+    /// carrick#2519: a base is internal when either the name the code reads
+    /// it by or the variable it links to is declared.
+    #[test]
+    fn a_base_is_internal_when_its_written_name_or_its_variable_is_declared() {
+        let canonical = |declared: &[&str], target: &str| {
+            let config = Config {
+                internal_env_vars: declared.iter().map(|s| s.to_string()).collect(),
+                ..Config::default()
+            };
+            let normalizer = UrlNormalizer::new(&config);
+            let mut aliases: crate::env_alias::EnvAliasMap =
+                [("env.API_URL".to_string(), "VITE_API_BASE_URL".to_string())].into();
+            normalizer.keep_declared_alias_names(&mut aliases);
+            let target = crate::env_alias::resolve_target_env_alias(target, &aliases)
+                .unwrap_or_else(|| target.to_string());
+            normalizer.consumer_call_path(&target)
+        };
+        let target = "${env.API_URL}/v1/register/search";
+        // The written name is declared, the linked variable is not.
+        assert_eq!(canonical(&["API_URL"], target), "/v1/register/search");
+        // Only the linked variable is declared.
+        assert_eq!(
+            canonical(&["VITE_API_BASE_URL"], target),
+            "/v1/register/search"
+        );
+        // Neither: the linked variable stays verbatim, as before.
+        assert_eq!(
+            canonical(&["OTHER_URL"], target),
+            "${process.env.VITE_API_BASE_URL}/v1/register/search"
+        );
+    }
+
     use super::*;
 
     fn create_test_config() -> Config {
