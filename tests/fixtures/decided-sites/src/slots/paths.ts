@@ -39,8 +39,8 @@ export function listRefunds(): Promise<Response> {
   return get("/refunds");
 }
 
-// A path that states a route with a path parameter is decided at the call,
-// whatever its callers pass.
+// A path parameter every caller passes literal text: each caller is a site,
+// with its literal.
 function readOne(id: string): Promise<Response> {
   return fetch(`/accounts/${id}`);
 }
@@ -68,4 +68,38 @@ export function archive(id: string): Promise<Response> {
 // the `?`.
 export function findGroup(id: string, workspace: string): Promise<Response> {
   return fetch(`/groups/${id}?workspace=${workspace}`);
+}
+
+// A path parameter some caller fills from data stays a path parameter at
+// the call.
+function readUser(id: string): Promise<Response> {
+  return fetch(`/users/${id}`);
+}
+
+export function readFirst(): Promise<Response> {
+  return readUser("first");
+}
+
+export function readFrom(user: { id: string }): Promise<Response> {
+  return readUser(user.id);
+}
+
+// The rest of a destructured options parameter, spread into the request:
+// the method is the one the caller's object writes.
+function sendNote(config: { path: string; method?: string; headers?: object }) {
+  const { path, headers, ...rest } = config;
+  return fetch(`${process.env.API}${path}`, { ...rest, credentials: "include" });
+}
+
+export function removeNote(id: string): Promise<Response> {
+  return sendNote({ path: `/notes/${id}`, method: "DELETE" });
+}
+
+function closeWith(path: string, init?: { method?: string; retries?: number }) {
+  const { retries, ...requestInit } = init ?? {};
+  return fetch(`${process.env.API}${path}`, { ...requestInit, credentials: "include" });
+}
+
+export function closeNote(id: string): Promise<Response> {
+  return closeWith(`/notes/${id}/close`, { method: "PATCH" });
 }

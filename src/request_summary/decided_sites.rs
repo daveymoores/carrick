@@ -723,6 +723,19 @@ fn written_at(call: &CallIr, arg: usize, key: Option<&str>) -> MethodValue {
             (None, Some((index, before))) if !before.contains_key(key) => MethodValue::Pieces(
                 vec![Piece::ParamKey(*index, key.to_string(), key.to_string())],
             ),
+            // The rest of a destructured parameter, spread first
+            // (carrick#2519): it holds the caller's key unless the pattern
+            // took the key out.
+            (None, None) => match &object.under_rest {
+                Some((index, taken)) if !taken.contains(key) => {
+                    MethodValue::Pieces(vec![Piece::ParamKey(
+                        *index,
+                        key.to_string(),
+                        key.to_string(),
+                    )])
+                }
+                _ => MethodValue::Pieces(vec![Piece::Unknown]),
+            },
             (None, _) => MethodValue::Pieces(vec![Piece::Unknown]),
         },
         (Some(key), Value::Str(pieces)) => match pieces.as_slice() {
@@ -954,6 +967,40 @@ impl<'a> Walk<'a, '_> {
         }
     }
 
+    /// Whether the call `placed`, whose slot value is `pieces`, is the site
+    /// ([`decides`]), unless a parameter of its function fills a path
+    /// segment and every caller passes that parameter text the source writes
+    /// whole: then each caller states the segment, and the callers are the
+    /// sites (one per caller, with its literal). A parameter some caller
+    /// fills with a value the code does not write (an id from data) stays a
+    /// path parameter at this call.
+    fn settles(&self, placed: &Placed<'a>, pieces: &[Piece], end: &LabelledEnd) -> bool {
+        decides(pieces, end)
+            && !(holds_parameter(pieces) && self.literal_everywhere(placed, pieces))
+    }
+
+    /// Whether some parameter `pieces` holds is passed literal text by every
+    /// caller of the function `placed` is written in (and it has callers).
+    fn literal_everywhere(&self, placed: &Placed<'a>, pieces: &[Piece]) -> bool {
+        let (Some(own), Some(key)) = (to_definition(pieces, placed.depth), placed.key) else {
+            return false;
+        };
+        let callers = self.calls.callers_of(placed.file, key);
+        if callers.is_empty() {
+            return false;
+        }
+        let literal = |caller: &Placed<'_>, index: usize| {
+            matches!(argument(caller.call, index), Some(Value::Str(pieces))
+                if !pieces.is_empty() && pieces.iter().all(|piece| matches!(piece, Piece::Lit(_))))
+        };
+        own.iter()
+            .filter_map(|piece| match piece {
+                Piece::Param(index, _) => Some(*index),
+                _ => None,
+            })
+            .any(|index| callers.iter().all(|caller| literal(caller, index)))
+    }
+
     /// Walk up the call graph from `down[0]`, whose slot value `pieces` (as
     /// its own body reads it) is still open ([`decides`]): each caller of its
     /// definition fills it, and the lowest caller whose value decides it is
@@ -989,7 +1036,7 @@ impl<'a> Walk<'a, '_> {
             let value = filled(&own, caller.call);
             let mut longer = vec![*caller];
             longer.extend_from_slice(down);
-            if decides(&value, end) {
+            if self.settles(caller, &value, end) {
                 self.site(&longer, end, value, parameter_positions(&own));
             } else {
                 self.up(&longer, &value, end, path);
@@ -1108,7 +1155,7 @@ pub fn decided_sites(
             continue;
         }
         let at_end = slot_value(last.call, slot);
-        if decides(&at_end, end) {
+        if walk.settles(&last, &at_end, end) {
             walk.site(&[last], end, at_end, BTreeSet::from([slot.arg]));
             continue;
         }
@@ -1138,11 +1185,11 @@ pub fn decided_sites(
             walk.lead(&chain[0], end, Undecided::CallbackParameter);
             continue;
         };
-        if decides(&top, end) {
+        if walk.settles(&chain[0], &top, end) {
             let below_open = n == 1
                 || values[1]
                     .as_ref()
-                    .is_none_or(|pieces| !decides(pieces, end));
+                    .is_none_or(|pieces| !walk.settles(&chain[1], pieces, end));
             if below_open {
                 walk.site(&chain, end, top, args[0].clone());
             }
@@ -2200,6 +2247,9 @@ pub(crate) mod tests {
             "fetch(path)",
             "fetch(`${process.env.API}${path}`, { ...init, credentials: \"include\" })",
             "fetch(`/groups/${id}?workspace=${workspace}`)",
+            "fetch(`/users/${id}`)",
+            "fetch(`${process.env.API}${path}`, { ...rest, credentials: \"include\" })",
+            "fetch(`${process.env.API}${path}`, { ...requestInit, credentials: \"include\" })",
         ]
         .iter()
         .map(|call| bottom(&end_for(&label, PATHS, &text, call), "fetch"))
@@ -2236,7 +2286,13 @@ pub(crate) mod tests {
             ),
             (line("get(\"/orders\")"), "${process.env.API}/orders"),
             (line("get(\"/refunds\")"), "${process.env.API}/refunds"),
-            (line("fetch(`/accounts/${id}`)"), "/accounts/${id}"),
+            (line("readOne(\"me\")"), "/accounts/me"),
+            (line("fetch(`/users/${id}`)"), "/users/${id}"),
+            (line("sendNote({"), "${process.env.API}/notes/${id}"),
+            (
+                line("closeWith(`/notes/"),
+                "${process.env.API}/notes/${id}/close",
+            ),
             (
                 line("call(`/archives/"),
                 "${process.env.API}/archives/${id}",
@@ -2248,12 +2304,33 @@ pub(crate) mod tests {
                 "{at} {name} in {sites:?}"
             );
         }
-        assert_eq!(sites.len(), 7, "{sites:?}");
-        // A route decided at its call is not carried to the caller.
-        assert!(
-            !sites.iter().any(|(at, _)| *at == line("readOne(\"me\")")),
-            "{sites:?}"
-        );
+        assert_eq!(sites.len(), 10, "{sites:?}");
+        // A segment every caller states is not a path parameter at the call;
+        // one a caller fills from data is, and its callers are not sites.
+        for not_a_site in [
+            "fetch(`/accounts/${id}`)",
+            "readUser(\"first\")",
+            "readUser(user.id)",
+        ] {
+            assert!(
+                !sites.iter().any(|(at, _)| *at == line(not_a_site)),
+                "{not_a_site}: {sites:?}"
+            );
+        }
+        // The method a caller writes into the rest of a destructured
+        // options parameter.
+        for (call, method) in [("sendNote({", "DELETE"), ("closeWith(`/notes/", "PATCH")] {
+            let site = decided
+                .sites
+                .iter()
+                .find(|site| site.line == line(call))
+                .unwrap();
+            assert!(
+                matches!(&site.method, Some(MethodValue::Pieces(pieces)) if pieces == &vec![Piece::Lit(method.into())]),
+                "{call}: {:?}",
+                site.method
+            );
+        }
         // The method a caller writes into a spread options object.
         let archive = decided
             .sites
@@ -2285,5 +2362,31 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             vec![(line("fetch(path)"), Undecided::NameNeverBound)]
         );
+    }
+
+    /// The rest of a destructured parameter is read for a decided site's
+    /// method only: the request summaries state no row through it, so no
+    /// summary row, and no body, moves (carrick#2519).
+    #[test]
+    fn a_spread_rest_moves_no_summary_row() {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let text = std::fs::read_to_string(root.join(PATHS)).unwrap();
+        let summaries = crate::request_summary::summarize(
+            &inputs,
+            &crate::client_semantics::LibrarySemantics::default(),
+        );
+        let lines: BTreeSet<u32> = inputs
+            .files
+            .keys()
+            .filter(|file| file.ends_with(PATHS))
+            .flat_map(|file| summaries.rows(file))
+            .flat_map(|at| at.values())
+            .flatten()
+            .map(|row| row.line)
+            .collect();
+        for call in ["sendNote({", "closeWith(`/notes/"] {
+            assert!(!lines.contains(&line_of(&text, call)), "{call}: {lines:?}");
+        }
     }
 }
