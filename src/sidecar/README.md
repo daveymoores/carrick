@@ -882,11 +882,11 @@ Response (counts only; the rows are in the file):
 }
 ```
 
-The file is gzip JSON lines, written to `<out_path>.partial` and renamed into place, through the write guard: a directory inside the scanned trees is refused unless it is beneath `.carrick`. Line 1 is `{"v":1,"typescript":"<version>","service":"<name>","files":N}`. Then one line per file, in request order: `{"f":"<repo-relative path>","h":"<sha256 of the bytes on disk>","r":[row, ...]}`, or with `"skip":"unreadable"` or `"skip":"not_in_program"` and no rows.
+The file is gzip JSON lines, written to `<out_path>.partial` and renamed into place, through the write guard: a directory inside the scanned trees is refused unless it is beneath `.carrick`. Line 1 is `{"v":3,"typescript":"<version>","service":"<name>","files":N}`. Then one line per file, in request order: `{"f":"<repo-relative path>","h":"<sha256 of the bytes on disk>","r":[row, ...]}`, or with `"skip":"unreadable"` or `"skip":"not_in_program"` and no rows.
 
 Each file is read in the program of the project that owns it, one owner at a time. A file that program does not take (JavaScript under a config without `allowJs`) is read after every owner, in the owner's `scripts` program: the same options with `allowJs` on, the owner's root declaration files and the files it did not take (carrick#2413). `not_in_program` is a file that program does not take either.
 
-Each row is `[kind, start, end, symbol, decl_file, decl_line, decl_package, type_text, flags]`, keyed by `(start, end, kind)`: TypeScript `getStart()`/`getEnd()` in UTF-16 code units.
+Each row is `[kind, start, end, symbol, decl_file, decl_line, decl_package, type_text, flags]`, keyed by `(start, end, kind)`: TypeScript `getStart()`/`getEnd()` in UTF-16 code units. Several `impl` rows, and several `decl` rows, share one key.
 
 | kind | node | symbol of | type of |
 |---|---|---|---|
@@ -894,8 +894,11 @@ Each row is `[kind, start, end, symbol, decl_file, decl_line, decl_package, type
 | `member` | property or element access | the name or the argument | the access |
 | `compare` | `=== !== == != < > <= >= instanceof in` | the left operand | the left operand |
 | `ident` | an identifier in expression position, a shorthand property `{ a }` included | itself | itself |
+| `jsx` | a JSX opening or self-closing element's tag | the tag's name | the tag |
+| `decl` | after a `call` or `member` row, at its span, when the member is read on a union whose constituents declare it at more than one place (carrick#2448) | one of those declarations, sorted by file then position | nothing |
+| `impl` | after a `call` or `member` row, at its span, when its declaration has no body (carrick#2430) | one implementation of it | nothing |
 
-The symbol follows aliases to a target that has a declaration. The declaration is the one the inferrer attributes it to (carrick#2031). `decl_file` is repo-relative (`node_modules/...` included), `lib:<file>` for the compiler's default library (its line is in ts-morph's copy of the library), `pkg:<name>/<path>` for an installed package outside the repo root, or `null`. `decl_package` is the module graph's or the path's package, else the `name` of the nearest `package.json` up to the repo root. `type_text` is the compiler's print of the type at the node with no enclosing declaration (`typeToString(getTypeAtLocation(node))`, default truncation), through `print-type.ts`, so one type reads the same from every file; a declaring file's path in it is written as `decl_file` names it. Flags: 1 `any`, 2 the error type (never with 1), 4 the checker threw at the node, 8 the declaration is outside the checkout and unnamed. The scanner pins the format in `src/position_rows.rs`.
+The symbol follows aliases to a target that has a declaration. The declaration is the one the inferrer attributes it to (carrick#2031). `decl_file` is repo-relative (`node_modules/...` included), `lib:<file>` for the compiler's default library (its line is in ts-morph's copy of the library), `pkg:<name>/<path>` for an installed package outside the repo root, or `null`. `decl_package` is the module graph's or the path's package, else the `name` of the nearest `package.json` up to the repo root. `type_text` is the compiler's print of the type at the node with no enclosing declaration (`typeToString(getTypeAtLocation(node))`, default truncation), through `print-type.ts`, so one type reads the same from every file; a declaring file's path in it is written as `decl_file` names it. Flags: 1 `any`, 2 the error type (never with 1), 4 the checker threw at the node, 8 the declaration is outside the checkout and unnamed, 16 an `impl` or `decl` row standing for more than 16 rows of its kind. The scanner pins the format in `src/position_rows.rs`.
 
 #### `resolve_definitions` - Read aliases out of a capture stub
 

@@ -102,10 +102,6 @@ describe('position_rows version 2: impl and jsx rows (carrick#2430)', () => {
   const implsAt = (file: string, text: string): unknown[][] =>
     rowsAt(file, 'impl', text).map((r) => [r[3], r[4], r[5], r[6], r[7], r[8]]);
 
-  it('writes format version 2', () => {
-    assert.strictEqual(JSON.parse(one.text.split('\n')[0]).v, 2);
-  });
-
   it('names the class and the object literal that implement an interface method, at the call and at the member', () => {
     const expected = [
       ['send', 'src/port.ts', 6, 'svc', null, 0],

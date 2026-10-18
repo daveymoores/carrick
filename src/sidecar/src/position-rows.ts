@@ -14,6 +14,7 @@
  * | `compare` | `=== !== == != < > <= >= instanceof in`           | the left operand          | the left operand |
  * | `ident`   | an identifier in expression position              | itself                    | itself         |
  * | `impl`    | a `call` or `member` whose declaration has no body | an implementation of it  | nothing        |
+ * | `decl`    | a `call` or `member` on a union of declaring types | one of those declarations | nothing       |
  * | `jsx`     | a JSX opening or self-closing element's tag        | the tag's name           | the tag        |
  *
  * An `impl` row (version 2, carrick#2430) follows the `call` or `member` row
@@ -24,9 +25,18 @@
  * initializer. Its `decl_*` name the implementing declaration. Past
  * {@link IMPL_CAP} the row is one, with {@link FLAG_TOO_MANY} and nothing else.
  *
- * A row's key is `(start, end, kind)`, except that several `impl` rows share
- * one: TypeScript `getStart()`/`getEnd()` of the node, in UTF-16 code units
- * from the start of the file, which is what the scanner's `sidecar_position`
+ * A `decl` row (version 3, carrick#2448) follows the `call` or `member` row
+ * it belongs to, before its `impl` rows, and has its span: one per
+ * declaration of the member when the receiver is a union whose constituents
+ * declare it at more than one place (`(pick ? a : b).get()` with two
+ * classes). That row names only the first of them. Each constituent's
+ * declaration is its own member's, or, for a member with none (a mapped
+ * type's), the declaration of the constituent type itself. Sorted and capped
+ * as `impl` rows are; `type_text` is `null`.
+ *
+ * A row's key is `(start, end, kind)`, except that several `impl` rows, and
+ * several `decl` rows, share one: TypeScript `getStart()`/`getEnd()` of the
+ * node, in UTF-16 code units from the start of the file, which is what the scanner's `sidecar_position`
  * gives for an SWC span. Every path written is relative to the scanned repo's
  * root, with `/` separators.
  *
@@ -53,7 +63,7 @@ import type { ProjectLoader } from './project-loader.js';
 import type { PositionRowsCounts } from './types.js';
 
 /** The format's version, written in the header. */
-export const POSITION_ROWS_VERSION = 2;
+export const POSITION_ROWS_VERSION = 3;
 
 /** The type is `any`, declared or inferred. Never set with the error type. */
 export const FLAG_ANY = 1;
@@ -63,7 +73,7 @@ export const FLAG_ERROR_TYPE = 2;
 export const FLAG_CHECKER_THREW = 4;
 /** The declaration is outside the checkout, not the default library and in no installed package. */
 export const FLAG_DECLARATION_UNNAMED = 8;
-/** An `impl` row standing for more implementations than {@link IMPL_CAP}; it names none. */
+/** An `impl` or `decl` row standing for more than {@link IMPL_CAP} rows of its kind; it names none. */
 export const FLAG_TOO_MANY = 16;
 /**
  * The declaration is published under the row's symbol name: its module
@@ -75,12 +85,12 @@ export const FLAG_PUBLISHED = 32;
 /** The declaration is what its module exports as `export =` or `default` (carrick#2508). */
 export const FLAG_MODULE_DEFAULT = 64;
 
-/** The most implementations one declaration's `impl` rows list. */
+/** The most `impl` rows one declaration lists, and the most `decl` rows one position lists. */
 export const IMPL_CAP = 16;
 
-/** The kinds {@link kindOf} gives a node; `impl` and `jsx` rows are written beside them. */
+/** The kinds {@link kindOf} gives a node; `impl`, `decl` and `jsx` rows are written beside them. */
 export type NodeKind = 'call' | 'member' | 'compare' | 'ident';
-export type PositionKind = NodeKind | 'impl' | 'jsx';
+export type PositionKind = NodeKind | 'impl' | 'decl' | 'jsx';
 
 /** `[kind, start, end, symbol, decl_file, decl_line, decl_package, type_text, flags]` */
 export type PositionRow = [
@@ -467,6 +477,7 @@ class PositionWalker {
         const row = this.row(kind, node, sourceFile);
         rows.push(row);
         if ((kind === 'call' || kind === 'member') && !(row[8] & FLAG_CHECKER_THREW)) {
+          for (const decl of this.declRows(kind, node)) rows.push(['decl', row[1], row[2], ...tail(decl)]);
           for (const impl of this.implRows(kind, node)) rows.push(['impl', row[1], row[2], ...tail(impl)]);
         }
       }
@@ -479,7 +490,7 @@ class PositionWalker {
     return rows;
   }
 
-  private row(kind: Exclude<PositionKind, 'impl'>, node: ts.Node, sourceFile: ts.SourceFile): PositionRow {
+  private row(kind: Exclude<PositionKind, 'impl' | 'decl'>, node: ts.Node, sourceFile: ts.SourceFile): PositionRow {
     const start = node.getStart(sourceFile);
     const end = node.getEnd();
     try {
@@ -642,18 +653,18 @@ class PositionWalker {
    * constituent that has the property; with several the row is left as it is.
    */
   private ownerDeclaration(kind: PositionKind, node: ts.Node, symbol: ts.Symbol): ts.Declaration | undefined {
-    if (kind !== 'member' && kind !== 'call') return undefined;
-    const named = nameNodeOf(kind, node);
-    const access = named?.parent;
-    if (!access || !(ts.isPropertyAccessExpression(access) || ts.isElementAccessExpression(access))) {
-      return undefined;
-    }
-    const receiver = this.checker.getTypeAtLocation(access.expression);
+    const receiver = this.receiverOf(kind, node);
+    if (!receiver) return undefined;
     const holders = (receiver.isUnionOrIntersection() ? receiver.types : [receiver]).filter(
       (constituent) => constituent.getProperty(symbol.name) !== undefined
     );
     if (holders.length !== 1) return undefined;
-    const owner = holders[0].getSymbol() ?? holders[0].aliasSymbol;
+    return this.typeDeclaration(holders[0]);
+  }
+
+  /** The declaration of a type's symbol, else of its alias symbol: a mapped type node, or the alias naming it. */
+  private typeDeclaration(type: ts.Type): ts.Declaration | undefined {
+    const owner = type.getSymbol() ?? type.aliasSymbol;
     return attributedDeclaration(() => this.program, owner?.declarations ?? []);
   }
 
@@ -718,6 +729,56 @@ class PositionWalker {
       (exports.byName.get(symbol.getName()) === symbol ? FLAG_PUBLISHED : 0) |
       (exports.wholes.includes(symbol) ? FLAG_MODULE_DEFAULT : 0)
     );
+  }
+
+  /** The type of the object a `member` or `call` row's name is read on, if the name is read on one. */
+  private receiverOf(kind: PositionKind, node: ts.Node): ts.Type | undefined {
+    if (kind !== 'member' && kind !== 'call') return undefined;
+    const access = nameNodeOf(kind, node)?.parent;
+    if (!access || !(ts.isPropertyAccessExpression(access) || ts.isElementAccessExpression(access))) {
+      return undefined;
+    }
+    return this.checker.getTypeAtLocation(access.expression);
+  }
+
+  /**
+   * The `decl` rows of a `call` or `member` row (spans unset): one per
+   * declaration the receiver's union constituents give the member, when they
+   * give more than one (carrick#2448). A constituent's declaration is its
+   * member's ({@link attributedDeclaration}), or, for a member with none, the
+   * constituent type's own ({@link typeDeclaration}). Two instantiations of
+   * one generic class, or one class and `undefined`, give one, and no row.
+   * A throw writes one row flagged {@link FLAG_CHECKER_THREW}.
+   */
+  private declRows(kind: 'call' | 'member', node: ts.Node): PositionRow[] {
+    const found = new Set<ts.Declaration>();
+    let name: string;
+    try {
+      const symbol = this.symbolOf(kind, node);
+      const receiver = this.receiverOf(kind, node);
+      if (!symbol || !receiver || !receiver.isUnion()) return [];
+      name = ts.symbolName(symbol);
+      for (const constituent of receiver.types) {
+        const member = constituent.getProperty(symbol.name);
+        if (!member) continue;
+        const declaration =
+          attributedDeclaration(() => this.program, member.declarations ?? []) ?? this.typeDeclaration(constituent);
+        if (declaration) found.add(declaration);
+      }
+    } catch {
+      return [['decl', 0, 0, null, null, null, null, null, FLAG_CHECKER_THREW]];
+    }
+    if (found.size < 2) return [];
+    if (found.size > IMPL_CAP) return [['decl', 0, 0, null, null, null, null, null, FLAG_TOO_MANY]];
+    const rows = [...found].map((declaration) => {
+      const file = declaration.getSourceFile();
+      const start = declaration.getStart(file);
+      const { declFile, declLine, declPackage } = this.located(file, start);
+      const flags = declFile === null ? FLAG_DECLARATION_UNNAMED : 0;
+      return { start, row: ['decl', 0, 0, name, declFile, declLine, declPackage, null, flags] as PositionRow };
+    });
+    rows.sort((a, b) => compareNames(a.row[4], b.row[4]) || a.start - b.start);
+    return rows.map(({ row }) => row);
   }
 
   /** The row's symbol, following aliases to a target that has a declaration. */
@@ -920,6 +981,7 @@ function nameNodeOf(kind: PositionKind, node: ts.Node): ts.Node | undefined {
     case 'ident':
       return node;
     case 'impl':
+    case 'decl':
       return undefined;
     case 'jsx':
       // The tag: `<Badge>`, `<ui.Button>`, `<this.Panel>`; a namespaced
