@@ -70,7 +70,7 @@ pub struct DiscoverySite {
 /// The labelled call a site reaches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SiteEnd {
-    /// The store's key for the package (`lib.dom`, `node:child_process`).
+    /// The store's key for the package (`lib:lib.dom.d.ts`, `node:child_process`).
     pub package: String,
     pub export: String,
     /// The member called on the export or its instance; `None` for the
@@ -191,13 +191,13 @@ pub(crate) fn receiver_spans(callee: &Expr) -> Vec<(u32, u32, bool)> {
 }
 
 /// The store's key for the package a row's declaration is in: the default
-/// library's file (`lib.dom`), a runtime module (`node:<module>`, the file
+/// library's file, as the store keys it (`lib:lib.dom.d.ts`), a runtime module (`node:<module>`, the file
 /// the runtime's types declare it in), or the package the declaring package
 /// stands for ([`runtime_package_of`]).
 fn store_key(row: &Row, exports: &[ExportClaims]) -> Option<String> {
     let file = row.decl_file()?;
-    if let Some(library) = file.strip_prefix("lib:") {
-        return Some(library.trim_end_matches(".d.ts").to_string());
+    if file.starts_with("lib:") {
+        return Some(file.to_string());
     }
     let package = row.decl_package()?;
     if package == RUNTIME_TYPES {
@@ -759,6 +759,34 @@ fn sort_key(site: &DiscoverySite) -> (&str, u32, u32, Option<(&str, u32, u32)>) 
 mod tests {
     use super::super::fixture_walk::walked;
     use super::*;
+
+    /// carrick#2504: a declaration in a default-library file is keyed as the
+    /// store keys the language's library, `lib:<file>`, not by the file's
+    /// stem.
+    #[test]
+    fn a_default_library_declaration_is_keyed_lib_colon_file() {
+        let row = |decl: &str| {
+            Row(
+                crate::position_rows::Kind::Call,
+                0,
+                5,
+                Some("fetch".into()),
+                Some(decl.into()),
+                Some(1),
+                None,
+                None,
+                0,
+            )
+        };
+        assert_eq!(
+            store_key(&row("lib:lib.dom.d.ts"), &[]),
+            Some("lib:lib.dom.d.ts".to_string())
+        );
+        assert_eq!(
+            store_key(&row("lib:lib.es2015.promise.d.ts"), &[]),
+            Some("lib:lib.es2015.promise.d.ts".to_string())
+        );
+    }
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))

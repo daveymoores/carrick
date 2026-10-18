@@ -4711,8 +4711,22 @@ impl LibraryAsk {
                 yarn_registry_env: yarn_registry_env.as_deref(),
                 npm_registry_env: npm_registry_env.as_deref(),
             },
-        )?
-        .with_roles(crate::library_store::roles_for(site_questions));
+        );
+        // The language's own library (carrick#2504): the default-library
+        // files the compiler read the code's globals from, asked only with
+        // site questions on.
+        let library = match inputs
+            .positions
+            .as_ref()
+            .map(|p| p.default_library_globals())
+        {
+            Some(Some((typescript, globals))) if site_questions => {
+                crate::library_store::default_library_packages(typescript, globals)
+            }
+            _ => Vec::new(),
+        };
+        let asked = crate::library_store::Asked::with_default_library(asked, library)?
+            .with_roles(crate::library_store::roles_for(site_questions));
         Some(Self {
             sites,
             asked,
@@ -18495,6 +18509,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 package: package.to_string(),
                 version: "1.0.0".to_string(),
                 specifiers: Vec::new(),
+                exports: Vec::new(),
             }],
         };
         let first = library_turn(&turns)(&request("lib")).await;
@@ -21674,6 +21689,146 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 assert_eq!(records, 0);
             }
         }
+    }
+
+    /// carrick#2504: the file a service calls `fetch(url, init)` in.
+    const LIB_FETCH_FILE: &str = "services/web/src/lib-fetch.ts";
+
+    fn lib_fetch_edit() -> [(&'static str, &'static str); 1] {
+        [(
+            "src/lib-fetch.ts",
+            "export function send(body: string): Promise<Response> {\n  return fetch(\"/send\", { method: \"POST\", body });\n}\n",
+        )]
+    }
+
+    /// carrick#2504: a service asks the store for the language's own
+    /// library only with site questions on: one `lib:<file>` package per
+    /// default-library file its code's globals are declared in, at the
+    /// compiler's version, narrowed with `exports` to those globals. Off, the
+    /// request is the one a run with no rows makes, byte for byte.
+    #[test]
+    fn a_service_asks_for_the_language_s_library_only_with_site_questions_on() {
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &lib_fetch_edit(),
+            true,
+        ) else {
+            return;
+        };
+        let root = on.repo.join("services/web");
+        let body = |inputs: &crate::request_summary::RequestSummaryInputs, site_questions| {
+            super::LibraryAsk::of(inputs, &root, &on.repo, Default::default(), site_questions)
+                .map(|ask| serde_json::to_string(&ask.asked.request).unwrap())
+        };
+        let off = body(&on.inputs, false).expect("off: the service asks about its packages");
+        assert!(
+            !off.contains("lib:") && !off.contains("exports"),
+            "off: the request names no library: {off}"
+        );
+        let request =
+            serde_json::from_str::<serde_json::Value>(&body(&on.inputs, true).unwrap()).unwrap();
+        let (typescript, _) = on
+            .inputs
+            .positions
+            .as_ref()
+            .unwrap()
+            .default_library_globals()
+            .unwrap();
+        let dom = request["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["package"] == "lib:lib.dom.d.ts")
+            .expect("on: the DOM library is asked about");
+        assert_eq!(dom["version"], typescript);
+        assert_eq!(dom["specifiers"], serde_json::json!(["lib:lib.dom.d.ts"]));
+        assert!(
+            dom["exports"].as_array().unwrap().contains(&"fetch".into()),
+            "on: narrowed to the globals the code uses: {dom}"
+        );
+        assert!(
+            !dom["exports"]
+                .as_array()
+                .unwrap()
+                .contains(&"WebSocket".into()),
+            "on: a global the code does not use is not asked"
+        );
+    }
+
+    /// The shim store's answer for the language's library: `fetch` labelled
+    /// an HTTP client under each `lib:` package the request names, at the
+    /// version it names, and nothing for any other.
+    fn lib_store(request: &crate::library_store::LibraryClaimsRequest) -> String {
+        let answers: Vec<serde_json::Value> = request
+            .packages
+            .iter()
+            .filter(|package| package.package.starts_with("lib:"))
+            .map(|package| {
+                serde_json::json!({
+                    "package": package.package, "version": package.version,
+                    "status": "answered",
+                    "exports": [{
+                        "specifier": package.package, "export": "fetch",
+                        "role": "http_client", "side": "client",
+                        "makes": [], "scopes": [],
+                        "ops": [{"op": "request", "member": null, "on": "export",
+                                 "name": {"arg": 0}}],
+                        "reserved": [], "calls": [], "patterns": []
+                    }]
+                })
+            })
+            .collect();
+        serde_json::json!({ "library_claims": answers }).to_string()
+    }
+
+    /// carrick#2504: `fetch(url, init)` in a service, with the store's
+    /// `lib:` label for it, is a discovery site with its record, keyed as
+    /// the store keys the language's library. The label reaches the scan
+    /// only because the request named the `lib:` package.
+    #[tokio::test]
+    async fn a_fetch_call_is_a_site_through_the_store_s_lib_label() {
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &lib_fetch_edit(),
+            true,
+        ) else {
+            return;
+        };
+        let root = on.repo.join("services/web");
+        let ask = super::LibraryAsk::of(&on.inputs, &root, &on.repo, Default::default(), true)
+            .expect("the service asks the store");
+        let settled = crate::library_store::ask_until_settled(
+            &ask.asked,
+            |_| async {},
+            |request| async move { Ok(lib_store(&request)) },
+        )
+        .await;
+        let of = super::site_records_of(&on.inputs, &on.repo, &settled.exports);
+        let sites: Vec<(u32, String, String)> = of
+            .decided
+            .sites
+            .iter()
+            .filter(|site| site.file == LIB_FETCH_FILE)
+            .map(|site| (site.line, site.end.package.clone(), site.end.role.clone()))
+            .collect();
+        assert_eq!(
+            sites,
+            vec![(2, "lib:lib.dom.d.ts".to_string(), "http_client".to_string())]
+        );
+        let records = of
+            .records
+            .iter()
+            .filter(|record| {
+                serde_json::to_string(&record.state.point)
+                    .unwrap()
+                    .contains("lib-fetch.ts")
+            })
+            .count();
+        assert_eq!(records, 1, "the site has its record");
     }
 
     /// carrick#2506: a factory typed in a DefinitelyTyped-style package
