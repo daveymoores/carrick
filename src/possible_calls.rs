@@ -58,6 +58,11 @@ pub enum UnreadReason {
     BelowBand,
     /// The call was not checked on this scan.
     Unanswered,
+    /// The call reaches a library export the store labels with a network
+    /// role and no op, so nothing says what it sends or receives
+    /// (carrick#2515). The reader has no phrase for it yet: it keeps the
+    /// row and the word, and shows no `why`.
+    NoOpClaim,
 }
 
 /// The slot the code does not state, and why.
@@ -174,6 +179,7 @@ fn reason_of_undecided(reason: Undecided) -> UnreadReason {
         // A parameter of a callback this code does not call is, like a
         // parameter nothing fills, a name only the running program knows.
         Undecided::NameNeverBound | Undecided::CallbackParameter => UnreadReason::NameNeverBound,
+        Undecided::NoOpClaim => UnreadReason::NoOpClaim,
     }
 }
 

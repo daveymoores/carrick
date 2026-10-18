@@ -396,6 +396,10 @@ pub enum Undecided {
     NameNeverBound,
     /// The slot holds a parameter of a callback this code does not call.
     CallbackParameter,
+    /// The call reaches an export the store labels with a network role and
+    /// no op (carrick#2515): the store says nothing about what its members
+    /// do, so no slot can be read. The call is listed, not named.
+    NoOpClaim,
 }
 
 /// A discovered call whose name no call of this code decides.
@@ -915,6 +919,23 @@ impl<'a> Walk<'a, '_> {
         }
     }
 
+    /// A call on an export the store labels with no op: a lead of its own
+    /// reason, at the labelled call.
+    fn no_op_claim(&mut self, end: &LabelledEnd) {
+        let lead = DecidedLead {
+            file: end.file.clone(),
+            line: end.line,
+            span_start: end.span_start,
+            span_end: end.span_end,
+            depth: 0,
+            end: end.clone(),
+            reason: Undecided::NoOpClaim,
+        };
+        if !self.out.leads.contains(&lead) {
+            self.out.leads.push(lead);
+        }
+    }
+
     /// Walk up the call graph from `down[0]`, whose slot value `pieces` (as
     /// its own body reads it) still holds a parameter: each caller of its
     /// definition fills it, and the lowest caller left with none is the
@@ -1005,7 +1026,8 @@ fn via_of(root: &Path, down: &[Placed<'_>]) -> Vec<Via> {
 
 /// Every call in `discovered` where its name is decided, and every one
 /// whose name no call of this code decides, read with the labels the store
-/// answers (`labels`). A labelled call no label answers is skipped. Files
+/// answers (`labels`). A labelled call no label answers is skipped, unless
+/// its export has no op label at all: that is a lead (carrick#2515). Files
 /// are named relative to `root`, the scanned repo's root.
 pub fn decided_sites(
     inputs: &RequestSummaryInputs,
@@ -1038,6 +1060,15 @@ pub fn decided_sites(
             continue;
         };
         let Some(label) = SiteLabel::find(labels, end) else {
+            // An export the store labels with a role and no op at all
+            // (carrick#2515): the call is a lead. An export with ops, and a
+            // member of it none labels, is not.
+            if !labels
+                .iter()
+                .any(|label| label.package == end.package && label.export == end.export)
+            {
+                walk.no_op_claim(end);
+            }
             continue;
         };
         walk.label = Some(label);
@@ -1418,6 +1449,69 @@ pub(crate) mod tests {
                     }),
                 },
             ]
+        );
+    }
+
+    /// carrick#2515: a call on an export the store labels `graphql_client`
+    /// with no op is a lead of its own reason and no site; a member the
+    /// store left unlabelled on an export that has ops is neither.
+    #[test]
+    fn a_call_on_an_export_with_no_op_is_a_lead_not_a_vanishing() {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([
+                { "package": "gql-thing", "version": "1.0.0", "specifier": "gql-thing",
+                  "export": "Client", "role": "graphql_client", "side": "client", "claims": [] },
+                { "package": "bus-thing", "version": "1.0.0", "specifier": "bus-thing",
+                  "export": "Bus", "role": "broker", "side": "client",
+                  "claims": [{ "kind": "op", "op": "send", "member": "publish",
+                               "name": { "arg": 0 } }] }
+            ]))
+            .unwrap();
+        let labels = SiteLabel::from_exports(&exports);
+        let end = |package: &str, export: &str, member: &str, role: &str, line: u32| LabelledEnd {
+            package: package.into(),
+            export: export.into(),
+            member: Some(member.into()),
+            role: role.into(),
+            op: None,
+            file: "src/gql.ts".into(),
+            line,
+            span_start: line * 100,
+            span_end: line * 100 + 20,
+        };
+        let sites = [
+            bottom(
+                &end("gql-thing", "Client", "query", "graphql_client", 3),
+                "client.query",
+            ),
+            bottom(
+                &end("gql-thing", "Client", "query", "graphql_client", 3),
+                "client.query",
+            ),
+            bottom(&end("bus-thing", "Bus", "close", "broker", 4), "bus.close"),
+        ];
+        let decided = decided_sites(&inputs, &root, &sites, &labels);
+        assert!(decided.sites.is_empty(), "{:?}", decided.sites);
+        assert_eq!(
+            decided
+                .leads
+                .iter()
+                .map(|lead| (lead.file.as_str(), lead.line, lead.reason))
+                .collect::<Vec<_>>(),
+            vec![("src/gql.ts", 3, Undecided::NoOpClaim)]
+        );
+        let found = crate::possible_calls::from_sites(&decided, &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].unread.reason,
+            crate::possible_calls::UnreadReason::NoOpClaim
+        );
+        assert_eq!(found[0].kind.as_deref(), Some("graphql"));
+        assert_eq!(
+            serde_json::to_value(found[0].unread.reason).unwrap(),
+            "no_op_claim"
         );
     }
 
