@@ -139,6 +139,11 @@ pub struct RegistryPackage {
     /// The specifiers the service imports it by. A runtime module's is its
     /// `node:` form, the only one the store takes.
     pub specifiers: Vec<String>,
+    /// For a `lib:<file>` entry, the globals the code uses from that file:
+    /// the whole file lists more than the store's cap holds (carrick#2504).
+    /// Omitted when empty, so a request without one is byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exports: Vec<String>,
 }
 
 /// Where a service's install lives: what the A2 rule reads.
@@ -188,11 +193,37 @@ impl Asked {
                         package: name.to_string(),
                         version: "1.0.0".to_string(),
                         specifiers: vec![name.to_string()],
+                        exports: Vec::new(),
                     })
                     .collect(),
             },
             spellings: BTreeMap::new(),
         }
+    }
+
+    /// This request plus `library` (the language's own library, from
+    /// [`default_library_packages`]). A service that asks about no package
+    /// still asks about the library, so `asked` may be `None`.
+    pub fn with_default_library(
+        asked: Option<Self>,
+        library: Vec<RegistryPackage>,
+    ) -> Option<Self> {
+        if library.is_empty() {
+            return asked;
+        }
+        let mut asked = asked.unwrap_or_else(|| Self {
+            request: LibraryClaimsRequest {
+                roles: ROLES.to_vec(),
+                packages: Vec::new(),
+            },
+            spellings: BTreeMap::new(),
+        });
+        let room = MAX_PACKAGES.saturating_sub(asked.request.packages.len());
+        asked
+            .request
+            .packages
+            .extend(library.into_iter().take(room));
+        Some(asked)
     }
 
     /// The same packages, asking `roles` instead.
@@ -284,6 +315,7 @@ pub fn request(specifiers: &BTreeSet<String>, install: &Install<'_>) -> Option<A
             package,
             version,
             specifiers: specifiers.into_iter().take(MAX_SPECIFIERS).collect(),
+            exports: Vec::new(),
         })
         .collect();
     (!packages.is_empty()).then(|| Asked {
@@ -293,6 +325,29 @@ pub fn request(specifiers: &BTreeSet<String>, install: &Install<'_>) -> Option<A
         },
         spellings,
     })
+}
+
+/// The language's own library as the store is asked about it (carrick#2504):
+/// one `lib:<file>` package per default-library file the program loads, at
+/// the compiler's version, narrowed to the globals the code uses from it.
+/// `globals` is by library file (`lib.dom.d.ts`).
+pub fn default_library_packages(
+    typescript: &str,
+    globals: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<RegistryPackage> {
+    globals
+        .iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(file, names)| {
+            let key = format!("lib:{file}");
+            RegistryPackage {
+                package: key.clone(),
+                version: typescript.to_string(),
+                specifiers: vec![key],
+                exports: names.iter().cloned().collect(),
+            }
+        })
+        .collect()
 }
 
 /// The entry one specifier is asked under.
@@ -1285,6 +1340,36 @@ mod tests {
         );
         let again = on.only(&BTreeSet::from(["lib".to_string()])).unwrap();
         assert_eq!(again.roles, NETWORK_ROLES.to_vec());
+    }
+
+    /// carrick#2504: the language's own library is one `lib:<file>` package
+    /// per file at the compiler's version, narrowed with `exports`, added to
+    /// a service's request even when it asks about no other package. A
+    /// request without one is the request it was (`exports` is not written).
+    #[test]
+    fn the_language_s_library_is_a_package_per_file_narrowed_to_its_globals() {
+        let globals: BTreeMap<String, BTreeSet<String>> = BTreeMap::from([
+            (
+                "lib.dom.d.ts".to_string(),
+                BTreeSet::from(["WebSocket".to_string(), "fetch".to_string()]),
+            ),
+            ("lib.es5.d.ts".to_string(), BTreeSet::new()),
+        ]);
+        let library = default_library_packages("6.0.2", &globals);
+        let asked = Asked::with_default_library(None, library).expect("the library is asked");
+        assert_eq!(
+            serde_json::to_string(&asked.request.packages).unwrap(),
+            r#"[{"package":"lib:lib.dom.d.ts","version":"6.0.2","specifiers":["lib:lib.dom.d.ts"],"exports":["WebSocket","fetch"]}]"#
+        );
+        assert!(Asked::with_default_library(None, Vec::new()).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        install_package(dir.path(), "lib", "1.0.0");
+        npm_lockfile(dir.path(), &[("lib", PUBLIC_TGZ)]);
+        let plain = request(&specifiers(&["lib"]), &install_at(dir.path())).unwrap();
+        assert_eq!(
+            Asked::with_default_library(Some(plain.clone()), Vec::new()),
+            Some(plain)
+        );
     }
 
     #[test]

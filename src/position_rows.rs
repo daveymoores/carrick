@@ -42,7 +42,7 @@
 //! of any other version is not read: no rows file outlives the run that
 //! wrote it, so its service reads as [`HoleReason::RowsMissing`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -327,6 +327,13 @@ pub struct PositionIndex {
     scan_root: PathBuf,
     /// By repo-relative path with `/` separators, as [`FileRows::f`].
     files: HashMap<String, IndexedFile>,
+    /// The compiler version the rows were read with ([`Header::typescript`]);
+    /// `None` for an index with no rows.
+    typescript: Option<String>,
+    /// The globals the code uses that the compiler's default library
+    /// declares, by the library file (`lib.dom.d.ts`): the symbol of each
+    /// identifier row whose declaration is a `lib:` file.
+    library_globals: BTreeMap<String, BTreeSet<String>>,
     /// How many lookups converted a span, for the tests that a reader asks
     /// once per position.
     #[cfg(test)]
@@ -368,6 +375,7 @@ impl PositionIndex {
 
     /// The index over a rows file read for the repo rooted at `scan_root`.
     pub fn of(scan_root: &Path, rows: RowsFile) -> Self {
+        let mut library_globals: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let files = rows
             .files
             .into_iter()
@@ -375,6 +383,17 @@ impl PositionIndex {
                 let mut rows = HashMap::new();
                 let mut impls: HashMap<(u32, u32), Vec<Row>> = HashMap::new();
                 for row in file.r {
+                    if row.kind() == Kind::Ident
+                        && let (Some(symbol), Some(library)) = (
+                            row.symbol(),
+                            row.decl_file().and_then(|file| file.strip_prefix("lib:")),
+                        )
+                    {
+                        library_globals
+                            .entry(library.to_string())
+                            .or_default()
+                            .insert(symbol.to_string());
+                    }
                     if row.kind() == Kind::Impl {
                         impls.entry((row.start(), row.end())).or_default().push(row);
                     } else {
@@ -395,8 +414,19 @@ impl PositionIndex {
             .collect();
         Self {
             files,
+            typescript: Some(rows.header.typescript),
+            library_globals,
             ..Self::missing(scan_root)
         }
+    }
+
+    /// The compiler version the rows were read with, and the globals the
+    /// code uses from each default-library file the program loads
+    /// (`lib.dom.d.ts` and its names): what the library store is asked
+    /// about the language's own library (carrick#2504). `None` for an index
+    /// with no rows.
+    pub fn default_library_globals(&self) -> Option<(&str, &BTreeMap<String, BTreeSet<String>>)> {
+        Some((self.typescript.as_deref()?, &self.library_globals))
     }
 
     /// How many lookups converted a span so far.
@@ -1082,5 +1112,38 @@ mod tests {
         let short = "{\"v\":2,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                      {\"f\":\"a.ts\",\"r\":[[\"call\",0,3]]}\n";
         assert!(read_rows(short.as_bytes()).is_err());
+    }
+
+    /// carrick#2504: the identifier rows whose declaration is a default-library
+    /// file give the globals the code uses from each file, and the header the
+    /// compiler version; a member row, and a declaration in a package, give none.
+    #[test]
+    fn the_index_names_the_default_library_globals_the_code_uses() {
+        let text = "{\"v\":2,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+                    {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[\
+                    [\"ident\",0,5,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
+                    [\"ident\",6,9,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
+                    [\"ident\",10,12,\"Promise\",\"lib:lib.es5.d.ts\",1,null,\"x\",0],\
+                    [\"member\",13,15,\"push\",\"lib:lib.es5.d.ts\",1,null,\"x\",0],\
+                    [\"ident\",16,18,\"lib\",\"node_modules/p/index.d.ts\",1,\"p\",\"x\",0]]}\n";
+        let index = PositionIndex::of(Path::new("/repo"), read_rows(text.as_bytes()).unwrap());
+        let (typescript, globals) = index.default_library_globals().unwrap();
+        assert_eq!(typescript, "6.0.2");
+        let got: Vec<(&str, Vec<&str>)> = globals
+            .iter()
+            .map(|(file, names)| (file.as_str(), names.iter().map(String::as_str).collect()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("lib.dom.d.ts", vec!["fetch"]),
+                ("lib.es5.d.ts", vec!["Promise"])
+            ]
+        );
+        assert!(
+            PositionIndex::missing(Path::new("/repo"))
+                .default_library_globals()
+                .is_none()
+        );
     }
 }

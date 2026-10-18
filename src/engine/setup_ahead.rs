@@ -1269,6 +1269,7 @@ pub(crate) mod tests {
                 package: package.to_string(),
                 version: "1.0.0".to_string(),
                 specifiers: Vec::new(),
+                exports: Vec::new(),
             }],
         };
         assert_eq!(library_ask(&request("lib")), library_ask(&request("lib")));
