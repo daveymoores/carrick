@@ -359,7 +359,7 @@ fn op_name(op: LibraryOp) -> &'static str {
 /// (contract amendment 2, B3): `of` names exactly one receiver, `on` the
 /// export, every instance, or both. An element carrying both, or neither,
 /// applies to nothing.
-fn applies(on: Option<ClaimOn>, of: Option<&str>, receiver: &str) -> bool {
+pub(crate) fn applies(on: Option<ClaimOn>, of: Option<&str>, receiver: &str) -> bool {
     let instance = receiver.starts_with("instance:");
     match (on, of) {
         (None, Some(of)) => of == receiver,

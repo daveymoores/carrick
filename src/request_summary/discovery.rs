@@ -7,7 +7,10 @@
 //! calls in its body, and so on, [`RequestSummaryInputs::reach`]), reaches a
 //! call or `new` on a labelled export: the export itself (`fetch(…)`, `new
 //! Socket(…)`), or a member of something whose row names a labelled export
-//! by its symbol or its type (`this.child.send(…)` on a `ChildProcess`). An
+//! by its symbol or its type (`this.child.send(…)` on a `ChildProcess`), or
+//! a member of an instance one of a labelled export's makers built, as the
+//! library-site reader reads it (`const app = pkg(); app.post(…)`, matched
+//! on the op the store labels on that receiver, carrick#2506). An
 //! export is matched by the name the store keys it by: the name the module
 //! publishes it as (`default`, `export =`, a renamed export) for a call
 //! through an import binding, and for a global of the language's own library
@@ -36,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use super::row_calls::Reach;
 use super::*;
-use crate::library_claims::{ExportClaims, runtime_package_of};
+use crate::library_claims::{ExportClaims, applies, runtime_package_of};
 use crate::library_store::RUNTIME_TYPES;
 use crate::position_rows::{FLAG_DECLARATION_UNNAMED, Kind, Row};
 use crate::services::type_sidecar::{LibraryClaim, LibraryOp, LibraryRole};
@@ -294,6 +297,10 @@ struct Walker<'a> {
     inputs: &'a RequestSummaryInputs,
     labels: &'a Labels<'a>,
     root: &'a Path,
+    /// Each call the library-site reader reads as made through an instance
+    /// a package export's maker built (`const app = pkg(); app.post(…)`),
+    /// by its file and SWC span ([`super::library_sites`]).
+    instances: HashMap<(&'a Path, u32, u32), &'a LibrarySite>,
     memo: HashMap<(PathBuf, String), Outcome>,
     /// The definitions being read, by how deep.
     reading: HashMap<(PathBuf, String), usize>,
@@ -429,6 +436,53 @@ impl Walker<'_> {
             && let Some(claims) = self.labels.global(symbol)
         {
             return Some(end(&claims.package, symbol, None, claims));
+        }
+        // `app.post(…)` where `const app = pkg()`: a member the store labels
+        // on the receiver that maker builds (`instance:()`), the instance
+        // read by the library-site reader, wherever it is held.
+        if let Some(site) = self
+            .instances
+            .get(&(file, call.site.span_start, call.site.span_end))
+            && site.path.is_empty()
+            && let Some(member) = site.member.as_deref()
+        {
+            let receivers = site.receiver_ids();
+            let exports = if site.export == "default" {
+                vec!["default", "export ="]
+            } else {
+                vec![site.export.as_str()]
+            };
+            for key in specifier_keys(&site.specifier) {
+                for export in &exports {
+                    let Some(claims) = self.labels.get(&key, export) else {
+                        continue;
+                    };
+                    let op = claims.claims.iter().find_map(|claim| match claim {
+                        LibraryClaim::Op {
+                            op,
+                            member: claimed,
+                            path,
+                            on,
+                            of,
+                            ..
+                        } if claimed.as_deref() == Some(member)
+                            && path.is_empty()
+                            && receivers
+                                .iter()
+                                .any(|receiver| applies(*on, of.as_deref(), receiver)) =>
+                        {
+                            Some(*op)
+                        }
+                        _ => None,
+                    });
+                    if let Some(op) = op {
+                        return Some(SiteEnd {
+                            op: Some(op),
+                            ..end(&key, export, Some(member), claims)
+                        });
+                    }
+                }
+            }
         }
         let package = package?;
         let positions = self.inputs.positions.as_ref()?;
@@ -657,10 +711,18 @@ pub fn discover(inputs: &RequestSummaryInputs, labels: &Labels<'_>, root: &Path)
     if inputs.positions.is_none() {
         return discovery;
     }
+    let library = super::library_sites(inputs);
+    let instances = library
+        .sites
+        .iter()
+        .filter(|site| site.origin.is_none() && !site.makers().is_empty())
+        .map(|site| ((site.file.as_path(), site.span_start, site.span_end), site))
+        .collect();
     let mut walker = Walker {
         inputs,
         labels,
         root,
+        instances,
         memo: HashMap::new(),
         reading: HashMap::new(),
     };

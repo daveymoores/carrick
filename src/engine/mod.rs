@@ -4818,6 +4818,8 @@ async fn site_rows_of(
     }
     let root = Path::new(repo_path);
     let SiteRecordsOf {
+        discovered,
+        reached_label,
         decided,
         records,
         labels: site_labels,
@@ -4834,10 +4836,22 @@ async fn site_rows_of(
         !protocol_producer_provenance(&root.join(&row.file), repo_path, service).is_mock()
     });
     key_site_requests_canonically(&mut rows, &UrlNormalizer::new(service));
+    let mut leads_by_reason: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for lead in &rows.leads {
+        let reason = serde_json::to_value(lead.unread.reason)
+            .ok()
+            .and_then(|reason| reason.as_str().map(str::to_string))
+            .unwrap_or_default();
+        *leads_by_reason.entry(reason).or_default() += 1;
+    }
     debug!(
-        sites = decided.sites.len(),
+        discovered,
+        reached_label,
+        decided = decided.sites.len(),
         rows = rows.rows.len(),
         possible_calls = rows.leads.len(),
+        leads_by_reason = ?leads_by_reason,
         "site questions: rows"
     );
     rows
@@ -4846,6 +4860,11 @@ async fn site_rows_of(
 /// What a service's site questions read before anything is asked
 /// ([`site_records_of`]).
 struct SiteRecordsOf {
+    /// The calls discovery lists: each one that reached a labelled export,
+    /// and each walk that entered code and stopped.
+    discovered: usize,
+    /// Those that reached a labelled export.
+    reached_label: usize,
     decided: crate::request_summary::decided_sites::Decided,
     records: Vec<crate::request_summary::site_record::SiteRecord>,
     labels: Vec<crate::request_summary::decided_sites::SiteLabel>,
@@ -4861,22 +4880,29 @@ fn site_records_of(
     claims: &[crate::library_claims::ExportClaims],
 ) -> SiteRecordsOf {
     let labels = crate::request_summary::discovery::Labels::of(claims);
-    let discovered: Vec<crate::request_summary::decided_sites::DiscoverySite> =
-        crate::request_summary::discovery::discover(inputs, &labels, root)
-            .sites
-            .iter()
-            .filter_map(|site| {
-                serde_json::to_value(site)
-                    .and_then(serde_json::from_value)
-                    .ok()
-            })
-            .collect();
+    let discovery = crate::request_summary::discovery::discover(inputs, &labels, root);
+    let reached_label = discovery
+        .sites
+        .iter()
+        .filter(|site| site.end.is_some())
+        .count();
+    let discovered: Vec<crate::request_summary::decided_sites::DiscoverySite> = discovery
+        .sites
+        .iter()
+        .filter_map(|site| {
+            serde_json::to_value(site)
+                .and_then(serde_json::from_value)
+                .ok()
+        })
+        .collect();
     let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
     let decided =
         crate::request_summary::decided_sites::decided_sites(inputs, root, &discovered, &labels);
     let records =
         crate::request_summary::site_record::site_records(inputs, root, &decided, &labels);
     SiteRecordsOf {
+        discovered: discovery.sites.len(),
+        reached_label,
         decided,
         records,
         labels,
@@ -21648,6 +21674,115 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 assert_eq!(records, 0);
             }
         }
+    }
+
+    /// carrick#2506: a factory typed in a DefinitelyTyped-style package
+    /// (`export =` in `@types/<name>`, the runtime package shipping no types),
+    /// imported by default. The store labels the package's `default`, with a
+    /// route op on the instance its call returns. The factory call is a
+    /// discovery site through its import binding, and the member call on the
+    /// instance is a site that reaches the op, so it is decided.
+    #[tokio::test]
+    async fn a_member_call_on_an_export_equals_factory_s_instance_is_a_decided_site() {
+        let edit = [
+            (
+                "node_modules/fixture-app/package.json",
+                r#"{ "name": "fixture-app", "version": "1.0.0", "main": "index.js" }"#,
+            ),
+            (
+                "node_modules/fixture-app/index.js",
+                "module.exports = function () { return {}; };\n",
+            ),
+            (
+                "node_modules/@types/fixture-app/package.json",
+                r#"{ "name": "@types/fixture-app", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/@types/fixture-app/index.d.ts",
+                "declare function make(): make.App;\ndeclare namespace make {\n  interface App {\n    post(path: string, handler: (body: unknown) => void): void;\n  }\n}\nexport = make;\n",
+            ),
+            (
+                "src/server.ts",
+                "import makeApp from \"fixture-app\";\n\nconst app = makeApp();\n\nfunction onOrder(body: unknown): void {\n  void body;\n}\n\napp.post(\"/orders\", onOrder);\n",
+            ),
+        ];
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        ) else {
+            return;
+        };
+        let answer = r#"{"library_claims":[{"package":"fixture-app","version":"1.0.0","status":"answered",
+            "type_packages":["@types/fixture-app"],"exports":[
+            {"specifier":"fixture-app","export":"default","role":"server_framework","side":null,
+             "makes":[{"form":"call","member":null}],"scopes":[],
+             "ops":[{"op":"receive","member":"post","of":"instance:()","name":{"arg":0},"handler":{"arg":1},"method":"POST"}],
+             "reserved":[],"calls":[],"patterns":[]}]}]}"#;
+        let exports = crate::library_store::parse_answer(answer).exports;
+        assert_eq!(exports.len(), 1, "the label parses");
+        let file = "services/web/src/server.ts";
+        let labels = crate::request_summary::discovery::Labels::of(&exports);
+        let discovered: Vec<(u32, String, Option<String>)> =
+            crate::request_summary::discovery::discover(&on.inputs, &labels, &on.repo)
+                .sites
+                .into_iter()
+                .filter(|site| site.file == file)
+                .map(|site| {
+                    (
+                        site.line,
+                        site.callee,
+                        site.end.map(|end| {
+                            format!(
+                                "{} {} {}",
+                                end.package,
+                                end.export,
+                                end.member.as_deref().unwrap_or("-")
+                            )
+                        }),
+                    )
+                })
+                .collect();
+        assert_eq!(
+            discovered,
+            vec![
+                (
+                    3,
+                    "makeApp".to_string(),
+                    Some("fixture-app default -".to_string())
+                ),
+                (
+                    9,
+                    "app.post".to_string(),
+                    Some("fixture-app default post".to_string())
+                ),
+            ],
+            "the factory call and the member call on its instance are sites"
+        );
+        let of = super::site_records_of(&on.inputs, &on.repo, &exports);
+        let decided: Vec<(String, u32, String)> = of
+            .decided
+            .sites
+            .iter()
+            .filter(|site| site.file == file)
+            .map(|site| (site.file.clone(), site.line, site.end.role.clone()))
+            .collect();
+        assert_eq!(
+            decided,
+            vec![(file.to_string(), 9, "server_framework".to_string())],
+            "the member call is decided"
+        );
+        // The debug line's counts, service-wide: the store labels only this
+        // package, so the two calls above are every call that reached a
+        // label; the other walks the fixture lists stopped.
+        assert_eq!(of.reached_label, 2, "calls that reached a label");
+        assert!(
+            of.discovered > of.reached_label,
+            "stopped walks are listed too"
+        );
+        assert_eq!(of.decided.sites.len(), 1, "decided sites");
     }
 
     /// carrick#2439: on, an answer in the band replaces the model's pub/sub
