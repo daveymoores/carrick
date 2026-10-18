@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.119](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.118...carrick-v0.3.119) (2026-10-18)
+
+
+### Features
+
+* **library-store:** ask every network role when site questions are on ([#2436](https://github.com/carrick-tools/carrick/issues/2436)) ([#2503](https://github.com/carrick-tools/carrick/issues/2503)) ([fca47c3](https://github.com/carrick-tools/carrick/commit/fca47c350c8edf5de0d88bc3722757c6a9bec5b3))
+* **library-store:** ask the store for the language's own library (lib: keys) ([#2504](https://github.com/carrick-tools/carrick/issues/2504)) ([#2509](https://github.com/carrick-tools/carrick/issues/2509)) ([6c0e6db](https://github.com/carrick-tools/carrick/commit/6c0e6db0cbf930c25e3e2d527c98f3afa17adfa4))
+* **sidecar:** library claims and listings for the default library's globals (lib: keys) ([#2502](https://github.com/carrick-tools/carrick/issues/2502)) ([68c7bcb](https://github.com/carrick-tools/carrick/commit/68c7bcbe9186938da74ba3cbaded073cc701fca2))
+
+
+### Bug Fixes
+
+* **discovery:** a member call on a factory's instance reaches the store's op ([#2506](https://github.com/carrick-tools/carrick/issues/2506)) ([#2507](https://github.com/carrick-tools/carrick/issues/2507)) ([a025e5c](https://github.com/carrick-tools/carrick/commit/a025e5cac8762bbc9e91f05815b8d393a482c7c6))
+* **discovery:** match a row by name only when its package publishes that name; read an export= target as default ([#2508](https://github.com/carrick-tools/carrick/issues/2508)) ([#2511](https://github.com/carrick-tools/carrick/issues/2511)) ([067fd3a](https://github.com/carrick-tools/carrick/commit/067fd3acdb7eaee284fab533b3363b5be8289147))
+
 ## [0.3.118](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.117...carrick-v0.3.118) (2026-10-17)
 
 
