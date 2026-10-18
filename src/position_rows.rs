@@ -40,11 +40,11 @@
 //!
 //! Version 2 (carrick#2430) added [`Kind::Impl`] and [`Kind::Jsx`]; version
 //! 3 (carrick#2448) added [`Kind::Decl`]. A file of any other version is not
-//! read: no rows file outlives the run that
-//! wrote it, so its service reads as [`HoleReason::RowsMissing`].
+//! read: its service reads as [`HoleReason::RowsMissing`]. A walk removes any
+//! earlier rows file before it writes, so none outlives the run that wrote it.
 //!
 //! [`FLAG_PUBLISHED`] and [`FLAG_MODULE_DEFAULT`] (carrick#2508) are flag
-//! bits within version 2, not a new version: a row written without them
+//! bits, not a new version: a row written without them
 //! still reads, and reads as a declaration nothing says is published, which
 //! discovery's name match abstains on.
 
@@ -1021,8 +1021,9 @@ mod tests {
     }
 
     /// carrick#2448: the reader reads version 3 only; a file of any other
-    /// version is an error, so `load_index` gives every lookup
-    /// [`HoleReason::RowsMissing`].
+    /// version is an error, so `load_index` over a version-2 file left by an
+    /// earlier build gives every lookup [`HoleReason::RowsMissing`] and the
+    /// scan goes on.
     #[test]
     fn a_rows_file_of_another_version_is_not_read() {
         for v in [2, 4] {
@@ -1037,7 +1038,7 @@ mod tests {
         let destination = destination_from(Some("1"), Some(dir.path()), dir.path(), "repo", None)
             .expect("the flag walks");
         std::fs::create_dir_all(destination.path().parent().unwrap()).unwrap();
-        let text = "{\"v\":1,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":2,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[[\"ident\",0,1,\"a\",\"a.ts\",1,null,\"1\",0]]}\n";
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut gz, text.as_bytes()).unwrap();

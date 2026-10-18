@@ -1104,13 +1104,13 @@ mod tests {
         );
     }
 
-    /// carrick#2508: the publication bits are flag bits within version 2. A
-    /// row written before them still reads, and reads as a declaration
-    /// nothing says is published: no name to match it by.
+    /// carrick#2508: the publication bits are flag bits. A row with neither
+    /// reads as a declaration nothing says is published: no name to match it
+    /// by.
     #[test]
     fn a_row_without_the_publication_bits_reads_and_names_nothing() {
         let text = concat!(
-            r#"{"v":2,"typescript":"5.9.3","service":"api","files":1}"#,
+            r#"{"v":3,"typescript":"5.9.3","service":"api","files":1}"#,
             "\n",
             r#"{"f":"src/a.ts","h":"00","r":[["call",0,7,"greet","node_modules/p/index.d.ts",1,"p","string",0],["call",9,16,"make","node_modules/p/index.d.ts",3,"p","App",96]]}"#,
             "\n"
