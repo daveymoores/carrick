@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.120](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.119...carrick-v0.3.120) (2026-10-18)
+
+
+### Features
+
+* **doctor:** no workflow warning where Carrick builds the index ([#2514](https://github.com/carrick-tools/carrick/issues/2514)) ([b4edb7f](https://github.com/carrick-tools/carrick/commit/b4edb7f145f84211055480518f211e15de88ae0c))
+* **init:** set up a cloud-built workspace without questions ([#2291](https://github.com/carrick-tools/carrick/issues/2291)) ([f1455d6](https://github.com/carrick-tools/carrick/commit/f1455d61c91798a62217913efd0f665a9aa40997)), closes [#2219](https://github.com/carrick-tools/carrick/issues/2219)
+* **sidecar:** decl rows list each declaration of a member read on a union ([#2448](https://github.com/carrick-tools/carrick/issues/2448) slice B) ([#2512](https://github.com/carrick-tools/carrick/issues/2512)) ([66400e9](https://github.com/carrick-tools/carrick/commit/66400e99de33a650f47f45c694d98ad848062b5c))
+* **site:** a call on an export with no op claim is a lead, not a vanishing ([#2515](https://github.com/carrick-tools/carrick/issues/2515)) ([#2516](https://github.com/carrick-tools/carrick/issues/2516)) ([ee7ab2a](https://github.com/carrick-tools/carrick/commit/ee7ab2a1403e1498950a9b2499b12051f8df167b))
+* **site:** route sites are not asked; a lead only where no row stands ([#2517](https://github.com/carrick-tools/carrick/issues/2517)) ([#2518](https://github.com/carrick-tools/carrick/issues/2518)) ([31202e3](https://github.com/carrick-tools/carrick/commit/31202e315b2312de99e624c06b25a831ce1ccd94))
+
 ## [0.3.119](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.118...carrick-v0.3.119) (2026-10-18)
 
 
