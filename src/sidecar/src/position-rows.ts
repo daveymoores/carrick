@@ -65,6 +65,15 @@ export const FLAG_CHECKER_THREW = 4;
 export const FLAG_DECLARATION_UNNAMED = 8;
 /** An `impl` row standing for more implementations than {@link IMPL_CAP}; it names none. */
 export const FLAG_TOO_MANY = 16;
+/**
+ * The declaration is published under the row's symbol name: its module
+ * exports it by that name, or it is a global (a script's top-level
+ * declaration, or one in `declare global`). A member of a class, interface,
+ * type literal or object literal never is (carrick#2508).
+ */
+export const FLAG_PUBLISHED = 32;
+/** The declaration is what its module exports as `export =` or `default` (carrick#2508). */
+export const FLAG_MODULE_DEFAULT = 64;
 
 /** The most implementations one declaration's `impl` rows list. */
 export const IMPL_CAP = 16;
@@ -438,6 +447,8 @@ class PositionWalker {
   private readonly implementations = new Map<ts.Declaration, PositionRow[]>();
   /** The same for a member whose symbol has no declaration, keyed by symbol. */
   private readonly undeclaredImplementations = new Map<ts.Symbol, PositionRow[]>();
+  /** Each module's exports by name, and its `export =` and `default` targets, aliases followed. */
+  private readonly moduleExports = new Map<ts.Symbol, { byName: Map<string, ts.Symbol>; wholes: ts.Symbol[] }>();
 
   constructor(
     private readonly program: ts.Program,
@@ -485,6 +496,8 @@ class PositionWalker {
         attributedDeclaration(() => this.program, symbol.declarations ?? []) ??
         this.ownerDeclaration(kind, node, symbol);
       if (!declaration) return [kind, start, end, ts.symbolName(symbol), null, null, null, typeText, flags];
+      // A declaration named through its owner's type is a member.
+      if ((symbol.declarations ?? []).includes(declaration)) flags |= this.publication(symbol, declaration);
       // A file's own module symbol is named by the compiler as the quoted
       // absolute file name (`"/<checkout>/pkg/index"`). Name it as `decl_file`
       // names the file. A symbol that merely lives in a file (CommonJS
@@ -642,6 +655,69 @@ class PositionWalker {
     if (holders.length !== 1) return undefined;
     const owner = holders[0].getSymbol() ?? holders[0].aliasSymbol;
     return attributedDeclaration(() => this.program, owner?.declarations ?? []);
+  }
+
+  /**
+   * How `declaration`'s module publishes `symbol`: {@link FLAG_PUBLISHED}
+   * when under the symbol's own name (or as a global), and
+   * {@link FLAG_MODULE_DEFAULT} when as the module's `export =` or `default`.
+   * The module is the nearest ambient `declare module "…"` or the file.
+   */
+  private publication(symbol: ts.Symbol, declaration: ts.Declaration): number {
+    let container: ts.Node | undefined = declaration.parent;
+    while (container && !ts.isSourceFile(container) && !ts.isModuleBlock(container)) {
+      // Anything but a statement list between the declaration and its module
+      // (a class, interface, type or object literal, a function body) makes
+      // it a member or a local.
+      if (!ts.isVariableDeclarationList(container) && !ts.isVariableStatement(container)) return 0;
+      container = container.parent;
+    }
+    if (!container) return 0;
+    const block = ts.isModuleBlock(container) ? container.parent : undefined;
+    if (block && block.flags & ts.NodeFlags.GlobalAugmentation) return FLAG_PUBLISHED;
+    // A namespace's member is published when the module its file is publishes it.
+    if (block && !ts.isStringLiteral(block.name)) return this.publishedByExports(symbol, declaration);
+    const moduleSymbol = this.checker.getSymbolAtLocation(block ? block.name : container);
+    if (moduleSymbol) return this.publishedIn(moduleSymbol, symbol);
+    // A script's top-level declaration is a global.
+    return ts.isSourceFile(container) && !ts.isExternalModule(container) ? FLAG_PUBLISHED : 0;
+  }
+
+  /** A namespace member, found among the exports of the module it sits in. */
+  private publishedByExports(symbol: ts.Symbol, declaration: ts.Declaration): number {
+    for (let node: ts.Node | undefined = declaration.parent; node; node = node.parent) {
+      if (ts.isModuleDeclaration(node) && ts.isStringLiteral(node.name)) {
+        const moduleSymbol = this.checker.getSymbolAtLocation(node.name);
+        return moduleSymbol ? this.publishedIn(moduleSymbol, symbol) : 0;
+      }
+      if (ts.isSourceFile(node)) {
+        const moduleSymbol = this.checker.getSymbolAtLocation(node);
+        return moduleSymbol ? this.publishedIn(moduleSymbol, symbol) & FLAG_PUBLISHED : 0;
+      }
+    }
+    return 0;
+  }
+
+  private publishedIn(moduleSymbol: ts.Symbol, symbol: ts.Symbol): number {
+    let exports = this.moduleExports.get(moduleSymbol);
+    if (!exports) {
+      const resolve = (s: ts.Symbol): ts.Symbol =>
+        s.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(s) : s;
+      const byName = new Map<string, ts.Symbol>();
+      for (const exported of this.checker.getExportsOfModule(moduleSymbol)) {
+        byName.set(exported.getName(), resolve(exported));
+      }
+      const wholes = [ts.InternalSymbolName.ExportEquals, ts.InternalSymbolName.Default]
+        .map((key) => moduleSymbol.exports?.get(key as ts.__String))
+        .filter((own): own is ts.Symbol => own !== undefined)
+        .map(resolve);
+      exports = { byName, wholes };
+      this.moduleExports.set(moduleSymbol, exports);
+    }
+    return (
+      (exports.byName.get(symbol.getName()) === symbol ? FLAG_PUBLISHED : 0) |
+      (exports.wholes.includes(symbol) ? FLAG_MODULE_DEFAULT : 0)
+    );
   }
 
   /** The row's symbol, following aliases to a target that has a declaration. */

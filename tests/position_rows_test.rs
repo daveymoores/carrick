@@ -30,8 +30,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use carrick::position_rows::{
-    FLAG_ANY, FLAG_ERROR_TYPE, Kind, RowsFile, ServiceWalk, content_hash, read_rows,
-    read_rows_file, record_service_rows,
+    FLAG_ANY, FLAG_ERROR_TYPE, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, Kind, RowsFile, ServiceWalk,
+    content_hash, read_rows, read_rows_file, record_service_rows,
 };
 use carrick::services::type_sidecar::{SidecarRecipe, TypeSidecar};
 use carrick::utils::sidecar_position;
@@ -307,7 +307,12 @@ fn the_committed_rows_parse_with_the_format_types() {
     assert_eq!(file.header.v, carrick::position_rows::FORMAT_VERSION);
     assert_eq!(file.header.service, "api");
     let rows: Vec<_> = file.files.iter().flat_map(|line| &line.r).collect();
-    assert!(rows.iter().all(|row| row.flags() & !31 == 0));
+    assert!(rows.iter().all(|row| row.flags() & !127 == 0));
+    assert!(rows.iter().any(|row| row.flags() & FLAG_PUBLISHED != 0));
+    // A publication bit names a declaration: never on a row that has none.
+    assert!(rows.iter().all(|row| {
+        row.flags() & (FLAG_PUBLISHED | FLAG_MODULE_DEFAULT) == 0 || row.decl_file().is_some()
+    }));
     assert!(rows.iter().any(|row| row.flags() & FLAG_ERROR_TYPE != 0));
     assert!(
         rows.iter()

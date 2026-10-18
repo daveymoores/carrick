@@ -17,6 +17,7 @@ import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { SidecarClient } from './helpers.js';
+import { FLAG_MODULE_DEFAULT, FLAG_PUBLISHED } from '../src/position-rows.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // Compiled to dist/test; the fixture lives beside the sources.
@@ -24,6 +25,9 @@ const FIXTURE = path.join(here, '..', '..', 'test', 'fixtures', 'position-rows-r
 const GOLDEN = path.join(here, '..', '..', 'test', 'fixtures', 'position-rows-require.golden.json');
 
 type Row = [string, number, number, string | null, string | null, number | null, string | null, string | null, number];
+
+/** The golden predates the publication bits (carrick#2508): compare without them. */
+const withoutPublication = (row: Row): Row => [...row.slice(0, 8), row[8] & ~(FLAG_PUBLISHED | FLAG_MODULE_DEFAULT)] as Row;
 
 describe('position_rows: a name bound by require() in a TypeScript file (carrick#2454)', () => {
   let root: string;
@@ -70,7 +74,7 @@ describe('position_rows: a name bound by require() in a TypeScript file (carrick
         .split('\n')
         .slice(1)
         .map((l) => JSON.parse(l) as { f: string; r: Row[] });
-      files = Object.fromEntries(lines.map((l) => [l.f, l.r]));
+      files = Object.fromEntries(lines.map((l) => [l.f, l.r.map(withoutPublication)]));
     } finally {
       await client.stop();
     }
