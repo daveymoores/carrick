@@ -52,7 +52,7 @@ test("cloud lane: a workflow present gets one note, no drift and no pin finding"
   assert.equal(findingCount(lines), 0);
   assert.ok(
     lines[0]!.text.endsWith(
-      ": Carrick rescans this repo on every push, so .github/workflows/carrick.yml is not needed. Its scans are not stored. You can delete it.",
+      ": Carrick now scans this repo in its own cloud runners on every push, so .github/workflows/carrick.yml is no longer needed and only uses CI minutes. You can delete it.",
     ),
     lines[0]!.text,
   );

@@ -542,7 +542,7 @@ export function checkWorkflow(repos: ConfiguredRepo[], lane: IndexLane = "laptop
     if (lane === "cloud") {
       lines.push(
         say(
-          `${repo.label}: Carrick rescans this repo on every push, so ${WORKFLOW_PATH} is not needed. Its scans are not stored. You can delete it.`,
+          `${repo.label}: Carrick now scans this repo in its own cloud runners on every push, so ${WORKFLOW_PATH} is no longer needed and only uses CI minutes. You can delete it.`,
         ),
       );
       continue;
