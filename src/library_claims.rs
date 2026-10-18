@@ -55,6 +55,17 @@ pub enum Side {
     Both,
 }
 
+/// How an export's side is decided (label structure v2, carrick#2434). A
+/// class one package uses on both ends (a socket a client constructs with a
+/// URL, and a server is handed by its connection event) has no side of its
+/// own: the store keeps its class label and `by_origin`, and the scanner
+/// decides each receiver's side from how the code got it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SideRule {
+    ByOrigin,
+}
+
 /// What a listed call that is no op, scope or maker does to its receiver
 /// (contract amendment 2, B1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,8 +108,21 @@ pub struct ExportClaims {
     /// `"default"` or the named export.
     pub export: String,
     pub role: LibraryRole,
+    /// The classifier's own option, kept beside the contract role it maps
+    /// to (`request_runner` is an `http_client`). Carried, never branched on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(default)]
     pub side: Option<Side>,
+    /// Label v2: the side is decided per receiver from its origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_rule: Option<SideRule>,
+    /// Label v2: the type-only packages whose declarations this package's
+    /// surface re-exports (`@types/<name>` and types-only core packages). A
+    /// declaration found in one of them is this package's
+    /// ([`runtime_package_of`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_packages: Vec<String>,
     #[serde(default)]
     pub claims: Vec<LibraryClaim>,
     #[serde(default)]
@@ -107,6 +131,19 @@ pub struct ExportClaims {
     /// never one name.
     #[serde(default)]
     pub patterns: Vec<String>,
+}
+
+/// The package a declaration found in `declaring` stands for: the package
+/// whose answered `type_packages` lists it, or, by the DefinitelyTyped
+/// convention, the package an `@types/*` name types. Anything else is itself.
+pub fn runtime_package_of(declaring: &str, exports: &[ExportClaims]) -> String {
+    if let Some(export) = exports
+        .iter()
+        .find(|export| export.type_packages.iter().any(|types| types == declaring))
+    {
+        return export.package.clone();
+    }
+    crate::engine::type_compat_v2::types_package_runtime_name(declaring)
 }
 
 /// The roles whose rows this module writes.
@@ -322,7 +359,7 @@ fn op_name(op: LibraryOp) -> &'static str {
 /// (contract amendment 2, B3): `of` names exactly one receiver, `on` the
 /// export, every instance, or both. An element carrying both, or neither,
 /// applies to nothing.
-fn applies(on: Option<ClaimOn>, of: Option<&str>, receiver: &str) -> bool {
+pub(crate) fn applies(on: Option<ClaimOn>, of: Option<&str>, receiver: &str) -> bool {
     let instance = receiver.starts_with("instance:");
     match (on, of) {
         (None, Some(of)) => of == receiver,
@@ -638,6 +675,7 @@ impl Reading<'_> {
                     member,
                     name: Some(name),
                     handler: Some(handler),
+                    runs: None,
                     name_scope,
                     ..
                 } if *member == self.site.member => Some((id, name, handler, name_scope)),
@@ -912,6 +950,29 @@ mod tests {
     ) -> Vec<LibraryRow> {
         let asked = std::cell::RefCell::new(Vec::new());
         read(sites, exports, verifier(&asked, verified)).rows
+    }
+
+    /// A declaration found in a type-only package stands for the package
+    /// whose answer lists it; an `@types/*` name keeps its convention; any
+    /// other name is itself (carrick#2434).
+    #[test]
+    fn a_type_only_package_is_keyed_to_the_package_that_lists_it() {
+        let mut core = export(json!({
+            "package": "fixture-server", "version": "4.0.0", "specifier": "fixture-server",
+            "export": "default", "role": "server_framework"
+        }));
+        core.type_packages = vec!["fixture-server-core-types".into()];
+        let exports = vec![core];
+        assert_eq!(
+            runtime_package_of("fixture-server-core-types", &exports),
+            "fixture-server"
+        );
+        assert_eq!(
+            runtime_package_of("@types/scope__name", &exports),
+            "@scope/name"
+        );
+        assert_eq!(runtime_package_of("@types/plain", &[]), "plain");
+        assert_eq!(runtime_package_of("other", &exports), "other");
     }
 
     fn bus() -> ExportClaims {
@@ -1409,6 +1470,58 @@ mod tests {
             asked.borrow().is_empty(),
             "nothing is asked for an HTTP export"
         );
+    }
+
+    /// carrick#2436: with site questions on the store answers every network
+    /// role, and a claim of a role other than the message roles (an HTTP
+    /// client's, a server framework's) feeds discovery and the site rows
+    /// only. Here it asks no check and states no library row: the rows are
+    /// those of the message-role claims alone, byte for byte.
+    #[test]
+    fn claims_of_the_roles_site_questions_add_state_no_library_row() {
+        let http = export(json!({
+            "package": "@fixture/http", "version": "2.0.0", "specifier": "@fixture/http",
+            "export": "http", "role": "http_client", "side": "client",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "publish", "on": "export",
+                  "name": { "arg": 0 }, "payload": { "arg": 1 } },
+                { "kind": "op", "op": "request", "member": "get", "on": "export",
+                  "name": { "arg": 0 }, "method": "GET" }
+            ]
+        }));
+        let server = export(json!({
+            "package": "@fixture/server", "version": "3.0.0", "specifier": "@fixture/server",
+            "export": "app", "role": "server_framework", "side": "server",
+            "claims": [
+                { "kind": "op", "op": "receive", "member": "subscribe", "on": "export",
+                  "name": { "arg": 0 }, "handler": { "arg": 1 } }
+            ]
+        }));
+        let sites = sites_of(&[(
+            "src/orders.ts",
+            "import { bus } from \"@fixture/bus\";\n\
+             import { http } from \"@fixture/http\";\n\
+             import { app } from \"@fixture/server\";\n\
+             export async function send() {\n\
+             \x20 await bus.publish(\"orders.created\", { id: 1 });\n\
+             \x20 await http.publish(\"orders.created\", { id: 1 });\n\
+             \x20 await http.get(\"/orders\");\n\
+             \x20 app.subscribe(\"orders.created\", (message) => {});\n\
+             }\n",
+        )]);
+        let message = vec![bus()];
+        let network = vec![bus(), http, server];
+        let asked_message = std::cell::RefCell::new(Vec::new());
+        let asked_network = std::cell::RefCell::new(Vec::new());
+        let from_message = read(&sites, &message, verifier(&asked_message, all));
+        let from_network = read(&sites, &network, verifier(&asked_network, all));
+        assert!(!from_message.rows.is_empty(), "the bus states its rows");
+        assert_eq!(from_network, from_message);
+        assert_eq!(
+            format!("{:?}", from_network.rows),
+            format!("{:?}", from_message.rows)
+        );
+        assert_eq!(*asked_network.borrow(), *asked_message.borrow());
     }
 
     /// An op claimed on one receiver by its id (`of`) is read only through

@@ -1,0 +1,113 @@
+[
+  {
+    "start": "registration",
+    "site": { "file": "src/parent.ts", "line": 9 },
+    "callee": "child.on",
+    "member": "on",
+    "names": [
+      { "arg": 0, "from": "argument", "text": "message", "shape": "name" }
+    ],
+    "functions": [{ "arg": 1 }],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "hole",
+          "reason": "callee_unread",
+          "file": "src/parent.ts",
+          "line": 9,
+          "text": "fork(script)"
+        }
+      }
+    ],
+    "library": [
+      {
+        "specifier": "node:child_process",
+        "export": "fork",
+        "receivers": ["instance:()"],
+        "member": "on"
+      }
+    ]
+  },
+  {
+    "start": "emission",
+    "site": { "file": "src/parent.ts", "line": 12 },
+    "callee": "child.send",
+    "member": "send",
+    "names": [
+      {
+        "arg": 0,
+        "from": "field",
+        "path": ["type"],
+        "text": "START",
+        "shape": "name"
+      }
+    ],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "hole",
+          "reason": "callee_unread",
+          "file": "src/parent.ts",
+          "line": 12,
+          "text": "fork(script)"
+        }
+      }
+    ],
+    "library": [
+      {
+        "specifier": "node:child_process",
+        "export": "fork",
+        "receivers": ["instance:()"],
+        "member": "send"
+      }
+    ]
+  },
+  {
+    "start": "registration",
+    "site": { "file": "src/parent.ts", "line": 19 },
+    "callee": "child.on",
+    "member": "on",
+    "names": [
+      { "arg": 0, "from": "argument", "text": "message", "shape": "name" }
+    ],
+    "functions": [{ "arg": 1 }],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "hole",
+          "reason": "callee_unread",
+          "file": "src/parent.ts",
+          "line": 19,
+          "text": "fork(script)"
+        }
+      }
+    ],
+    "library": [
+      {
+        "specifier": "node:child_process",
+        "export": "fork",
+        "receivers": ["instance:()"],
+        "member": "on"
+      }
+    ]
+  },
+  {
+    "start": "registration",
+    "site": { "file": "src/worker.ts", "line": 8 },
+    "callee": "process.on",
+    "member": "on",
+    "names": [
+      { "arg": 0, "from": "argument", "text": "message", "shape": "name" }
+    ],
+    "functions": [{ "arg": 1 }],
+    "chains": [
+      {
+        "hops": [],
+        "end": { "kind": "global", "name": "process", "steps": ["on"] }
+      }
+    ]
+  }
+]

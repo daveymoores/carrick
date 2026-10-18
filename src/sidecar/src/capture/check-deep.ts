@@ -14,6 +14,11 @@
  * It is used for exactly one thing: setting `CheckVerdict.resolved`. No bucket
  * changes because of it, so a scan's verdicts are identical with and without
  * it — what changes is whether a reader is told the verdict is a fact.
+ *
+ * One more reading rides the same walk (carrick#1538): the sent side's
+ * unwidened alias, where a probe carries it. A member-level `any` there would
+ * let that reading assign to anything, so the classifier lets it clear a
+ * mismatch only when this walk ran over it and found nothing.
  */
 
 import ts from 'typescript';
@@ -22,12 +27,17 @@ import * as path from 'node:path';
 import { sidecarCompilerOptions } from './compiler-options.js';
 import type { TypeProvenance } from './api.js';
 import { findDisqualifyingTopTypes, provenanceOf } from './deep-walk.js';
-import type { ProbePlan } from './check-probe.js';
+import { UNWIDENED_LOCAL_NAME, type ProbePlan } from './check-probe.js';
 
 /** Deep findings for one pair, per probe side. */
 export interface PairDeepFindings {
   sent: TypeProvenance[];
   expected: TypeProvenance[];
+  /**
+   * Findings on the sent side's unwidened reading (carrick#1538). Absent when
+   * the probe carries none, or when its export could not be resolved.
+   */
+  sentUnwidened?: TypeProvenance[];
 }
 
 /** The one compiler program over the assembled probes, shared by every
@@ -83,7 +93,15 @@ export function probeDeepFindings(
     const sent = walkImportedAlias(file, 'Sent', program, checker);
     const expected = walkImportedAlias(file, 'Expected', program, checker);
     if (sent === undefined || expected === undefined) continue;
-    results.set(plan.pairId, { sent, expected });
+    const sentUnwidened =
+      plan.unwidenedFromLine === undefined
+        ? undefined
+        : walkImportedAlias(file, UNWIDENED_LOCAL_NAME, program, checker);
+    results.set(plan.pairId, {
+      sent,
+      expected,
+      ...(sentUnwidened === undefined ? {} : { sentUnwidened }),
+    });
   }
   return results;
 }
@@ -95,7 +113,7 @@ export function probeDeepFindings(
  */
 function walkImportedAlias(
   file: ts.SourceFile,
-  localName: 'Sent' | 'Expected',
+  localName: 'Sent' | 'Expected' | typeof UNWIDENED_LOCAL_NAME,
   program: ts.Program,
   checker: ts.TypeChecker
 ): TypeProvenance[] | undefined {

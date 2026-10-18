@@ -63,7 +63,7 @@ export interface ReadBound {
 
 /** `p` with every link resolved; a path that does not exist yet resolves
  * through its deepest existing ancestor. */
-function realOf(p: string): string {
+export function realOf(p: string): string {
   const abs = path.resolve(p);
   const tail: string[] = [];
   let dir = abs;

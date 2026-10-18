@@ -1,0 +1,66 @@
+[
+  {
+    "start": "emission",
+    "site": { "file": "src/router.ts", "line": 18 },
+    "callee": "router.get",
+    "member": "get",
+    "spread": true,
+    "names": [
+      { "arg": 0, "from": "argument", "text": "/lookup/:id", "shape": "path" }
+    ],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "hole",
+          "reason": "callee_unread",
+          "file": "src/router.ts",
+          "line": 18,
+          "text": "router"
+        }
+      }
+    ]
+  },
+  {
+    "start": "emission",
+    "site": { "file": "src/server.ts", "line": 8 },
+    "callee": "res.end",
+    "member": "end",
+    "names": [
+      { "arg": 0, "from": "argument", "text": "ok", "shape": "name" }
+    ],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "hole",
+          "reason": "callee_unread",
+          "file": "src/server.ts",
+          "line": 8,
+          "text": "res"
+        }
+      }
+    ]
+  },
+  {
+    "start": "emission",
+    "site": { "file": "src/server.ts", "line": 12 },
+    "callee": "res.end",
+    "member": "end",
+    "names": [
+      { "arg": 0, "from": "argument", "text": "metrics", "shape": "name" }
+    ],
+    "chains": [
+      {
+        "hops": [],
+        "end": {
+          "kind": "hole",
+          "reason": "callee_unread",
+          "file": "src/server.ts",
+          "line": 12,
+          "text": "res"
+        }
+      }
+    ]
+  }
+]

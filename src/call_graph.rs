@@ -71,7 +71,10 @@
 use crate::agents::file_orchestrator::FileOrchestrator;
 use crate::import_bindings::{BindingResolver, DEFAULT_EXPORT, Lookup, ResolvedBinding};
 use crate::parser::parse_file;
-use crate::receiver_type::{ReceiverTypes, module_scope_types};
+use crate::receiver_type::{
+    CalledType, FactoryCall, FactoryTables, ReceiverTypes, StatedReturn, TypedCall, factory_tables,
+    module_scope_types,
+};
 use crate::visitor::{
     CalleeRef, CalleeShape, FunctionCallRef, FunctionDefinition, FunctionDefinitionExtractor,
     ImportSymbolExtractor, ImportedSymbol, SymbolKind,
@@ -143,6 +146,9 @@ pub struct FileCallIndex {
     /// TokenService()`. What lets `tokens.issue()` in an importing file
     /// resolve to `TokenService.issue`.
     pub instances: ReceiverTypes,
+    /// What each module-scope function states it returns, and the module-scope
+    /// bindings a factory call initialises ([`factory_tables`], carrick#1146).
+    pub factories: FactoryTables,
 }
 
 /// What resolution reads from a file OUTSIDE the scanned service, parsed on
@@ -152,6 +158,7 @@ struct ExternalModule {
     definitions: HashMap<String, u32>,
     imports: HashMap<String, ImportedSymbol>,
     instances: ReceiverTypes,
+    factories: FactoryTables,
 }
 
 /// One class member a workspace package's surface publishes.
@@ -178,6 +185,29 @@ fn class_member(key: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((class, member))
+}
+
+/// How many functions a factory may hand its result through before one states
+/// the class: `getClient()` returning `createClient()` returning `new C()` is
+/// three functions, two hops (carrick#1146).
+const FACTORY_CHAIN_DEPTH: usize = 2;
+
+/// One module's resolution tables, wherever the module sits: in the scanned
+/// service's index, or outside it and parsed on first use.
+#[derive(Clone)]
+enum ModuleRef<'a> {
+    Indexed(&'a FileCallIndex),
+    External(PathBuf),
+}
+
+impl ModuleRef<'_> {
+    /// The path an import written in this module resolves from.
+    fn importer(&self) -> PathBuf {
+        match self {
+            Self::Indexed(index) => index.path.clone(),
+            Self::External(file) => file.clone(),
+        }
+    }
 }
 
 /// Where a resolved call lands.
@@ -585,9 +615,9 @@ pub struct CallSiteTargets {
     by_file: HashMap<PathBuf, HashMap<u32, ReachedAt>>,
 }
 
-/// A resolved call site's span end, and the definition (file as walked,
-/// definition key) it reaches.
-type ReachedAt = (u32, (PathBuf, String));
+/// A resolved call site's span end, the definition (file as walked,
+/// definition key) it reaches, and the line that definition opens on.
+type ReachedAt = (u32, (PathBuf, String), u32);
 
 impl CallSiteTargets {
     fn record(&mut self, file: &Path, span: swc_common::Span, target: &Target) {
@@ -596,8 +626,25 @@ impl CallSiteTargets {
         }
         self.by_file.entry(file.to_path_buf()).or_default().insert(
             span.lo.0,
-            (span.hi.0, (target.file.clone(), target.key.clone())),
+            (
+                span.hi.0,
+                (target.file.clone(), target.key.clone()),
+                target.line,
+            ),
         );
+    }
+
+    /// Every call site of `file` that resolution followed: its span start and
+    /// end in the discovery source map, and the file and opening line of the
+    /// definition it reaches. The file and line are how a definition is named
+    /// across services, where a definition key is one service's own
+    /// (carrick#1146).
+    pub fn sites_in(&self, file: &Path) -> impl Iterator<Item = (u32, u32, &Path, u32)> {
+        self.by_file.get(file).into_iter().flat_map(|sites| {
+            sites
+                .iter()
+                .map(|(lo, (hi, (target, _), line))| (*lo, *hi, target.as_path(), *line))
+        })
     }
 
     /// The definition (file as walked, definition key) the call whose span
@@ -611,7 +658,19 @@ impl CallSiteTargets {
         self.by_file
             .get(file)?
             .get(&span_lo)
-            .map(|(_, target)| target)
+            .map(|(_, target, _)| target)
+    }
+
+    /// Every resolved call site: the file it is written in, its span start
+    /// and end in the discovery source map, and the definition (file as
+    /// walked, definition key) it reaches. Inverted, it names each
+    /// definition's in-repo callers (carrick#2386).
+    pub fn every_site(&self) -> impl Iterator<Item = (&Path, u32, u32, &(PathBuf, String))> {
+        self.by_file.iter().flat_map(|(file, sites)| {
+            sites
+                .iter()
+                .map(move |(lo, (hi, target, _))| (file.as_path(), *lo, *hi, target))
+        })
     }
 
     /// The definition the call spanning exactly `span_lo..span_hi` reaches
@@ -620,8 +679,8 @@ impl CallSiteTargets {
         self.by_file
             .get(file)?
             .get(&span_lo)
-            .filter(|(hi, _)| *hi == span_hi)
-            .map(|(_, target)| target)
+            .filter(|(hi, _, _)| *hi == span_hi)
+            .map(|(_, target, _)| target)
     }
 }
 
@@ -888,6 +947,7 @@ impl<'a> CallResolver<'a> {
                         .collect(),
                     imports: call_resolution_imports(&module, imports.imported_symbols).0,
                     instances: module_scope_types(&module),
+                    factories: factory_tables(&module),
                 }
             });
             self.external.insert(file.to_path_buf(), parsed);
@@ -991,8 +1051,201 @@ impl<'a> CallResolver<'a> {
         if callee.receiver.declared {
             return None;
         }
-        let specifier = callee.receiver.origin.as_deref()?;
-        self.resolve_surface_member(specifier, &callee.name)
+        if let Some(specifier) = callee.receiver.origin.as_deref()
+            && let Some(target) = self.resolve_surface_member(specifier, &callee.name)
+        {
+            return Some(target);
+        }
+        let module = ModuleRef::Indexed(index);
+        if let Some(factory) = callee.receiver.factory.as_ref()
+            && let Some(target) = self.resolve_factory_member(&module, factory, &callee.name)
+        {
+            return Some(target);
+        }
+        let typed = callee.receiver.typed_factory.as_ref()?;
+        self.resolve_typed_call_member(&module, typed, &callee.name)
+    }
+
+    /// `client.foo(...)` where `const client = createClient()`: the member of
+    /// the class the declaration of `createClient` states it returns
+    /// (carrick#1146).
+    ///
+    /// Tried last, so every edge the forms above already state is unchanged.
+    /// The class name is resolved in the module that WRITES it, the factory's
+    /// own: a class that module declares, or the one its import names. So two
+    /// classes of one name in two files are never confused, and a name that
+    /// is an interface, a type alias or a type parameter reaches no member
+    /// and states no edge.
+    ///
+    /// A factory whose call yields a promise states the class only where the
+    /// binding awaits it.
+    fn resolve_factory_member(
+        &mut self,
+        module: &ModuleRef<'a>,
+        factory: &FactoryCall,
+        member: &str,
+    ) -> Option<Target> {
+        let (module, class, promised) =
+            self.factory_class(module, &factory.callee, FACTORY_CHAIN_DEPTH)?;
+        if promised && !factory.awaited {
+            return None;
+        }
+        self.resolve_named_class_member(&module, &class, member)
+    }
+
+    /// `client.foo(...)` where `const client = make()` and `make` is a value
+    /// declared as a function type: inline (`make: () => Client`) or by an
+    /// alias (`make: MakeClient`, `type MakeClient = () => Client`)
+    /// (carrick#1561).
+    ///
+    /// An inline type writes the class name in the receiver's own module; an
+    /// alias writes it in the alias's module ([`Self::alias_class`]). The
+    /// same rules as [`Self::resolve_factory_member`] from there on.
+    fn resolve_typed_call_member(
+        &mut self,
+        module: &ModuleRef<'a>,
+        typed: &TypedCall,
+        member: &str,
+    ) -> Option<Target> {
+        let (module, class, promised) = match &typed.called {
+            CalledType::Returns { name, promised } => (module.clone(), name.clone(), *promised),
+            CalledType::Alias(alias) => self.alias_class(module, alias)?,
+        };
+        if promised && !typed.awaited {
+            return None;
+        }
+        self.resolve_named_class_member(&module, &class, member)
+    }
+
+    /// `member` of the class `class` names in `module`: one the module
+    /// declares, or the one its import names.
+    fn resolve_named_class_member(
+        &mut self,
+        module: &ModuleRef<'a>,
+        class: &str,
+        member: &str,
+    ) -> Option<Target> {
+        if let Some(target) = self.definition_in(module, member_keys(class, member)) {
+            return Some(target);
+        }
+        let symbol = self.import_in(module, class)?;
+        let binding = self.resolve_import(&module.importer(), &symbol)?;
+        let declaring_class = binding
+            .local_name
+            .clone()
+            .unwrap_or_else(|| symbol.imported_name.clone());
+        self.lookup_in_file(&binding.file, member_keys(&declaring_class, member))
+    }
+
+    /// The class a call to `function`, as `module` names it, returns: the
+    /// module that writes the class name, the name, and whether the caller
+    /// receives a promise of it. `hops` is how many more functions the walk
+    /// may pass through when one returns another's call.
+    fn factory_class(
+        &mut self,
+        module: &ModuleRef<'a>,
+        function: &str,
+        hops: usize,
+    ) -> Option<(ModuleRef<'a>, String, bool)> {
+        let (module, stated) = match self.stated_return(module, function) {
+            Some(stated) => (module.clone(), stated),
+            // Not a function of this module: the one its import names.
+            None => {
+                let symbol = self.import_in(module, function)?;
+                if matches!(symbol.kind, SymbolKind::Namespace) {
+                    return None;
+                }
+                let binding = self.resolve_import(&module.importer(), &symbol)?;
+                let declared = binding
+                    .local_name
+                    .clone()
+                    .unwrap_or_else(|| symbol.imported_name.clone());
+                let module = self.module_ref(binding.file);
+                let stated = self.stated_return(&module, &declared)?;
+                (module, stated)
+            }
+        };
+        match stated {
+            StatedReturn::Class { name, promised } => Some((module, name, promised)),
+            StatedReturn::Call { callee, promised } => {
+                let hops = hops.checked_sub(1)?;
+                let (module, class, inner) = self.factory_class(&module, &callee, hops)?;
+                Some((module, class, promised || inner))
+            }
+        }
+    }
+
+    fn module_ref(&self, file: PathBuf) -> ModuleRef<'a> {
+        match self.per_file.get(&file) {
+            Some(index) => ModuleRef::Indexed(index),
+            None => ModuleRef::External(file),
+        }
+    }
+
+    /// The class a call of a value typed by the alias `alias`, as `module`
+    /// names it, returns: the module that declares the alias, the class name
+    /// and whether the caller receives a promise of it. An imported alias is
+    /// followed through the TYPE exports, where `export type` declares it,
+    /// and read under the name it was imported by.
+    fn alias_class(
+        &mut self,
+        module: &ModuleRef<'a>,
+        alias: &str,
+    ) -> Option<(ModuleRef<'a>, String, bool)> {
+        let (module, stated) = match self.alias_return(module, alias) {
+            Some(stated) => (module.clone(), stated),
+            None => {
+                let symbol = self.import_in(module, alias)?;
+                if !matches!(symbol.kind, SymbolKind::Named) {
+                    return None;
+                }
+                let file = self.bindings.resolve_type(
+                    &module.importer(),
+                    &symbol.source,
+                    &symbol.imported_name,
+                )?;
+                let module = self.module_ref(file);
+                let stated = self.alias_return(&module, &symbol.imported_name)?;
+                (module, stated)
+            }
+        };
+        match stated {
+            StatedReturn::Class { name, promised } => Some((module, name, promised)),
+            StatedReturn::Call { .. } => None,
+        }
+    }
+
+    fn stated_return(&mut self, module: &ModuleRef<'a>, function: &str) -> Option<StatedReturn> {
+        self.factories_in(module)?.returns.get(function).cloned()
+    }
+
+    fn alias_return(&mut self, module: &ModuleRef<'a>, alias: &str) -> Option<StatedReturn> {
+        self.factories_in(module)?.aliases.get(alias).cloned()
+    }
+
+    fn factories_in<'m>(&'m mut self, module: &'m ModuleRef<'a>) -> Option<&'m FactoryTables> {
+        match module {
+            ModuleRef::Indexed(index) => Some(&index.factories),
+            ModuleRef::External(file) => Some(&self.external_module(file)?.factories),
+        }
+    }
+
+    fn import_in(&mut self, module: &ModuleRef<'a>, local: &str) -> Option<ImportedSymbol> {
+        match module {
+            ModuleRef::Indexed(index) => index.imports.get(local).cloned(),
+            ModuleRef::External(file) => self.external_module(file)?.imports.get(local).cloned(),
+        }
+    }
+
+    fn definition_in(
+        &mut self,
+        module: &ModuleRef<'a>,
+        keys: impl IntoIterator<Item = String>,
+    ) -> Option<Target> {
+        match module {
+            ModuleRef::Indexed(index) => keys.into_iter().find_map(|key| same_file(index, key)),
+            ModuleRef::External(file) => self.lookup_in_file(file, keys),
+        }
     }
 
     /// `obj.foo(...)` where `obj`'s value traces back to a workspace package:
@@ -1129,10 +1382,16 @@ impl<'a> CallResolver<'a> {
             return self.lookup_in_file(&binding.file, [name.to_string()]);
         }
 
-        let declaring_class = binding
-            .local_name
-            .clone()
-            .unwrap_or_else(|| symbol.imported_name.clone());
+        // A binding with no local name is published under its export name. A
+        // default import's `imported_name` is the importer's own local name,
+        // so an anonymous `export default { … }` is named `default` here, the
+        // key its members are indexed under (carrick#2396). A named export
+        // with no local binding (`exports.table = { … }`) keeps its own name.
+        let declaring_class = match (&binding.local_name, &symbol.kind) {
+            (Some(local), _) => local.clone(),
+            (None, SymbolKind::Default) => DEFAULT_EXPORT.to_string(),
+            (None, _) => symbol.imported_name.clone(),
+        };
         if let Some(target) =
             self.lookup_in_file(&binding.file, member_keys(&declaring_class, name))
         {
@@ -1154,7 +1413,22 @@ impl<'a> CallResolver<'a> {
     fn resolve_instance_member(&mut self, binding: &ResolvedBinding, name: &str) -> Option<Target> {
         // A binding with no local name is an anonymous default export.
         let local = binding.local_name.as_deref().unwrap_or(DEFAULT_EXPORT);
-        let (class, import) = self.module_instance(&binding.file, local)?;
+        let Some((class, import)) = self.module_instance(&binding.file, local) else {
+            // `export const tokens = makeTokens()`: the module states no class
+            // for the binding, and the factory's declaration may
+            // (carrick#1146).
+            let module = self.module_ref(binding.file.clone());
+            let factory = match &module {
+                ModuleRef::Indexed(index) => index.factories.bindings.get(local).cloned(),
+                ModuleRef::External(file) => self
+                    .external_module(file)?
+                    .factories
+                    .bindings
+                    .get(local)
+                    .cloned(),
+            }?;
+            return self.resolve_factory_member(&module, &factory, name);
+        };
         let Some(symbol) = import else {
             return self.lookup_in_file(&binding.file, member_keys(&class, name));
         };
@@ -1528,6 +1802,7 @@ mod tests {
                 computed_requires,
                 field_types: functions.field_types,
                 instances: module_scope_types(&module),
+                factories: factory_tables(&module),
             };
             per_file.insert(path.clone(), index);
             per_file_definitions.push((path.clone(), functions.function_definitions));
@@ -2926,6 +3201,37 @@ mod tests {
         drop(dir);
     }
 
+    /// A member call through a default import of an anonymous `export default
+    /// { … }` reaches the member, which is keyed `default.<member>`: the
+    /// importer's own local name is not the key (carrick#2396). A default
+    /// import of a named const object reaches it under the declared name.
+    #[test]
+    fn a_member_of_a_default_exported_object_resolves_through_the_import() {
+        let (dir, defs) = scan(&[
+            (
+                "src/worker.ts",
+                "export default {\n  async fetch(request: Request) {\n    return request;\n  },\n};\n",
+            ),
+            (
+                "src/bound.ts",
+                "const handler = {\n  handle(request: Request) {\n    return request;\n  },\n};\n\
+                 export default handler;\n",
+            ),
+            (
+                "src/probe.ts",
+                "import worker from \"./worker\";\n\
+                 import bound from \"./bound\";\n\
+                 export function probe(request: Request) {\n  bound.handle(request);\n  return worker.fetch(request);\n}\n",
+            ),
+        ]);
+
+        assert_eq!(
+            callee_names(&defs, "probe"),
+            ["default.fetch", "handler.handle"]
+        );
+        drop(dir);
+    }
+
     /// A module-scope singleton published by a sibling workspace package that
     /// is not in the scanned service: the declaring module and the module it
     /// imports the class from are both read on demand.
@@ -3002,6 +3308,111 @@ mod tests {
             "{:?}",
             callee_names(&defs, "read")
         );
+        drop(dir);
+    }
+
+    /// A receiver bound from a factory call takes the class the factory's
+    /// declaration states (carrick#1146), and the class name is read in the
+    /// module that writes it: two files each declare a `Client`, and each
+    /// factory reaches its own.
+    #[test]
+    fn a_factory_bound_receiver_resolves_to_the_class_its_factory_states() {
+        let (dir, defs) = scan(&[
+            (
+                "src/runs/client.ts",
+                "export class Client {\n  get(id: string) {\n    return id;\n  }\n}\n",
+            ),
+            (
+                "src/runs/factory.ts",
+                "import { Client } from \"./client\";\n\
+                 export function createRuns(): Client {\n  return new Client();\n}\n",
+            ),
+            (
+                "src/mail/client.ts",
+                "export class Client {\n  get(id: string) {\n    return id;\n  }\n}\n\
+                 export const createMail = () => new Client();\n\
+                 export const mail = createMail();\n",
+            ),
+            (
+                "src/read.ts",
+                "import { createRuns } from \"./runs/factory\";\n\
+                 import { createMail, mail } from \"./mail/client\";\n\
+                 export function readRun(id: string) {\n  \
+                 const runs = createRuns();\n  return runs.get(id);\n}\n\
+                 export function readMail(id: string) {\n  \
+                 const client = createMail();\n  return client.get(id);\n}\n\
+                 export function readShared(id: string) {\n  return mail.get(id);\n}\n",
+            ),
+        ]);
+
+        let run = callee_names(&defs, "readRun");
+        assert_eq!(run, ["Client.get", "createRuns"]);
+        let files = callee_files(&defs, "readRun");
+        assert!(files[0].ends_with("src/runs/client.ts"), "{files:?}");
+
+        let files = callee_files(&defs, "readMail");
+        assert_eq!(
+            callee_names(&defs, "readMail"),
+            ["Client.get", "createMail"]
+        );
+        assert!(files[0].ends_with("src/mail/client.ts"), "{files:?}");
+
+        // An imported module-scope binding its module initialises from a
+        // factory call.
+        let files = callee_files(&defs, "readShared");
+        assert_eq!(callee_names(&defs, "readShared"), ["Client.get"]);
+        assert!(files[0].ends_with("src/mail/client.ts"), "{files:?}");
+        drop(dir);
+    }
+
+    /// A receiver bound by calling a function VALUE resolves by the value's
+    /// declared type (carrick#1561): an inline function type, an alias
+    /// imported type-only from another module, and a local annotated with
+    /// one. A type that returns a union names no one class, and a value
+    /// handed in with no type states nothing.
+    #[test]
+    fn a_receiver_returned_by_a_function_typed_value_resolves_to_the_class_its_type_states() {
+        let (dir, defs) = scan(&[
+            (
+                "src/store.ts",
+                "export class Store {\n  load(key: string) {\n    return key;\n  }\n}\n\
+                 export class Cache {\n  load(key: string) {\n    return key;\n  }\n}\n",
+            ),
+            (
+                "src/types.ts",
+                "import type { Store, Cache } from \"./store\";\n\
+                 export type OpenStore = (name: string) => Promise<Store>;\n\
+                 export type OpenEither = (name: string) => Store | Cache;\n",
+            ),
+            (
+                "src/jobs.ts",
+                "import type { Store } from \"./store\";\n\
+                 import type { OpenStore, OpenEither } from \"./types\";\n\
+                 export function inline(open: (name: string) => Store) {\n  \
+                 const store = open(\"a\");\n  return store.load(\"k\");\n}\n\
+                 export async function aliased(open: OpenStore) {\n  \
+                 const store = await open(\"a\");\n  return store.load(\"k\");\n}\n\
+                 export function unawaited(open: OpenStore) {\n  \
+                 const store = open(\"a\");\n  return store.load(\"k\");\n}\n\
+                 export async function bound(pick: () => OpenStore) {\n  \
+                 const open: OpenStore = pick();\n  \
+                 const store = await open(\"a\");\n  return store.load(\"k\");\n}\n\
+                 export function union(open: OpenEither) {\n  \
+                 const store = open(\"a\");\n  return store.load(\"k\");\n}\n\
+                 export function untyped(open) {\n  \
+                 const store = open(\"a\");\n  return store.load(\"k\");\n}\n",
+            ),
+        ]);
+
+        for function in ["inline", "aliased", "bound"] {
+            assert_eq!(callee_names(&defs, function), ["Store.load"], "{function}");
+            let files = callee_files(&defs, function);
+            assert!(files[0].ends_with("src/store.ts"), "{function}: {files:?}");
+        }
+        // A promise of the class is not the class until it is awaited.
+        assert!(callee_names(&defs, "unawaited").is_empty());
+        assert!(callee_names(&defs, "union").is_empty());
+        assert!(callee_names(&defs, "untyped").is_empty());
         drop(dir);
     }
 

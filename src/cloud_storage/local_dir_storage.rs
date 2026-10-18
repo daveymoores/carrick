@@ -69,6 +69,22 @@ impl CrossRepoReads {
     }
 }
 
+/// The single-segment file stem a `(repo, service)` pair is stored under. The
+/// service is part of the key so a multi-service repo writes one file per
+/// service instead of clobbering itself down to a single repo file; the
+/// sanitisation also stops a repo/service id containing a path separator
+/// from escaping the cache dir. The per-position rows are named by the same
+/// stem (carrick#2405).
+pub(crate) fn blob_stem(repo_name: &str, service_name: Option<&str>) -> String {
+    let key = match service_name {
+        Some(svc) if !svc.is_empty() => format!("{repo_name}__{svc}"),
+        _ => repo_name.to_string(),
+    };
+    key.chars()
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .collect()
+}
+
 pub struct LocalDirStorage {
     cache_dir: PathBuf,
     reads: CrossRepoReads,
@@ -94,21 +110,10 @@ impl LocalDirStorage {
         Ok(Self { cache_dir, reads })
     }
 
-    /// Sanitize a `(repo, service)` pair into a single-segment file stem. The
-    /// service is part of the key so a multi-service repo writes one file per
-    /// service instead of clobbering itself down to a single repo file; the
-    /// sanitisation also stops a repo/service id containing a path separator
-    /// from escaping the cache dir.
+    /// Where a `(repo, service)` pair's blob is stored ([`blob_stem`]).
     fn cache_path(&self, repo_name: &str, service_name: Option<&str>) -> PathBuf {
-        let key = match service_name {
-            Some(svc) if !svc.is_empty() => format!("{repo_name}__{svc}"),
-            _ => repo_name.to_string(),
-        };
-        let safe: String = key
-            .chars()
-            .map(|c| if c == '/' || c == '\\' { '_' } else { c })
-            .collect();
-        self.cache_dir.join(format!("{safe}.json"))
+        self.cache_dir
+            .join(format!("{}.json", blob_stem(repo_name, service_name)))
     }
 
     /// Write `data` to its cache file.

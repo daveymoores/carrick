@@ -1,0 +1,1 @@
+{ "name": "@acme/cjs", "version": "1.0.0", "types": "./dist/index.d.cts", "main": "./dist/index.cjs" }

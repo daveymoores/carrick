@@ -23,6 +23,11 @@
 //!   method, and this pass never touches it.
 //! - **Only a model row is corrected.** A deterministic row read its method off
 //!   the source it was resolved from.
+//! - **Only the requests of the function the call reaches are read**
+//!   (carrick#2384): that function and the functions of its own module it
+//!   calls, not the module's other functions. A verb-spelled call counts as a
+//!   request only when it can name a route
+//!   ([`crate::wrapper_request_shape::call_request_verb`]).
 //! - **The declaration's requests must agree** on one literal verb
 //!   ([`fold_module`]). A module that parameterizes its method, or issues
 //!   requests that disagree, states nothing, and the row keeps what it had —
@@ -46,7 +51,9 @@ use crate::agents::file_analyzer_agent::{DataCallResult, FileAnalysisResult, Res
 use crate::import_bindings::BindingResolver;
 use crate::type_manifest::normalize_manifest_method;
 use crate::workspace_resolver::WorkspaceIndex;
-use crate::wrapper_call_join::{declaration_reached, read_call_sites, resolve_module, site_of};
+use crate::wrapper_call_join::{
+    CallSite, FileCalls, declaration_reached, read_call_sites, site_of,
+};
 use crate::wrapper_request_shape::{RequestShapeSignal, WrapperRequestShape, fold_module};
 
 /// What the pass decided, so a scan can state it rather than change the index
@@ -87,8 +94,8 @@ pub fn correct_wrapper_call_methods(
         Some(workspace) => BindingResolver::with_workspace(workspace.clone()),
         None => BindingResolver::new(),
     };
-    // One module is read once however many sites reach it.
-    let mut declarations: HashMap<PathBuf, DeclarationRequests> = HashMap::new();
+    // One declaration is read once however many sites reach it.
+    let mut declarations: HashMap<DeclarationKey, DeclarationRequests> = HashMap::new();
 
     for key in keys {
         let file = Path::new(&key);
@@ -125,10 +132,25 @@ pub fn correct_wrapper_call_methods(
             ) else {
                 continue;
             };
-            let requests = declarations
-                .entry(reached.file.clone())
-                .or_insert_with(|| declaration_requests(workspace, &reached.file))
-                .clone();
+            // The function the call runs, not the module it sits in: a sibling
+            // function's request is not this call's (carrick#2384).
+            let member = site.member.clone().filter(|_| !site.direct);
+            let identity = (reached.file.clone(), reached.local.clone(), member);
+            let requests = match declarations.get(&identity) {
+                Some(requests) => requests.clone(),
+                None => {
+                    let requests = declaration_requests(
+                        &mut resolver,
+                        workspace,
+                        &reached.file,
+                        reached.local.as_deref(),
+                        identity.2.as_deref(),
+                        true,
+                    );
+                    declarations.insert(identity, requests.clone());
+                    requests
+                }
+            };
             match requests {
                 DeclarationRequests::None => {}
                 DeclarationRequests::Unreadable => {
@@ -188,37 +210,80 @@ enum DeclarationRequests {
     Stated(WrapperRequestShape),
 }
 
-/// Read what one module's requests state, following one hop for a module that
-/// issues none of its own.
-fn declaration_requests(workspace: Option<&WorkspaceIndex>, module: &Path) -> DeclarationRequests {
-    let Some((own, specifiers)) = module_requests(module) else {
+/// A declaration a call reaches: the module, the name it binds there, and the
+/// member of it the call runs.
+type DeclarationKey = (PathBuf, Option<String>, Option<String>);
+
+/// Read what the requests of one declaration state, following one hop for a
+/// declaration that issues none of its own.
+///
+/// The declaration is the function the call runs (`local`, and `member` for a
+/// call through an object's or class's member), with the functions of the same
+/// module it calls. A request elsewhere in the module is another function's:
+/// `clear()` calling `cache.delete(…)` says nothing about `send()` (carrick#2384).
+/// A declaration the module does not state by name (a default export, a
+/// binding the resolver could not follow) is read as the whole module.
+fn declaration_requests(
+    resolver: &mut BindingResolver,
+    workspace: Option<&WorkspaceIndex>,
+    module: &Path,
+    local: Option<&str>,
+    member: Option<&str>,
+    hop: bool,
+) -> DeclarationRequests {
+    let Some(calls) = read_call_sites(module) else {
         return DeclarationRequests::None;
     };
-    if own != DeclarationRequests::None {
-        // The module performs HTTP itself, so its own requests are what its
-        // members issue. Its imports are not read then: its own requests
+    let scoped = scoped_sites(&calls, local, member);
+    let signals: Vec<&RequestShapeSignal> = scoped.iter().map(|site| &site.request).collect();
+    if signals
+        .iter()
+        .any(|signal| **signal != RequestShapeSignal::NotARequest)
+    {
+        // The declaration performs HTTP itself, so its own requests are what
+        // it issues. What it imports is not read then: its own requests
         // already answer, and a client module that also imports another client
         // says nothing about which one a member uses.
-        return own;
+        return match fold_module(signals) {
+            Some(shape) => DeclarationRequests::Stated(shape),
+            None => DeclarationRequests::Unreadable,
+        };
+    }
+    if !hop {
+        return DeclarationRequests::None;
     }
 
-    // A module that issues no request delegates to one it imports — the guard
-    // between the site and the fetcher. Exactly one hop: every module it
-    // imports that issues a request of its own has to agree, and a verb one
-    // module further out is not read at all.
+    // A declaration that issues no request delegates to one it imports: the
+    // guard between the site and the fetcher. Exactly one hop: every
+    // declaration it calls that issues a request of its own has to agree, and
+    // a verb one module further out is not read at all.
     let mut folded: Option<WrapperRequestShape> = None;
-    let mut seen: Vec<PathBuf> = Vec::new();
-    for specifier in specifiers {
-        let Some(next) = resolve_module(workspace, module, &specifier) else {
+    let mut seen: Vec<DeclarationKey> = Vec::new();
+    for site in scoped {
+        let Some(reached) = declaration_reached(
+            resolver,
+            workspace,
+            module,
+            module,
+            &calls.imports,
+            &site.root,
+        ) else {
             continue;
         };
-        if seen.contains(&next) {
+        let next_member = site.member.clone().filter(|_| !site.direct);
+        let identity = (reached.file.clone(), reached.local.clone(), next_member);
+        if seen.contains(&identity) {
             continue;
         }
-        seen.push(next.clone());
-        let Some((delegated, _)) = module_requests(&next) else {
-            continue;
-        };
+        seen.push(identity.clone());
+        let delegated = declaration_requests(
+            resolver,
+            workspace,
+            &identity.0,
+            identity.1.as_deref(),
+            identity.2.as_deref(),
+            false,
+        );
         match delegated {
             DeclarationRequests::None => continue,
             DeclarationRequests::Unreadable => return DeclarationRequests::Unreadable,
@@ -241,23 +306,82 @@ fn declaration_requests(workspace: Option<&WorkspaceIndex>, module: &Path) -> De
     }
 }
 
-/// What one module's OWN requests state, with the specifiers it imports.
-/// `None` when the module cannot be read at all.
-fn module_requests(module: &Path) -> Option<(DeclarationRequests, Vec<String>)> {
-    let calls = read_call_sites(module)?;
-    let signals: Vec<&RequestShapeSignal> = calls.sites.iter().map(|site| &site.request).collect();
-    let issues_request = signals
-        .iter()
-        .any(|signal| **signal != RequestShapeSignal::NotARequest);
-    let requests = if !issues_request {
-        DeclarationRequests::None
-    } else {
-        match fold_module(signals) {
-            Some(shape) => DeclarationRequests::Stated(shape),
-            None => DeclarationRequests::Unreadable,
-        }
+/// The calls the declaration `local` (and its `member`) makes: those inside
+/// its source, and inside any function of the same module they call, followed
+/// to a fixed point. The whole module when it states no such declaration.
+fn scoped_sites<'a>(
+    calls: &'a FileCalls,
+    local: Option<&str>,
+    member: Option<&str>,
+) -> Vec<&'a CallSite> {
+    let Some(start) = local.and_then(|name| declaration_ranges(calls, name, member)) else {
+        return calls.sites.iter().collect();
     };
-    Some((requests, calls.specifiers))
+    let mut ranges: Vec<(u32, u32)> = start;
+    let mut followed: Vec<(&str, Option<&str>)> = Vec::new();
+    loop {
+        let inside = |site: &CallSite| {
+            ranges
+                .iter()
+                .any(|(lo, hi)| *lo <= site.span && site.span < *hi)
+        };
+        let mut added: Vec<(u32, u32)> = Vec::new();
+        for site in calls.sites.iter().filter(|site| inside(site)) {
+            // A binding the module declares, called: its own source is part of
+            // what this call runs. An imported name is another module's.
+            if calls.imports.contains_key(&site.root) {
+                continue;
+            }
+            let called = (
+                site.root.as_str(),
+                site.member.as_deref().filter(|_| !site.direct),
+            );
+            if followed.contains(&called) {
+                continue;
+            }
+            followed.push(called);
+            if let Some(more) = declaration_ranges(calls, called.0, called.1) {
+                added.extend(more);
+            }
+        }
+        if added.is_empty() {
+            break;
+        }
+        ranges.extend(added);
+    }
+    calls
+        .sites
+        .iter()
+        .filter(|site| {
+            ranges
+                .iter()
+                .any(|(lo, hi)| *lo <= site.span && site.span < *hi)
+        })
+        .collect()
+}
+
+/// The source of the declaration `name`, narrowed to `member` when the module
+/// states that member. `None` when the module declares no such name.
+fn declaration_ranges(
+    calls: &FileCalls,
+    name: &str,
+    member: Option<&str>,
+) -> Option<Vec<(u32, u32)>> {
+    let named = |wanted: Option<&str>| -> Vec<(u32, u32)> {
+        calls
+            .bindings
+            .iter()
+            .filter(|binding| binding.name == name && binding.member.as_deref() == wanted)
+            .map(|binding| (binding.lo, binding.hi))
+            .collect()
+    };
+    let narrowed = member.map(|member| named(Some(member))).unwrap_or_default();
+    let ranges = if narrowed.is_empty() {
+        named(None)
+    } else {
+        narrowed
+    };
+    (!ranges.is_empty()).then_some(ranges)
 }
 
 /// Whether this row is one the pass may correct: the model's own reading.
@@ -885,9 +1009,8 @@ export class BuildClient {
                 "import { decodeEnvelope } from \"./envelope\";\n\n\
                  export const orders = {\n  \
                  place(body: { sku: string }) {\n    \
-                 return client.createOrder(body);\n  },\n  \
-                 async decode(output: unknown) {\n    \
-                 return decodeEnvelope({ data: output, format: \"json\" }, client);\n  },\n};\n",
+                 const order = client.createOrder(body);\n    \
+                 return decodeEnvelope({ data: order, format: \"json\" }, client);\n  },\n};\n",
                 "POST",
             ),
             "decode helper with data",
@@ -1000,6 +1123,141 @@ export class BuildClient {
                 WrapperMethodCorrections {
                     corrected: 1,
                     declaration_unreadable: 0
+                }
+            )
+        );
+    }
+
+    /// carrick#2384's site: a call through a function of an imported module,
+    /// stating no verb.
+    const SEND_SITE: &str = "import { send } from \"../lib/items\";\n\n\
+                             export function load() {\n  \
+                             return send(\"a1\");\n}\n";
+
+    /// What the site's verb is once the pass has read `declaration` as the
+    /// module `send` comes from, when the model answered the site `GET`.
+    fn send_verb_through(declaration: &str) -> (Option<String>, WrapperMethodCorrections) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "src/lib/items.ts", declaration);
+        let site = write(root, "src/routes/load.ts", SEND_SITE);
+        let (results, corrections) = correct(vec![(
+            site.clone(),
+            vec![row(SEND_SITE, "send(\"a1\")", "GET", "/v1/items/a1")],
+        )]);
+        (method(&results, &site), corrections)
+    }
+
+    /// carrick#2384: `send` goes through a client the reader cannot see, and a
+    /// sibling function of the same module clears a store. The sibling's
+    /// `.delete` is not a request `send` makes, so the site keeps its GET.
+    #[test]
+    fn a_sibling_function_s_store_delete_is_not_the_site_s_request() {
+        assert_eq!(
+            send_verb_through(
+                "export function send(name: string) {\n  \
+                 return client.dispatch(`/v1/items/${name}`);\n}\n\n\
+                 export function clear() {\n  cache.delete(\"k\");\n}\n",
+            ),
+            (Some("GET".to_string()), WrapperMethodCorrections::default())
+        );
+    }
+
+    /// The same module read for the function the call reaches: its own verb
+    /// call is the request, wherever the module's other functions sit.
+    #[test]
+    fn the_reached_function_s_own_verb_call_still_states_its_verb() {
+        assert_eq!(
+            send_verb_through(
+                "export function clear() {\n  cache.get(\"/v1/other\");\n}\n\n\
+                 export function send(name: string) {\n  \
+                 return client.delete(`/v1/items/${name}`);\n}\n",
+            ),
+            (
+                Some("DELETE".to_string()),
+                WrapperMethodCorrections {
+                    corrected: 1,
+                    declaration_unreadable: 0
+                }
+            )
+        );
+    }
+
+    /// A function the reached one calls in its own module is part of what the
+    /// call reaches.
+    #[test]
+    fn a_same_module_function_the_reached_one_calls_is_read() {
+        assert_eq!(
+            send_verb_through(
+                "function post(path: string) {\n  \
+                 return client.delete(path);\n}\n\n\
+                 export function send(name: string) {\n  return post(`/v1/items/${name}`);\n}\n",
+            ),
+            (
+                Some("DELETE".to_string()),
+                WrapperMethodCorrections {
+                    corrected: 1,
+                    declaration_unreadable: 0
+                }
+            )
+        );
+    }
+
+    /// A wrapper forwards its caller's route in an argument the source does not
+    /// spell out; that is still a request with its verb.
+    #[test]
+    fn a_verb_call_forwarding_a_route_binding_states_its_verb() {
+        assert_eq!(
+            send_verb_through(
+                "export function send(path: string) {\n  return client.delete(path);\n}\n",
+            ),
+            (
+                Some("DELETE".to_string()),
+                WrapperMethodCorrections {
+                    corrected: 1,
+                    declaration_unreadable: 0
+                }
+            )
+        );
+    }
+
+    /// The same through a member of an exported object: a sibling member's
+    /// `{ data }` helper or store call is not the reached member's request.
+    #[test]
+    fn a_sibling_member_s_calls_are_not_the_reached_member_s() {
+        assert_eq!(
+            order_verb_through(
+                "import { decodeEnvelope } from \"./envelope\";\n\n\
+                 export const orders = {\n  \
+                 place(body: { sku: string }) {\n    \
+                 return client.createOrder(body);\n  },\n  \
+                 async decode(output: unknown) {\n    \
+                 return decodeEnvelope({ data: output, format: \"json\" }, client);\n  },\n  \
+                 clear() {\n    cache.delete(\"k\");\n  },\n};\n",
+                "POST",
+            ),
+            (
+                Some("POST".to_string()),
+                WrapperMethodCorrections::default()
+            )
+        );
+    }
+
+    /// A verb-named member call with no route-shaped argument is not read as
+    /// a request: inside the reached function it states no verb, and the scan
+    /// counts the site.
+    #[test]
+    fn a_verb_call_with_no_route_argument_states_no_verb() {
+        assert_eq!(
+            send_verb_through(
+                "export function send(name: string) {\n  \
+                 cache.delete(\"k\");\n  return client.dispatch(name);\n}\n",
+            ),
+            (
+                Some("GET".to_string()),
+                WrapperMethodCorrections {
+                    corrected: 0,
+                    declaration_unreadable: 1
                 }
             )
         );

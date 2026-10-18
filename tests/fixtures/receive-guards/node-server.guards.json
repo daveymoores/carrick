@@ -1,0 +1,250 @@
+[
+  {
+    "literal": "/health",
+    "position": "case",
+    "negated": false,
+    "site": {
+      "file": "src/server.ts",
+      "line": 17
+    },
+    "subject": "pathname",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/server.ts",
+        "line": 33,
+        "callee": "createServer",
+        "arg": 0,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    ],
+    "end": {
+      "kind": "external_import",
+      "specifier": "node:http",
+      "export": "createServer",
+      "steps": []
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "send",
+        "file": "src/server.ts",
+        "line": 18,
+        "target": "src/server.ts:send"
+      }
+    ]
+  },
+  {
+    "literal": "/ready",
+    "position": "case",
+    "negated": false,
+    "site": {
+      "file": "src/server.ts",
+      "line": 20
+    },
+    "subject": "pathname",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/server.ts",
+        "line": 33,
+        "callee": "createServer",
+        "arg": 0,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    ],
+    "end": {
+      "kind": "external_import",
+      "specifier": "node:http",
+      "export": "createServer",
+      "steps": []
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "send",
+        "file": "src/server.ts",
+        "line": 22,
+        "target": "src/server.ts:send"
+      }
+    ]
+  },
+  {
+    "literal": "/live",
+    "position": "case",
+    "negated": false,
+    "site": {
+      "file": "src/server.ts",
+      "line": 21
+    },
+    "subject": "pathname",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/server.ts",
+        "line": 33,
+        "callee": "createServer",
+        "arg": 0,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    ],
+    "end": {
+      "kind": "external_import",
+      "specifier": "node:http",
+      "export": "createServer",
+      "steps": []
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "send",
+        "file": "src/server.ts",
+        "line": 22,
+        "target": "src/server.ts:send"
+      }
+    ]
+  },
+  {
+    "literal": "/about",
+    "position": "table_key",
+    "negated": false,
+    "site": {
+      "file": "src/server.ts",
+      "line": 25
+    },
+    "subject": "pathname",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/server.ts",
+        "line": 33,
+        "callee": "createServer",
+        "arg": 0,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    ],
+    "end": {
+      "kind": "external_import",
+      "specifier": "node:http",
+      "export": "createServer",
+      "steps": []
+    },
+    "branch": [
+      {
+        "kind": "value",
+        "text": "\"About us\"",
+        "file": "src/server.ts",
+        "line": 5
+      }
+    ]
+  },
+  {
+    "literal": "/contact",
+    "position": "table_key",
+    "negated": false,
+    "site": {
+      "file": "src/server.ts",
+      "line": 25
+    },
+    "subject": "pathname",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/server.ts",
+        "line": 33,
+        "callee": "createServer",
+        "arg": 0,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    ],
+    "end": {
+      "kind": "external_import",
+      "specifier": "node:http",
+      "export": "createServer",
+      "steps": []
+    },
+    "branch": [
+      {
+        "kind": "value",
+        "text": "\"Write to us\"",
+        "file": "src/server.ts",
+        "line": 6
+      }
+    ]
+  },
+  {
+    "literal": "/version",
+    "position": "equality",
+    "negated": false,
+    "site": {
+      "file": "src/server.ts",
+      "line": 36
+    },
+    "subject": "req.url",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/server.ts",
+        "line": 35,
+        "callee": "createServer",
+        "arg": 0,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "url"
+        ]
+      }
+    ],
+    "end": {
+      "kind": "external_import",
+      "specifier": "node:http",
+      "export": "createServer",
+      "steps": []
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "send",
+        "file": "src/server.ts",
+        "line": 37,
+        "target": "src/server.ts:send"
+      }
+    ]
+  }
+]

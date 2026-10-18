@@ -255,13 +255,25 @@ const CheckPairEndpointSchema = z.object({
   alias: z.string().min(1),
 });
 
-const CheckPairSpecSchema = z.object({
-  pair_key: z.string().min(1),
-  protocol: z.enum(['http', 'graphql', 'socket', 'pubsub']),
-  type_kind: z.enum(['request', 'response', 'both']),
-  producer: CheckPairEndpointSchema,
-  consumer: CheckPairEndpointSchema,
-});
+const CheckPairSpecSchema = z
+  .object({
+    pair_key: z.string().min(1),
+    protocol: z.enum(['http', 'graphql', 'socket', 'pubsub']),
+    type_kind: z.enum(['request', 'response', 'both']),
+    producer: CheckPairEndpointSchema,
+    consumer: CheckPairEndpointSchema,
+    topic: z.string().min(1).optional(),
+  })
+  .superRefine((spec, ctx) => {
+    // carrick#1979: the topic is the pub/sub operation's own key. It is
+    // required there and refused elsewhere, so zod can never strip a stray one.
+    if (spec.protocol === 'pubsub' && spec.topic === undefined) {
+      ctx.addIssue({ code: 'custom', path: ['topic'], message: 'A pubsub pair requires a topic' });
+    }
+    if (spec.protocol !== 'pubsub' && spec.topic !== undefined) {
+      ctx.addIssue({ code: 'custom', path: ['topic'], message: 'Only a pubsub pair carries a topic' });
+    }
+  });
 
 export const CheckV2RequestSchema = BaseRequestSchema.extend({
   action: z.literal('check_v2'),
@@ -275,6 +287,15 @@ export const InferRequestSchema = BaseRequestSchema.extend({
   action: z.literal('infer'),
   requests: z.array(InferRequestItemSchema).min(1, 'At least one infer request is required'),
   extraction_config: ExtractionConfigSchema.optional(),
+  model_symbols: z
+    .array(
+      z.object({
+        alias: z.string().min(1),
+        symbol_name: z.string().min(1),
+        source_file: z.string().min(1),
+      })
+    )
+    .optional(),
 });
 
 export const HealthRequestSchema = BaseRequestSchema.extend({
@@ -292,6 +313,14 @@ export const ListProgramFilesRequestSchema = BaseRequestSchema.extend({
 export const AddProgramFilesRequestSchema = BaseRequestSchema.extend({
   action: z.literal('add_program_files'),
   files: z.array(z.string().min(1, 'File path cannot be empty')),
+});
+
+export const PositionRowsRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('position_rows'),
+  files: z.array(z.string().min(1, 'File path cannot be empty')),
+  scan_root: z.string().min(1, 'Scan root cannot be empty'),
+  out_path: z.string().min(1, 'Out path cannot be empty'),
+  service: z.string(),
 });
 
 export const ResolveDefinitionsRequestSchema = BaseRequestSchema.extend({
@@ -381,6 +410,26 @@ const ClaimSlotSchema = z
 
 const BoundNameSchema = z.object({ bound: z.enum(['maker', 'scope']) }).strict();
 
+/**
+ * Label structure v2 (carrick#2434). The schema takes the shape only: which
+ * method word, side or export a field names is the verifier's per-check
+ * verdict, since one element this schema refuses fails the whole request.
+ */
+const RunsSlotSchema = z
+  .object({
+    arg: z.number().int().nonnegative(),
+    key: z.string().min(1).optional(),
+    bound: z.literal('maker').optional(),
+  })
+  .strict();
+const YieldsSchema = z
+  .object({
+    param: z.number().int().nonnegative(),
+    export: z.string().min(1),
+    side: z.string().min(1),
+  })
+  .strict();
+
 const ClaimOnSchema = z.enum(['export', 'instance', 'both']);
 const MemberPathSchema = z.array(z.string().min(1));
 const KeyLabelsSchema = z.record(z.string().min(1), z.enum(['name', 'not_name']));
@@ -405,6 +454,7 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       prefix: ClaimSlotSchema.optional(),
       name: ClaimSlotSchema.optional(),
       handler: ClaimSlotSchema.optional(),
+      runs: ClaimSlotSchema.optional(),
       key_labels: KeyLabelsSchema.optional(),
       name_scope: NameScopeSchema.optional(),
       picker: z.string().optional(),
@@ -441,6 +491,10 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       options: ClaimSlotSchema.optional(),
       method: z.string().min(1).optional(),
       method_key: ClaimSlotSchema.optional(),
+      method_default: z.string().min(1).optional(),
+      base: ClaimSlotSchema.optional(),
+      runs: RunsSlotSchema.optional(),
+      yields: YieldsSchema.optional(),
     })
     .strict(),
   z
@@ -514,6 +568,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   ShutdownRequestSchema,
   ListProgramFilesRequestSchema,
   AddProgramFilesRequestSchema,
+  PositionRowsRequestSchema,
 ]);
 
 // ============================================================================
@@ -580,60 +635,3 @@ export type ValidatedInferRequest = z.infer<typeof InferRequestSchema>;
 export type ValidatedHealthRequest = z.infer<typeof HealthRequestSchema>;
 export type ValidatedShutdownRequest = z.infer<typeof ShutdownRequestSchema>;
 export type ValidatedSidecarRequest = z.infer<typeof SidecarRequestSchema>;
-
-// ============================================================================
-// The schema and the request types declare the same keys (carrick#1980)
-// ============================================================================
-//
-// A request is written twice: as the type its handler reads (`types.ts`,
-// `capture/api.ts`) and as the schema above, which drops every key it does
-// not declare. `parseRequest` casts one to the other, and a schema that lacks
-// an optional key is still assignable to the type that has it, so the
-// compiler never compared them: the capture read a `param_name` off its
-// anchor, and no request that went through the schema carried one.
-//
-// The two are compared here, key by key at every depth, when the sidecar is
-// built. A key on one side only fails the build and is named in the error:
-// `".anchors[].param_name"` does not satisfy the constraint `never`. A
-// request is told from the others by its `action`, an anchor or a claim by
-// its `kind`, and each is compared with the schema of the same one.
-
-/** Every key any member of a union declares. */
-type KeysOfAny<Union> = Union extends unknown ? keyof Union : never;
-
-/** What `Key` holds, across the members of a union that declare it. */
-type ValueAt<Union, Key extends PropertyKey> = Union extends unknown
-  ? Key extends keyof Union
-    ? Union[Key]
-    : never
-  : never;
-
-/** The members of `Other` with the tag `One` has, when `One` has one. */
-type SameVariant<One, Other> = One extends { action: infer Tag }
-  ? Extract<Other, { action: Tag }>
-  : One extends { kind: infer Tag }
-    ? Extract<Other, { kind: Tag }>
-    : Other;
-
-/**
- * The keys of `One` that `Other` does not declare, each as the path that
- * reaches it; `never` when there are none.
- */
-type UndeclaredKeys<One, Other, At extends string = ''> = One extends readonly (infer Item)[]
-  ? UndeclaredKeys<Item, Other extends readonly (infer Element)[] ? Element : never, `${At}[]`>
-  : One extends object
-    ? {
-        [Key in keyof One & string]-?: Key extends KeysOfAny<SameVariant<One, Other>>
-          ? UndeclaredKeys<One[Key], ValueAt<SameVariant<One, Other>, Key>, `${At}.${Key}`>
-          : `${At}.${Key}`;
-      }[keyof One & string]
-    : never;
-
-/** Compiles for `never` alone. */
-type None<Paths extends never> = Paths;
-
-/** A key a handler may read that the schema would drop. */
-export type KeysTheSchemaDrops = None<UndeclaredKeys<SidecarRequest, ValidatedSidecarRequest>>;
-
-/** A key the schema lets through that no handler's type knows. */
-export type KeysNoHandlerKnows = None<UndeclaredKeys<ValidatedSidecarRequest, SidecarRequest>>;

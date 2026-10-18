@@ -1,0 +1,6 @@
+{
+  "name": "@acme/events",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": { ".": { "@acme/source": "./src/index.ts", "types": "./dist/index.d.ts", "default": "./dist/index.js" } }
+}

@@ -17,13 +17,27 @@
  */
 
 import ts from 'typescript';
-import { findUnresolvedPlaceholders, type UnresolvedAtAnchor } from './deep-walk.js';
+import { findUncarriedPositions, findUnresolvedPlaceholders, type UnresolvedAtAnchor } from './deep-walk.js';
 
 /** Files the specifier walk visits from one anchor before it stops. */
 const MAX_REACHABLE_FILES = 256;
 
 /** Per-program memo: source file name -> unresolved specifiers it reaches. */
 const reachableCache = new WeakMap<ts.Program, Map<string, string[]>>();
+
+/** Per anchor program: the files it reads that the surface emit cannot carry. */
+const uncarriedByProgram = new WeakMap<ts.Program, (fileName: string) => boolean>();
+
+/**
+ * Name the files of `program` the surface emit cannot carry (carrick#2418):
+ * the sources of the projects its owner references, which the anchor program
+ * reads and the emit reaches only as unbuilt output. A position typed from
+ * one of them counts as unresolved, so a top type the emit leaves there is
+ * labelled with its cause and never as declared.
+ */
+export function markUncarried(program: ts.Program, uncarried: (fileName: string) => boolean): void {
+  uncarriedByProgram.set(program, uncarried);
+}
 
 /**
  * The unresolved placeholders inside `type` (read at `location` in `sourceFile`),
@@ -41,9 +55,10 @@ export function unresolvedAtAnchor(
   pathPrefix = ''
 ): UnresolvedAtAnchor | undefined {
   const checker = program.getTypeChecker();
-  const paths = findUnresolvedPlaceholders(type, program, checker, location).map((path) =>
-    prefixPath(pathPrefix, path)
-  );
+  const uncarried = uncarriedByProgram.get(program);
+  const found = findUnresolvedPlaceholders(type, program, checker, location);
+  if (uncarried) found.push(...findUncarriedPositions(type, program, checker, location, uncarried));
+  const paths = [...new Set(found)].map((path) => prefixPath(pathPrefix, path));
   if (paths.length === 0) return undefined;
   return { paths, specifiers: unresolvedSpecifiersReachableFrom(program, sourceFile) };
 }

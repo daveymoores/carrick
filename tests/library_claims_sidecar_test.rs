@@ -104,6 +104,7 @@ fn job(labels: &[(&str, KeyLabel)]) -> LibraryClaim {
         prefix: None,
         name: Some(keyed("id")),
         handler: Some(keyed("run")),
+        runs: None,
         key_labels: labels
             .iter()
             .map(|(key, label)| (key.to_string(), *label))
@@ -152,6 +153,10 @@ fn send(member: &str, path: &[&str], place: Place, name: OpName, payload: u32) -
         options: None,
         method: None,
         method_key: None,
+        method_default: None,
+        base: None,
+        runs: None,
+        yields: None,
     }
 }
 
@@ -275,6 +280,10 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
                 options: None,
                 method: None,
                 method_key: None,
+                method_default: None,
+                base: None,
+                runs: None,
+                yields: None,
             },
         ),
     ];

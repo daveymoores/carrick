@@ -115,7 +115,17 @@ function referenceMatch(
   if (exact.length > 0) return pick(exact.map((c) => c.node));
   if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(target)) return undefined;
   const containing = candidates.filter((c) => c.text.includes(target));
-  if (containing.length > 0) return pick(containing.map((c) => c.node));
+  if (containing.length > 0) {
+    // carrick#2114: among the holders that open with the text, the nearest to
+    // the stated line, then the smallest.
+    const opening = lineNumber === undefined ? [] : containing.filter((c) => c.text.startsWith(target));
+    if (lineNumber !== undefined && opening.length > 0) {
+      const distance = (c: { node: Node }) => Math.abs(c.node.getStartLineNumber() - lineNumber);
+      const nearest = Math.min(...opening.map(distance));
+      return pick(opening.filter((c) => distance(c) === nearest).map((c) => c.node));
+    }
+    return pick(containing.map((c) => c.node));
+  }
   const reverse = candidates.filter(
     (c) => c.text.length >= 8 && c.text.length >= target.length * 0.5 && target.includes(c.text)
   );

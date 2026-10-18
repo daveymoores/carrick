@@ -1,0 +1,11 @@
+{
+  "name": "@fixture/shared",
+  "version": "1.0.0",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  }
+}

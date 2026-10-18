@@ -467,10 +467,21 @@ export interface CheckPairSpec {
   type_kind: ProbeTypeKind;
   producer: CheckPairEndpoint;
   consumer: CheckPairEndpoint;
+  /**
+   * The topic of a pub/sub pair (carrick#1979), and only of one. The probe
+   * tests each side for a member typed as this literal, to tell a side that
+   * is the whole message from a side that is its payload.
+   */
+  topic?: string;
 }
 
 /**
- * Four-bucket classifier output (pinned decision 7):
+ * Classifier output: the four buckets of pinned decision 7, and one more
+ * (carrick#1538).
+ *  - producer_wider: the published sent type mismatches and the handler's
+ *    return, read with no literal widened, does not. What travels agrees, so
+ *    it is stored as compatible with the class beside it, and it carries no
+ *    diagnostic.
  *  - compatible: no diagnostics; the value-level assignment holds.
  *  - incompatible: an assignment-class diagnostic (TS2322/2741/...) — real
  *    compiler text is the report.
@@ -483,7 +494,8 @@ export type VerdictBucket =
   | 'compatible'
   | 'incompatible'
   | 'unverifiable'
-  | 'gate_caught_baked_any';
+  | 'gate_caught_baked_any'
+  | 'producer_wider';
 
 export interface CheckVerdict {
   /** Deterministic FNV-1a hash of the pair (never a temp path). */

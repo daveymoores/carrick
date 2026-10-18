@@ -143,8 +143,36 @@ pub fn take_schedules() -> Vec<Schedule> {
 pub async fn in_declared_order<R, Fut>(
     count: usize,
     width: usize,
-    mut start: impl FnMut(usize) -> Fut,
+    start: impl FnMut(usize) -> Fut,
 ) -> Vec<R>
+where
+    Fut: Future<Output = R>,
+{
+    let (results, schedule) = admit(count, width, start).await;
+    if let Ok(mut passes) = SCHEDULES.lock() {
+        passes.push(schedule);
+    }
+    results
+}
+
+/// [`in_declared_order`] for work that is not a pass of the analysis, such
+/// as the walk lane: its schedule is not one [`take_schedules`] returns.
+pub(super) async fn admit_in_declared_order<R, Fut>(
+    count: usize,
+    width: usize,
+    start: impl FnMut(usize) -> Fut,
+) -> Vec<R>
+where
+    Fut: Future<Output = R>,
+{
+    admit(count, width, start).await.0
+}
+
+async fn admit<R, Fut>(
+    count: usize,
+    width: usize,
+    mut start: impl FnMut(usize) -> Fut,
+) -> (Vec<R>, Schedule)
 where
     Fut: Future<Output = R>,
 {
@@ -170,13 +198,11 @@ where
         schedule.finished.push(index);
         results[index] = Some(result);
     }
-    if let Ok(mut passes) = SCHEDULES.lock() {
-        passes.push(schedule);
-    }
-    results
+    let results = results
         .into_iter()
         .map(|result| result.expect("every admitted job ends with a result"))
-        .collect()
+        .collect();
+    (results, schedule)
 }
 
 /// Run `work` on a thread of its own and await what it returns.

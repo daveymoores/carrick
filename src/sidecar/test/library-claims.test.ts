@@ -1471,14 +1471,11 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
   it('answers role_unsupported for roles and ops this build does not read', async () => {
     const checks = [
       check('fixture-kv', 'createClient', 'graphql_client', 'export', make('call', null)),
-      check('fixture-kv', 'get', 'server_framework', 'export', make('call', null)),
       check('@fixture/tasks', 'tasks', 'broker', 'export', op('execute', 'trigger', { name: { arg: 0 } })),
     ];
-    assert.deepStrictEqual(verdicts(await send(checks)), [
-      'unchecked role_unsupported',
-      'unchecked role_unsupported',
-      'unchecked role_unsupported',
-    ]);
+    // `server_framework` is read since label structure v2 (carrick#2434,
+    // `library-claims-v2.test.ts`).
+    assert.deepStrictEqual(verdicts(await send(checks)), ['unchecked role_unsupported', 'unchecked role_unsupported']);
   });
 
   it('answers one verdict per check, in request order, and rejects a malformed receiver on its own', async () => {

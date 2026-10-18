@@ -1,0 +1,245 @@
+[
+  {
+    "literal": "READY",
+    "shape": "name",
+    "position": "case",
+    "negated": false,
+    "site": {
+      "file": "src/parent.ts",
+      "line": 11
+    },
+    "subject": "msg.type",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/parent.ts",
+        "line": 9,
+        "callee": "child.on",
+        "arg": 1,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "type"
+        ],
+        "args": [
+          {
+            "arg": 0,
+            "text": "message"
+          }
+        ]
+      }
+    ],
+    "end": {
+      "kind": "hole",
+      "reason": "callee_unread",
+      "file": "src/parent.ts",
+      "line": 9,
+      "text": "fork(script)"
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "send",
+        "file": "src/parent.ts",
+        "line": 12,
+        "target": null
+      }
+    ]
+  },
+  {
+    "literal": "DONE",
+    "shape": "name",
+    "position": "case",
+    "negated": false,
+    "site": {
+      "file": "src/parent.ts",
+      "line": 14
+    },
+    "subject": "msg.type",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/parent.ts",
+        "line": 9,
+        "callee": "child.on",
+        "arg": 1,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "type"
+        ],
+        "args": [
+          {
+            "arg": 0,
+            "text": "message"
+          }
+        ]
+      }
+    ],
+    "end": {
+      "kind": "hole",
+      "reason": "callee_unread",
+      "file": "src/parent.ts",
+      "line": 9,
+      "text": "fork(script)"
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "kill",
+        "file": "src/parent.ts",
+        "line": 15,
+        "target": null
+      }
+    ]
+  },
+  {
+    "literal": "FAILED",
+    "shape": "name",
+    "position": "equality",
+    "negated": false,
+    "site": {
+      "file": "src/parent.ts",
+      "line": 21
+    },
+    "subject": "msg.type",
+    "conjoined": [],
+    "hops": [],
+    "within": [
+      {
+        "file": "src/parent.ts",
+        "line": 19,
+        "callee": "child.on",
+        "arg": 1,
+        "path": [],
+        "args": [
+          {
+            "arg": 0,
+            "text": "message"
+          }
+        ]
+      }
+    ],
+    "end": {
+      "kind": "hole",
+      "reason": "unread_expression",
+      "file": "src/parent.ts",
+      "line": 19,
+      "text": "parseMessage(raw)"
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "kill",
+        "file": "src/parent.ts",
+        "line": 22,
+        "target": null
+      }
+    ]
+  },
+  {
+    "literal": "stop",
+    "shape": "name",
+    "position": "equality",
+    "negated": false,
+    "site": {
+      "file": "src/worker.ts",
+      "line": 9
+    },
+    "subject": "msg.kind",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/worker.ts",
+        "line": 8,
+        "callee": "process.on",
+        "arg": 1,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "kind"
+        ],
+        "args": [
+          {
+            "arg": 0,
+            "text": "message"
+          }
+        ]
+      }
+    ],
+    "end": {
+      "kind": "global",
+      "name": "process",
+      "steps": [
+        "on"
+      ]
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "exit",
+        "file": "src/worker.ts",
+        "line": 10,
+        "target": null
+      }
+    ]
+  },
+  {
+    "literal": "Signals.PAUSE",
+    "shape": "unresolved",
+    "constant": {
+      "specifier": "invented-protocol",
+      "export": "Signals",
+      "path": [
+        "PAUSE"
+      ]
+    },
+    "position": "equality",
+    "negated": false,
+    "site": {
+      "file": "src/worker.ts",
+      "line": 12
+    },
+    "subject": "msg.kind",
+    "conjoined": [],
+    "hops": [
+      {
+        "kind": "handed_to",
+        "file": "src/worker.ts",
+        "line": 8,
+        "callee": "process.on",
+        "arg": 1,
+        "path": [],
+        "param": 0,
+        "steps": [
+          "kind"
+        ],
+        "args": [
+          {
+            "arg": 0,
+            "text": "message"
+          }
+        ]
+      }
+    ],
+    "end": {
+      "kind": "global",
+      "name": "process",
+      "steps": [
+        "on"
+      ]
+    },
+    "branch": [
+      {
+        "kind": "call",
+        "callee": "pause",
+        "file": "src/worker.ts",
+        "line": 13,
+        "target": "src/worker.ts:pause"
+      }
+    ]
+  }
+]

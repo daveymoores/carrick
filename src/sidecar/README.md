@@ -108,13 +108,14 @@ A client must skip progress frames rather than treat the first frame as the answ
 | `bundle`, `verify_library_claims` | One per program the request reads, when that program is ready. |
 | `capture_v2` | One as it reaches each stage, `phase` naming it: `program` (the program the anchors are read in is being built), `anchors` (they are being resolved; `message` is `<done> of <total>`, starting at `0`, then at most one every 1.5 s), `emit` (declarations), `self-check` (the stub). The last one written says how far a capture whose process died had got. |
 | `check_v2` | A keepalive every 1.5 s while it installs and checks; `phase` names the stage. |
+| `position_rows` | As `infer`, counting the files walked, with `phase` `positions`. |
 | every other action | None. |
 
 Frames are written by the work itself, between units, except for `check_v2`, whose work runs in child processes. A handler that stops finishing units stops writing them.
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `infer`, `retype_check`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files` and `add_program_files` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
+`init` resolves a project; `bundle`, `infer`, `retype_check`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files`, `add_program_files` and `position_rows` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
 
 `capture_v2`, `check_v2`, `resolve_definitions`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
@@ -134,6 +135,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `list_library_surface` | yes | List a package's declared surface the way the verifier reads it, with its full-surface hash |
 | `list_program_files` | yes | The files the program was built from, in order |
 | `add_program_files` | yes | Add files to the program in a given order |
+| `position_rows` | yes | Write the compiler's rows for every call, member access, comparison and identifier of a service's files (record-only) |
 | `resolve_definitions` | no | As-written and structural form of captured aliases |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
 | `health` | no | Readiness and init cost |
@@ -589,6 +591,7 @@ Rules for the message roles (`broker`, `in_process_bus`, `socket`):
 | A maker is checked on the receiver `export`; an element with `of` only on that receiver; one `on` the export only there, `on` instances only on an instance; `on` never on a receiver a scope returns | `unchecked receiver_invalid` |
 | A member (and each `path` hop) is declared by the receiver's home packages: the named package and its `@types` package, the packages its export is re-exported from, and the package that declares the receiver's type (a hop adds the package that declares its type). Never the runtime's type packages, never only another package's base. A base the class binds with a concrete type its home packages declare (`extends Emitter<L, E, OwnReservedEvents>`) counts as declared. | `failed member_inherited` |
 | A claim that names a runtime module itself (`node:events`) reads the runtime's types package's ambient `declare module` block, reports that package's installed version, and has that package as its home (contract amendment 1, A1). A bare name (`events`) is a registry package's, a `node:` block only the service writes is not the runtime's, and HTTP reads `node:` as #1564 does. | `unchecked module_local` |
+| A claim on the language's own library names a default-library file as `lib:<lib file>` (`lib:lib.dom.d.ts`) and a global it declares as its export (carrick#2445). The global is read as `globalThis.<name>`, its home is the default-library file set (a member the service's own `declare global` block adds is not), and its installed version is the compiler's, so the store keys it `lib:lib.dom.d.ts@<typescript version>`. A global the file does not declare, or a file the program's `lib` setting does not load, is missing; a type-only global has no value to read. | `unchecked export_missing` |
 | A hop typed `any`, `unknown` or `{}` | `unchecked member_untyped` |
 | The name slot accepts a string and is not a key of a concrete index-signature map. A key of a map the library takes as a type parameter (an event map defaulting to an index signature) reads as a string slot (amendment 2, B6). | `failed name_not_string` / `failed name_index_key` |
 | A positional `base` or `prefix` accepts a string | `failed slot_not_string` |
@@ -640,7 +643,7 @@ Lists each specifier the way `verify_library_claims` reads it, from the same pro
 }
 ```
 
-`packages` are module specifiers: a package, its subpaths, or a runtime module (`node:events`, listed from the runtime's types package, as the message roles read it). `exports` (optional) lists only the named exports of a specifier. `max_entries` (default 1000) caps each specifier; exports, receivers, members, signatures, parameters and keys each count one. Every export and receiver is listed before any member name, and every member name before any signature, so the cap cuts signatures first.
+`packages` are module specifiers: a package, its subpaths, a runtime module (`node:events`, listed from the runtime's types package, as the message roles read it), or a default-library file (`lib:lib.dom.d.ts`, listing the value globals it declares when the program's `lib` setting loads it, and nothing otherwise; carrick#2445). `exports` (optional) lists only the named exports of a specifier. `max_entries` (default 1000) caps each specifier; exports, receivers, members, signatures, parameters and keys each count one. Every export and receiver is listed before any member name, and every member name before any signature, so the cap cuts signatures first.
 
 Per specifier, the listing holds each value export (sorted by name; a module that exports a value whole with `export =` also lists `default`, the value a default import gets, when the program compiles that import), and per export the receivers a claim can be read on, in the verifier's grammar: `export`; `instance:()` and `instance:new` when calling or constructing the export, through the signatures a maker claim reads there, builds one object type (overloads whose return says nothing aside); `instance:<member>` and `instance:new:<member>` when calling or constructing one of its members does. A made receiver is read as the verifier reads it, built with no argument and no type argument, so a generic maker's instance is listed at its declared type-parameter defaults (carrick#1696). Every field is read with the verifier's own predicate. Each receiver lists the call and construct signatures a claim with a null member reads, and its callable members (by name), with `own` when an op claim reads the member as the receiver's own (`ownCallee`: its home packages declare it, or it sits on another package's base the receiver binds with its own type, and they write a signature of it). An own member lists the signatures the verifier reads; an inherited one, every library signature. Each signature lists its parameters: `optional`, `rest`, printed `type` (every union in canonical order, inside function and conditional types too), `accepts_string` and `function` (as a positional name and handler are checked there: through a rest's element, a type parameter's constraint and a conditional's branches), the `keys` a claim can name at an options object (by name, of each union member that is an object type, each with `optional`, `accepts_string` and `function`), and the string `literals` the slot spells. A member or key keyed by a symbol (`[Symbol.iterator]`) is not listed: no claim can name it. Type text names `from_dir` as `<root>`.
 
@@ -695,6 +698,8 @@ Each item locates one expression. The fields are `file_path`, `line_number` and 
 `infer_kind` is one of `function_return`, `expression`, `call_result`, `variable`, `response_body`, `request_body`, `signature_return`, `function_param`, `receiver_type`.
 
 `extraction_config` carries the caller's unwrap rules (wrapper symbols, origin module globs, payload paths). **Live behaviour depends on it**: without it the inferrer cannot unwrap a framework envelope, so a probe written without one does not reproduce what a real scan sees.
+
+`model_symbols` (optional) carries the type a model named for a producer's response, one entry per alias: `{ "alias", "symbol_name", "source_file" }`. For a `response_body` or `function_return` request with that alias, the answer carries `model_symbol_relation`: how the named type relates to the compiler's type of what the handler sends, by assignability both ways. `relation` is `same`, `list` (the read is a list of the symbol, `depth` levels), `member` (the symbol is one member of the read's union), `nullable` (the read is the symbol or `null`/`undefined`) or `different`. It is absent where nothing could be compared: the symbol does not resolve to a type in the program, or the read holds `any` or `unknown`. The scanner keeps the symbol on `same` and `member`, keeps it at the read's depth on `list`, and drops it otherwise so the inference defines the alias (carrick#2111).
 
 A `response_body` or `function_return` answer can also carry `unwidened_type_string`: the same inference read again with every literal on the handler's path kept at its literal type (`scope: "all" | "specific"` where `type_string` says `scope: string`). It is absent when the two are the same, and when keeping the literals added a diagnostic on the path. The reading of one batch stops after 120 seconds and keeps the answers it has.
 
@@ -852,6 +857,48 @@ Response:
 To give a second process the first one's program, send the first one's `list_program_files` answer to the second one's `add_program_files` before the second one answers any other request. Both processes then build from the same roots in the same order, so they hold the same files in the same order. A process that has already added files keeps them where they are.
 
 Both actions read the default project, the one that types every file no referenced project owns. A file a referenced project owns (carrick#1604) is in that project's program from its tsconfig, so `add_program_files` skips it, and no request adds files to that program.
+
+#### `position_rows` - The compiler's rows for every position (carrick#2405)
+
+Record-only: nothing in a scan reads the rows yet. The scanner asks for them only with `CARRICK_POSITION_ROWS=1` and a local store (`CARRICK_LOCAL_STORAGE_DIR`), of a process of its own started after the service's analysis sidecar is gone. The walk reads each file in the program of the project that owns it, one owner's program at a time, releasing each before it builds the next. A file no program lists is added, as `infer` adds one.
+
+```json
+{
+  "request_id": "14",
+  "action": "position_rows",
+  "files": ["/repo/apps/api/src/a.ts", "/repo/apps/api/src/b.ts"],
+  "scan_root": "/repo",
+  "out_path": "/store/positions/repo__api.jsonl.gz",
+  "service": "api"
+}
+```
+
+Response (counts only; the rows are in the file):
+```json
+{
+  "request_id": "14",
+  "status": "success",
+  "result": { "files": 2, "rows": 380, "resolved": 361, "any": 4, "error_type": 2, "bytes": 2411, "load_ms": 980, "walk_ms": 120 }
+}
+```
+
+The file is gzip JSON lines, written to `<out_path>.partial` and renamed into place, through the write guard: a directory inside the scanned trees is refused unless it is beneath `.carrick`. Line 1 is `{"v":3,"typescript":"<version>","service":"<name>","files":N}`. Then one line per file, in request order: `{"f":"<repo-relative path>","h":"<sha256 of the bytes on disk>","r":[row, ...]}`, or with `"skip":"unreadable"` or `"skip":"not_in_program"` and no rows.
+
+Each file is read in the program of the project that owns it, one owner at a time. A file that program does not take (JavaScript under a config without `allowJs`) is read after every owner, in the owner's `scripts` program: the same options with `allowJs` on, the owner's root declaration files and the files it did not take (carrick#2413). `not_in_program` is a file that program does not take either.
+
+Each row is `[kind, start, end, symbol, decl_file, decl_line, decl_package, type_text, flags]`, keyed by `(start, end, kind)`: TypeScript `getStart()`/`getEnd()` in UTF-16 code units. Several `impl` rows, and several `decl` rows, share one key.
+
+| kind | node | symbol of | type of |
+|---|---|---|---|
+| `call` | call, `new`, tagged template | the callee's name, through `( )`, `as`, `!`, `satisfies` | the call |
+| `member` | property or element access | the name or the argument | the access |
+| `compare` | `=== !== == != < > <= >= instanceof in` | the left operand | the left operand |
+| `ident` | an identifier in expression position, a shorthand property `{ a }` included | itself | itself |
+| `jsx` | a JSX opening or self-closing element's tag | the tag's name | the tag |
+| `decl` | after a `call` or `member` row, at its span, when the member is read on a union whose constituents declare it at more than one place (carrick#2448) | one of those declarations, sorted by file then position | nothing |
+| `impl` | after a `call` or `member` row, at its span, when its declaration has no body (carrick#2430) | one implementation of it | nothing |
+
+The symbol follows aliases to a target that has a declaration. The declaration is the one the inferrer attributes it to (carrick#2031). `decl_file` is repo-relative (`node_modules/...` included), `lib:<file>` for the compiler's default library (its line is in ts-morph's copy of the library), `pkg:<name>/<path>` for an installed package outside the repo root, or `null`. `decl_package` is the module graph's or the path's package, else the `name` of the nearest `package.json` up to the repo root. `type_text` is the compiler's print of the type at the node with no enclosing declaration (`typeToString(getTypeAtLocation(node))`, default truncation), through `print-type.ts`, so one type reads the same from every file; a declaring file's path in it is written as `decl_file` names it. Flags: 1 `any`, 2 the error type (never with 1), 4 the checker threw at the node, 8 the declaration is outside the checkout and unnamed, 16 an `impl` or `decl` row standing for more than 16 rows of its kind. The scanner pins the format in `src/position_rows.rs`.
 
 #### `resolve_definitions` - Read aliases out of a capture stub
 

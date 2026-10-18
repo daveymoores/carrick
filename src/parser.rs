@@ -186,14 +186,7 @@ pub fn parse_file(
     source_map: &Lrc<SourceMap>,
     handler: &Handler,
 ) -> Option<Module> {
-    // Read file content
-    let file_content = match fs::read_to_string(file_path) {
-        Ok(content) => content,
-        Err(e) => {
-            warn!("Error reading file {}: {}", file_path.display(), e);
-            return None;
-        }
-    };
+    let file_content = read_source(file_path)?;
     parse_source(
         file_path,
         FileName::Real(file_path.to_path_buf()),
@@ -201,6 +194,26 @@ pub fn parse_file(
         source_map,
         handler,
     )
+}
+
+/// The text [`parse_file`] parses `file_path` from, as read from disk (a BOM
+/// included), or `None` for a file that is not script or cannot be read.
+pub fn read_source(file_path: &Path) -> Option<String> {
+    // A data module an import or `require` reaches (`./ranges.json`,
+    // `../package.json`) is not script: handing it to the ES parser fails on
+    // its first key and prints a parse-error block for a file no pass reads
+    // (carrick#2300). The extension list is the one the walk and the
+    // resolvers use, so they cannot disagree about a file.
+    if !crate::file_finder::has_source_extension(file_path) {
+        return None;
+    }
+    match fs::read_to_string(file_path) {
+        Ok(content) => Some(content),
+        Err(e) => {
+            warn!("Error reading file {}: {}", file_path.display(), e);
+            None
+        }
+    }
 }
 
 /// [`parse_file`] over text already in hand: a copy of `file_path` that is
@@ -295,6 +308,55 @@ mod tests {
 
             arrow.visit_children_with(self);
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // carrick#2300: a data module reached by an import or a `require` is not
+    // parsed as script, so no parse-error block is printed for it.
+    #[test]
+    fn a_data_module_is_not_parsed_as_script_and_prints_nothing() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp_dir.path().join("ranges.json"),
+            r#"{"low": 1, "high": 9}"#,
+        )
+        .expect("write json");
+        std::fs::write(
+            tmp_dir.path().join("package.json"),
+            r#"{"version": "1.2.3"}"#,
+        )
+        .expect("write package");
+        std::fs::write(
+            tmp_dir.path().join("main.ts"),
+            "import ranges from './ranges.json' with { type: 'json' };\nconst pkg = require('./package.json');\nexport const top = ranges.high;\n",
+        )
+        .expect("write source");
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let captured = Captured::default();
+        let handler = Handler::with_emitter_writer(Box::new(captured.clone()), Some(cm.clone()));
+
+        assert!(parse_file(&tmp_dir.path().join("ranges.json"), &cm, &handler).is_none());
+        assert!(parse_file(&tmp_dir.path().join("package.json"), &cm, &handler).is_none());
+        assert!(
+            parse_file(&tmp_dir.path().join("main.ts"), &cm, &handler).is_some(),
+            "the source file that imports them still parses"
+        );
+        let printed = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(printed.is_empty(), "no parse-error block: {printed}");
+        assert!(!handler.has_errors());
     }
 
     #[test]

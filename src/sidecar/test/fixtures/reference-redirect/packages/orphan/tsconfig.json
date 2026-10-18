@@ -1,0 +1,4 @@
+{
+  "compilerOptions": { "composite": true, "rootDir": "src", "outDir": "dist", "strict": true },
+  "include": ["src"]
+}

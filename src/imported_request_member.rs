@@ -236,10 +236,7 @@ pub type RequestMemberIndex = HashMap<String, RequestMember>;
 
 /// A member and the module that declared it, as an importing file sees it.
 ///
-/// Generic over what a member IS, because two indexes are folded the same way:
-/// the request members here, and the dispatch members of
-/// [`crate::wrapper_dispatch`]. The default keeps `OwnedMember<PathBuf>`
-/// reading as it always has.
+/// Generic over what a member IS; the default is the request members here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedMember<Id, M = RequestMember> {
     pub member: M,

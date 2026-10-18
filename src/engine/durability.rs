@@ -172,6 +172,10 @@ impl ModelSetup {
 pub struct ServiceAnalysis {
     pub data: CloudRepoData,
     pub deferred: Option<String>,
+    /// The definitions each model call row's call goes through, read while
+    /// the service's files are in hand and settled once every service is
+    /// (carrick#1146). Never serialised.
+    pub call_through: crate::call_through::CallThroughSites,
 }
 
 /// The model work one service still owes once its analysis has run.
@@ -190,11 +194,16 @@ impl OwedWork {
         self.deferred.is_none() && self.losses.is_empty() && self.retry_error.is_none()
     }
 
-    /// Whether what is owed makes the service's index thinner than a complete
-    /// one. Intents are the exception: a function with no intent was never a
-    /// reason to hold an index back, and still is not.
+    /// Whether what is owed is work a re-run can mend, so the service is not
+    /// yet complete. Intents are the exception: a function with no intent was
+    /// never a reason to hold an index back, and still is not. Neither is a
+    /// file whose answer is final (`final_files`): it is missing from the
+    /// index on every scan of those bytes, so it does not make the run
+    /// incomplete or the scan failed (carrick#2488).
     pub fn thins_the_index(&self) -> bool {
-        self.deferred.is_some() || self.losses.files > 0 || self.retry_error.is_some()
+        self.deferred.is_some()
+            || self.losses.files > self.losses.final_files
+            || self.retry_error.is_some()
     }
 
     /// Whether its model stages were deferred because a limit of the cloud's
@@ -224,8 +233,8 @@ impl OwedWork {
 
     /// Whether all this service owes is files whose answer the cloud called
     /// final ([`ServiceLosses::final_files`]). They are still missing from its
-    /// index, so the service is pending and held back like any other that lost
-    /// a file; what changes is that nothing asks for them again.
+    /// index, but no re-run can mend them, so the service is complete
+    /// ([`Self::thins_the_index`]) and nothing asks for them again.
     fn owes_only_final_files(&self) -> bool {
         self.deferred.is_none()
             && self.retry_error.is_none()
@@ -271,7 +280,7 @@ impl OwedWork {
         }
         if self.losses.final_files > 0 {
             parts.push(format!(
-                "{} file(s) the cloud cannot analyse",
+                "{} file(s) Carrick cannot analyse",
                 self.losses.final_files
             ));
         }
@@ -296,7 +305,10 @@ impl OwedWork {
 /// - Deferred: its files were never sent, so no unanalysed-file list describes
 ///   the gap. It lands only when there is no index to thin (`has_index`
 ///   false).
-/// - Files the analyzer did not answer for: it lands when the cloud decides
+/// - Files the analyzer did not answer for: only files a re-run can mend
+///   count (`files - final_files`); a file whose answer is final is missing
+///   from the index either way, so holding the service back gains nothing.
+///   It lands when the cloud decides
 ///   with the service's own list (a laptop first index of the service,
 ///   `laptop && !has_index`). CI never sends the list, so CI holds it back.
 ///
@@ -312,7 +324,8 @@ pub fn holds_back(owed: &OwedWork, has_index: bool, laptop: bool, allow_partial:
     if owed.deferred.is_some() {
         return has_index;
     }
-    owed.losses.files > 0 && (has_index || !laptop)
+    let mendable = owed.losses.files.saturating_sub(owed.losses.final_files);
+    mendable > 0 && (has_index || !laptop)
 }
 
 /// Set to a number of seconds to change how long a run waits before it
@@ -422,23 +435,36 @@ pub fn pending_summary(
     pending: &[(String, OwedWork)],
     laptop: bool,
 ) -> String {
-    let complete_line = if complete.is_empty() {
+    // A service whose only owed work is final files is complete: a re-run
+    // cannot mend it (carrick#2488). It is listed with what it lost.
+    let (final_only, pending): (Vec<_>, Vec<_>) = pending
+        .iter()
+        .partition(|(_, owed)| owed.owes_only_final_files());
+    let complete_items: Vec<String> = complete
+        .iter()
+        .cloned()
+        .chain(
+            final_only
+                .iter()
+                .map(|(service, owed)| format!("{service} ({})", owed.describe())),
+        )
+        .collect();
+    let complete_line = if complete_items.is_empty() {
         "Complete: none.".to_string()
     } else {
-        format!("Complete: {}.", complete.join(", "))
+        format!("Complete: {}.", complete_items.join(", "))
     };
     let pending_line = pending
         .iter()
         .map(|(service, owed)| format!("{service} ({})", owed.describe()))
         .collect::<Vec<_>>()
         .join(", ");
-    let final_files: usize = pending
+    let final_files: usize = final_only
         .iter()
+        .chain(pending.iter())
         .map(|(_, owed)| owed.losses.final_files)
         .sum();
-    let a_rerun_finishes_some = pending
-        .iter()
-        .any(|(_, owed)| !owed.owes_only_final_files());
+    let a_rerun_finishes_some = !pending.is_empty();
     let what = if final_files > 0 { "the rest" } else { "them" };
     let rerun = a_rerun_finishes_some.then(|| {
         if laptop {
@@ -459,10 +485,12 @@ pub fn pending_summary(
     .into_iter()
     .flatten()
     .collect();
-    format!(
-        "{complete_line} Pending model analysis: {pending_line}. {}",
-        closing.join(" ")
-    )
+    let pending_part = if pending.is_empty() {
+        String::new()
+    } else {
+        format!(" Pending model analysis: {pending_line}.")
+    };
+    format!("{complete_line}{pending_part} {}", closing.join(" "))
 }
 
 #[cfg(test)]
@@ -837,22 +865,25 @@ mod tests {
     }
 
     /// carrick#1897: a service that owes only files whose answer is final is
-    /// not retried, because asking again gets that answer again. It is still
-    /// pending and still held back: the files are missing from its index like
-    /// any other lost file. One thing another ask may mend beside them, and
-    /// the service is retried as it always was.
+    /// not retried, because asking again gets that answer again, and it does
+    /// not thin the index in the sense a re-run could mend (carrick#2488):
+    /// it is complete, its files still named in the summary. One thing
+    /// another ask may mend beside them, and the service is pending and
+    /// retried as it always was.
     #[test]
-    fn a_service_that_owes_only_final_files_is_pending_and_not_retried() {
+    fn a_service_that_owes_only_final_files_is_complete_and_not_retried() {
         let only_final = lost_with_final(2, 2);
         assert!(!only_final.is_empty());
         assert!(!only_final.worth_retrying());
-        assert!(only_final.thins_the_index());
+        // Complete: a re-run cannot mend it (carrick#2488).
+        assert!(!only_final.thins_the_index());
         assert!(!only_final.only_refused());
         assert_eq!(only_final.refused_for_capacity(), None);
-        assert!(holds_back(&only_final, true, true, false));
-        assert!(holds_back(&only_final, false, false, false));
+        assert!(!holds_back(&only_final, true, true, false));
+        assert!(!holds_back(&only_final, false, false, false));
         assert!(!holds_back(&only_final, false, true, false));
 
+        assert!(lost_with_final(2, 1).thins_the_index());
         assert!(lost_with_final(2, 1).worth_retrying());
         assert!(lost_with_final(2, 0).worth_retrying());
         let with_intents = OwedWork {
@@ -872,8 +903,16 @@ mod tests {
         assert!(deferred.worth_retrying());
     }
 
-    const FINAL_ANSWER_FOR_ONE: &str = "The cloud's answer for 1 file(s) is final: a re-run gets \
-                                        the same until the file or Carrick changes.";
+    /// A service whose only losses are final lands in CI with an index; one
+    /// final loss beside a loss a re-run can mend is still held back.
+    #[test]
+    fn only_losses_a_rerun_can_mend_hold_a_service_back() {
+        assert!(!holds_back(&lost_with_final(1, 1), true, false, false));
+        assert!(holds_back(&lost_with_final(2, 1), true, false, false));
+    }
+
+    const FINAL_ANSWER_FOR_ONE: &str = "The answer for 1 file(s) is final: a re-run gives the \
+                                        same result until the file changes or Carrick is updated.";
 
     /// carrick#1897: the run's closing lines never advise a re-run for a file
     /// whose answer is final. A service that owes nothing else gets no such
@@ -886,11 +925,47 @@ mod tests {
             assert_eq!(
                 pending_summary(&["api".to_string()], &pending, laptop),
                 format!(
-                    "Complete: api. Pending model analysis: billing (1 file(s) the cloud cannot \
-                     analyse). {FINAL_ANSWER_FOR_ONE}"
+                    "Complete: api, billing (1 file(s) Carrick cannot analyse). \
+                     {FINAL_ANSWER_FOR_ONE}"
                 )
             );
         }
+    }
+
+    /// carrick#2488: a service whose only owed work is final files is listed
+    /// under Complete with its parenthesis, and no pending part is written
+    /// when nothing else is pending.
+    #[test]
+    fn a_final_only_service_is_listed_as_complete_with_its_parenthesis() {
+        let owed = [("billing".to_string(), lost_with_final(2, 2))];
+        assert_eq!(
+            pending_summary(&["api".to_string()], &owed, true),
+            "Complete: api, billing (2 file(s) Carrick cannot analyse). The answer for 2 \
+             file(s) is final: a re-run gives the same result until the file changes or \
+             Carrick is updated."
+        );
+        let only = pending_summary(&[], &owed, false);
+        assert!(only.starts_with("Complete: billing (2 file(s)"), "{only}");
+        assert!(!only.contains("Pending model analysis"), "{only}");
+    }
+
+    /// A final-only service moves to Complete; a service beside it with work
+    /// a re-run can mend stays pending with today's wording.
+    #[test]
+    fn a_final_only_service_beside_a_mendable_one_moves_and_the_other_stays() {
+        let owed = [
+            ("billing".to_string(), lost_with_final(1, 1)),
+            ("worker".to_string(), lost_with_final(1, 0)),
+        ];
+        assert_eq!(
+            pending_summary(&["api".to_string()], &owed, false),
+            format!(
+                "Complete: api, billing (1 file(s) Carrick cannot analyse). Pending model \
+                 analysis: worker (1 file(s) not analysed). The next scan asks the model only \
+                 for the pending work and replays everything else from cache. \
+                 {FINAL_ANSWER_FOR_ONE}"
+            )
+        );
     }
 
     /// Beside work a re-run does finish, the advice covers that work and the
@@ -906,7 +981,7 @@ mod tests {
             pending_summary(&[], &mixed, true),
             format!(
                 "Complete: none. Pending model analysis: billing (2 file(s) not analysed; 1 \
-                 file(s) the cloud cannot analyse), worker (1 file(s) not analysed). Re-run \
+                 file(s) Carrick cannot analyse), worker (1 file(s) not analysed). Re-run \
                  `carrick index` to finish the rest: it asks the model only for the pending work \
                  and replays everything else from cache. {FINAL_ANSWER_FOR_ONE}"
             )
@@ -915,7 +990,7 @@ mod tests {
             pending_summary(&[], &mixed, false),
             format!(
                 "Complete: none. Pending model analysis: billing (2 file(s) not analysed; 1 \
-                 file(s) the cloud cannot analyse), worker (1 file(s) not analysed). The next \
+                 file(s) Carrick cannot analyse), worker (1 file(s) not analysed). The next \
                  scan asks the model only for the pending work and replays everything else from \
                  cache. {FINAL_ANSWER_FOR_ONE}"
             )

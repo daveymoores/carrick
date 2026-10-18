@@ -1,0 +1,9 @@
+{
+  "name": "constant-routes",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "invented-router": "1.0.0",
+    "invented-routes": "1.0.0"
+  }
+}

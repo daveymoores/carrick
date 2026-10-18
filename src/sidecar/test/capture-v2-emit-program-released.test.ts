@@ -68,10 +68,10 @@ describe('carrick#1916: a capture holds no earlier program when the self-check s
   ];
 
   /** One capture, and the heap left after a full collection at the first report of each stage. */
-  const liveAtEachStage = (outDir: string): Partial<Record<CapturePhase, number>> => {
+  const liveAtEachStage = (outDir: string, repoRoot: string = root): Partial<Record<CapturePhase, number>> => {
     const live: Partial<Record<CapturePhase, number>> = {};
     const result = captureStub({
-      repoRoot: root,
+      repoRoot,
       serviceName: 'ledger',
       anchors,
       outDir,
@@ -85,32 +85,72 @@ describe('carrick#1916: a capture holds no earlier program when the self-check s
     return live;
   };
 
-  it('holds, as the self-check starts, what it held before the first program was built', () => {
+  /** The least a capture of `repoRoot` holds as its self-check starts, over what it held before its first program. */
+  const leastHeld = (repoRoot: string): { heldMb: number; live: Partial<Record<CapturePhase, number>> } => {
     const out = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1916-released-stub-'));
     try {
       // Once unmeasured: the compiler's own code and tables are loaded by its
       // first use and stay, and they are not what a capture holds.
-      liveAtEachStage(path.join(out, 'warm'));
+      liveAtEachStage(path.join(out, 'warm'), repoRoot);
       // Then three captures, and the least any of them held. A capture that
       // keeps a program keeps it every time; the engine compiling a function
       // in the background can keep one alive for an instant, once.
       const runs = ['a', 'b', 'c'].map((name) => {
-        const live = liveAtEachStage(path.join(out, name));
+        const live = liveAtEachStage(path.join(out, name), repoRoot);
         const before = live.program;
         const atSelfCheck = live['self-check'];
         assert.ok(before !== undefined && atSelfCheck !== undefined, JSON.stringify(live));
         return { heldMb: (atSelfCheck - before) / MB, live };
       });
-      const least = runs.reduce((a, b) => (a.heldMb <= b.heldMb ? a : b));
-      // One program of this service, held, is some 40 MB; released, the
-      // capture holds its anchors and the emitted text, well under 1 MB.
-      assert.ok(
-        least.heldMb < 8,
-        `the capture holds ${least.heldMb.toFixed(1)} MB more as the self-check starts than before it built a program: ` +
-          JSON.stringify(Object.fromEntries(Object.entries(least.live).map(([phase, bytes]) => [phase, Math.round(bytes / MB)])))
-      );
+      return runs.reduce((a, b) => (a.heldMb <= b.heldMb ? a : b));
     } finally {
       fs.rmSync(out, { recursive: true, force: true });
+    }
+  };
+
+  const assertReleased = (least: { heldMb: number; live: Partial<Record<CapturePhase, number>> }): void => {
+    // One program of this service, held, is some 40 MB; released, the
+    // capture holds its anchors and the emitted text, well under 1 MB.
+    assert.ok(
+      least.heldMb < 8,
+      `the capture holds ${least.heldMb.toFixed(1)} MB more as the self-check starts than before it built a program: ` +
+        JSON.stringify(Object.fromEntries(Object.entries(least.live).map(([phase, bytes]) => [phase, Math.round(bytes / MB)])))
+    );
+  };
+
+  it('holds, as the self-check starts, what it held before the first program was built', () => {
+    assertReleased(leastHeld(root));
+  });
+
+  // carrick#2317: a file that declares an augmentation is a root of the
+  // program the anchors are read in, and of the emit's. It is often the
+  // service's entry file, which imports the whole service, so both programs
+  // grow by it. Neither is held when the self-check starts.
+  it('holds no more when an augmentation file brings the rest of the service into both programs', () => {
+    const augmented = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-2317-released-')));
+    try {
+      fs.cpSync(root, augmented, { recursive: true });
+      const modules = Array.from({ length: 40 }, (_, i) => `part${i}`);
+      for (const name of modules) {
+        fs.writeFileSync(
+          path.join(augmented, 'src', `${name}.ts`),
+          `export interface ${name}Row { id: string; ${name}: number }\nexport function ${name}(): ${name}Row[] { return []; }\n`
+        );
+      }
+      fs.writeFileSync(
+        path.join(augmented, 'src', 'index.ts'),
+        [
+          ...modules.map((name) => `import { ${name} } from './${name}';`),
+          'declare global {',
+          '  interface Request { ledger: string }',
+          '}',
+          `export const parts = [${modules.join(', ')}];`,
+          '',
+        ].join('\n')
+      );
+      assertReleased(leastHeld(augmented));
+    } finally {
+      fs.rmSync(augmented, { recursive: true, force: true });
     }
   });
 });

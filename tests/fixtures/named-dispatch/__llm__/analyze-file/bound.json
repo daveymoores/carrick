@@ -1,0 +1,45 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:7",
+      "line_number": 7,
+      "target": "${REMOTE_URL}/orders.bound",
+      "method": "GET",
+      "pattern_matched": "bind(",
+      "call_expression_text": "bind(localList, \"orders.bound\", { timeoutMs: 1 })",
+      "call_expression_line": 7,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:8",
+      "line_number": 8,
+      "target": "/orders/:id",
+      "method": "GET",
+      "pattern_matched": "endpoint(",
+      "call_expression_text": "endpoint(\"/orders/:id\")",
+      "call_expression_line": 8,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "/orders.warm",
+      "method": "GET",
+      "pattern_matched": "eager(",
+      "call_expression_text": "eager(\"orders.warm\")",
+      "call_expression_line": 9,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

@@ -186,7 +186,28 @@ function isMarkableLiteral(node: Node): boolean {
   // Syntax, not a value: a quoted property name, a tagged template's text.
   if ((parent as Node & { getNameNode?(): Node }).getNameNode?.() === node) return false;
   if (Node.isTaggedTemplateExpression(parent)) return false;
+  // Already kept narrow by the source (carrick#2343): marking it again writes
+  // `('warn' as const) as const`, which the compiler rejects (a const
+  // assertion applies to a literal only), and that one diagnostic would cost
+  // the whole reading.
+  if (isConstAssertionOperand(node)) return false;
   return !initialisesMutableBinding(node);
+}
+
+/**
+ * Whether the literal, through any parentheses, is what a const assertion
+ * (`x as const`, `<const>x`) asserts. Any other assertion takes a marked
+ * literal: `('a' as const) as string` is valid.
+ */
+function isConstAssertionOperand(literal: Node): boolean {
+  let node: Node = literal;
+  let parent = node.getParent();
+  while (parent && Node.isParenthesizedExpression(parent)) {
+    node = parent;
+    parent = node.getParent();
+  }
+  if (!parent || !(Node.isAsExpression(parent) || Node.isTypeAssertion(parent))) return false;
+  return parent.getTypeNode()?.getText() === 'const';
 }
 
 /**

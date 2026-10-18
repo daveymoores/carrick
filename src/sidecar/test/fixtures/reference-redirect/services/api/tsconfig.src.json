@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "customConditions": ["@acme/source"],
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../../packages/shapes" },
+    { "path": "../../packages/legacy" },
+    { "path": "../../packages/cjs" }
+  ]
+}

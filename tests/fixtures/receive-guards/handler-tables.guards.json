@@ -1,0 +1,64 @@
+[
+  {
+    "literal": "remove",
+    "shape": "name",
+    "position": "table_key",
+    "negated": false,
+    "site": {
+      "file": "src/dispatch.ts",
+      "line": 17
+    },
+    "subject": "event.type",
+    "conjoined": [],
+    "hops": [],
+    "end": {
+      "kind": "entry_point",
+      "file": "src/dispatch.ts",
+      "line": 16,
+      "function": "dispatch",
+      "param": 0,
+      "steps": [
+        "type"
+      ]
+    },
+    "branch": [
+      {
+        "kind": "value",
+        "text": "(payload) => drop(payload)",
+        "file": "src/dispatch.ts",
+        "line": 13
+      }
+    ]
+  },
+  {
+    "literal": "save",
+    "shape": "name",
+    "position": "table_key",
+    "negated": false,
+    "site": {
+      "file": "src/dispatch.ts",
+      "line": 17
+    },
+    "subject": "event.type",
+    "conjoined": [],
+    "hops": [],
+    "end": {
+      "kind": "entry_point",
+      "file": "src/dispatch.ts",
+      "line": 16,
+      "function": "dispatch",
+      "param": 0,
+      "steps": [
+        "type"
+      ]
+    },
+    "branch": [
+      {
+        "kind": "value",
+        "text": "(payload) => store(payload)",
+        "file": "src/dispatch.ts",
+        "line": 12
+      }
+    ]
+  }
+]

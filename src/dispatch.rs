@@ -949,6 +949,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         });
 
         let findings = dispatch_operation_findings(&[producer, consumer]);
@@ -1036,6 +1037,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         }
     }
 

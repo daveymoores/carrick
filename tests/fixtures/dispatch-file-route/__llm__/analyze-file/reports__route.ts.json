@@ -1,0 +1,63 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "owner_node": "",
+      "method": "GET",
+      "path": "/api/reports",
+      "handler_name": "GET",
+      "pattern_matched": "export async function GET",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "{ totals: [] }",
+      "response_expression_line": 4,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": { "location": "body", "field": "view", "value": "totals" }
+    },
+    {
+      "candidate_id": "@line:7",
+      "line_number": 1,
+      "owner_node": "",
+      "method": "GET",
+      "path": "/api/reports",
+      "handler_name": "GET",
+      "pattern_matched": "export async function GET",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "{ trend: [] }",
+      "response_expression_line": 7,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": { "location": "body", "field": "view", "value": "trend" }
+    },
+    {
+      "candidate_id": "endpoint:route.ts:GET:export",
+      "line_number": 1,
+      "owner_node": "",
+      "method": "GET",
+      "path": "/api/reports",
+      "handler_name": "GET",
+      "pattern_matched": "export async function GET",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "{ rows: [] }",
+      "response_expression_line": 10,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": { "location": "body", "field": "view", "value": "export" }
+    }
+  ],
+  "data_calls": [],
+  "dispatch_tables": [
+    {
+      "location": "body",
+      "field": "view",
+      "values": ["totals", "trend", "export"],
+      "handler_name": "GET",
+      "line_number": 3
+    }
+  ]
+}

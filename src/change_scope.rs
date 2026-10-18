@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::cloud_storage::CloudRepoData;
 use crate::config::Config;
@@ -111,6 +111,9 @@ impl Scope {
 pub struct ThisRun<'a> {
     pub scanner_version: &'a str,
     pub cache_version: u32,
+    /// Whether this run asks the model: only such a run can ask for an
+    /// extraction config a stored blob went without.
+    pub asks_model: bool,
 }
 
 /// One root a service's walk reads: a directory relative to the repository's
@@ -308,7 +311,7 @@ pub fn decide(
             "the stored index was read from uncommitted changes",
         );
     }
-    if let Some(owed) = owed_work(stored) {
+    if let Some(owed) = owed_work(stored, this_run) {
         return Scope::analysed(Reason::StoredIncomplete, owed);
     }
     if stored.config_json.as_deref() != config_json {
@@ -355,13 +358,28 @@ pub fn decide(
 }
 
 /// What a stored blob says it still owed when it was written: degraded types,
-/// files the model never answered, candidates no model was asked about.
-fn owed_work(stored: &CloudRepoData) -> Option<String> {
+/// an extraction config that never arrived, files the model never answered,
+/// candidates no model was asked about.
+fn owed_work(stored: &CloudRepoData, this_run: ThisRun<'_>) -> Option<String> {
     if let Some(degraded) = &stored.types_degraded {
         return Some(format!(
             "the stored index lost its types ({})",
             degraded.stage
         ));
+    }
+    // The extraction config was asked for and did not arrive, so the blob's
+    // types kept their machinery wrappers and are what a contract check would
+    // compare. A blob keeps the config it was analysed with, an empty rule
+    // set included, so a recorded status beside no config is the one case an
+    // analysis repairs: it asks for the config again (carrick#2301). A status
+    // beside a config (a capture that produced no stub) is not: nothing an
+    // analysis asks for would change it. A run that asks no model cannot ask
+    // for the config either.
+    if this_run.asks_model
+        && stored.type_extraction_status.is_some()
+        && stored.cached_extraction_config.is_none()
+    {
+        return Some("the stored index was written without its extraction config".to_string());
     }
     let boundary = stored.boundary.as_ref()?;
     if boundary.files_lost.total > 0 {
@@ -432,6 +450,18 @@ pub fn plan<'a>(
                     "scope: {label} carried (inputs unchanged since {})",
                     short(commit)
                 ),
+                // A stored index that lacks something is a gap in the index: the
+                // person reading the scan is not told why, the debug log is.
+                Scope::Analysed {
+                    reason: Reason::StoredIncomplete,
+                    detail,
+                } => {
+                    info!("scope: {label} analysed");
+                    debug!(
+                        "scope: {label} analysed ({}: {detail})",
+                        Reason::StoredIncomplete.as_str()
+                    );
+                }
                 Scope::Analysed { reason, detail } => {
                     info!("scope: {label} analysed ({}: {detail})", reason.as_str())
                 }
@@ -814,6 +844,7 @@ mod tests {
     const THIS: ThisRun<'static> = ThisRun {
         scanner_version: "1.0.0",
         cache_version: 7,
+        asks_model: true,
     };
 
     fn stored(commit: &str) -> CloudRepoData {
@@ -1084,6 +1115,35 @@ mod tests {
             reason(&decide_with(Some(&degraded), Ok(&changes), api_inputs())),
             Some(Reason::StoredIncomplete)
         );
+        let mut wrapped = stored("abcdef1234");
+        wrapped.type_extraction_status = Some("machinery unwrapping disabled this run".to_string());
+        assert_eq!(
+            reason(&decide_with(Some(&wrapped), Ok(&changes), api_inputs())),
+            Some(Reason::StoredIncomplete)
+        );
+        // A run that asks no model cannot ask for the config.
+        let no_model = ThisRun {
+            asks_model: false,
+            ..THIS
+        };
+        let carried = decide(
+            Some(&wrapped),
+            no_model,
+            Some("{\"serviceName\":\"api\"}"),
+            Ok(&changes),
+            api_inputs,
+        );
+        assert_eq!(reason(&carried), None);
+        // A status beside a config is not this rule's: the config arrived,
+        // and analysing again would ask for nothing new.
+        let mut no_stub = stored("abcdef1234");
+        no_stub.type_extraction_status =
+            Some("v2 type capture degraded: no stub package was produced".to_string());
+        no_stub.cached_extraction_config = Some(Default::default());
+        assert_eq!(
+            reason(&decide_with(Some(&no_stub), Ok(&changes), api_inputs())),
+            None
+        );
         let mut lost = stored("abcdef1234");
         lost.boundary = Some(crate::boundary::ServiceBoundary {
             files_lost: crate::boundary::Counted::new(2, Vec::new()),
@@ -1169,7 +1229,7 @@ mod tests {
 
     // --- carrick#2228: main's copy judged by each service's inputs ---
 
-    use crate::git_state::tests::{committed_repo, git_in};
+    use crate::git_state::tests::{committed_repo, git_in, partial_clone_without_remote};
     use crate::pr_baseline::{MainCopy, main_copy};
 
     /// Three services: `web` imports a file of `api` by a relative path, and
@@ -1365,5 +1425,29 @@ mod tests {
             MainCopy::Stale,
             "a README change is a whole-tree difference"
         );
+    }
+
+    /// A blobless clone holds both commits' trees but not the stored commit's
+    /// copy of a file that changed since, and no remote answers. Whether the
+    /// trees differ is a question about trees: it is answered offline, and a
+    /// copy stored before that change is stale (carrick#2365). Some git
+    /// versions read file contents for `git diff --quiet`, fail to fetch them
+    /// and leave the copy counted as current. A full clone answers the same.
+    #[test]
+    fn a_blobless_clone_compares_trees_without_fetching_contents() {
+        for filter in [true, false] {
+            let (_root, clone, base) = partial_clone_without_remote(filter);
+            let head = git_in(&clone, &["rev-parse", "HEAD"]);
+            assert_eq!(
+                crate::git_state::differs_under(&clone.to_string_lossy(), &base, &head),
+                Ok(true),
+                "blobless: {filter}"
+            );
+            assert_eq!(
+                judged(&clone, &[], &[copy_at("api", &base)], &head),
+                MainCopy::Stale,
+                "blobless: {filter}"
+            );
+        }
     }
 }

@@ -16,8 +16,11 @@
 //!   asks npm about every name it receives, so a private name would reach the
 //!   public registry. Anything this cannot prove is not sent.
 //! - **The answer** is read one element at a time ([`parse_answer`]) and can
-//!   never fail a scan. An entry the store has not finished is `pending`, and
-//!   is asked once more after the analysis ([`settle`]), and again next scan.
+//!   never fail a scan. An entry the store has not finished is `pending`. One
+//!   whose build is queued, in flight or starting ([`WAITED_REASONS`]) is
+//!   asked again every [`POLL_INTERVAL`] for up to [`WAIT_CAP`] from the first
+//!   ask ([`ask_until_settled`], carrick#2496); any other pending package is
+//!   named at the end and asked again next scan.
 //! - **Transport (A5)** is the agent service's one path
 //!   ([`crate::agent_service::AgentService::post_to_lambda`]): the scan slot,
 //!   the scanner version, the pacer. The route's 2xx body is the answer
@@ -39,11 +42,36 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::agent_service::AgentCallError;
-use crate::library_claims::{CallClaim, ExportClaims, Side};
+use crate::library_claims::{CallClaim, ExportClaims, Side, SideRule};
 use crate::services::type_sidecar::{LibraryClaim, LibraryRole};
 
 /// The roles this scanner reads rows for: the store spends nothing on others.
 pub const ROLES: [&str; 3] = ["broker", "socket", "in_process_bus"];
+
+/// Every network role the store answers (carrick-cloud#2377), asked when
+/// site questions are on ([`crate::site_questions::enabled`], carrick#2436):
+/// discovery and the site labels read all of them. The message roles come
+/// first, in [`ROLES`]' order. Library rows still read the message roles
+/// only ([`crate::library_claims::read`]), so a claim of another role feeds
+/// discovery and the site rows and states no library row.
+pub const NETWORK_ROLES: [&str; 6] = [
+    "broker",
+    "socket",
+    "in_process_bus",
+    "http_client",
+    "graphql_client",
+    "server_framework",
+];
+
+/// The roles a scan asks the store for: every network role with site
+/// questions on, the message roles alone with them off.
+pub fn roles_for(site_questions: bool) -> &'static [&'static str] {
+    if site_questions {
+        &NETWORK_ROLES
+    } else {
+        &ROLES
+    }
+}
 
 /// The store's route.
 pub const ROUTE: &str = "/library-claims";
@@ -53,6 +81,23 @@ pub const MOCK_SEED: &str = "default";
 
 /// How long one ask may take before the scan goes on without it.
 pub const ASK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long between two asks for the packages the store is still building.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long, from the first ask, the scan waits for those packages.
+pub const WAIT_CAP: Duration = Duration::from_secs(600);
+
+/// The store's pending reasons (carrick-cloud `lambdas/library-claims/http.ts`
+/// `missing`) that a wait can end: a build is running (`in_flight`) or is
+/// about to be started by this very ask (`building`). Every other pending
+/// reason is a state asking again does not change within a scan: a stage the
+/// store has no pin for (`classifier_unavailable`, `picker_unavailable`,
+/// `lister_unavailable`), a store it could not read (`store_unavailable`,
+/// `store_row_unreadable`) or a build it could not dispatch
+/// (`dispatch_failed`). A failed build is not pending at all: the store
+/// answers it `skipped` (`build_failed`, due a retry later).
+pub const WAITED_REASONS: [&str; 2] = ["in_flight", "building"];
 
 /// The most registry packages one request carries (the store's cap).
 const MAX_PACKAGES: usize = 200;
@@ -64,7 +109,7 @@ const MAX_SPECIFIERS: usize = 32;
 const PUBLIC_REGISTRIES: [&str; 2] = ["registry.npmjs.org", "registry.yarnpkg.com"];
 
 /// The runtime's types package: a runtime module's version is its version.
-const RUNTIME_TYPES: &str = "@types/node";
+pub(crate) const RUNTIME_TYPES: &str = "@types/node";
 
 /// The lockfiles an install writes.
 const LOCKFILES: [&str; 5] = [
@@ -94,6 +139,11 @@ pub struct RegistryPackage {
     /// The specifiers the service imports it by. A runtime module's is its
     /// `node:` form, the only one the store takes.
     pub specifiers: Vec<String>,
+    /// For a `lib:<file>` entry, the globals the code uses from that file:
+    /// the whole file lists more than the store's cap holds (carrick#2504).
+    /// Omitted when empty, so a request without one is byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exports: Vec<String>,
 }
 
 /// Where a service's install lives: what the A2 rule reads.
@@ -124,6 +174,64 @@ pub struct Asked {
 }
 
 impl Asked {
+    /// A request naming `packages` at 1.0.0, for tests that drive the wait
+    /// without an install.
+    #[cfg(test)]
+    pub(crate) fn naming(packages: &[&str]) -> Self {
+        Self::naming_for(packages, &ROLES)
+    }
+
+    /// [`Self::naming`], asking `roles`.
+    #[cfg(test)]
+    pub(crate) fn naming_for(packages: &[&str], roles: &[&'static str]) -> Self {
+        Self {
+            request: LibraryClaimsRequest {
+                roles: roles.to_vec(),
+                packages: packages
+                    .iter()
+                    .map(|name| RegistryPackage {
+                        package: name.to_string(),
+                        version: "1.0.0".to_string(),
+                        specifiers: vec![name.to_string()],
+                        exports: Vec::new(),
+                    })
+                    .collect(),
+            },
+            spellings: BTreeMap::new(),
+        }
+    }
+
+    /// This request plus `library` (the language's own library, from
+    /// [`default_library_packages`]). A service that asks about no package
+    /// still asks about the library, so `asked` may be `None`.
+    pub fn with_default_library(
+        asked: Option<Self>,
+        library: Vec<RegistryPackage>,
+    ) -> Option<Self> {
+        if library.is_empty() {
+            return asked;
+        }
+        let mut asked = asked.unwrap_or_else(|| Self {
+            request: LibraryClaimsRequest {
+                roles: ROLES.to_vec(),
+                packages: Vec::new(),
+            },
+            spellings: BTreeMap::new(),
+        });
+        let room = MAX_PACKAGES.saturating_sub(asked.request.packages.len());
+        asked
+            .request
+            .packages
+            .extend(library.into_iter().take(room));
+        Some(asked)
+    }
+
+    /// The same packages, asking `roles` instead.
+    pub fn with_roles(mut self, roles: &[&'static str]) -> Self {
+        self.request.roles = roles.to_vec();
+        self
+    }
+
     /// The request for only `packages`, or `None` when it names none of
     /// them.
     fn only(&self, packages: &BTreeSet<String>) -> Option<LibraryClaimsRequest> {
@@ -207,6 +315,7 @@ pub fn request(specifiers: &BTreeSet<String>, install: &Install<'_>) -> Option<A
             package,
             version,
             specifiers: specifiers.into_iter().take(MAX_SPECIFIERS).collect(),
+            exports: Vec::new(),
         })
         .collect();
     (!packages.is_empty()).then(|| Asked {
@@ -216,6 +325,29 @@ pub fn request(specifiers: &BTreeSet<String>, install: &Install<'_>) -> Option<A
         },
         spellings,
     })
+}
+
+/// The language's own library as the store is asked about it (carrick#2504):
+/// one `lib:<file>` package per default-library file the program loads, at
+/// the compiler's version, narrowed to the globals the code uses from it.
+/// `globals` is by library file (`lib.dom.d.ts`).
+pub fn default_library_packages(
+    typescript: &str,
+    globals: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<RegistryPackage> {
+    globals
+        .iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(file, names)| {
+            let key = format!("lib:{file}");
+            RegistryPackage {
+                package: key.clone(),
+                version: typescript.to_string(),
+                specifiers: vec![key],
+                exports: names.iter().cloned().collect(),
+            }
+        })
+        .collect()
 }
 
 /// The entry one specifier is asked under.
@@ -746,8 +878,13 @@ fn deno_lock_key(key: &str) -> Option<(&str, &str)> {
 pub struct LibraryAnswer {
     /// Every export of every `answered` package, element by element.
     pub exports: Vec<ExportClaims>,
-    /// The packages the store has not finished (`pending`): asked again.
+    /// The packages the store has not finished (`pending`).
     pub pending: BTreeSet<String>,
+    /// The part of `pending` a wait can end ([`WAITED_REASONS`]).
+    pub building: BTreeSet<String>,
+    /// The packages answered `skipped` with `build_failed`: named, never
+    /// waited on (carrick#2496).
+    pub build_failed: BTreeSet<String>,
     /// Entries answered, for the log.
     pub answered: usize,
     /// Entries skipped, for the log.
@@ -778,12 +915,19 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
             "pending" => {
                 if let Some(package) = package {
                     answer.pending.insert(package.to_string());
+                    let reason = entry.get("reason").and_then(Value::as_str);
+                    if reason.is_some_and(|reason| WAITED_REASONS.contains(&reason)) {
+                        answer.building.insert(package.to_string());
+                    }
                 }
                 continue;
             }
             other => {
                 answer.skipped += 1;
                 let reason = entry.get("reason").and_then(|reason| reason.as_str());
+                if let (Some(package), Some("build_failed")) = (package, reason) {
+                    answer.build_failed.insert(package.to_string());
+                }
                 debug!(
                     package = package.unwrap_or("?"),
                     status = other,
@@ -799,13 +943,32 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
             answer.dropped += 1;
             continue;
         };
+        // Label v2 (carrick#2434): the package's type-only packages. A name
+        // that is not a string says nothing and is skipped.
+        let type_packages: Vec<String> = entry
+            .get("type_packages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|name| {
+                name.as_str()
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+            .collect();
         for export in entry
             .get("exports")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            match parse_export(package, version, export, &mut answer.dropped) {
+            match parse_export(
+                package,
+                version,
+                &type_packages,
+                export,
+                &mut answer.dropped,
+            ) {
                 Some(claims) => answer.exports.push(claims),
                 None => answer.dropped += 1,
             }
@@ -819,6 +982,7 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
 fn parse_export(
     package: &str,
     version: &str,
+    type_packages: &[String],
     export: &Value,
     dropped: &mut usize,
 ) -> Option<ExportClaims> {
@@ -828,6 +992,16 @@ fn parse_export(
     let side: Option<Side> = match export.get("side") {
         None | Some(Value::Null) => None,
         Some(side) => Some(serde_json::from_value(side.clone()).ok()?),
+    };
+    // Label v2 (carrick#2434). A label is carried as written; a side rule
+    // this build has no word for drops the export, as an unknown role does.
+    let label = match export.get("label") {
+        None | Some(Value::Null) => None,
+        Some(label) => Some(label.as_str()?.to_string()),
+    };
+    let side_rule: Option<SideRule> = match export.get("side_rule") {
+        None | Some(Value::Null) => None,
+        Some(rule) => Some(serde_json::from_value(rule.clone()).ok()?),
     };
     let elements = |list: &str| -> Vec<Value> {
         export
@@ -871,7 +1045,10 @@ fn parse_export(
         specifier,
         export: name,
         role,
+        label,
         side,
+        side_rule,
+        type_packages: type_packages.to_vec(),
         claims,
         calls,
         patterns,
@@ -896,50 +1073,118 @@ where
     S: FnOnce(LibraryClaimsRequest) -> Fut,
     Fut: Future<Output = Result<String, AgentCallError>>,
 {
-    let _turn = gate(&request).await;
-    match tokio::time::timeout(ASK_TIMEOUT, send(request)).await {
-        Ok(Ok(text)) => parse_answer(&text),
-        Ok(Err(error)) => {
-            warn!(%error, "library store: no claims this scan");
-            LibraryAnswer::default()
-        }
-        Err(_) => {
-            warn!("library store: no answer in time; no claims this scan");
-            LibraryAnswer::default()
-        }
-    }
+    try_ask(request, gate, send, ASK_TIMEOUT)
+        .await
+        .unwrap_or_default()
 }
 
-/// The claims the service reads its library rows through: `first`'s, and,
-/// when the store had packages pending, theirs from one more ask through
-/// `send`. A package still pending is asked again next scan.
-pub async fn settle<G, GateFut, S, Fut>(
-    asked: &Asked,
-    first: LibraryAnswer,
+/// [`ask`], saying when there was no answer (a refusal, an error, a timeout
+/// of `limit`) instead of reading it as an answer naming nothing.
+async fn try_ask<G, GateFut, S, Fut>(
+    request: LibraryClaimsRequest,
     gate: G,
     send: S,
-) -> Vec<ExportClaims>
+    limit: Duration,
+) -> Option<LibraryAnswer>
 where
     G: FnOnce(&LibraryClaimsRequest) -> GateFut,
     GateFut: Future,
     S: FnOnce(LibraryClaimsRequest) -> Fut,
     Fut: Future<Output = Result<String, AgentCallError>>,
 {
-    let mut exports = first.exports;
-    let mut pending = first.pending;
-    if let Some(again) = asked.only(&pending) {
-        let second = ask(again, gate, send).await;
-        exports.extend(second.exports);
-        pending = second.pending;
+    let _turn = gate(&request).await;
+    match tokio::time::timeout(limit, send(request)).await {
+        Ok(Ok(text)) => Some(parse_answer(&text)),
+        Ok(Err(error)) => {
+            warn!(%error, "library store: no claims this scan");
+            None
+        }
+        Err(_) => {
+            warn!("library store: no answer in time; no claims this scan");
+            None
+        }
     }
+}
+
+/// What the store gave a scan once it stopped asking.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Settled {
+    /// Every export of every package answered, from any ask.
+    pub exports: Vec<ExportClaims>,
+    /// The packages the scan ends without: pending at the last answer, or
+    /// still being built when the wait ran out or the store stopped answering.
+    pub pending: BTreeSet<String>,
+    /// The packages the store answered `skipped` with `build_failed`.
+    pub build_failed: BTreeSet<String>,
+    /// Whether the store was asked at all.
+    pub asked: bool,
+}
+
+/// The store's answer for `asked`, waiting for the packages it is building
+/// (carrick#2496). The first ask is the whole request. The packages it
+/// answered `pending` for a reason a build can end ([`WAITED_REASONS`]) are
+/// asked again, alone, every [`POLL_INTERVAL`] until each is answered or
+/// [`WAIT_CAP`] has passed since the first ask began. The wait is this
+/// future's alone, so the caller runs it beside the analysis. A store that
+/// stops answering ends the wait: it never fails the scan.
+///
+/// `gate` is taken before every ask, as [`ask`]'s is.
+pub async fn ask_until_settled<G, GateFut, S, Fut>(asked: &Asked, gate: G, send: S) -> Settled
+where
+    G: Fn(&LibraryClaimsRequest) -> GateFut,
+    GateFut: Future,
+    S: Fn(LibraryClaimsRequest) -> Fut,
+    Fut: Future<Output = Result<String, AgentCallError>>,
+{
+    let started = tokio::time::Instant::now();
+    let deadline = started + WAIT_CAP;
+    let Some(first) = try_ask(asked.request.clone(), &gate, &send, ASK_TIMEOUT).await else {
+        return Settled {
+            asked: true,
+            ..Settled::default()
+        };
+    };
+    let mut exports = first.exports;
+    let mut pending: BTreeSet<String> =
+        first.pending.difference(&first.building).cloned().collect();
+    let mut building = first.building;
+    let mut build_failed = first.build_failed;
+    let mut polls = 0usize;
+    while !building.is_empty() {
+        let next = tokio::time::Instant::now() + POLL_INTERVAL;
+        if next >= deadline {
+            break;
+        }
+        tokio::time::sleep_until(next).await;
+        let Some(again) = asked.only(&building) else {
+            break;
+        };
+        let limit = ASK_TIMEOUT.min(deadline - tokio::time::Instant::now());
+        polls += 1;
+        let Some(second) = try_ask(again, &gate, &send, limit).await else {
+            break;
+        };
+        exports.extend(second.exports);
+        pending.extend(second.pending.difference(&second.building).cloned());
+        build_failed.extend(second.build_failed);
+        building = second.building;
+    }
+    pending.extend(building);
     debug!(
         answered = first.answered,
         skipped = first.skipped,
         dropped = first.dropped,
+        polls,
+        waited_s = started.elapsed().as_secs(),
         pending = pending.len(),
         "library store: answered"
     );
-    asked.claims(exports)
+    Settled {
+        exports: asked.claims(exports),
+        pending,
+        build_failed,
+        asked: true,
+    }
 }
 
 /// The store's own 200 bodies, for the tests on both sides of the
@@ -954,6 +1199,13 @@ pub(crate) mod store_bodies {
     /// (`JSON.stringify({ library_claims })`).
     pub const ANSWERED: &str = r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"answered","surface_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","exports":[{"specifier":"lib","export":"default","role":"broker","side":null,"classifier":"jev-test/q1","makes":[],"scopes":[],"ops":[{"op":"send","member":"publish","on":"export","name":{"arg":0},"payload":{"arg":1},"picker":"gemini-test/q1"}],"reserved":[],"calls":[],"patterns":[]}]}]}"#;
 
+    /// The store's 200 body under label structure v2 (carrick#2434), byte
+    /// for byte as carrick-cloud's `lambdas/library-claims/http.test.js`
+    /// case "label v2 rides on the wire" sends it: a `ver` row's
+    /// `type_packages`, a class row's `side_rule` on a picked role and its
+    /// `label` on a class-only role.
+    pub const ANSWERED_V2: &str = r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"answered","surface_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","type_packages":["@types/lib"],"exports":[{"specifier":"lib","export":"Server","role":"socket","side":null,"side_rule":"by_origin","classifier":"jev-test/q1","makes":[],"scopes":[],"ops":[{"op":"send","member":"publish","on":"export","name":{"arg":0},"payload":{"arg":1},"picker":"gemini-test/q1"}],"reserved":[],"calls":[],"patterns":[]},{"specifier":"lib","export":"request","role":"http_client","label":"request_runner","side":null,"classifier":"jev-test/q1","makes":[],"scopes":[],"ops":[],"reserved":[],"calls":[],"patterns":[]}]}]}"#;
+
     /// The same store's 200 body for a package it cannot answer yet: the
     /// case "with no lister pinned, every package is pending and no build
     /// starts".
@@ -962,7 +1214,9 @@ pub(crate) mod store_bodies {
 
 #[cfg(test)]
 mod tests {
-    use super::store_bodies::{ANSWERED as STORE_ANSWERED, PENDING as STORE_PENDING};
+    use super::store_bodies::{
+        ANSWERED as STORE_ANSWERED, ANSWERED_V2 as STORE_ANSWERED_V2, PENDING as STORE_PENDING,
+    };
     use super::*;
     use std::fs;
 
@@ -1061,6 +1315,60 @@ mod tests {
                 "packages": [{"package": "lib", "version": "1.0.0", "specifiers": ["lib"]}],
             }),
             "no workspace_packages: in-repo packages are carrick#1666's"
+        );
+    }
+
+    /// carrick#2436: with site questions off the request is today's, byte for
+    /// byte. On, it asks every network role the store answers for the same
+    /// packages, and so does the re-ask of a package still being built.
+    #[test]
+    fn the_request_asks_every_network_role_only_with_site_questions_on() {
+        let dir = tempfile::tempdir().unwrap();
+        install_package(dir.path(), "lib", "1.0.0");
+        npm_lockfile(dir.path(), &[("lib", PUBLIC_TGZ)]);
+        let asked = request(&specifiers(&["lib"]), &install_at(dir.path())).unwrap();
+        let off = asked.clone().with_roles(roles_for(false));
+        assert_eq!(off, asked);
+        assert_eq!(
+            serde_json::to_string(&off.request).unwrap(),
+            r#"{"roles":["broker","socket","in_process_bus"],"packages":[{"package":"lib","version":"1.0.0","specifiers":["lib"]}]}"#
+        );
+        let on = asked.with_roles(roles_for(true));
+        assert_eq!(
+            serde_json::to_string(&on.request).unwrap(),
+            r#"{"roles":["broker","socket","in_process_bus","http_client","graphql_client","server_framework"],"packages":[{"package":"lib","version":"1.0.0","specifiers":["lib"]}]}"#
+        );
+        let again = on.only(&BTreeSet::from(["lib".to_string()])).unwrap();
+        assert_eq!(again.roles, NETWORK_ROLES.to_vec());
+    }
+
+    /// carrick#2504: the language's own library is one `lib:<file>` package
+    /// per file at the compiler's version, narrowed with `exports`, added to
+    /// a service's request even when it asks about no other package. A
+    /// request without one is the request it was (`exports` is not written).
+    #[test]
+    fn the_language_s_library_is_a_package_per_file_narrowed_to_its_globals() {
+        let globals: BTreeMap<String, BTreeSet<String>> = BTreeMap::from([
+            (
+                "lib.dom.d.ts".to_string(),
+                BTreeSet::from(["WebSocket".to_string(), "fetch".to_string()]),
+            ),
+            ("lib.es5.d.ts".to_string(), BTreeSet::new()),
+        ]);
+        let library = default_library_packages("6.0.2", &globals);
+        let asked = Asked::with_default_library(None, library).expect("the library is asked");
+        assert_eq!(
+            serde_json::to_string(&asked.request.packages).unwrap(),
+            r#"[{"package":"lib:lib.dom.d.ts","version":"6.0.2","specifiers":["lib:lib.dom.d.ts"],"exports":["WebSocket","fetch"]}]"#
+        );
+        assert!(Asked::with_default_library(None, Vec::new()).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        install_package(dir.path(), "lib", "1.0.0");
+        npm_lockfile(dir.path(), &[("lib", PUBLIC_TGZ)]);
+        let plain = request(&specifiers(&["lib"]), &install_at(dir.path())).unwrap();
+        assert_eq!(
+            Asked::with_default_library(Some(plain.clone()), Vec::new()),
+            Some(plain)
         );
     }
 
@@ -1830,6 +2138,119 @@ mod tests {
         assert_eq!(answer.skipped, 2);
     }
 
+    /// Label structure v2 (carrick#2434): every field the rebuilt store
+    /// writes reads into the claims, and the checks the scanner sends carry
+    /// it on to the verifier.
+    #[test]
+    fn a_label_v2_answer_reads_every_field() {
+        let answer = parse_answer(
+            r#"{"library_claims":[{"package":"fixture-sockets","version":"2.0.0","status":"answered",
+                "type_packages":["@types/fixture-sockets","",7],"exports":[
+                {"specifier":"fixture-sockets","export":"SocketServer","role":"socket","label":"socket_server",
+                 "side":null,"side_rule":"by_origin",
+                 "makes":[{"form":"new","member":null,"runs":{"arg":0,"key":"handler"}}],
+                 "ops":[
+                    {"op":"receive","member":"on","of":"instance:new","handler":{"arg":1},
+                     "yields":{"param":0,"export":"Socket","side":"server"}},
+                    {"op":"request","member":"request","of":"instance:new","name":{"arg":0},
+                     "method_key":{"arg":1,"key":"method"},"method_default":"GET","base":{"arg":2}},
+                    {"op":"request","member":"mutate","of":"instance:new","runs":{"bound":"maker","arg":0}}
+                 ]}]}]}"#,
+        );
+        assert_eq!((answer.answered, answer.dropped), (1, 0));
+        let export = &answer.exports[0];
+        assert_eq!(export.label.as_deref(), Some("socket_server"));
+        assert_eq!(export.side_rule, Some(SideRule::ByOrigin));
+        assert_eq!(
+            export.type_packages,
+            vec!["@types/fixture-sockets".to_string()]
+        );
+        assert_eq!(export.claims.len(), 4);
+        let sent = serde_json::to_value(&export.claims).unwrap();
+        assert_eq!(
+            sent[0]["runs"],
+            serde_json::json!({ "arg": 0, "key": "handler" })
+        );
+        assert_eq!(
+            sent[1]["yields"],
+            serde_json::json!({ "param": 0, "export": "Socket", "side": "server" })
+        );
+        assert_eq!(sent[2]["method_default"], "GET");
+        assert_eq!(sent[2]["base"], serde_json::json!({ "arg": 2 }));
+        assert_eq!(
+            sent[3]["runs"],
+            serde_json::json!({ "bound": "maker", "arg": 0 })
+        );
+    }
+
+    #[test]
+    fn the_store_s_label_v2_body_reads_its_label_side_rule_and_type_packages() {
+        let answer = parse_answer(STORE_ANSWERED_V2);
+        assert_eq!((answer.answered, answer.dropped), (1, 0));
+        type Read<'a> = (&'a str, Option<&'a str>, Option<SideRule>, &'a [String]);
+        let read: Vec<Read> = answer
+            .exports
+            .iter()
+            .map(|export| {
+                (
+                    export.export.as_str(),
+                    export.label.as_deref(),
+                    export.side_rule,
+                    export.type_packages.as_slice(),
+                )
+            })
+            .collect();
+        let types = ["@types/lib".to_string()];
+        assert_eq!(
+            read,
+            vec![
+                ("Server", None, Some(SideRule::ByOrigin), &types[..]),
+                ("request", Some("request_runner"), None, &types[..]),
+            ]
+        );
+    }
+
+    /// A v2 field in a shape this build cannot read drops its element and
+    /// counts it; a side rule it has no word for drops the export.
+    #[test]
+    fn a_label_v2_field_out_of_shape_is_dropped_and_counted() {
+        let answer = parse_answer(
+            r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"answered","exports":[
+                {"specifier":"lib","export":"default","role":"http_client","label":"request_runner","ops":[
+                    {"op":"request","member":"get","on":"export","name":{"arg":0},"method":"GET"},
+                    {"op":"request","member":"get","on":"export","name":{"arg":0},"method_default":5},
+                    {"op":"request","member":"get","on":"export","runs":{"bound":"scope","arg":0}},
+                    {"op":"receive","member":"on","on":"export","yields":{"param":-1,"export":"S","side":"server"}}
+                ]},
+                {"specifier":"lib","export":"Socket","role":"socket","side_rule":"by_mood"},
+                {"specifier":"lib","export":"Labelled","role":"socket","label":7}
+            ]}]}"#,
+        );
+        assert_eq!(answer.exports.len(), 1);
+        assert_eq!(answer.exports[0].label.as_deref(), Some("request_runner"));
+        assert_eq!(answer.exports[0].claims.len(), 1);
+        // Three ops and two exports.
+        assert_eq!(answer.dropped, 5);
+    }
+
+    /// An answer in the shape before label v2 reads as it did, and its
+    /// claims go to the verifier byte for byte as before: no v2 key appears.
+    #[test]
+    fn an_answer_in_today_s_shape_reads_and_sends_unchanged() {
+        let answer = parse_answer(STORE_ANSWERED);
+        let export = &answer.exports[0];
+        assert_eq!((export.label.as_ref(), export.side_rule), (None, None));
+        assert!(export.type_packages.is_empty());
+        assert_eq!(
+            serde_json::to_string(&export.claims).unwrap(),
+            r#"[{"kind":"op","op":"send","member":"publish","on":"export","name":{"arg":0},"payload":{"arg":1},"picker":"gemini-test/q1"}]"#
+        );
+        let carried = serde_json::to_value(export).unwrap();
+        for key in ["label", "side_rule", "type_packages"] {
+            assert!(carried.get(key).is_none(), "{key} is written though absent");
+        }
+    }
+
     #[test]
     fn an_answer_that_is_not_the_contract_s_shape_is_no_claims() {
         assert_eq!(parse_answer("not json"), LibraryAnswer::default());
@@ -1857,33 +2278,6 @@ mod tests {
         install_package(dir, "other", "1.0.0");
         npm_lockfile(dir, &[("lib", PUBLIC_TGZ), ("other", PUBLIC_TGZ)]);
         request(&specifiers(&["lib", "other"]), &install_at(dir)).unwrap()
-    }
-
-    #[tokio::test]
-    async fn a_pending_package_is_asked_once_more_and_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let asked = asked_lib_and_other(dir.path());
-        let first = parse_answer(STORE_PENDING);
-        let mut sent = None;
-        let claims = settle(
-            &asked,
-            first,
-            |_| async {},
-            |request| {
-                sent = Some(request);
-                async { Ok(STORE_ANSWERED.to_string()) }
-            },
-        )
-        .await;
-        let sent = sent.expect("the pending package is asked again");
-        assert_eq!(
-            sent.packages
-                .iter()
-                .map(|p| p.package.as_str())
-                .collect::<Vec<_>>(),
-            vec!["lib"]
-        );
-        assert_eq!(claims.len(), 1);
     }
 
     /// carrick#1066. The turn is taken before the ask and held until it has
@@ -1925,25 +2319,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_pending_asks_nothing_more() {
-        let dir = tempfile::tempdir().unwrap();
-        let asked = asked_lib_and_other(dir.path());
-        let first = parse_answer(STORE_ANSWERED);
-        let claims = settle(
-            &asked,
-            first,
-            |_| async {},
-            |_| async {
-                panic!("nothing was pending");
-                #[allow(unreachable_code)]
-                Ok(String::new())
-            },
-        )
-        .await;
-        assert_eq!(claims.len(), 1);
-    }
-
-    #[tokio::test]
     async fn a_refused_ask_is_no_claims_and_never_an_error() {
         let refused = ask(
             LibraryClaimsRequest {
@@ -1960,15 +2335,193 @@ mod tests {
         )
         .await;
         assert_eq!(refused, LibraryAnswer::default());
+    }
+
+    /// The store's pending body for `lib` with `reason`, as `http.ts` sends it.
+    fn pending_for(reason: &str) -> String {
+        format!(
+            r#"{{"library_claims":[{{"package":"lib","version":"1.0.0","status":"pending","reason":"{reason}"}}]}}"#
+        )
+    }
+
+    /// A fake store: the nth ask gets `bodies[n]` (the last one repeats; an
+    /// empty string is a refusal), and every request is kept with the
+    /// (paused) clock's reading when it arrived.
+    struct FakeStore {
+        bodies: Vec<String>,
+        seen: std::sync::Mutex<Vec<(Duration, Vec<String>)>>,
+        start: tokio::time::Instant,
+    }
+
+    impl FakeStore {
+        fn new(bodies: Vec<String>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                bodies,
+                seen: Default::default(),
+                start: tokio::time::Instant::now(),
+            })
+        }
+
+        async fn send(&self, request: LibraryClaimsRequest) -> Result<String, AgentCallError> {
+            let mut seen = self.seen.lock().unwrap();
+            let n = seen.len();
+            seen.push((
+                self.start.elapsed(),
+                request.packages.iter().map(|p| p.package.clone()).collect(),
+            ));
+            match &self.bodies[n.min(self.bodies.len() - 1)] {
+                body if body.is_empty() => Err(AgentCallError::permanent(
+                    "scan_not_started",
+                    "no scan is running for this credential".to_string(),
+                )),
+                body => Ok(body.clone()),
+            }
+        }
+
+        async fn run(self: &std::sync::Arc<Self>, asked: &Asked) -> Settled {
+            let store = self.clone();
+            ask_until_settled(
+                asked,
+                |_| async {},
+                move |request| {
+                    let store = store.clone();
+                    async move { store.send(request).await }
+                },
+            )
+            .await
+        }
+
+        fn asks(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_package_being_built_is_waited_for_and_read_once_answered() {
         let dir = tempfile::tempdir().unwrap();
         let asked = asked_lib_and_other(dir.path());
-        let kept = settle(
-            &asked,
-            parse_answer(STORE_ANSWERED),
-            |_| async {},
-            |_| async { Ok(String::new()) },
-        )
-        .await;
-        assert_eq!(kept.len(), 1, "a failed re-ask keeps the first answer");
+        let store = FakeStore::new(vec![
+            pending_for("in_flight"),
+            pending_for("in_flight"),
+            pending_for("building"),
+            STORE_ANSWERED.to_string(),
+        ]);
+        let settled = store.run(&asked).await;
+        assert_eq!(settled.exports.len(), 1, "the claims are read");
+        assert!(settled.pending.is_empty());
+        assert_eq!(store.asks(), 4);
+        let seen = store.seen.lock().unwrap();
+        assert_eq!(
+            seen[1].0, POLL_INTERVAL,
+            "the first poll is one interval on"
+        );
+        assert_eq!(seen[3].0, POLL_INTERVAL * 3);
+        assert_eq!(seen[1].1, vec!["lib".to_string()], "asked alone");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_package_still_building_at_the_cap_stops_the_wait_and_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let store = FakeStore::new(vec![pending_for("in_flight")]);
+        let settled = store.run(&asked).await;
+        assert_eq!(settled.pending, specifiers(&["lib"]));
+        assert!(settled.exports.is_empty());
+        let seen = store.seen.lock().unwrap();
+        // Ruled 2026-10-17: every 10 s, for 10 minutes from the first ask.
+        assert_eq!(POLL_INTERVAL, Duration::from_secs(10));
+        assert_eq!(WAIT_CAP, Duration::from_secs(600));
+        assert_eq!(seen.len(), 60, "the first ask at 0, then one per interval");
+        assert_eq!(seen.last().unwrap().0, Duration::from_secs(590));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reason_no_build_can_end_is_not_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        for reason in [
+            "lister_unavailable",
+            "classifier_unavailable",
+            "picker_unavailable",
+            "store_unavailable",
+            "store_row_unreadable",
+            "dispatch_failed",
+        ] {
+            let store = FakeStore::new(vec![pending_for(reason)]);
+            let settled = store.run(&asked).await;
+            assert_eq!(store.asks(), 1, "{reason}: no second ask");
+            assert_eq!(settled.pending, specifiers(&["lib"]), "{reason}: named");
+        }
+        let failed = r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"skipped","reason":"build_failed"}]}"#;
+        let store = FakeStore::new(vec![failed.to_string()]);
+        let settled = store.run(&asked).await;
+        assert_eq!(
+            store.asks(),
+            1,
+            "a failed build due a retry later is not waited for"
+        );
+        assert!(settled.pending.is_empty(), "and it is skipped, not pending");
+        assert_eq!(settled.build_failed, specifiers(&["lib"]), "but named");
+        let invalid = r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"skipped","reason":"invalid_package"}]}"#;
+        let settled = FakeStore::new(vec![invalid.to_string()]).run(&asked).await;
+        assert!(settled.build_failed.is_empty(), "no other skipped reason");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_package_being_built_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let body = r#"{"library_claims":[
+            {"package":"lib","version":"1.0.0","status":"pending","reason":"in_flight"},
+            {"package":"other","version":"1.0.0","status":"pending","reason":"lister_unavailable"}]}"#;
+        let store = FakeStore::new(vec![body.to_string(), STORE_ANSWERED.to_string()]);
+        let settled = store.run(&asked).await;
+        assert_eq!(store.asks(), 2);
+        assert_eq!(store.seen.lock().unwrap()[1].1, vec!["lib".to_string()]);
+        assert_eq!(settled.pending, specifiers(&["other"]));
+        assert_eq!(settled.exports.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_package_answered_first_time_asks_nothing_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let store = FakeStore::new(vec![STORE_ANSWERED.to_string()]);
+        let settled = store.run(&asked).await;
+        assert_eq!(store.asks(), 1);
+        assert_eq!(store.start.elapsed(), Duration::ZERO, "and waits nothing");
+        assert_eq!(settled.exports.len(), 1);
+        assert!(settled.pending.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_store_that_stops_answering_ends_the_wait_and_never_fails_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let store = FakeStore::new(vec![pending_for("building"), String::new()]);
+        let settled = store.run(&asked).await;
+        assert_eq!(store.asks(), 2, "one refused poll ends it");
+        assert_eq!(settled.pending, specifiers(&["lib"]));
+        let store = FakeStore::new(vec![String::new()]);
+        let settled = store.run(&asked).await;
+        assert_eq!(store.asks(), 1);
+        assert!(settled.exports.is_empty());
+        assert!(
+            settled.pending.is_empty(),
+            "a store that never answered named nothing pending"
+        );
+    }
+
+    #[test]
+    fn the_store_s_pending_reasons_split_into_waited_and_not() {
+        let answer = parse_answer(
+            r#"{"library_claims":[
+                {"package":"a","version":"1.0.0","status":"pending","reason":"in_flight"},
+                {"package":"b","version":"1.0.0","status":"pending","reason":"building"},
+                {"package":"c","version":"1.0.0","status":"pending","reason":"lister_unavailable"},
+                {"package":"d","version":"1.0.0","status":"pending"}]}"#,
+        );
+        assert_eq!(answer.pending, specifiers(&["a", "b", "c", "d"]));
+        assert_eq!(answer.building, specifiers(&["a", "b"]));
     }
 }

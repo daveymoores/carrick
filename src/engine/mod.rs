@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use swc_common::{
-    SourceMap,
+    FileName, SourceMap,
     errors::{ColorConfig, Handler},
     sync::Lrc,
 };
@@ -52,6 +52,7 @@ pub mod service_workers;
 pub mod setup_ahead;
 pub(crate) mod type_compat_v2;
 pub(crate) mod upload_boundary;
+mod walk_lane;
 
 /// Current cache format version.
 ///
@@ -669,6 +670,24 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage + Sync>(
     result
 }
 
+/// Tell the cloud the repo's full declared service set (carrick-cloud#909).
+///
+/// `services` is what config resolution produced for the whole repo, so it is
+/// the set whatever `--changed-only` analyses or carries. Each entry is the
+/// `service_name` that service's own write sends, `None` where it sends none.
+/// A dirty tree names none: its config is not main's, and the cloud retires
+/// rows by this set.
+fn note_declared_services<T: CloudStorage>(storage: &T, services: &[Config], dirty: bool) {
+    if dirty {
+        return;
+    }
+    let declared: Vec<Option<String>> = services
+        .iter()
+        .map(|service| service.service_name.clone())
+        .collect();
+    storage.note_declared_services(&declared);
+}
+
 /// The marker a finished run owes the scan it opened, if any.
 ///
 /// A failure says so with `scan-failed`. A `--pr` run closes with
@@ -949,11 +968,18 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // 3. Resolve the services declared for this repo (one for the common
     //    single-service case; one per directory for a monorepo carrick.json).
     let repo_name = get_repository_name(repo_path);
-    let services = resolve_services(repo_path)?;
+    let crate::service_derivation::ScanServices {
+        services,
+        declared,
+        without_source: members_without_source,
+    } = resolve_services(repo_path)?;
     let multi_service = services.len() > 1;
     if multi_service {
         info!("Resolved {} services in {}", services.len(), repo_name);
     }
+    // The whole declared set, before `--changed-only` narrows what is analysed
+    // (carrick-cloud#909).
+    note_declared_services(storage, &services, git_state.dirty);
     // What was downloaded is every OTHER repo in the project: a project whose
     // only repo is this one has nothing to fetch, and "from 0 repos" under a
     // green tick read as a download that had silently failed (carrick#1023
@@ -1009,6 +1035,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             crate::change_scope::ThisRun {
                 scanner_version: env!("CARGO_PKG_VERSION"),
                 cache_version: CACHE_VERSION,
+                asks_model: !crate::local_mode::no_model(),
             },
         )
     } else {
@@ -1030,35 +1057,64 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .filter(|(_, at)| at.is_some())
         .map(|(service, _)| service.clone())
         .collect();
-    // Every service's detection and guidance, asked for from here on beside
-    // the loop below instead of one service at a time inside it
-    // (carrick#1895). Dropped with this function, which ends every ask.
-    let setups = setup_ahead::SetupsAhead::start(repo_path, &analysed, |service| {
-        if no_cache {
-            return None;
-        }
-        previous_generation(previous_generations, &repo_name, service)
-            .map(setup_ahead::StoredSetup::of)
-    });
-    let scan = std::sync::Arc::new(ServiceScan {
-        repo_path: repo_path.to_string(),
-        services: analysed.into(),
-        sidecar: sidecar.map(TypeSidecar::recipe),
-        run_intents,
-        graphql_schemas,
-        setups: std::sync::Arc::new(setups),
-        workspace: workspace_scan,
-    });
-    let upload_blocked = multi_service && !storage.supports_multi_service();
+    let recipe = sidecar.map(TypeSidecar::recipe);
     // Several services at once, each on a thread of its own and each started
     // in declared order (carrick#1066). A failure in one stops none of the
     // others, and each result is kept at its service's index. A carried
     // service is no job: it is never handed to a worker.
-    let width = service_workers::width(scan.services.len(), crate::analysis_channel::dispatching());
+    let width = service_workers::width(analysed.len(), crate::analysis_channel::dispatching());
     debug!(
         "Analysing services {} at a time: {}",
         width.count, width.why
     );
+    // The pass is timed from here: the walks are part of it, as they were
+    // when each ran inside the loop.
+    let pass_started = Instant::now();
+    // Every analysed service's compiler walk, when the run walks, in a lane
+    // of its own that ends before the loop starts (carrick#2413 slice G1).
+    let walking = walk_lane::requested();
+    let (walk_ends, walked) = if walking {
+        walk_lane::signals(analysed.len())
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let lane = walk_lane::walk_all(
+        recipe.clone(),
+        repo_path,
+        if walking { &analysed } else { &[] },
+        width.count,
+        walk_ends,
+    );
+    // Every service's detection and guidance, asked for from here on beside
+    // the loop below instead of one service at a time inside it
+    // (carrick#1895), each once its own walk has ended. Dropped with this
+    // function, which ends every ask.
+    let setups = setup_ahead::SetupsAhead::start(
+        repo_path,
+        &analysed,
+        |service| {
+            if no_cache {
+                return None;
+            }
+            previous_generation(previous_generations, &repo_name, service)
+                .map(setup_ahead::StoredSetup::of)
+        },
+        walked,
+    );
+    // The loop starts once every walk has ended: no walk process is alive
+    // beside an analysis sidecar.
+    let walks = lane.await;
+    let scan = std::sync::Arc::new(ServiceScan {
+        repo_path: repo_path.to_string(),
+        services: analysed.into(),
+        sidecar: recipe,
+        run_intents,
+        graphql_schemas,
+        setups: std::sync::Arc::new(setups),
+        workspace: workspace_scan,
+        walks: walking.then_some(walks),
+    });
+    let upload_blocked = multi_service && !storage.supports_multi_service();
     let jobs: Vec<ServiceJob> = services
         .iter()
         .zip(&scan_index)
@@ -1075,7 +1131,6 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             generation: PreviousGeneration::Stored,
         })
         .collect();
-    let pass_started = Instant::now();
     let outcomes = scan.analyze_all(jobs, width.count).await;
     crate::scan_timing::pass_ended(pass_started.elapsed().as_secs_f64());
     let mut runs: Vec<ServiceRun> = Vec::with_capacity(services.len());
@@ -1083,6 +1138,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // place, every analysed one's outcome in its.
     let mut outcomes: Vec<Option<ServiceOutcome>> = outcomes.into_iter().map(Some).collect();
     let mut first_failure = None;
+    // Services nobody declared whose walk read no source (carrick#2298).
+    let mut without_source = Vec::new();
     for (index, service) in services.iter().enumerate() {
         let Some(at) = scan_index[index] else {
             // Carried, which only a service with a stored generation is, and
@@ -1098,10 +1155,18 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             .expect("every analysed service has an outcome")
         {
             Ok(run) => runs.push(run),
+            Err(error) if !declared && error.is::<NoSourceFiles>() => {
+                without_source.push((index, error));
+            }
             Err(error) => {
                 first_failure.get_or_insert((index, error));
             }
         }
+    }
+    // No service of the run holds source: the scan target is wrong, which is
+    // the failure it always was.
+    if runs.is_empty() && first_failure.is_none() && !without_source.is_empty() {
+        first_failure = Some(without_source.remove(0));
     }
     if let Some((index, error)) = first_failure {
         // Not a model failure — those defer, they do not reach here — so
@@ -1135,10 +1200,42 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     git_state.dirty,
                     unchanged_at_start.as_ref(),
                 );
+                // The landing is an upload and says so while it runs. The
+                // failure it follows was raised in the analysis, and the
+                // stage the run reports is that one (carrick#2298). With
+                // services analysed side by side it is the last stage any of
+                // them entered, as `scan_stage` keeps it.
+                let failed_in = crate::scan_stage::current();
                 upload_service_payloads(storage, &payloads, no_cache, false, &boundary).await;
+                crate::scan_stage::enter(failed_in);
             }
         }
         return Err(error);
+    }
+    // The services left out take no further part: everything below reads
+    // `services`, `scan_index` and `runs` position for position.
+    let services_without_source: Vec<String> = without_source
+        .iter()
+        .map(|(index, _)| {
+            let service = &services[*index];
+            service
+                .service_name
+                .clone()
+                .or_else(|| service.directory.clone())
+                .unwrap_or_else(|| "(root)".to_string())
+        })
+        .collect();
+    let (services, scan_index): (Vec<Config>, Vec<Option<usize>>) = services
+        .into_iter()
+        .zip(scan_index)
+        .enumerate()
+        .filter(|(index, _)| !without_source.iter().any(|(left_out, _)| left_out == index))
+        .map(|(_, kept)| kept)
+        .unzip();
+    // What the index lacks is not told to a person reading the scan: the
+    // debug log keeps it (carrick#2298).
+    for line in without_source_lines(&members_without_source, &services_without_source) {
+        debug!("{line}");
     }
 
     // 4a. A dispatched run ends here, and this is its whole product: every
@@ -1341,6 +1438,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     if let Some(line) = crate::scan_health::in_process_pubsub_line() {
         crate::progress::announce(&line);
     }
+    // Library packages the store had not built by the end of the wait
+    // (carrick#2496): named, so a gap in the library rows is not silent.
+    for line in crate::scan_health::library_pending_lines() {
+        crate::progress::announce(&line);
+    }
     if let Some(summary) = crate::scan_health::summary_line() {
         warn!("{summary}");
     }
@@ -1392,6 +1494,25 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             );
         }
     }
+    // 4d. A model row at a call through the repository's own code takes the
+    // request that call reaches (carrick#1146). Here, because the request is
+    // usually written in another service: this is the first point at which
+    // every service's rows and definitions are in hand, and the last before
+    // the payloads and the cross-service check are built from them. A
+    // carried or held-back service is read and never written: the generation
+    // the index serves stands in for it.
+    {
+        let mut services: Vec<crate::call_through::ServiceRows<'_>> = runs
+            .iter_mut()
+            .map(|run| crate::call_through::ServiceRows {
+                writable: !run.carried && !run.held_back,
+                data: &mut run.data,
+                sites: &run.call_through,
+            })
+            .collect();
+        crate::call_through::settle(&mut services);
+    }
+
     // Whether this run leaves a service short of a complete index. A missing
     // function description alone does not: it never held an index back.
     let incomplete = runs.iter().any(|run| run.owed.thins_the_index());
@@ -2122,6 +2243,10 @@ struct ServiceScan {
     /// The repo-wide external-call pass, built by the first service to ask
     /// and read by the rest.
     workspace: std::sync::Arc<crate::external_call_candidates::WorkspaceScan>,
+    /// Each analysed service's walk, by its index, when the run walks
+    /// (carrick#2413): read by its analysis and by the owed-work retry, and
+    /// kept until the run ends.
+    walks: Option<Vec<walk_lane::Walked>>,
 }
 
 /// One service's analysis in this run, and what it still owes.
@@ -2135,6 +2260,9 @@ struct ServiceRun {
     /// Not analysed: `data` is its stored generation (`--changed-only`,
     /// carrick#2227).
     carried: bool,
+    /// The definitions each of its model call rows goes through, for the
+    /// pass that settles them once every service is read (carrick#1146).
+    call_through: crate::call_through::CallThroughSites,
 }
 
 impl ServiceRun {
@@ -2151,6 +2279,7 @@ impl ServiceRun {
             owed: durability::OwedWork::default(),
             held_back: false,
             carried: true,
+            call_through: Default::default(),
         }
     }
 }
@@ -2244,8 +2373,12 @@ impl ServiceScan {
         .await
         // The one place the error is flattened: what is not the model's to
         // defer ends the run with its words, and nothing downstream reads its
-        // type.
-        .map_err(|error| error.to_string().into())
+        // type. Except a walk that read no source, which the run may leave
+        // out instead (carrick#2298).
+        .map_err(|error| match error.downcast::<NoSourceFiles>() {
+            Ok(no_source) => no_source as Box<dyn std::error::Error + Send + Sync>,
+            Err(error) => error.to_string().into(),
+        })
     }
 
     /// [`Self::analyze`] inside the service's [`crate::current_service`] scope.
@@ -2279,6 +2412,18 @@ impl ServiceScan {
         let packages = load_packages_for_service(&self.repo_path, service)?;
         let packages_took = service_started.elapsed();
 
+        // The compiler's rows for every position of the service's files
+        // (carrick#2405), when asked for, read before discovery
+        // (carrick#2413). Walked in the lane before the loop, in a process
+        // that exited before any analysis sidecar started, so the two
+        // programs never share a heap. Outside the local and model split:
+        // the walk is neither the analysis nor its wait.
+        let positions = self
+            .walks
+            .as_ref()
+            .and_then(|walks| walks.get(index))
+            .map(walk_lane::Walked::index);
+
         // A sidecar process of the service's own, scoped to its directory and
         // tsconfig, at the full heap cap. It is dropped, and its process
         // stopped, when this analysis ends.
@@ -2302,6 +2447,7 @@ impl ServiceScan {
                 &self.workspace,
                 &self.run_intents,
                 &self.graphql_schemas,
+                positions,
             )))
             .await;
         let analysis = analysis?;
@@ -2378,6 +2524,7 @@ impl ServiceScan {
             owed,
             held_back: false,
             carried: false,
+            call_through: analysis.call_through,
         })
     }
 }
@@ -2524,6 +2671,10 @@ fn local_boundaries(
 /// Stdout, beside the report it belongs to. The eval projection mode returns
 /// long before this, so the machine-readable output on stdout is never mixed
 /// with it.
+///
+/// The services left out for holding no source are not named here
+/// ([`without_source_lines`] goes to the debug log): a gap in the index is
+/// told to the agent that reads the results, not to a person.
 fn print_boundaries(boundaries: &[(String, crate::boundary::ServiceBoundary)]) {
     if boundaries.is_empty() {
         return;
@@ -3282,12 +3433,38 @@ fn hash_workspace_package_jsons(
 ) -> Result<String, std::io::Error> {
     let repo_root = Path::new(repo_path);
     let inputs = crate::deno_support::resolution_inputs(repo_root, &packages.source_paths)?;
+    // A manifest's key is part of what every stored blob's hash was computed
+    // from, so it stays what was written for each way of naming the root
+    // (carrick#2314, pinned by `tests/manifest_hash_pin_test.rs`):
+    //
+    // - A manifest under `repo_root` as spelled: its path inside the tree.
+    // - A relative manifest path (the root was named `.` or by a relative
+    //   path, and `repo_root` is its canonical form): the path as written,
+    //   `./apps/api/package.json`. It names no machine, and every blob
+    //   stored by a scan run as `carrick .` was hashed with it. Making it
+    //   agree with the absolute spelling is carrick#1715.
+    // - An absolute manifest path `repo_root` does not prefix (a symlink on
+    //   the way in, resolved in one and not the other): its path inside the
+    //   tree. Written as it stands it would name the directory the checkout
+    //   sits in, and a second checkout of one commit would ask for its setup
+    //   again.
+    let canonical_root = repo_root.canonicalize().ok();
+    let inside = |path: &Path| -> Option<PathBuf> {
+        if let Ok(relative) = path.strip_prefix(repo_root) {
+            return Some(relative.to_path_buf());
+        }
+        if path.is_relative() {
+            return None;
+        }
+        let root = canonical_root.as_ref()?;
+        let parent = path.parent()?.canonicalize().ok()?;
+        Some(parent.strip_prefix(root).ok()?.join(path.file_name()?))
+    };
     let mut keyed: Vec<(String, &PathBuf)> = inputs
         .iter()
         .map(|path| {
-            let relative = path
-                .strip_prefix(repo_root)
-                .unwrap_or(path)
+            let relative = inside(path)
+                .unwrap_or_else(|| path.clone())
                 .to_string_lossy()
                 .to_string();
             (relative, path)
@@ -3391,6 +3568,7 @@ async fn analyze_current_repo_incremental(
     workspace: &crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
     graphql_schemas: &crate::graphql::SchemaCatalogue,
+    positions: Option<crate::position_rows::PositionIndex>,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
@@ -3408,7 +3586,7 @@ async fn analyze_current_repo_incremental(
         function_definitions,
         repo_name,
         request_inputs,
-    } = discover_files_and_symbols(repo_path, config, cm.clone())?;
+    } = discover_with_positions(repo_path, config, cm.clone(), positions)?;
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
     // 3. Check if we can use incremental mode. The cache version is the whole
@@ -3697,7 +3875,7 @@ async fn analyze_current_repo_incremental(
                     &semantics_root,
                     summaries_sender,
                 ),
-                first_library_answer(library_ask.as_ref()),
+                settled_library_answer(library_ask.as_ref()),
             );
             let analysis = analysis?;
             setup.detection.client_semantics = settled;
@@ -3755,11 +3933,19 @@ async fn analyze_current_repo_incremental(
                 service,
                 graphql_schemas,
             );
-            protocol_extractions.library = library_rows(
+            let (library, claims) = library_rows(
                 library_ask.as_ref(),
                 library_answer,
                 sidecar,
                 &semantics_root,
+            );
+            protocol_extractions.library = library;
+            protocol_extractions.site = site_rows_of(
+                crate::site_questions::enabled(),
+                &request_inputs,
+                repo_path,
+                service,
+                &claims,
             )
             .await;
             let withdrawn = withdraw_model_routes_at_definitions(
@@ -3813,7 +3999,7 @@ async fn analyze_current_repo_incremental(
                 &setup.detection,
                 &protocol_extractions.event_bus,
             );
-            append_deterministic_protocol_operations(
+            let site_fold = append_deterministic_protocol_operations(
                 &mut cloud_data,
                 &protocol_extractions,
                 &merged_results,
@@ -3890,6 +4076,7 @@ async fn analyze_current_repo_incremental(
                 &library_sites,
                 repo_path,
             );
+            apply_site_fold_to_manifest(&mut manifest_entries, &site_fold, repo_path);
             if !manifest_entries.is_empty() {
                 cloud_data.type_manifest = Some(manifest_entries);
             }
@@ -3940,6 +4127,7 @@ async fn analyze_current_repo_incremental(
                 file_orchestrator
                     .collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
             );
+            protocol_infer.extend(site_infer_requests(&site_fold, repo_path));
 
             crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -4011,9 +4199,21 @@ async fn analyze_current_repo_incremental(
             // phases add up to `analysis` rather than falling short of it.
             crate::phase_timing::mark(crate::phase_timing::Phase::Other);
 
+            let call_through = crate::call_through::read_sites(
+                &merged_results,
+                &request_inputs,
+                repo_path,
+                &cloud_data.function_definitions,
+                &|file, function| {
+                    analysis
+                        .passes_body
+                        .contains(&(file.to_path_buf(), function.to_string()))
+                },
+            );
             return Ok(ServiceAnalysis {
                 data: cloud_data,
                 deferred: setup.deferred,
+                call_through,
             });
         } else {
             debug!("git could not compare the tree, falling back to full analysis");
@@ -4363,6 +4563,9 @@ struct ProtocolExtractions {
     /// claims (carrick#1662, [`library_rows`]). Read once the request inputs
     /// and the sidecar are at hand, after the scan above.
     library: crate::library_claims::LibraryRows,
+    /// The rows and possible calls the decided sites come to (carrick#2439,
+    /// [`site_rows_of`]). Empty, and off, unless `CARRICK_SITE_QUESTIONS=1`.
+    site: crate::site_rows::SiteRows,
 }
 
 /// The directories to walk for a service's own GraphQL SDL files: its
@@ -4443,6 +4646,7 @@ fn scan_protocol_extractions(
             sockets,
             event_bus,
             library: crate::library_claims::LibraryRows::default(),
+            site: crate::site_rows::SiteRows::default(),
         },
         document_sites,
     )
@@ -4474,6 +4678,25 @@ impl LibraryAsk {
         if crate::local_mode::no_model() || sidecar.is_none() {
             return None;
         }
+        Self::of(
+            inputs,
+            service_root,
+            repo_root,
+            turns,
+            crate::site_questions::enabled(),
+        )
+    }
+
+    /// What the service asks: the roles [`crate::library_store::roles_for`]
+    /// `site_questions` (carrick#2436), for the public registry packages its
+    /// library calls go through.
+    fn of(
+        inputs: &crate::request_summary::RequestSummaryInputs,
+        service_root: &Path,
+        repo_root: &Path,
+        turns: setup_ahead::AskTurns,
+        site_questions: bool,
+    ) -> Option<Self> {
         let sites = crate::request_summary::library_sites(inputs);
         let specifiers: BTreeSet<String> = sites.packages().into_values().flatten().collect();
         let home = dirs::home_dir();
@@ -4488,7 +4711,22 @@ impl LibraryAsk {
                 yarn_registry_env: yarn_registry_env.as_deref(),
                 npm_registry_env: npm_registry_env.as_deref(),
             },
-        )?;
+        );
+        // The language's own library (carrick#2504): the default-library
+        // files the compiler read the code's globals from, asked only with
+        // site questions on.
+        let library = match inputs
+            .positions
+            .as_ref()
+            .map(|p| p.default_library_globals())
+        {
+            Some(Some((typescript, globals))) if site_questions => {
+                crate::library_store::default_library_packages(typescript, globals)
+            }
+            _ => Vec::new(),
+        };
+        let asked = crate::library_store::Asked::with_default_library(asked, library)?
+            .with_roles(crate::library_store::roles_for(site_questions));
         Some(Self {
             sites,
             asked,
@@ -4530,41 +4768,165 @@ fn library_turn(
     }
 }
 
-/// The store's first answer for `ask`, asked beside the analysis.
-async fn first_library_answer(ask: Option<&LibraryAsk>) -> crate::library_store::LibraryAnswer {
+/// The store's answer for `ask`, waiting for the packages it is building up
+/// to [`crate::library_store::WAIT_CAP`] from the first ask (carrick#2496).
+/// Run beside the analysis, so a scan whose analysis outlasts the builds
+/// waits nothing more.
+async fn settled_library_answer(ask: Option<&LibraryAsk>) -> crate::library_store::Settled {
     match ask {
         Some(ask) => {
-            crate::library_store::ask(
-                ask.asked.request.clone(),
-                library_turn(&ask.turns),
+            crate::library_store::ask_until_settled(
+                &ask.asked,
+                |request| library_turn(&ask.turns)(request),
                 send_to_library_store,
             )
             .await
         }
-        None => crate::library_store::LibraryAnswer::default(),
+        None => crate::library_store::Settled::default(),
     }
 }
 
 /// The service's library rows: its library sites read through the claims
-/// the store answered (packages it had pending asked once more), each
-/// verified by the sidecar from `from_dir`. Nothing asked reads nothing.
-async fn library_rows(
+/// the store answered, each verified by the sidecar from `from_dir`. The
+/// packages the scan ends without are recorded for the summary and the
+/// upload ([`crate::scan_health::record_library_packages`]). Nothing
+/// asked reads nothing.
+fn library_rows(
     ask: Option<&LibraryAsk>,
-    first: crate::library_store::LibraryAnswer,
+    settled: crate::library_store::Settled,
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
-) -> crate::library_claims::LibraryRows {
+) -> (
+    crate::library_claims::LibraryRows,
+    Vec<crate::library_claims::ExportClaims>,
+) {
     let Some(ask) = ask else {
-        return crate::library_claims::LibraryRows::default();
+        return Default::default();
     };
-    let claims = crate::library_store::settle(
-        &ask.asked,
-        first,
-        library_turn(&ask.turns),
-        send_to_library_store,
+    crate::scan_health::record_library_packages(crate::scan_health::LibraryUnready {
+        pending: settled.pending,
+        failed: settled.build_failed,
+    });
+    (
+        read_library_rows(&ask.sites, &settled.exports, sidecar, from_dir),
+        settled.exports,
+    )
+}
+
+/// The service's site rows (carrick#2439): every call discovery finds that
+/// reaches an export the settled `claims` label, reported where its name is
+/// decided, its record built, the records that ask a slot asked, and the
+/// answers read into rows and possible calls ([`crate::site_rows`]). Off
+/// unless `enabled` (`CARRICK_SITE_QUESTIONS=1`); with no compiler rows
+/// (`CARRICK_POSITION_ROWS=1`) discovery finds nothing. A row in a mock or
+/// test tree of the service states nothing.
+async fn site_rows_of(
+    enabled: bool,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    repo_path: &str,
+    service: &Config,
+    claims: &[crate::library_claims::ExportClaims],
+) -> crate::site_rows::SiteRows {
+    if !enabled {
+        return crate::site_rows::SiteRows::default();
+    }
+    let root = Path::new(repo_path);
+    let SiteRecordsOf {
+        discovered,
+        reached_label,
+        decided,
+        records,
+        labels: site_labels,
+    } = site_records_of(inputs, root, claims);
+    let answers = crate::site_questions::ask_service(
+        &crate::site_questions::agent(),
+        &get_repository_name(repo_path),
+        service.service_name.as_deref(),
+        crate::site_rows::questions(&records),
     )
     .await;
-    read_library_rows(&ask.sites, &claims, sidecar, from_dir)
+    let mut rows = crate::site_rows::of(&decided, &records, &site_labels, &answers);
+    rows.rows.retain(|row| {
+        !protocol_producer_provenance(&root.join(&row.file), repo_path, service).is_mock()
+    });
+    key_site_requests_canonically(&mut rows, &UrlNormalizer::new(service));
+    let mut leads_by_reason: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for lead in &rows.leads {
+        let reason = serde_json::to_value(lead.unread.reason)
+            .ok()
+            .and_then(|reason| reason.as_str().map(str::to_string))
+            .unwrap_or_default();
+        *leads_by_reason.entry(reason).or_default() += 1;
+    }
+    let no_op_claim = decided
+        .leads
+        .iter()
+        .filter(|lead| lead.reason == crate::request_summary::decided_sites::Undecided::NoOpClaim)
+        .count();
+    debug!(
+        discovered,
+        reached_label,
+        decided = decided.sites.len(),
+        no_op_claim,
+        rows = rows.rows.len(),
+        possible_calls = rows.leads.len(),
+        leads_by_reason = ?leads_by_reason,
+        "site questions: rows"
+    );
+    rows
+}
+
+/// What a service's site questions read before anything is asked
+/// ([`site_records_of`]).
+struct SiteRecordsOf {
+    /// The calls discovery lists: each one that reached a labelled export,
+    /// and each walk that entered code and stopped.
+    discovered: usize,
+    /// Those that reached a labelled export.
+    reached_label: usize,
+    decided: crate::request_summary::decided_sites::Decided,
+    records: Vec<crate::request_summary::site_record::SiteRecord>,
+    labels: Vec<crate::request_summary::decided_sites::SiteLabel>,
+}
+
+/// The site labels the settled `claims` give, of every role the store was
+/// asked for (carrick#2436), every call discovery finds that reaches one,
+/// where each one's name is decided, and each decided site's record. Files
+/// are named relative to `root`, the scanned repo's root.
+fn site_records_of(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    root: &Path,
+    claims: &[crate::library_claims::ExportClaims],
+) -> SiteRecordsOf {
+    let labels = crate::request_summary::discovery::Labels::of(claims);
+    let discovery = crate::request_summary::discovery::discover(inputs, &labels, root);
+    let reached_label = discovery
+        .sites
+        .iter()
+        .filter(|site| site.end.is_some())
+        .count();
+    let discovered: Vec<crate::request_summary::decided_sites::DiscoverySite> = discovery
+        .sites
+        .iter()
+        .filter_map(|site| {
+            serde_json::to_value(site)
+                .and_then(serde_json::from_value)
+                .ok()
+        })
+        .collect();
+    let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
+    let decided =
+        crate::request_summary::decided_sites::decided_sites(inputs, root, &discovered, &labels);
+    let records =
+        crate::request_summary::site_record::site_records(inputs, root, &decided, &labels);
+    SiteRecordsOf {
+        discovered: discovery.sites.len(),
+        reached_label,
+        decided,
+        records,
+        labels,
+    }
 }
 
 /// `sites` read through `claims`, each verified by the sidecar against the
@@ -4874,7 +5236,7 @@ fn append_deterministic_protocol_operations(
     in_process: &crate::in_process_pubsub::InProcessPubsub,
     repo_path: &str,
     service: &Config,
-) {
+) -> crate::site_rows::SiteFold {
     // Same "{file}:{line}" convention the mount-graph conversions use. A
     // call's row; a producer's is `to_producer` below.
     let to_call = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
@@ -4909,6 +5271,7 @@ fn append_deterministic_protocol_operations(
         handler_span: None,
         name_scope: None,
         library_semantics: Vec::new(),
+        inference: None,
     };
     // A producer's row: tagged when its file sits in a mock or test-support
     // tree of the service, as an HTTP route is (#380, carrick#1626).
@@ -5004,6 +5367,30 @@ fn append_deterministic_protocol_operations(
         &to_producer,
         &to_call,
     );
+
+    // Site answers fold last, against every row a reader stated
+    // (carrick#2439), and the sites that state no row are possible calls.
+    let site = crate::site_rows::fold(
+        cloud_data,
+        &extractions.site,
+        Path::new(repo_path),
+        |key, file, line, side| match side {
+            crate::site_rows::RowSide::Call => to_call(key, file, line),
+            crate::site_rows::RowSide::Endpoint => to_producer(key, file, line),
+        },
+    );
+    crate::possible_calls::attach_when(extractions.site.enabled, cloud_data, site.leads.clone());
+    if extractions.site.enabled {
+        debug!(
+            routes = extractions.site.routes.len(),
+            route_kept_reader = site.route_kept_reader,
+            possible_calls = site.leads.len(),
+            stated = site.stated.len(),
+            withdrawn = site.withdrawn.len(),
+            "site questions: fold"
+        );
+    }
+    site
 }
 
 /// Where library rows were stated (carrick#1662), by normalized file and
@@ -6118,6 +6505,166 @@ fn add_graphql_request_entry(
     });
 }
 
+/// Key every HTTP request a site row states as every consumer row is keyed:
+/// on its canonical call path ([`UrlNormalizer::consumer_call_path`]), never
+/// the target as written.
+fn key_site_requests_canonically(
+    rows: &mut crate::site_rows::SiteRows,
+    normalizer: &UrlNormalizer,
+) {
+    for row in &mut rows.rows {
+        if row.side == crate::site_rows::RowSide::Call
+            && let OperationKey::Http { path, .. } = &mut row.key
+        {
+            *path = normalizer.consumer_call_path(path);
+        }
+    }
+}
+
+/// The manifest role a site row's side takes.
+fn site_manifest_role(side: crate::site_rows::RowSide) -> ManifestRole {
+    match side {
+        crate::site_rows::RowSide::Call => ManifestRole::Consumer,
+        crate::site_rows::RowSide::Endpoint => ManifestRole::Producer,
+    }
+}
+
+/// The per-site id a site row's consumer aliases carry, as every consumer
+/// row's do; `None` for a producer that is not HTTP (key-only aliases).
+fn site_row_site_id(row: &crate::site_rows::SiteRow, repo_path: &str) -> Option<String> {
+    let http = matches!(row.key, OperationKey::Http { .. });
+    (row.side == crate::site_rows::RowSide::Call || http)
+        .then(|| build_site_id(&row.file, row.line, &row.key, repo_path))
+}
+
+/// The manifest after the site fold (carrick#2439): a reader row the fold
+/// replaced leaves no entry, and every site row stated is anchored where its
+/// record says, so the type check reads it like any row (carrick#2472 C3).
+/// An HTTP row whose path is not a bare route gets none, as a reader's
+/// would not.
+fn apply_site_fold_to_manifest(
+    entries: &mut Vec<TypeManifestEntry>,
+    fold: &crate::site_rows::SiteFold,
+    repo_path: &str,
+) {
+    let root = Path::new(repo_path);
+    entries.retain(|entry| {
+        !fold.withdrawn.iter().any(|(file, line, key, side)| {
+            crate::site_rows::relative(root, &entry.file_path) == *file
+                && entry.line_number == *line
+                && entry.key == *key
+                && entry.role == site_manifest_role(*side)
+        })
+    });
+    for row in &fold.stated {
+        let role = site_manifest_role(row.side);
+        let site_id = site_row_site_id(row, repo_path);
+        match &row.key {
+            OperationKey::Http { path, .. } => {
+                if path.starts_with('/') {
+                    add_manifest_pair(
+                        entries,
+                        row.key.clone(),
+                        role,
+                        &row.file,
+                        row.line,
+                        site_id.as_deref(),
+                    );
+                }
+            }
+            _ => add_protocol_manifest_entry(
+                entries,
+                &row.key,
+                role,
+                &row.file,
+                row.line,
+                None,
+                site_id.as_deref(),
+            ),
+        }
+    }
+}
+
+/// The type requests for the site rows the fold stated (carrick#2472 C3),
+/// each at its record's anchor by span: a send's payload expression, an
+/// HTTP request's result at its call, and a handler's first parameter. A
+/// row whose record has no such anchor asks nothing for that type; an HTTP
+/// route's handler is not asked (its request and response are read off the
+/// route, not the parameter).
+fn site_infer_requests(
+    fold: &crate::site_rows::SiteFold,
+    repo_path: &str,
+) -> Vec<crate::services::type_sidecar::InferRequestItem> {
+    use crate::services::type_sidecar::InferRequestItem;
+    use crate::site_rows::RowSide;
+    let root = Path::new(repo_path);
+    let at = |anchor: &crate::request_summary::site_record::AnchorAt,
+              infer_kind: InferKind,
+              alias: String,
+              param_name: Option<String>| InferRequestItem {
+        file_path: root.join(&anchor.file).to_string_lossy().into_owned(),
+        line_number: anchor.line,
+        span_start: Some(anchor.span_start),
+        span_end: Some(anchor.span_end),
+        expression_text: None,
+        expression_line: None,
+        infer_kind,
+        alias: Some(alias),
+        param_name,
+    };
+    let mut requests = Vec::new();
+    for row in &fold.stated {
+        let role = site_manifest_role(row.side);
+        let site_id = site_row_site_id(row, repo_path);
+        let alias = |kind: ManifestTypeKind| {
+            build_manifest_type_alias_with_site_id(&row.key, role, kind, site_id.as_deref())
+        };
+        let anchors = &row.anchors;
+        match (&row.key, row.side) {
+            (OperationKey::Http { path, .. }, RowSide::Call) if path.starts_with('/') => {
+                if let Some(payload) = &anchors.payload_at {
+                    requests.push(at(
+                        payload,
+                        InferKind::Expression,
+                        alias(ManifestTypeKind::Request),
+                        None,
+                    ));
+                }
+                requests.push(at(
+                    &anchors.call,
+                    InferKind::CallResult,
+                    alias(ManifestTypeKind::Response),
+                    None,
+                ));
+            }
+            (OperationKey::Http { .. }, _) => {}
+            (_, RowSide::Call) => {
+                if let Some(payload) = &anchors.payload_at {
+                    requests.push(at(
+                        payload,
+                        InferKind::Expression,
+                        alias(ManifestTypeKind::Response),
+                        None,
+                    ));
+                }
+            }
+            (_, RowSide::Endpoint) => {
+                if let Some(handler) = &anchors.handler
+                    && let Some(param) = &handler.param_name
+                {
+                    requests.push(at(
+                        &handler.at,
+                        InferKind::FunctionParam,
+                        alias(ManifestTypeKind::Response),
+                        Some(param.clone()),
+                    ));
+                }
+            }
+        }
+    }
+    requests
+}
+
 /// Add a single Response-kind manifest entry for a non-HTTP operation. Shared
 /// by `append_protocol_manifest_entries`; the HTTP path uses
 /// `add_manifest_pair` instead (it emits both Request and Response and dispatches
@@ -6618,6 +7165,8 @@ fn build_cloud_data_from_mount_graph(
         scanner_build: crate::cloud_storage::ScannerBuild::current(),
         boundary: None,
         dispatch_tables: None,
+        possible_calls: None,
+        possible_calls_omitted: None,
     }
 }
 
@@ -7348,7 +7897,7 @@ fn sample_file_imports(
 /// detection is asked with, read before the scan reaches the service so the
 /// ask can be made ahead of it (carrick#1895).
 ///
-/// The same walk and the same parse as [`discover_files_and_symbols`], over
+/// The same walk and the same parse as [`discover_with_positions`], over
 /// the canonical `repo_path`, so the sample is the one discovery will read
 /// (`the_sample_read_ahead_is_the_one_discovery_reads`). Each file is parsed
 /// a second time when the scan reaches it; what this keeps is the sample, not
@@ -7375,10 +7924,24 @@ fn read_import_sample(
     Some(sample)
 }
 
+#[cfg(test)]
 fn discover_files_and_symbols(
     repo_path: &str,
     service: &Config,
     cm: Lrc<SourceMap>,
+) -> FileDiscoveryResult {
+    discover_with_positions(repo_path, service, cm, None)
+}
+
+/// Discover the service's files and symbols, binding each file's compiler
+/// rows, when the run walked them, to the text discovery parses it from
+/// (carrick#2413): the one read of the file, so the rows' hash is checked
+/// against the bytes every span is counted in.
+fn discover_with_positions(
+    repo_path: &str,
+    service: &Config,
+    cm: Lrc<SourceMap>,
+    mut positions: Option<crate::position_rows::PositionIndex>,
 ) -> FileDiscoveryResult {
     crate::scan_stage::enter(crate::scan_stage::Stage::Discovery);
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
@@ -7434,10 +7997,9 @@ fn discover_files_and_symbols(
                     .join("; ")
             )
         };
-        return Err(format!(
+        return Err(Box::new(NoSourceFiles(format!(
             "No JS/TS source files found under {scope} in '{repo_path}'. {advice}"
-        )
-        .into());
+        ))));
     }
     for left_out in &left_out {
         info!("{}", left_out_line(left_out));
@@ -7476,7 +8038,20 @@ fn discover_files_and_symbols(
     let mut wanted_from: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     for file_path in &files {
-        if let Some(module) = parse_file(file_path, &cm, &handler) {
+        let parsed = match positions.as_mut() {
+            Some(index) => crate::parser::read_source(file_path).and_then(|text| {
+                index.bind(file_path, &text);
+                crate::parser::parse_source(
+                    file_path,
+                    FileName::Real(file_path.clone()),
+                    text,
+                    &cm,
+                    &handler,
+                )
+            }),
+            None => parse_file(file_path, &cm, &handler),
+        };
+        if let Some(module) = parsed {
             // Extract import symbols
             let file_imports = sample_file_imports(&mut all_import_facts, &module);
 
@@ -7497,8 +8072,11 @@ fn discover_files_and_symbols(
                 .keys()
                 .cloned()
                 .collect();
-            let request_ir =
+            let mut request_ir =
                 crate::request_summary::extract_file_ir(&module, &cm, &definition_keys);
+            // Which functions the module offers, keyed as the extractor keys
+            // them, for where a guard's chain ends (carrick#2386).
+            request_ir.place_definitions(&func_extractor.function_definitions);
 
             let canonical = file_path
                 .canonicalize()
@@ -7519,10 +8097,17 @@ fn discover_files_and_symbols(
                     computed_requires,
                     field_types: func_extractor.field_types,
                     instances: crate::receiver_type::module_scope_types(&module),
+                    factories: crate::receiver_type::factory_tables(&module),
                 },
             );
             per_file_definitions.push((file_path.clone(), func_extractor.function_definitions));
         }
+    }
+    if let Some(index) = &positions {
+        debug!(
+            "Position rows bound to discovery's reads: {:?}",
+            index.file_states()
+        );
     }
 
     // One row per definition, with same-named definitions in different files
@@ -7579,7 +8164,25 @@ fn discover_files_and_symbols(
         files: request_irs,
         sites: resolution.sites,
         bindings: resolution.bindings,
-    };
+        positions,
+        links: None,
+        row_calls: None,
+    }
+    .linked();
+    if let Some(links) = &request_inputs.links {
+        debug!(
+            "Position rows for service {}: {}",
+            service.service_name.as_deref().unwrap_or("(root)"),
+            links.describe()
+        );
+    }
+    if let Some(row_calls) = &request_inputs.row_calls {
+        debug!(
+            "Position rows for service {}: {}",
+            service.service_name.as_deref().unwrap_or("(root)"),
+            row_calls.describe()
+        );
+    }
 
     debug!(
         "Extracted {} import facts and {} function definitions from {} files",
@@ -7606,6 +8209,27 @@ pub(crate) fn discover_request_inputs(root: &Path) -> crate::request_summary::Re
     discover_files_and_symbols(&root.to_string_lossy(), &Config::default(), cm)
         .expect("discovery reads the service")
         .request_inputs
+}
+
+/// What discovery hands the request summaries for one service of the repo
+/// at `repo`, with `positions` bound as a scan binds them, or with none as a
+/// scan without rows has: for the census of the compiler rows' lookups and
+/// the tests of what the summaries read through them (carrick#2413).
+#[cfg(test)]
+pub(crate) fn discover_service_inputs(
+    repo: &Path,
+    service: &Config,
+    positions: Option<crate::position_rows::PositionIndex>,
+) -> crate::request_summary::RequestSummaryInputs {
+    let cm: Lrc<SourceMap> = Default::default();
+    discover_with_positions(
+        &canonical_repo_path(&repo.to_string_lossy()),
+        service,
+        cm,
+        positions,
+    )
+    .expect("discovery reads the service")
+    .request_inputs
 }
 
 /// The service's request summaries (carrick#1555), composed with the library
@@ -7847,8 +8471,61 @@ fn semantics_schedule_applies(generation: PreviousGeneration) -> bool {
 /// A config that exists but cannot be parsed, or that declares paths that
 /// don't exist, is a hard error: silently falling back to defaults would
 /// ignore the user's declared service layout and upload a wrong index.
-fn resolve_services(repo_path: &str) -> Result<Vec<Config>, Box<dyn std::error::Error>> {
-    crate::service_derivation::resolve_for_scan(std::path::Path::new(repo_path)).map_err(Into::into)
+///
+/// The list comes with where it came from: a service nobody declared that
+/// holds no source is left out of the run rather than failing it
+/// (carrick#2298).
+fn resolve_services(
+    repo_path: &str,
+) -> Result<crate::service_derivation::ScanServices, Box<dyn std::error::Error>> {
+    crate::service_derivation::scan_services(std::path::Path::new(repo_path)).map_err(Into::into)
+}
+
+/// A service's walk read no source file.
+///
+/// Typed because the run decides on it: for a service somebody declared in
+/// `carrick.json` it is a wrong path and fails the scan; a service nobody
+/// declared is left out and named in the debug log (carrick#2298).
+#[derive(Debug)]
+struct NoSourceFiles(String);
+
+impl std::fmt::Display for NoSourceFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoSourceFiles {}
+
+/// What the debug log says about the services the run left out because they
+/// hold no source (carrick#2298): the workspace members the derivation
+/// dropped, in one line, then one line for each service whose walk read
+/// nothing.
+fn without_source_lines(members: &[String], services: &[String]) -> Vec<String> {
+    /// Directories named before the rest become a count.
+    const NAMED: usize = 5;
+    let mut lines = Vec::new();
+    if !members.is_empty() {
+        let mut named = members
+            .iter()
+            .take(NAMED)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if members.len() > NAMED {
+            named.push_str(&format!(" and {} more", members.len() - NAMED));
+        }
+        lines.push(format!(
+            "{} workspace member(s) left out, no JS/TS source: {named}",
+            members.len()
+        ));
+    }
+    lines.extend(
+        services.iter().map(|service| {
+            format!("{service}: left out, the scan read no JS/TS source file in it")
+        }),
+    );
+    lines
 }
 
 /// Build-artifact directories to skip everywhere.
@@ -9251,7 +9928,7 @@ async fn analyze_current_repo(
             &service_root,
             summaries_sender,
         ),
-        first_library_answer(library_ask.as_ref()),
+        settled_library_answer(library_ask.as_ref()),
     );
     let analysis_result = analysis_result?;
     setup.detection.client_semantics = settled;
@@ -9297,8 +9974,17 @@ async fn analyze_current_repo(
         service,
         graphql_schemas,
     );
-    protocol_extractions.library =
-        library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root).await;
+    let (library, claims) =
+        library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root);
+    protocol_extractions.library = library;
+    protocol_extractions.site = site_rows_of(
+        crate::site_questions::enabled(),
+        &request_inputs,
+        repo_path,
+        service,
+        &claims,
+    )
+    .await;
     let withdrawn = withdraw_model_routes_at_definitions(
         &mut analysis_result.mount_graph,
         &analysis_result.file_results,
@@ -9348,7 +10034,7 @@ async fn analyze_current_repo(
         &setup.detection,
         &protocol_extractions.event_bus,
     );
-    append_deterministic_protocol_operations(
+    let site_fold = append_deterministic_protocol_operations(
         &mut cloud_data,
         &protocol_extractions,
         &analysis_result.file_results,
@@ -9386,6 +10072,7 @@ async fn analyze_current_repo(
         &library_sites,
         repo_path,
     );
+    apply_site_fold_to_manifest(&mut manifest_entries, &site_fold, repo_path);
     if !manifest_entries.is_empty() {
         cloud_data.type_manifest = Some(manifest_entries);
     }
@@ -9438,6 +10125,7 @@ async fn analyze_current_repo(
     protocol_infer.extend(
         file_orchestrator.collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
     );
+    protocol_infer.extend(site_infer_requests(&site_fold, repo_path));
 
     crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -9528,9 +10216,21 @@ async fn analyze_current_repo(
     ));
     crate::phase_timing::mark(crate::phase_timing::Phase::Other);
 
+    let call_through = crate::call_through::read_sites(
+        &analysis_result.file_results,
+        &request_inputs,
+        repo_path,
+        &cloud_data.function_definitions,
+        &|file, function| {
+            analysis_result
+                .passes_body
+                .contains(&(file.to_path_buf(), function.to_string()))
+        },
+    );
     Ok(ServiceAnalysis {
         data: cloud_data,
         deferred: setup.deferred,
+        call_through,
     })
 }
 
@@ -9782,6 +10482,49 @@ mod tests {
     fn modules_without_config() -> crate::workspace_resolver::WorkspaceIndex {
         let empty = tempfile::tempdir().expect("tempdir");
         crate::workspace_resolver::WorkspaceIndex::build_with_aliases(empty.path(), None)
+    }
+
+    /// carrick#2496. The hand-off from the settled store answer into the scan
+    /// health: one package still building when the wait ends and one the store
+    /// could not build are each counted for the service and each named once,
+    /// in their own sentence.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_with_a_pending_and_a_failed_package_prints_both_sentences_once() {
+        let asked = crate::library_store::Asked::naming(&["hand-off-a", "hand-off-b"]);
+        let body = r#"{"library_claims":[
+            {"package":"hand-off-a","version":"1.0.0","status":"pending","reason":"in_flight"},
+            {"package":"hand-off-b","version":"1.0.0","status":"skipped","reason":"build_failed"}]}"#;
+        let ask = super::LibraryAsk {
+            sites: Default::default(),
+            asked,
+            turns: Default::default(),
+        };
+        let service = Some("hand-off-service".to_string());
+        crate::current_service::scope(service.clone(), async {
+            let settled = crate::library_store::ask_until_settled(
+                &ask.asked,
+                |_| async {},
+                |_| async { Ok(body.to_string()) },
+            )
+            .await;
+            super::library_rows(Some(&ask), settled, None, std::path::Path::new("."));
+        })
+        .await;
+        assert_eq!(
+            crate::scan_health::library_packages_for(service.as_deref()),
+            Some((1, 1))
+        );
+        let lines: Vec<String> = crate::scan_health::library_pending_lines()
+            .into_iter()
+            .filter(|line| line.contains("hand-off-"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "1 library was not ready in time, so calls through it may be missing from this index: hand-off-a. The next scan adds it.",
+                "Carrick could not read 1 library yet, so calls through it are missing from this index: hand-off-b.",
+            ]
+        );
     }
 
     /// carrick#1490: "ran" is what the check did. A check that panics is
@@ -10870,6 +11613,54 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
+    /// A tree reached through a symlink hashes as the tree itself, whichever
+    /// of the root and the manifest path went through the link: the hash is
+    /// what decides whether a stored setup is replayed, and two checkouts of
+    /// one commit must agree on it.
+    #[cfg(unix)]
+    #[test]
+    fn the_manifest_hash_does_not_depend_on_how_the_tree_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir_all(real.join("apps/api")).unwrap();
+        std::fs::write(real.join("apps/api/package.json"), "{}").unwrap();
+        let link = real.parent().unwrap().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let expected = hash_file_content("apps/api/package.json\0{}\0");
+        for (root, manifest_root) in [(&real, &link), (&link, &real), (&real, &real)] {
+            let packages =
+                Packages::new(vec![manifest_root.join("apps/api/package.json")]).unwrap();
+            assert_eq!(
+                hash_workspace_package_jsons(&packages, root.to_str().unwrap()).unwrap(),
+                expected,
+                "root {root:?}, manifest under {manifest_root:?}"
+            );
+        }
+    }
+
+    /// carrick#2314: a manifest the scan named by a relative path (the root
+    /// was `.` or a relative path) keeps that spelling as its key, against a
+    /// root that is canonical by then. Every blob stored by a scan run as
+    /// `carrick .` was hashed with it.
+    #[test]
+    fn a_relative_manifest_path_is_keyed_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for written in ["./apps/api/package.json", "tree/apps/api/package.json"] {
+            let packages = Packages {
+                source_paths: vec![PathBuf::from(written)],
+                ..Default::default()
+            };
+            // Nothing is read at a relative path from a test's own directory:
+            // the key is what this pins.
+            assert_eq!(
+                hash_workspace_package_jsons(&packages, root.to_str().unwrap()).unwrap(),
+                hash_file_content(&format!("{written}\0missing\0")),
+                "{written}"
+            );
+        }
+    }
+
     #[test]
     fn deno_resolution_inputs_invalidate_service_cache() {
         let dir = tempfile::tempdir().unwrap();
@@ -11388,7 +12179,36 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }
+    }
+
+    /// carrick-cloud#909: the run states every service its config resolution
+    /// produced, named as each one's own write names it, and a dirty tree
+    /// states none.
+    #[test]
+    fn the_run_states_every_declared_service_and_a_dirty_tree_none() {
+        let named = |name: Option<&str>| Config {
+            service_name: name.map(str::to_string),
+            ..Default::default()
+        };
+        let services = [named(Some("api")), named(Some("worker")), named(None)];
+
+        let clean = ScriptedStorage::new(Vec::new(), Vec::new());
+        note_declared_services(&clean, &services, false);
+        assert_eq!(
+            clean.declared.lock().unwrap().clone(),
+            Some(vec![
+                Some("api".to_string()),
+                Some("worker".to_string()),
+                None
+            ])
+        );
+
+        let dirty = ScriptedStorage::new(Vec::new(), Vec::new());
+        note_declared_services(&dirty, &services, true);
+        assert_eq!(dirty.declared.lock().unwrap().clone(), None);
     }
 
     /// A storage whose every answer is scripted, so the upload loop's
@@ -11405,6 +12225,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         /// files, and so that its write actions must supersede the stored
         /// generation (carrick#1306).
         analyzed_noted: std::sync::atomic::AtomicBool,
+        /// The declared service set the run stated (carrick-cloud#909).
+        declared: std::sync::Mutex<Option<Vec<Option<String>>>>,
     }
 
     impl ScriptedStorage {
@@ -11419,6 +12241,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 uploaded_bodies: std::sync::Mutex::new(Vec::new()),
                 landed_asks: std::sync::Mutex::new(Vec::new()),
                 analyzed_noted: std::sync::atomic::AtomicBool::new(false),
+                declared: std::sync::Mutex::new(None),
             }
         }
 
@@ -11448,6 +12271,10 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
 
     #[async_trait::async_trait]
     impl CloudStorage for ScriptedStorage {
+        fn note_declared_services(&self, declared: &[Option<String>]) {
+            *self.declared.lock().unwrap() = Some(declared.to_vec());
+        }
+
         fn note_analyzed_files(&self) {
             self.analyzed_noted
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -12067,6 +12894,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
 
         let mut graph = MountGraph::new();
@@ -12319,6 +13147,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         relativize_cloud_paths(
@@ -12496,6 +13326,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
 
         let test_data = CloudRepoData {
@@ -12534,6 +13365,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -12586,6 +13419,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }];
 
         // Test Config merging
@@ -12644,6 +13479,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
 
         let test_data = vec![CloudRepoData {
@@ -12682,6 +13518,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -13420,6 +14258,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         // Staging unavailable: the request body has to carry the payload, so
@@ -13477,6 +14317,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         let stripped = strip_ast_nodes(data, true);
@@ -13547,6 +14389,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 scanner_build: None,
                 boundary: None,
                 dispatch_tables: None,
+                possible_calls: None,
+                possible_calls_omitted: None,
             }
         }
 
@@ -13626,6 +14470,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -13847,6 +14693,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -13995,6 +14843,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         attach_external_call_candidates(
@@ -14120,6 +14970,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         attach_external_call_candidates(
@@ -14239,6 +15091,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -14281,7 +15135,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     #[test]
     fn resolve_services_without_config_defaults_to_single_service() {
         let tmp = tempfile::tempdir().unwrap();
-        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        let services = resolve_services(tmp.path().to_str().unwrap())
+            .unwrap()
+            .services;
         assert_eq!(services.len(), 1);
         assert!(services[0].directory.is_none());
     }
@@ -14347,7 +15203,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         )
         .unwrap();
 
-        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        let services = resolve_services(tmp.path().to_str().unwrap())
+            .unwrap()
+            .services;
         assert_eq!(services.len(), 3);
         assert!(services[0].is_external_call("ENV_VAR:GITHUB_API_BASE:/repos"));
         assert!(services[1].is_external_call("ENV_VAR:GITHUB_API_BASE:/repos"));
@@ -14399,7 +15257,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         )
         .unwrap();
 
-        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        let services = resolve_services(tmp.path().to_str().unwrap())
+            .unwrap()
+            .services;
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].directory.as_deref(), Some("svc"));
     }
@@ -14749,6 +15609,269 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             silent.len(),
             1,
             "only `bump()` is proven silent: {silent:?}"
+        );
+    }
+
+    /// The span start a site's call carries ([`crate::request_summary`]'s
+    /// `Site::span_start`): the offset of `needle` in `source`, in SWC
+    /// numbering.
+    fn site_start(source: &str, needle: &str) -> u32 {
+        let offset = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} not in the source"));
+        u32::try_from(offset).unwrap() + crate::swc_scanner::SWC_SPAN_BASE
+    }
+
+    /// carrick#2281: a call of a function that binds a name and hands back a
+    /// callable sends nothing where it is written, at module level as inside
+    /// a body. The callable sends later, through a nested function that
+    /// forwards the name, and whether it runs is not the call's to say.
+    /// Holds whether the transport is a package the scan does not read or an
+    /// object of the repository whose method calls `fetch`.
+    #[test]
+    fn a_call_that_binds_a_name_into_a_callable_is_silent_at_module_level() {
+        let handlers = "import { bind } from \"./bind\";\n\nfunction localList() {\n  return [];\n}\n\nexport const listOrders = bind(localList, \"orders.list\", { timeoutMs: 1 });\n\nexport function later() {\n  return bind(localList, \"orders.read\", { timeoutMs: 1 });\n}\n";
+        let bind = |transport: &str| {
+            format!(
+                "import {{ transport }} from \"{transport}\";\n\nexport function bind<T>(local: T, name: string, options: {{ timeoutMs: number }}) {{\n  const timeout = options.timeoutMs;\n  return async (...rest: unknown[]) => {{\n    const send = () => transport.post(name, rest);\n    return send();\n  }};\n}}\n"
+            )
+        };
+        let package = bind("rpc-transport");
+        let own = bind("./transport");
+        let variants: [(&str, Vec<(&str, &str)>); 2] = [
+            (
+                "a package's transport",
+                vec![("src/handlers.ts", handlers), ("src/bind.ts", &package)],
+            ),
+            (
+                "the repository's transport",
+                vec![
+                    ("src/handlers.ts", handlers),
+                    ("src/bind.ts", &own),
+                    (
+                        "src/transport.ts",
+                        "const BASE = process.env.RPC_URL;\n\nexport const transport = {\n  post(name: string, args: unknown) {\n    return fetch(`${BASE}/rpc`, { method: \"POST\", body: JSON.stringify({ name, args }) });\n  },\n};\n",
+                    ),
+                ],
+            ),
+        ];
+        for (variant, files) in variants {
+            let (dir, discovery) = discover_sources(&files);
+            let silent = summaries_of(&discovery)
+                .silent(&dir.path().join("src/handlers.ts"))
+                .cloned()
+                .unwrap_or_default();
+            for needle in [
+                "bind(localList, \"orders.list\"",
+                "bind(localList, \"orders.read\"",
+            ] {
+                assert!(
+                    silent.contains(&site_start(handlers, needle)),
+                    "{variant}: `{needle}` is silent: {silent:?}"
+                );
+            }
+        }
+    }
+
+    /// The silent sites of `file` among `needles`, each named by the text its
+    /// call opens with.
+    fn silent_among<'n>(
+        dir: &tempfile::TempDir,
+        discovery: &FileDiscovery,
+        file: &str,
+        source: &str,
+        needles: &[&'n str],
+    ) -> Vec<&'n str> {
+        let silent = summaries_of(discovery)
+            .silent(&dir.path().join(file))
+            .cloned()
+            .unwrap_or_default();
+        needles
+            .iter()
+            .copied()
+            .filter(|needle| silent.contains(&site_start(source, needle)))
+            .collect()
+    }
+
+    /// carrick#2281: a call on one of the language's own collections sends
+    /// nothing, so a function that only stores a handler in a `new Map()`
+    /// sends nothing either. A callback handed to such a call is still read,
+    /// and a collection the file cannot vouch for is not one: a binding
+    /// assigned again, or a file that binds the constructor's name itself.
+    #[test]
+    fn a_call_on_a_language_collection_sends_nothing() {
+        let use_source = "import { register, registerNamed, forEach } from \"./registry\";\nimport { swap } from \"./reassigned\";\nimport { own } from \"./own-map\";\nimport { imported } from \"./imported-map\";\n\nfunction listOrders() {\n  return [];\n}\n\nregister(listOrders, \"orders.list\");\nregisterNamed(\"orders.read\", listOrders);\nforEach(\"orders.each\");\nswap(\"orders.swap\", listOrders);\nown(\"orders.own\", listOrders);\nimported(\"orders.imported\", listOrders);\n";
+        let (dir, discovery) = discover_sources(&[
+            ("src/use.ts", use_source),
+            (
+                "src/registry.ts",
+                "const table = new Map<string, () => unknown>();\n\nexport function register(handler: () => unknown, name: string) {\n  table.set(name, handler);\n}\n\nexport function registerNamed(name: string, handler: () => unknown) {\n  table.set(name, handler);\n}\n\nexport function forEach(name: string) {\n  table.forEach(() => {\n    fetch(`/api/${name}`);\n  });\n}\n",
+            ),
+            (
+                "src/reassigned.ts",
+                "let table = new Map<string, () => unknown>();\n\nexport function reset() {\n  table = new Map();\n}\n\nexport function swap(name: string, handler: () => unknown) {\n  table.set(name, handler);\n}\n",
+            ),
+            (
+                "src/own-map.ts",
+                "class Map {\n  set(name: string, value: unknown) {\n    return send(name, value);\n  }\n}\n\ndeclare function send(name: string, value: unknown): unknown;\n\nconst table = new Map();\n\nexport function own(name: string, handler: () => unknown) {\n  table.set(name, handler);\n}\n",
+            ),
+            (
+                "src/imported-map.ts",
+                "import { Map } from \"remote-collections\";\n\nconst table = new Map();\n\nexport function imported(name: string, handler: () => unknown) {\n  table.set(name, handler);\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            silent_among(
+                &dir,
+                &discovery,
+                "src/use.ts",
+                use_source,
+                &[
+                    "register(listOrders",
+                    "registerNamed(",
+                    "forEach(\"orders.each\"",
+                    "swap(",
+                    "own(",
+                    "imported(",
+                ],
+            ),
+            vec!["register(listOrders", "registerNamed("],
+            "only the calls that store into a collection the file builds and \
+             never replaces"
+        );
+    }
+
+    /// carrick#2281: a function that hands out a function that may send is
+    /// not silent at a call that writes a route, at module level or in a
+    /// body: the call may bind that route into what it hands out. A name
+    /// with no `/`, or a factory whose handed-out function is proven silent,
+    /// leaves the call silent.
+    #[test]
+    fn a_call_that_writes_a_route_into_a_handed_out_function_is_not_silent() {
+        let use_source = "import { endpoint, inert, through } from \"./endpoint\";\n\nexport const getOrder = endpoint(\"/orders/:id\");\nexport const nested = endpoint({ path: \"/orders/:id/lines\" });\nexport const named = endpoint(\"orders.read\");\nexport const quiet = inert(\"/orders/:id\");\nexport const relayed = through(\"/orders/:id/relayed\");\n\nexport function later() {\n  return endpoint(\"/orders/:id/later\");\n}\n";
+        let (dir, discovery) = discover_sources(&[
+            ("src/use.ts", use_source),
+            (
+                "src/endpoint.ts",
+                "import { client } from \"opaque-client\";\n\nexport function endpoint(path: unknown) {\n  return (id: string) => client.call(path, id);\n}\n\nexport function inert(path: string) {\n  return (id: string) => `${path}:${id}`;\n}\n\nexport function through(path: string) {\n  return endpoint(path);\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            silent_among(
+                &dir,
+                &discovery,
+                "src/use.ts",
+                use_source,
+                &[
+                    "endpoint(\"/orders/:id\")",
+                    "endpoint({",
+                    "endpoint(\"orders.read\")",
+                    "inert(",
+                    "through(",
+                    "endpoint(\"/orders/:id/later\")",
+                ],
+            ),
+            vec!["endpoint(\"orders.read\")", "inert("],
+        );
+    }
+
+    /// carrick#2281: a model row whose id joined no candidate has no span. It
+    /// is placed by its line, at the one outermost call opening there, and
+    /// withdrawn when that call is silent and the row's text writes it. The
+    /// silent set and the placement count in the same units, so a row at a
+    /// silent call goes. A row on an inner line of a multi-line call, at a
+    /// chain whose outermost call is not silent, with text naming an
+    /// argument's call, or with no text, stays.
+    #[test]
+    fn a_model_row_with_no_span_is_withdrawn_at_the_silent_call_its_line_opens() {
+        use crate::agents::file_analyzer_agent::{
+            DataCallResult, FileAnalysisResult, ResolutionSource,
+        };
+        let use_source = "import { register } from \"./registry\";\n\nfunction listOrders() {\n  return [];\n}\n\nregister(listOrders, \"orders.list\");\nregister(\n  listOrders,\n  \"orders.save\",\n);\nregister(withAudit(listOrders), \"orders.audit\");\nregister(listOrders, \"orders.then\").then(() => undefined);\n\nfunction withAudit<T>(handler: T): T {\n  return handler;\n}\n";
+        let (dir, discovery) = discover_sources(&[
+            ("src/use.ts", use_source),
+            (
+                "src/registry.ts",
+                "const table = new Map<string, () => unknown>();\n\nexport function register(handler: () => unknown, name: string) {\n  table.set(name, handler);\n}\n",
+            ),
+        ]);
+        let path = dir.path().join("src/use.ts");
+        let silent = summaries_of(&discovery)
+            .silent(&path)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            silent.contains(&site_start(
+                use_source,
+                "register(listOrders, \"orders.list\")"
+            )),
+            "the summaries' span start and the placement's are one unit: {silent:?}"
+        );
+        let row = |line: i32, text: Option<&str>| DataCallResult {
+            candidate_id: format!("@line:{line}"),
+            line_number: line,
+            target: "/stated".to_string(),
+            method: Some("GET".to_string()),
+            call_kind: None,
+            pattern_matched: String::new(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: text.map(str::to_string),
+            call_expression_line: Some(line),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            dispatch: None,
+            resolution_source: Some(ResolutionSource::Model),
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+        };
+        let multi_line = "register(\n  listOrders,\n  \"orders.save\",\n)";
+        let chain = "register(listOrders, \"orders.then\").then(() => undefined)";
+        let mut result = FileAnalysisResult {
+            data_calls: vec![
+                row(7, Some("register(listOrders, \"orders.list\")")),
+                row(8, Some(multi_line)),
+                row(10, Some(multi_line)),
+                row(
+                    12,
+                    Some("register(withAudit(listOrders), \"orders.audit\")"),
+                ),
+                row(12, Some("withAudit(listOrders)")),
+                row(13, Some("register(listOrders, \"orders.then\")")),
+                row(13, Some(chain)),
+                row(7, None),
+            ],
+            ..Default::default()
+        };
+        let withdrawn = crate::agents::file_orchestrator::FileOrchestrator::withdraw_silent_sites(
+            &mut result,
+            &silent,
+            &path,
+            use_source,
+        );
+        let kept: Vec<(i32, Option<&str>)> = result
+            .data_calls
+            .iter()
+            .map(|call| (call.line_number, call.call_expression_text.as_deref()))
+            .collect();
+        assert_eq!(withdrawn, 3, "kept: {kept:?}");
+        assert_eq!(
+            kept,
+            vec![
+                (10, Some(multi_line)),
+                (12, Some("withAudit(listOrders)")),
+                (13, Some("register(listOrders, \"orders.then\")")),
+                (13, Some(chain)),
+                (7, None),
+            ]
         );
     }
 
@@ -15149,9 +16272,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     /// carrick#1562: a call to a module-scope builder is what the builder
     /// returns, with the call's arguments in its parameters: an arrow, a
     /// function declaration, and one held in a constant object. A function
-    /// that does more than return, a builder in an object the module writes
-    /// through, and one that picks its return by a `switch` (alternatives,
-    /// carrick#1694) state nothing.
+    /// that declares a local `const` first is the same (carrick#2447); a
+    /// builder in an object the module writes through, and one that picks its
+    /// return by a `switch` (alternatives, carrick#1694) state nothing.
     #[test]
     fn a_builder_s_return_is_the_request_s_url() {
         let (dir, discovery) = discover_sources(&[(
@@ -15189,6 +16312,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     "${process.env.API_BASE}/api/orders/${id}".to_string()
                 ),
                 (16, "DELETE".to_string(), "/api/teams/core".to_string()),
+                // A local `const` before the `return` is inlined
+                // (carrick#2447).
+                (17, "GET".to_string(), "/api/x/${x}".to_string()),
             ]
         );
     }
@@ -15524,7 +16650,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     /// semantics the client's own sites state nothing (the verb rule), a
     /// `Map` built in place or bound to the client's name reaches no claim,
     /// a field written twice holds no instance, and a factory handed
-    /// anything but one object literal builds nothing.
+    /// anything but one object literal, or a constant holding one that the
+    /// file hands nowhere else (carrick#2451), builds nothing.
     #[test]
     fn nothing_but_the_named_client_reaches_a_claim() {
         let (dir, discovery) = discover_sources(&[
@@ -15533,7 +16660,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 "src/negatives.ts",
                 "import http from \"@fixture/http\";\n\
                  \n\
+                 declare function log(o: object): void;\n\
                  const options = { baseURL: \"/opts\" };\n\
+                 log(options);\n\
                  const indirect = http.create(options);\n\
                  \n\
                  export function cached() {\n\
@@ -16959,6 +18088,20 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 "import { api } from \"./api\";\n\
                  export function r() { return api.get(\"/read\"); }\n",
             ),
+            ("src/q01b/config.ts", "export const BASE = \"/q01right\";\n"),
+            (
+                "src/q01b/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 import { BASE } from \"./config\";\n\
+                 export const api = http.create({ baseURL: BASE });\n",
+            ),
+            (
+                "src/q01b/reader.ts",
+                "import { api } from \"./api\";\n\
+                 const BASE = \"/q01wrong\";\n\
+                 export const b = BASE;\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
             (
                 "src/q04/api.ts",
                 "import http from \"@fixture/http\";\n\
@@ -16981,10 +18124,20 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                  export function r() { return api.get(\"/read\"); }\n",
             ),
         ]);
-        for file in ["src/q06/reader.ts", "src/q01/reader.ts"] {
-            let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
-            assert!(rows.is_empty(), "{file}: {rows:#?}");
-        }
+        let rows = library_rows_of(&dir, &discovery, "src/q06/reader.ts", &verified_sample());
+        assert!(rows.is_empty(), "{rows:#?}");
+        // An imported constant that holds text states that text (carrick#2447),
+        // the same as a constant written beside the client (q04).
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/q01/reader.ts"),
+            stated(&[(2, "GET", "/q01right/read")])
+        );
+        // The importer's own `BASE` is another binding: the base is read where
+        // the client is built, never by name in the importer.
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/q01b/reader.ts"),
+            stated(&[(4, "GET", "/q01right/read")])
+        );
         assert_eq!(
             library_rows_of(&dir, &discovery, "src/q06/api.ts", &verified_sample())
                 .iter()
@@ -17372,6 +18525,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 package: package.to_string(),
                 version: "1.0.0".to_string(),
                 specifiers: Vec::new(),
+                exports: Vec::new(),
             }],
         };
         let first = library_turn(&turns)(&request("lib")).await;
@@ -17921,6 +19075,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             printed_names: Vec::new(),
             raw_text_read: false,
             response_modes: None,
+            model_symbol_relation: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -17958,6 +19113,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             printed_names: Vec::new(),
             raw_text_read: false,
             response_modes: None,
+            model_symbol_relation: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -17995,6 +19151,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             printed_names: Vec::new(),
             raw_text_read: false,
             response_modes: None,
+            model_symbol_relation: None,
         }
     }
 
@@ -20299,6 +21456,795 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         }
     }
 
+    /// One site row for the engine tests (carrick#2439): at `file`:7, span
+    /// 100..130, its payload at 112..118 and its handler at 120..129.
+    fn site_row(
+        file: &str,
+        key: OperationKey,
+        side: crate::site_rows::RowSide,
+        in_band: bool,
+    ) -> crate::site_rows::SiteRow {
+        use crate::request_summary::site_record::{AnchorAt, HandlerAnchor, TypeAnchors};
+        let at = |span_start: u32, span_end: u32| AnchorAt {
+            file: file.to_string(),
+            line: 7,
+            span_start,
+            span_end,
+        };
+        crate::site_rows::SiteRow {
+            file: file.to_string(),
+            line: 7,
+            key,
+            side,
+            source: crate::agents::file_analyzer_agent::ResolutionSource::Model,
+            inference: Some(crate::site_rows::SiteInference {
+                by: crate::site_rows::InferenceBy::SiteQuestion,
+                question_set: Some("qs".to_string()),
+                confidence: if in_band { 0.9 } else { 0.5 },
+                orders_agree: true,
+            }),
+            in_band,
+            name_scope: None,
+            anchors: TypeAnchors {
+                call: at(100, 130),
+                payload: None,
+                payload_at: Some(at(112, 118)),
+                handler: Some(HandlerAnchor {
+                    at: at(120, 129),
+                    param: 0,
+                    param_name: Some("message".to_string()),
+                }),
+            },
+            lead: crate::possible_calls::PossibleCall {
+                file_path: file.to_string(),
+                line_number: 7,
+                span_start: 100,
+                span_end: 130,
+                kind: Some("pubsub".to_string()),
+                role: None,
+                labelled_end: None,
+                unread: crate::possible_calls::Unread {
+                    slot: "name".to_string(),
+                    reason: crate::possible_calls::UnreadReason::BelowBand,
+                },
+                trace_depth: 0,
+            },
+        }
+    }
+
+    /// carrick#2515: with the switch off, an export the store labels with no
+    /// op writes no lead either; the blob is as it was.
+    #[tokio::test]
+    async fn an_export_with_no_op_writes_nothing_with_the_switch_off() {
+        let inputs = crate::engine::discover_request_inputs(
+            &crate::request_summary::decided_sites::tests::decided_fixture(),
+        );
+        let claims: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([
+                { "package": "gql-thing", "version": "1.0.0", "specifier": "gql-thing",
+                  "export": "Client", "role": "graphql_client", "claims": [] }
+            ]))
+            .unwrap();
+        let off = site_rows_of(false, &inputs, ".", &Config::default(), &claims).await;
+        assert!(!off.enabled && off.rows.is_empty() && off.leads.is_empty());
+    }
+
+    /// carrick#2439: with the switch off the site pass reads nothing and the
+    /// blob is byte for byte the one the scan wrote before it, with no
+    /// `possible_calls` and no `inference` on any row.
+    #[tokio::test]
+    async fn site_rows_off_leave_the_blob_byte_identical() {
+        let inputs = crate::engine::discover_request_inputs(
+            &crate::request_summary::decided_sites::tests::decided_fixture(),
+        );
+        let off = site_rows_of(false, &inputs, ".", &Config::default(), &[]).await;
+        assert!(!off.enabled && off.rows.is_empty() && off.leads.is_empty());
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "svc/src/orders.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "orders.created",
+                    crate::operation::PubsubRole::Publisher,
+                    None,
+                    None,
+                )],
+                ..Default::default()
+            },
+        );
+        let base = repo_with_bundle("svc", None, "");
+        let blob = |site: crate::site_rows::SiteRows| {
+            let extractions = ProtocolExtractions {
+                site,
+                ..ProtocolExtractions::default()
+            };
+            let mut cloud_data = base.clone();
+            append_deterministic_protocol_operations(
+                &mut cloud_data,
+                &extractions,
+                &file_results,
+                &crate::in_process_pubsub::InProcessPubsub::default(),
+                ".",
+                &Config::default(),
+            );
+            serde_json::to_string(&cloud_data).unwrap()
+        };
+        let before = blob(crate::site_rows::SiteRows::default());
+        // A pass that was off holds rows only by mistake; none of them
+        // reaches the blob.
+        let stray = crate::site_rows::SiteRows {
+            enabled: false,
+            rows: vec![site_row(
+                "svc/src/orders.ts",
+                OperationKey::pubsub("orders.settled"),
+                crate::site_rows::RowSide::Call,
+                true,
+            )],
+            leads: Vec::new(),
+            routes: Vec::new(),
+        };
+        assert_eq!(blob(off), before);
+        assert_eq!(blob(stray), before);
+        assert!(!before.contains("possible_calls") && !before.contains("inference"));
+    }
+
+    /// carrick#2436: a service's library ask names every network role with
+    /// site questions on, and today's message roles, byte for byte, with them
+    /// off, for the same packages.
+    #[test]
+    fn a_service_s_library_ask_names_the_roles_its_switch_picks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |file: &str, text: &str| {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "package.json",
+            r#"{ "name": "service", "dependencies": { "fixture-bus": "^1.0.0" } }"#,
+        );
+        write(
+            "node_modules/fixture-bus/package.json",
+            r#"{"name":"fixture-bus","version":"1.0.0"}"#,
+        );
+        write(
+            "package-lock.json",
+            r#"{"lockfileVersion":3,"packages":{"node_modules/fixture-bus":{"version":"1.0.0","resolved":"https://registry.npmjs.org/fixture-bus/-/fixture-bus-1.0.0.tgz"}}}"#,
+        );
+        write(
+            "src/orders.ts",
+            "import { bus } from \"fixture-bus\";\nexport async function send() {\n  await bus.publish(\"orders.created\", { id: 1 });\n}\n",
+        );
+        let inputs = crate::engine::discover_request_inputs(root);
+        let body = |site_questions: bool| {
+            let ask =
+                super::LibraryAsk::of(&inputs, root, root, Default::default(), site_questions)
+                    .expect("the service asks about its public package");
+            serde_json::to_string(&ask.asked.request).unwrap()
+        };
+        let packages = r#""packages":[{"package":"fixture-bus","version":"1.0.0","specifiers":["fixture-bus"]}]"#;
+        assert_eq!(
+            body(false),
+            format!(r#"{{"roles":["broker","socket","in_process_bus"],{packages}}}"#)
+        );
+        assert_eq!(
+            body(true),
+            format!(
+                r#"{{"roles":["broker","socket","in_process_bus","http_client","graphql_client","server_framework"],{packages}}}"#
+            )
+        );
+    }
+
+    /// The store's answer for the HTTP client the site fixture calls
+    /// through: its export when the request names `http_client`, nothing for
+    /// a request that names only other roles, as the store answers.
+    fn http_store(request: &crate::library_store::LibraryClaimsRequest) -> String {
+        if !request.roles.contains(&"http_client") {
+            return r#"{"library_claims":[{"package":"fixture-http","version":"1.0.0","status":"answered","exports":[]}]}"#
+                .to_string();
+        }
+        r#"{"library_claims":[{"package":"fixture-http","version":"1.0.0","status":"answered","exports":[
+            {"specifier":"fixture-http","export":"default","role":"http_client","side":"client",
+             "makes":[],"scopes":[],
+             "ops":[{"op":"request","member":"get","on":"export","name":{"arg":0},"method":"GET"}],
+             "reserved":[],"calls":[],"patterns":[]}]}]}"#
+            .to_string()
+    }
+
+    /// carrick#2436: with site questions on, the scan asks the store for
+    /// every network role, so a call through an HTTP client's export is a
+    /// discovery site with its record. Off, the ask names the message roles
+    /// alone, the store answers no HTTP label, and the call is no site.
+    #[tokio::test]
+    async fn an_http_client_s_call_is_a_site_only_when_site_questions_ask_its_role() {
+        let edit = [
+            (
+                "node_modules/fixture-http/package.json",
+                r#"{ "name": "fixture-http", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/fixture-http/index.d.ts",
+                "export interface HttpStatic {\n  get(url: string): Promise<unknown>;\n}\ndeclare const http: HttpStatic;\nexport default http;\n",
+            ),
+            (
+                "src/orders-api.ts",
+                "import http from \"fixture-http\";\n\nexport function listOrders(): Promise<unknown> {\n  return http.get(\"/orders\");\n}\n",
+            ),
+        ];
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        ) else {
+            return;
+        };
+        let file = "services/web/src/orders-api.ts";
+        for site_questions in [false, true] {
+            let asked = crate::library_store::Asked::naming_for(
+                &["fixture-http"],
+                crate::library_store::roles_for(site_questions),
+            );
+            let settled = crate::library_store::ask_until_settled(
+                &asked,
+                |_| async {},
+                |request| async move { Ok(http_store(&request)) },
+            )
+            .await;
+            let of = super::site_records_of(&on.inputs, &on.repo, &settled.exports);
+            let sites: Vec<(String, u32, String)> = of
+                .decided
+                .sites
+                .iter()
+                .filter(|site| site.file == file)
+                .map(|site| (site.file.clone(), site.line, site.end.role.clone()))
+                .collect();
+            let records = of
+                .records
+                .iter()
+                .filter(|record| {
+                    serde_json::to_string(&record.state.point)
+                        .unwrap()
+                        .contains("orders-api.ts")
+                })
+                .count();
+            if site_questions {
+                assert_eq!(
+                    sites,
+                    vec![(file.to_string(), 4, "http_client".to_string())],
+                    "on: the HTTP call is a site"
+                );
+                assert_eq!(records, 1, "on: the site has its record");
+            } else {
+                assert!(sites.is_empty(), "off: no HTTP label, no site");
+                assert_eq!(records, 0);
+            }
+        }
+    }
+
+    /// carrick#2504: the file a service calls `fetch(url, init)` in.
+    const LIB_FETCH_FILE: &str = "services/web/src/lib-fetch.ts";
+
+    fn lib_fetch_edit() -> [(&'static str, &'static str); 1] {
+        [(
+            "src/lib-fetch.ts",
+            "export function send(body: string): Promise<Response> {\n  return fetch(\"/send\", { method: \"POST\", body });\n}\n",
+        )]
+    }
+
+    /// carrick#2504: a service asks the store for the language's own
+    /// library only with site questions on: one `lib:<file>` package per
+    /// default-library file its code's globals are declared in, at the
+    /// compiler's version, narrowed with `exports` to those globals. Off, the
+    /// request is the one a run with no rows makes, byte for byte.
+    #[test]
+    fn a_service_asks_for_the_language_s_library_only_with_site_questions_on() {
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &lib_fetch_edit(),
+            true,
+        ) else {
+            return;
+        };
+        let root = on.repo.join("services/web");
+        let body = |inputs: &crate::request_summary::RequestSummaryInputs, site_questions| {
+            super::LibraryAsk::of(inputs, &root, &on.repo, Default::default(), site_questions)
+                .map(|ask| serde_json::to_string(&ask.asked.request).unwrap())
+        };
+        let off = body(&on.inputs, false).expect("off: the service asks about its packages");
+        assert!(
+            !off.contains("lib:") && !off.contains("exports"),
+            "off: the request names no library: {off}"
+        );
+        let request =
+            serde_json::from_str::<serde_json::Value>(&body(&on.inputs, true).unwrap()).unwrap();
+        let (typescript, _) = on
+            .inputs
+            .positions
+            .as_ref()
+            .unwrap()
+            .default_library_globals()
+            .unwrap();
+        let dom = request["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["package"] == "lib:lib.dom.d.ts")
+            .expect("on: the DOM library is asked about");
+        assert_eq!(dom["version"], typescript);
+        assert_eq!(dom["specifiers"], serde_json::json!(["lib:lib.dom.d.ts"]));
+        assert!(
+            dom["exports"].as_array().unwrap().contains(&"fetch".into()),
+            "on: narrowed to the globals the code uses: {dom}"
+        );
+        assert!(
+            !dom["exports"]
+                .as_array()
+                .unwrap()
+                .contains(&"WebSocket".into()),
+            "on: a global the code does not use is not asked"
+        );
+    }
+
+    /// The shim store's answer for the language's library: `fetch` labelled
+    /// an HTTP client under each `lib:` package the request names, at the
+    /// version it names, and nothing for any other.
+    fn lib_store(request: &crate::library_store::LibraryClaimsRequest) -> String {
+        let answers: Vec<serde_json::Value> = request
+            .packages
+            .iter()
+            .filter(|package| package.package.starts_with("lib:"))
+            .map(|package| {
+                serde_json::json!({
+                    "package": package.package, "version": package.version,
+                    "status": "answered",
+                    "exports": [{
+                        "specifier": package.package, "export": "fetch",
+                        "role": "http_client", "side": "client",
+                        "makes": [], "scopes": [],
+                        "ops": [{"op": "request", "member": null, "on": "export",
+                                 "name": {"arg": 0}}],
+                        "reserved": [], "calls": [], "patterns": []
+                    }]
+                })
+            })
+            .collect();
+        serde_json::json!({ "library_claims": answers }).to_string()
+    }
+
+    /// carrick#2504: `fetch(url, init)` in a service, with the store's
+    /// `lib:` label for it, is a discovery site with its record, keyed as
+    /// the store keys the language's library. The label reaches the scan
+    /// only because the request named the `lib:` package.
+    #[tokio::test]
+    async fn a_fetch_call_is_a_site_through_the_store_s_lib_label() {
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &lib_fetch_edit(),
+            true,
+        ) else {
+            return;
+        };
+        let root = on.repo.join("services/web");
+        let ask = super::LibraryAsk::of(&on.inputs, &root, &on.repo, Default::default(), true)
+            .expect("the service asks the store");
+        let settled = crate::library_store::ask_until_settled(
+            &ask.asked,
+            |_| async {},
+            |request| async move { Ok(lib_store(&request)) },
+        )
+        .await;
+        let of = super::site_records_of(&on.inputs, &on.repo, &settled.exports);
+        let sites: Vec<(u32, String, String)> = of
+            .decided
+            .sites
+            .iter()
+            .filter(|site| site.file == LIB_FETCH_FILE)
+            .map(|site| (site.line, site.end.package.clone(), site.end.role.clone()))
+            .collect();
+        assert_eq!(
+            sites,
+            vec![(2, "lib:lib.dom.d.ts".to_string(), "http_client".to_string())]
+        );
+        let records = of
+            .records
+            .iter()
+            .filter(|record| {
+                serde_json::to_string(&record.state.point)
+                    .unwrap()
+                    .contains("lib-fetch.ts")
+            })
+            .count();
+        assert_eq!(records, 1, "the site has its record");
+    }
+
+    /// carrick#2506: a factory typed in a DefinitelyTyped-style package
+    /// (`export =` in `@types/<name>`, the runtime package shipping no types),
+    /// imported by default. The store labels the package's `default`, with a
+    /// route op on the instance its call returns. The factory call is a
+    /// discovery site through its import binding, and the member call on the
+    /// instance is a site that reaches the op, so it is decided.
+    #[tokio::test]
+    async fn a_member_call_on_an_export_equals_factory_s_instance_is_a_decided_site() {
+        let edit = [
+            (
+                "node_modules/fixture-app/package.json",
+                r#"{ "name": "fixture-app", "version": "1.0.0", "main": "index.js" }"#,
+            ),
+            (
+                "node_modules/fixture-app/index.js",
+                "module.exports = function () { return {}; };\n",
+            ),
+            (
+                "node_modules/@types/fixture-app/package.json",
+                r#"{ "name": "@types/fixture-app", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/@types/fixture-app/index.d.ts",
+                "declare function make(): make.App;\ndeclare namespace make {\n  interface App {\n    post(path: string, handler: (body: unknown) => void): void;\n  }\n}\nexport = make;\n",
+            ),
+            (
+                "src/server.ts",
+                "import makeApp from \"fixture-app\";\n\nconst app = makeApp();\n\nfunction onOrder(body: unknown): void {\n  void body;\n}\n\napp.post(\"/orders\", onOrder);\n",
+            ),
+        ];
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        ) else {
+            return;
+        };
+        let answer = r#"{"library_claims":[{"package":"fixture-app","version":"1.0.0","status":"answered",
+            "type_packages":["@types/fixture-app"],"exports":[
+            {"specifier":"fixture-app","export":"default","role":"server_framework","side":null,
+             "makes":[{"form":"call","member":null}],"scopes":[],
+             "ops":[{"op":"receive","member":"post","of":"instance:()","name":{"arg":0},"handler":{"arg":1},"method":"POST"}],
+             "reserved":[],"calls":[],"patterns":[]}]}]}"#;
+        let exports = crate::library_store::parse_answer(answer).exports;
+        assert_eq!(exports.len(), 1, "the label parses");
+        let file = "services/web/src/server.ts";
+        let labels = crate::request_summary::discovery::Labels::of(&exports);
+        let discovered: Vec<(u32, String, Option<String>)> =
+            crate::request_summary::discovery::discover(&on.inputs, &labels, &on.repo)
+                .sites
+                .into_iter()
+                .filter(|site| site.file == file)
+                .map(|site| {
+                    (
+                        site.line,
+                        site.callee,
+                        site.end.map(|end| {
+                            format!(
+                                "{} {} {}",
+                                end.package,
+                                end.export,
+                                end.member.as_deref().unwrap_or("-")
+                            )
+                        }),
+                    )
+                })
+                .collect();
+        assert_eq!(
+            discovered,
+            vec![
+                (
+                    3,
+                    "makeApp".to_string(),
+                    Some("fixture-app default -".to_string())
+                ),
+                (
+                    9,
+                    "app.post".to_string(),
+                    Some("fixture-app default post".to_string())
+                ),
+            ],
+            "the factory call and the member call on its instance are sites"
+        );
+        let of = super::site_records_of(&on.inputs, &on.repo, &exports);
+        let decided: Vec<(String, u32, String)> = of
+            .decided
+            .sites
+            .iter()
+            .filter(|site| site.file == file)
+            .map(|site| (site.file.clone(), site.line, site.end.role.clone()))
+            .collect();
+        assert_eq!(
+            decided,
+            vec![(file.to_string(), 9, "server_framework".to_string())],
+            "the member call is decided"
+        );
+        // The debug line's counts, service-wide: the store labels only this
+        // package, so the two calls above are every call that reached a
+        // label; the other walks the fixture lists stopped.
+        assert_eq!(of.reached_label, 2, "calls that reached a label");
+        assert!(
+            of.discovered > of.reached_label,
+            "stopped walks are listed too"
+        );
+        assert_eq!(of.decided.sites.len(), 1, "decided sites");
+    }
+
+    /// carrick#2439: on, an answer in the band replaces the model's pub/sub
+    /// row at its site and carries its answer, and the sites that state no
+    /// row are written as possible calls.
+    #[test]
+    fn site_rows_on_fold_into_the_blob_and_write_possible_calls() {
+        // The full scan path keys its rows by the walked, absolute path; the
+        // incremental path repo-relative. The fold meets both.
+        for (repo_path, prefix) in [(".", ""), ("/repo", "/repo/")] {
+            site_rows_fold_at(repo_path, prefix);
+        }
+    }
+
+    fn site_rows_fold_at(repo_path: &str, prefix: &str) {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut model = pubsub_op(
+            "orders.created",
+            crate::operation::PubsubRole::Publisher,
+            None,
+            None,
+        );
+        model.line_number = 7;
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            format!("{prefix}svc/src/orders.ts"),
+            FileAnalysisResult {
+                pubsub_operations: vec![model],
+                ..Default::default()
+            },
+        );
+        let below = site_row(
+            "svc/src/other.ts",
+            OperationKey::pubsub("maybe"),
+            crate::site_rows::RowSide::Call,
+            false,
+        );
+        let extractions = ProtocolExtractions {
+            site: crate::site_rows::SiteRows {
+                enabled: true,
+                rows: vec![
+                    site_row(
+                        "svc/src/orders.ts",
+                        OperationKey::pubsub("orders.settled"),
+                        crate::site_rows::RowSide::Call,
+                        true,
+                    ),
+                    below,
+                ],
+                leads: Vec::new(),
+                routes: Vec::new(),
+            },
+            ..ProtocolExtractions::default()
+        };
+        let mut cloud_data = repo_with_bundle("svc", None, "");
+        let fold = append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &file_results,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            repo_path,
+            &Config::default(),
+        );
+        let at_site: Vec<(String, Option<ResolutionSource>, bool)> = cloud_data
+            .calls
+            .iter()
+            .filter(|row| {
+                crate::site_rows::relative(Path::new(repo_path), &row.file_path.to_string_lossy())
+                    == "svc/src/orders.ts:7"
+            })
+            .map(|row| {
+                (
+                    row.key.canonical(),
+                    row.resolution_source,
+                    row.inference.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            at_site,
+            vec![(
+                "pubsub|orders.settled".to_string(),
+                Some(ResolutionSource::Model),
+                true
+            )]
+        );
+        assert_eq!(fold.withdrawn.len(), 1, "{repo_path}");
+        let leads = cloud_data.possible_calls.expect("written when on");
+        assert_eq!(
+            leads
+                .iter()
+                .map(|lead| lead.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["svc/src/other.ts"]
+        );
+    }
+
+    /// carrick#2439: an HTTP request a site states is keyed on its canonical
+    /// call path, as the reader's rows are: a full URL on a declared internal
+    /// domain becomes its bare route; a route registration keeps its path.
+    #[test]
+    fn site_requests_are_keyed_on_the_canonical_call_path() {
+        use crate::site_rows::RowSide;
+        let config = Config {
+            internal_domains: BTreeSet::from(["api.internal.test".to_string()]),
+            ..Config::default()
+        };
+        let mut rows = crate::site_rows::SiteRows {
+            enabled: true,
+            rows: vec![
+                site_row(
+                    "src/client.ts",
+                    OperationKey::http("GET", "https://api.internal.test/v1/orders"),
+                    RowSide::Call,
+                    true,
+                ),
+                site_row(
+                    "src/routes.ts",
+                    OperationKey::http("GET", "https://api.internal.test/v1/orders"),
+                    RowSide::Endpoint,
+                    true,
+                ),
+            ],
+            leads: Vec::new(),
+            routes: Vec::new(),
+        };
+        key_site_requests_canonically(&mut rows, &UrlNormalizer::new(&config));
+        let keys: Vec<String> = rows.rows.iter().map(|row| row.key.canonical()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "http|GET|/v1/orders".to_string(),
+                "http|GET|https://api.internal.test/v1/orders".to_string(),
+            ]
+        );
+    }
+
+    /// carrick#2439 / carrick#2472 C3: a reader row the fold replaced leaves
+    /// no manifest entry, and each site row stated is anchored where its
+    /// record says: a send's payload expression, an HTTP request's result at
+    /// its call, and a handler's first parameter, each by span and under the
+    /// alias its manifest entry carries.
+    #[test]
+    fn the_site_fold_anchors_its_rows_in_the_manifest() {
+        use crate::site_rows::RowSide;
+        let publish = site_row(
+            "src/orders.ts",
+            OperationKey::pubsub("orders.settled"),
+            RowSide::Call,
+            true,
+        );
+        let subscriber = site_row(
+            "src/jobs.ts",
+            OperationKey::pubsub("orders.settled"),
+            RowSide::Endpoint,
+            true,
+        );
+        let request = site_row(
+            "src/client.ts",
+            OperationKey::http("POST", "/v1/orders"),
+            RowSide::Call,
+            true,
+        );
+        let fold = crate::site_rows::SiteFold {
+            stated: vec![publish, subscriber, request],
+            withdrawn: vec![(
+                "src/orders.ts".to_string(),
+                7,
+                OperationKey::pubsub("orders"),
+                RowSide::Call,
+            )],
+            leads: Vec::new(),
+            route_kept_reader: 0,
+        };
+        let mut entries = Vec::new();
+        add_protocol_manifest_entry(
+            &mut entries,
+            &OperationKey::pubsub("orders"),
+            ManifestRole::Consumer,
+            "src/orders.ts",
+            7,
+            None,
+            Some("x"),
+        );
+        apply_site_fold_to_manifest(&mut entries, &fold, "/repo");
+        let keyed: Vec<(String, ManifestRole, ManifestTypeKind)> = entries
+            .iter()
+            .map(|entry| (entry.key.canonical(), entry.role, entry.type_kind))
+            .collect();
+        assert!(!keyed.iter().any(|(key, ..)| key == "pubsub|orders"));
+        for wanted in [
+            (
+                "pubsub|orders.settled",
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+            ),
+            (
+                "pubsub|orders.settled",
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+            ),
+            (
+                "http|POST|/v1/orders",
+                ManifestRole::Consumer,
+                ManifestTypeKind::Request,
+            ),
+            (
+                "http|POST|/v1/orders",
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+            ),
+        ] {
+            assert!(
+                entries.iter().any(|entry| entry.key.canonical() == wanted.0
+                    && entry.role == wanted.1
+                    && entry.type_kind == wanted.2),
+                "{wanted:?} in {keyed:?}"
+            );
+        }
+
+        let requests = site_infer_requests(&fold, "/repo");
+        let aliases: HashSet<&str> = entries
+            .iter()
+            .map(|entry| entry.type_alias.as_str())
+            .collect();
+        for request in &requests {
+            assert!(
+                aliases.contains(request.alias.as_deref().unwrap()),
+                "{request:?}"
+            );
+        }
+        let asked: Vec<(&str, InferKind, Option<u32>, Option<&str>)> = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.file_path.as_str(),
+                    request.infer_kind.clone(),
+                    request.span_start,
+                    request.param_name.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                (
+                    "/repo/src/orders.ts",
+                    InferKind::Expression,
+                    Some(112),
+                    None
+                ),
+                (
+                    "/repo/src/jobs.ts",
+                    InferKind::FunctionParam,
+                    Some(120),
+                    Some("message")
+                ),
+                (
+                    "/repo/src/client.ts",
+                    InferKind::Expression,
+                    Some(112),
+                    None
+                ),
+                (
+                    "/repo/src/client.ts",
+                    InferKind::CallResult,
+                    Some(100),
+                    None
+                ),
+            ]
+        );
+    }
+
     /// carrick#1662: a library row is a `library_claim` fact carrying its
     /// name's scope and its claim ids, on the producer side for a subscriber
     /// or a listener and the call side for a publisher or an emitter. A row
@@ -21129,6 +23075,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 publishers: vec![bus("job.retry", "/repo/apps/api/src/mocks/jobs.ts")],
             },
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         file_results.insert(
@@ -21705,6 +23652,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             graphql,
             sockets: Default::default(),
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
         let mut entries = Vec::new();
         append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
@@ -22180,6 +24128,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 )],
             },
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
 
         let mut entries = Vec::new();
@@ -22254,6 +24203,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             graphql,
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
 
         let mut entries = Vec::new();
@@ -22320,6 +24270,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 emitters: vec![emitter.clone()],
             },
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
 
         let mut entries = Vec::new();
@@ -22757,6 +24708,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
         append_pubsub_operations(
             &mut cloud_data,
@@ -22861,6 +24813,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 }],
             },
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -23279,6 +25232,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
 
         let mut entries = Vec::new();
@@ -23417,6 +25371,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
 
         // The producer manifest entry's alias (Producer, Response).
@@ -23482,6 +25437,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
         };
         assert!(
             orchestrator
@@ -23524,6 +25480,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
+                inference: None,
             })
             .collect();
         repo
@@ -23615,6 +25572,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }
     }
 }

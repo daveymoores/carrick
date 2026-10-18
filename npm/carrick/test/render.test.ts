@@ -229,7 +229,7 @@ test("the boundary keeps the CLI's wording", () => {
   assert.ok(
     lines.includes("  1 call site(s) that named a client member and did not resolve to it (usersClient.get)"),
   );
-  assert.ok(lines.includes("  4 bare route-literal call site(s) left unclassified"));
+  assert.ok(lines.includes("  4 route-literal call site(s) left unclassified"));
   assert.ok(lines.includes("  6 row(s) the model alone states (11 joined a deterministic row)"));
   assert.ok(
     lines.includes("  1 model endpoint(s) dropped in modules a routing convention claims"),
@@ -242,6 +242,35 @@ test("the boundary keeps the CLI's wording", () => {
     false,
     "a zero count prints no line",
   );
+});
+
+test("a dropped model endpoint is printed with the row it names", () => {
+  const lines = boundaryLines(
+    {
+      commit_hash: "abc1234def",
+      files_attempted: 1,
+      model_endpoints_dropped_unanchored: {
+        total: 2,
+        reasons: ["src/worker.ts:14 GET /metrics", "src/worker.ts:30 POST /audit"],
+      },
+    },
+    "worker",
+  );
+  assert.ok(
+    lines.includes(
+      "  2 route(s) found by analysis but left out of the index: their registration site could not be located (e.g. src/worker.ts:14 GET /metrics)",
+    ),
+    lines.join("\n"),
+  );
+  const none = boundaryLines(
+    {
+      commit_hash: "abc1234def",
+      files_attempted: 1,
+      model_endpoints_dropped_unanchored: { total: 0 },
+    },
+    "worker",
+  );
+  assert.equal(none.some((line) => line.includes("model endpoint(s) dropped:")), false);
 });
 
 test("the CLI's own boundary lines are what boundaryFor returns", () => {
@@ -271,7 +300,7 @@ test("a local index dispatches nothing, so the header drops the analyzer count",
     "webapp",
   );
   assert.equal(lines[0], "webapp at abc1234");
-  assert.equal(lines[1], "  3 bare route-literal call site(s) left unclassified");
+  assert.equal(lines[1], "  3 route-literal call site(s) left unclassified");
 });
 
 test("a boundary with a degraded type stage says which stage", () => {

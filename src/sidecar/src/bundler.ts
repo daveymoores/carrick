@@ -22,7 +22,7 @@ import {
   expandTypeStructural,
   type ExpandOrigin,
 } from './type-structural-expander.js';
-import { externalImportsOf } from './origin.js';
+import { externalImportsOf, isExternalOrigin } from './origin.js';
 import { statusTableBody } from './capture/index.js';
 
 /**
@@ -116,10 +116,11 @@ function declaredName(declaration: Node): string | undefined {
  * it is: a model names a type where the consumer imports it from, usually a
  * barrel that only has `export *`.
  */
-function declarationSite(
+export function declarationSite(
   sourceFile: SourceFile,
   name: string,
-  label: string
+  label: string,
+  origin: ExpandOrigin
 ): DeclarationSite | { reason: string } {
   if (declaresName(sourceFile, name)) return { sourceFile, name };
   const declarations = exportedDeclarations(sourceFile, name, new Set());
@@ -133,7 +134,10 @@ function declarationSite(
     // An installed package's declaration names types from the package's own
     // files, which the bundle does not carry, so its text would dangle. The
     // failure is what it was before the walk, and inference keeps the row.
-    if (file.isInNodeModules() || file.isFromExternalLibrary()) {
+    // A package of the checkout that a package manager links into
+    // `node_modules` is the user's own source and is followed (carrick#2304):
+    // the compiler marks it external too, so its flag alone cannot decide.
+    if (isExternalOrigin(origin.program, file.compilerNode, origin.repoRoot, origin.imports)) {
       return { reason: `Symbol '${name}' is re-exported from an installed package in ${label}` };
     }
     const declared = declaredName(declaration);
@@ -331,7 +335,7 @@ export class TypeBundler {
       };
     }
 
-    const site = declarationSite(sourceFile, symbol.symbol_name, symbol.source_file);
+    const site = declarationSite(sourceFile, symbol.symbol_name, symbol.source_file, this.expandOrigin());
     return 'reason' in site ? { valid: false, reason: site.reason } : { valid: true };
   }
 
@@ -342,7 +346,7 @@ export class TypeBundler {
       : path.resolve(this.repoRoot, symbol.source_file);
     const sourceFile = this.project.getSourceFile(absolutePath);
     if (!sourceFile) return undefined;
-    const site = declarationSite(sourceFile, symbol.symbol_name, symbol.source_file);
+    const site = declarationSite(sourceFile, symbol.symbol_name, symbol.source_file, this.expandOrigin());
     return 'reason' in site ? undefined : site;
   }
 

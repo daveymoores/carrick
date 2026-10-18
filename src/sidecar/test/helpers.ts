@@ -8,6 +8,7 @@ import * as http from 'node:http';
 import * as zlib from 'node:zlib';
 import type { Project } from 'ts-morph';
 import type { ExpandOrigin } from '../src/type-structural-expander.js';
+import { FLAG_MODULE_DEFAULT, FLAG_PUBLISHED } from '../src/position-rows.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -283,4 +284,42 @@ export class SidecarClient {
       this.process = null;
     }
   }
+}
+
+/**
+ * The kinds each rows version holds: version 1 (carrick#2405); version 2 adds
+ * `impl` and `jsx` (carrick#2430); version 3 adds `decl` (carrick#2448).
+ */
+const VERSION_1_KINDS = new Set(['call', 'member', 'compare', 'ident']);
+const VERSION_2_KINDS = new Set([...VERSION_1_KINDS, 'impl', 'jsx']);
+
+/** The flag bits a later walk adds to rows of a version-1 kind (carrick#2508). */
+const LATER_FLAGS = FLAG_PUBLISHED | FLAG_MODULE_DEFAULT;
+
+/**
+ * A decompressed rows file as version `v` wrote it: the header's `v` set to
+ * `v`, every row of a later kind dropped and the flag bits `cleared`, every
+ * other byte as written.
+ */
+function asVersionRows(text: string, v: number, kinds: Set<string>, cleared: number): string {
+  const lines = text.trimEnd().split('\n');
+  const header = { ...(JSON.parse(lines[0]) as Record<string, unknown>), v };
+  const files = lines.slice(1).map((line) => {
+    const file = JSON.parse(line) as { r: unknown[][] };
+    const rows = file.r
+      .filter((row) => kinds.has(row[0] as string))
+      .map((row) => [...row.slice(0, 8), (row[8] as number) & ~cleared]);
+    return JSON.stringify({ ...file, r: rows });
+  });
+  return [JSON.stringify(header), ...files].join('\n') + '\n';
+}
+
+/** A decompressed rows file as version 1 wrote it, before the publication bits (carrick#2508). */
+export function asVersion1Rows(text: string): string {
+  return asVersionRows(text, 1, VERSION_1_KINDS, LATER_FLAGS);
+}
+
+/** A decompressed rows file as version 2 wrote it. */
+export function asVersion2Rows(text: string): string {
+  return asVersionRows(text, 2, VERSION_2_KINDS, 0);
 }

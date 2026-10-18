@@ -51,18 +51,27 @@ import { selfCheckStub } from './self-check.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { DenoProject, findDenoConfig } from './deno-project.js';
 import { emitsAlike, ProjectGraph, type ServiceProject } from './project-references.js';
+import { redirectingCompilerHost, referenceRedirect, type ReferenceRedirect } from './reference-redirect.js';
+import { markUncarried } from './unresolved.js';
 import { findServiceTsconfig } from './service-config.js';
 import { placeEmittedTree, surfaceModuleInTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
 import { sidecarCompilerOptions } from './compiler-options.js';
-import { boundedCompilerHost, boundedSys, untrustedReadBound, type ReadBound } from './checkout.js';
+import { boundedCompilerHost, boundedSys, isInsideCheckout, untrustedReadBound, type ReadBound } from './checkout.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
 export { sidecarCompilerOptions } from './compiler-options.js';
 export { isInsideCheckout, untrustedReadBound, UNTRUSTED_TREE_ENV, type ReadBound } from './checkout.js';
 export { serviceConfigPath } from './project-references.js';
+export { referenceRedirectOf } from './reference-redirect.js';
 export { findServiceTsconfig } from './service-config.js';
+// carrick#2405: the per-position rows write through the guard, and name an
+// installed declaring file the way the capture's resolution walk does.
+export { WriteGuard } from './guarded-fs.js';
+export { installedPackageDirectory } from './installed-package-directory.js';
+export { isDeclarationFileName, packageNameOf } from './specifiers.js';
+export { moduleExport } from './anchors.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar
 // reaches it only through this door (index.js).
 export { runCheck } from './check.js';
@@ -176,6 +185,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // references others and the anchors' files do not all belong to one project.
   let ownerGroups: Map<ServiceProject, number[]> | undefined;
   let emitProject: ServiceProject | undefined;
+  // The projects the named config reaches, when it is a tsconfig.
+  let projectGraph: ProjectGraph | undefined;
   // Everything this capture writes, it writes through `guard` (carrick#1748):
   // the stub dir, the staging dir, and the surface entry. A stub dir is
   // emptied before it is written, so one that is or holds the repo is refused
@@ -256,6 +267,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     }
     if (unfiled.length > 0) groups.set(emit, [...(groups.get(emit) ?? []), ...unfiled]);
     errors.push(...graph.diagnostics);
+    projectGraph = graph;
     parsed = emit.parsed;
     projectConfigPath = emit.configPath;
     emitProject = emit;
@@ -288,19 +300,36 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // ---- Phase A: analysis program over placeholder entry + anchor sources ----
   let resolved: ResolvedAnchor[];
   const progress = opts.onProgress ?? (() => {});
-  const analysisCtx = { repoRoot, entryDir: path.dirname(entryPath), entryPath, guard, progress, bound };
+  // The files of a project that declare a module or global augmentation are
+  // roots of both programs below: the one its anchors are read in and the one
+  // that emits the surface (carrick#2317). Read once per project.
+  const augmentations = augmentationReader(bound);
+  // Each anchor program reads the projects its owner references as an editor
+  // does (carrick#2418). The emit below keeps the compiler's own resolution.
+  const graphForRedirect = projectGraph;
+  const redirectFor = (owner: ServiceProject): ReferenceRedirect | undefined =>
+    graphForRedirect ? referenceRedirect(graphForRedirect.closureOf(owner), repoRoot) : undefined;
+  const analysisCtx: AnalysisContext = {
+    repoRoot,
+    entryDir: path.dirname(entryPath),
+    entryPath,
+    guard,
+    progress,
+    bound,
+    augmentations,
+    redirectFor,
+    readsReferences: graphForRedirect?.hasReferences ?? false,
+  };
   try {
     resolved = ownerGroups && emitProject
       ? resolveAnchorsByOwner(opts, ownerGroups, emitProject, analysisCtx, errors)
-      : resolveAnchors(opts, parsed, analysisCtx, deno);
+      : resolveAnchors(opts, parsed, analysisCtx, deno, emitProject);
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }
 
-  // ---- Augmentation detection over the tsconfig's full file list ----
-  const augmentationSources = [...new Set([...findAugmentationFiles(
-    parsed.fileNames.filter((f) => !f.includes(`${path.sep}node_modules${path.sep}`))
-  ), ...(deno?.globals ?? [])])];
+  // ---- Augmentation files of the project that emits the surface ----
+  const augmentationSources = [...new Set([...augmentations(parsed), ...(deno?.globals ?? [])])];
 
   // ---- Phase B: declaration emit of the final entry ----
   const entryLines = ['// Generated by Carrick capture v2. Deleted after emit.'];
@@ -794,7 +823,7 @@ function resolveAnchorsByOwner(
   const resolved = new Array<ResolvedAnchor>(opts.anchors.length);
   for (const [owner, indexes] of groups) {
     const anchors = indexes.map((index) => opts.anchors[index]);
-    const group = resolveAnchors({ ...opts, anchors }, owner.parsed, ctx);
+    const group = resolveAnchors({ ...opts, anchors }, owner.parsed, ctx, undefined, owner);
     let demoted = 0;
     group.forEach((anchor, position) => {
       const index = indexes[position];
@@ -848,14 +877,78 @@ interface AnalysisContext {
   progress: (phase: CapturePhase, message: string) => void;
   /** The untrusted-tree read bound, or undefined. */
   bound: ReadBound | undefined;
+  /** The augmentation files of a project, see `augmentationReader`. */
+  augmentations: (parsed: ts.ParsedCommandLine) => readonly string[];
+  /** How an owner's program reads the projects it references, if it references any. */
+  redirectFor: (owner: ServiceProject) => ReferenceRedirect | undefined;
+  /** Whether the named config references other projects, so owners are read by references. */
+  readsReferences: boolean;
 }
 
-/** Phase A: build the placeholder entry, then resolve every anchor. */
+/**
+ * The files of an anchor program the surface emit cannot carry (carrick#2418):
+ * the sources of the projects its owner references, and a workspace package's
+ * source reached through a link (an external-library file inside the checkout
+ * under no `node_modules`). The anchor program types them; the emit, under
+ * the compiler's own resolution, reaches the first as unbuilt output and does
+ * not emit the second.
+ */
+function uncarriedFiles(
+  program: ts.Program,
+  redirect: ReferenceRedirect | undefined,
+  repoRoot: string
+): (fileName: string) => boolean {
+  return (fileName) => {
+    if (redirect?.referenceFor(fileName)) return true;
+    const sourceFile = program.getSourceFile(fileName);
+    const slashed = fileName.replace(/\\/g, '/');
+    return (
+      sourceFile !== undefined &&
+      program.isSourceFileFromExternalLibrary(sourceFile) &&
+      isInsideCheckout(slashed, repoRoot) &&
+      !slashed.includes('/node_modules/')
+    );
+  };
+}
+
+/**
+ * The files a project's config lists that declare a module or global
+ * augmentation, for one capture: each project's list is read from disk once,
+ * however many programs are built over it.
+ *
+ * A project's own compile holds these files whether or not anything imports
+ * them, so a program that stands in for that compile must hold them too. A
+ * file under `node_modules` is the package's business, and a file outside the
+ * read bound is not opened, not even to look for the declaration.
+ */
+function augmentationReader(
+  bound: ReadBound | undefined
+): (parsed: ts.ParsedCommandLine) => readonly string[] {
+  const byProject = new Map<ts.ParsedCommandLine, readonly string[]>();
+  return (parsed) => {
+    let files = byProject.get(parsed);
+    if (!files) {
+      files = findAugmentationFiles(
+        parsed.fileNames.filter(
+          (f) => !f.includes(`${path.sep}node_modules${path.sep}`) && (!bound || bound.allows(f))
+        )
+      );
+      byProject.set(parsed, files);
+    }
+    return files;
+  };
+}
+
+/**
+ * Phase A: build the placeholder entry, then resolve every anchor. `owner` is
+ * the tsconfig project `parsed` came from, when there is one.
+ */
 function resolveAnchors(
   opts: CaptureStubOptions,
   parsed: ts.ParsedCommandLine,
   ctx: AnalysisContext,
   deno?: DenoProject,
+  owner?: ServiceProject,
 ): ResolvedAnchor[] {
   const placeholderLines = ['// Carrick capture v2 analysis placeholder.'];
   for (const anchor of opts.anchors) {
@@ -875,7 +968,17 @@ function resolveAnchors(
       ...parsed.options,
       noEmit: true,
     });
-    const program = ts.createProgram([ctx.entryPath, ...anchorSources, ...(deno?.globals ?? [])], options, programHost(options, deno, ctx.bound));
+    // The project's augmentation files are roots: its own compile reads a
+    // member one of them declares wherever the member is read, imported or not.
+    const rootNames = [
+      ...new Set([ctx.entryPath, ...anchorSources, ...ctx.augmentations(parsed), ...(deno?.globals ?? [])]),
+    ];
+    const redirect = owner && !deno ? ctx.redirectFor(owner) : undefined;
+    const host = redirect
+      ? redirectingCompilerHost(programHost(options, deno, ctx.bound) ?? ts.createCompilerHost(options), options, redirect)
+      : programHost(options, deno, ctx.bound);
+    const program = ts.createProgram(rootNames, options, host);
+    if (owner && !deno && ctx.readsReferences) markUncarried(program, uncarriedFiles(program, redirect, ctx.repoRoot));
     // The checker binds every file of the program when it is first asked for,
     // which the first anchor would otherwise do: asked for here, so that the
     // report below says the program is whole before any anchor is read.
@@ -941,6 +1044,7 @@ export {
   constituents,
   httpStatus,
   statesNoBody,
+  statesNoShape,
   statusKeyCode,
   statusTableBody,
   statusTableOf,

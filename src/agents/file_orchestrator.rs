@@ -20,15 +20,16 @@ use crate::{
     agent_service::AgentService,
     agents::{
         file_analyzer_agent::{
-            DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent,
-            MountResult, PubsubOperation, ResolutionSource,
+            AnalysisPrompt, DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult,
+            FileAnalyzerAgent, MountResult, PubsubOperation, ResolutionSource,
         },
         framework_guidance_agent::ProtocolGuidance,
+        source_parts::{Limits, ShownLines, SourceCut, SourcePart},
     },
-    call_base::resolve_call_base,
+    call_base::{resolve_call_base, stated_base, written_base},
     cloud_storage::{ManifestRole, ManifestTypeKind},
+    compared_route_literals::{ComparisonPosition, compared_route_literals},
     config::Config,
-    dispatch::Dispatch,
     engine::type_compat_v2::{ReceiverRole, classify_receiver},
     env_alias::{
         EnvAliasExtractor, EnvAliasMap, EnvFallbackMap, EnvSchemaIndex, LiteralBaseMap,
@@ -58,7 +59,7 @@ use crate::{
     swc_scanner::{
         CandidateTarget, ControllerRouteBinding, DecoratorRoute, PubsubAnchorOp,
         RouteDescriptorEndpoint, SwcScanner, collect_import_sources, is_producer_route_path,
-        normalize_path_params,
+        normalize_path_params, parse_standalone_module,
     },
     type_manifest::{
         build_manifest_type_alias, build_manifest_type_alias_with_site_id, build_site_id,
@@ -67,7 +68,6 @@ use crate::{
     url_normalizer::UrlNormalizer,
     visitor::{ImportSymbolExtractor, ImportedSymbol, SymbolKind, TypeSymbolExtractor},
     workspace_resolver::{Resolution, WorkspaceIndex},
-    wrapper_dispatch::{DispatchMemberIndex, collect_dispatch_members},
     wrapper_request_shape::{self, RequestShapeSignal, WrapperRequestShape},
 };
 use futures::stream::StreamExt;
@@ -106,6 +106,71 @@ pub const MAX_PART_CANDIDATES: usize = 32;
 /// The cloud's error code for an answer that ended at the response's limit.
 const OUTPUT_TRUNCATED_CODE: &str = "output_truncated";
 
+/// The most bytes of user message ([`crate::agents::file_analyzer_agent::AnalysisPrompt`]'s
+/// `text`) a file is asked in whole, and the most any one request carries
+/// (carrick#2309). A file whose whole prompt is over it is asked in parts
+/// from its first request.
+///
+/// Measured on one first index (carrick#2299): every request under 300 KB of
+/// user message was answered, and every refusal for capacity and every
+/// request that ran to the cloud's 120 s limit was on 395 KB or more. Bytes,
+/// because the scanner has no tokenizer: on that run's prompts of 100 KB and
+/// more a prompt token was 2.2 to 3.3 bytes (median 2.6), so this is about
+/// 96,000 tokens and at most about 115,000. No prompt of 128,000 tokens or
+/// under failed, and failures began at 150,000.
+pub const WHOLE_PROMPT_MAX_BYTES: usize = 250_000;
+
+/// The cloud's error code for a request too large to ask the model
+/// (carrick-cloud#2267). Its `details.max_prompt_bytes` states the limit.
+const PROMPT_TOO_LARGE_CODE: &str = "prompt_too_large";
+
+/// The reason a file is recorded as not analysed under when it cannot be cut
+/// into requests under the line: an item with no list to cut, holding a
+/// candidate, is over it on its own, or the file does not parse for the cut
+/// (carrick#2309). Final: the same bytes are cut the same way on every scan.
+pub const FILE_TOO_LARGE_CODE: &str = "file_too_large";
+
+/// A file that cannot be asked in requests under the line (carrick#2309).
+/// Decided before any request about it is sent, or when the cloud's size
+/// verdict refuses a part that cannot be cut again (carrick#2310).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTooLarge;
+
+impl std::fmt::Display for FileTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the file is too large for Carrick to analyse, even split into parts")
+    }
+}
+
+impl std::error::Error for FileTooLarge {}
+
+/// The cloud's final verdict that a request is too large to ask, when `error`
+/// is one (carrick#2310): the code, on an answer the cloud called final. A
+/// cloud that sends no such verdict never reaches the code that reads it.
+fn size_verdict<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a crate::agent_service::AgentCallError> {
+    error
+        .downcast_ref::<crate::agent_service::AgentCallError>()
+        .filter(|e| e.code == PROMPT_TOO_LARGE_CODE && e.is_final_answer())
+}
+
+/// The line a request refused for size is cut under: the cloud's stated limit
+/// when it states one, and never the refused request's own size or more, so
+/// that request is never sent again as it was.
+fn line_after_size_verdict(
+    verdict: &crate::agent_service::AgentCallError,
+    line: usize,
+    refused_bytes: usize,
+) -> usize {
+    let refused_under = refused_bytes.saturating_sub(1);
+    verdict
+        .max_prompt_bytes()
+        .unwrap_or(refused_under)
+        .min(line)
+        .min(refused_under)
+}
+
 /// The cloud's final verdict that an answer does not fit one response, when
 /// `error` is one: the code, on an answer the cloud itself called final
 /// ([`crate::agent_service::AgentCallError::is_final_answer`]).
@@ -133,54 +198,24 @@ pub struct ListedCandidate {
     pub span_end: u32,
 }
 
-/// A run of consecutive candidate groups of one file, asked about in one
-/// request (carrick#1898).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CandidatePart {
-    /// Where the part's first group sits among the file's groups in source
-    /// order. It orders a file's parts and names one.
-    pub first_group: usize,
-    /// The part's groups, in source order. A group is the candidates that
-    /// share a start, each given as its position in the prompt's listing.
-    pub groups: Vec<Vec<usize>>,
-}
+/// The most bytes of source one part's window holds, and the most bytes of
+/// declarations shown beside it (carrick#2308). See
+/// [`crate::agents::source_parts`] for how a file is cut under them.
+pub const PART_WINDOW_BYTES: usize = 64_000;
+pub const PART_CONTEXT_BYTES: usize = 16_000;
 
-impl CandidatePart {
-    /// The part's candidates as positions in the prompt's listing, in the
-    /// order the prompt lists them.
-    pub fn candidates(&self) -> Vec<usize> {
-        let mut positions: Vec<usize> = self.groups.iter().flatten().copied().collect();
-        positions.sort_unstable();
-        positions
-    }
+/// The most bytes of another module's source a prompt carries: an attached
+/// wrapper module is cut to this, and a declaration shown beside a part's
+/// window is shown by its first line when it is over it (carrick#2308).
+pub const WRAPPER_SNIPPET_MAX: usize = 4_000;
 
-    /// The two halves of a part of several groups, split at its middle group.
-    /// `None` for a single group: its candidates are never separated.
-    pub fn halves(&self) -> Option<(Self, Self)> {
-        if self.groups.len() < 2 {
-            return None;
-        }
-        let middle = self.groups.len() / 2;
-        Some((
-            Self {
-                first_group: self.first_group,
-                groups: self.groups[..middle].to_vec(),
-            },
-            Self {
-                first_group: self.first_group + middle,
-                groups: self.groups[middle..].to_vec(),
-            },
-        ))
-    }
-
-    /// The part's name in a log line and a dump: its first and last group.
-    pub fn label(&self) -> String {
-        format!(
-            "{:04}-{:04}",
-            self.first_group,
-            self.first_group + self.groups.len().saturating_sub(1)
-        )
-    }
+/// One part's answer, beside the window of the file the part was asked about
+/// (carrick#2308).
+#[derive(Debug, Clone)]
+pub struct PartAnswer {
+    /// The part's window: its first and last line.
+    pub window: (u32, u32),
+    pub answer: FileAnalysisResult,
 }
 
 /// A file's candidates as groups in source order: the candidates that share a
@@ -197,126 +232,174 @@ fn candidate_groups(listed: &[ListedCandidate]) -> Vec<Vec<usize>> {
     by_start.into_values().collect()
 }
 
-/// The parts a file is asked in: runs of consecutive groups in source order,
-/// each holding at most `max_candidates` (carrick#1898).
+/// The rows of one kind that echo no listed candidate, as a set keyed by what
+/// each states and its line (carrick#2308).
 ///
-/// A function of the file's candidates and nothing else, so the same file is
-/// asked in the same parts on every scan. A group that alone holds more than
-/// the limit is a part on its own.
-pub fn candidate_parts(listed: &[ListedCandidate], max_candidates: usize) -> Vec<CandidatePart> {
-    let mut parts: Vec<CandidatePart> = Vec::new();
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut held = 0;
-    let mut first_group = 0;
-    for (index, group) in candidate_groups(listed).into_iter().enumerate() {
-        if !groups.is_empty() && held + group.len() > max_candidates {
-            parts.push(CandidatePart {
-                first_group,
-                groups: std::mem::take(&mut groups),
-            });
-            first_group = index;
-            held = 0;
-        }
-        held += group.len();
-        groups.push(group);
-    }
-    if !groups.is_empty() {
-        parts.push(CandidatePart {
-            first_group,
-            groups,
-        });
-    }
-    parts
+/// A row keeps the place it was first stated in. Where a later part states
+/// the same key, its row takes that place only when it ranks higher.
+struct KeyedRows<T> {
+    rows: Vec<(T, u8)>,
+    place: HashMap<String, usize>,
 }
 
-/// Append the rows of `more` that `rows` does not hold already, byte for
-/// byte as they serialize.
-fn append_unseen_rows<T: serde::Serialize>(
-    rows: &mut Vec<T>,
-    seen: &mut HashSet<String>,
-    more: Vec<T>,
-) {
-    for row in more {
-        match serde_json::to_string(&row) {
-            Ok(key) => {
-                if seen.insert(key) {
-                    rows.push(row);
+impl<T> KeyedRows<T> {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            place: HashMap::new(),
+        }
+    }
+
+    /// Keep `row` under `key`, which is what the row states as JSON. A row
+    /// whose key cannot be written is kept: nothing says it repeats.
+    fn keep(&mut self, key: serde_json::Result<String>, row: T, rank: u8) {
+        let Ok(key) = key else {
+            self.rows.push((row, rank));
+            return;
+        };
+        match self.place.get(&key) {
+            Some(place) => {
+                if rank > self.rows[*place].1 {
+                    self.rows[*place] = (row, rank);
                 }
             }
-            // A row that cannot be compared is kept: nothing says it repeats.
-            Err(_) => rows.push(row),
+            None => {
+                self.place.insert(key, self.rows.len());
+                self.rows.push((row, rank));
+            }
         }
+    }
+
+    fn into_rows(self) -> Vec<T> {
+        self.rows.into_iter().map(|(row, _)| row).collect()
     }
 }
 
-/// The one answer a file asked in parts stores (carrick#1898).
+/// The one answer a file asked in parts stores (carrick#1898, carrick#2308).
 ///
-/// `answers` holds each part's answer beside the part's `first_group`, in
-/// whatever order the parts completed. The result does not depend on that
-/// order:
+/// `answers` holds each part's answer beside the part's window, in whatever
+/// order the parts completed. The result does not depend on that order:
 ///
-/// - route and call rows are every part's rows, ordered by where their
-///   candidate sits in the source; rows of one candidate keep the order their
-///   part gave them, and a row whose id names no listed candidate follows the
-///   rows that do, in part order;
-/// - the rows that carry no candidate id (mounts, pub/sub and GraphQL
-///   operations, dispatch tables) are a set: every part reads the whole file
-///   and may state the same one, so a row is kept the first time it is
-///   stated, parts taken in source order, and an exact repeat is dropped.
+/// - route and call rows that echo a listed candidate id are every part's
+///   rows, ordered by where their candidate sits in the source; rows of one
+///   candidate keep the order their part gave them;
+/// - every other row (a mount, a pub/sub or GraphQL operation, a consumer
+///   locate, a dispatch table, and a route or call row that echoes no listed
+///   id) is one of a set keyed by what it states and its line. Where two
+///   parts state the same key, the row from the part whose window holds that
+///   line is kept, and where no such part states it, the first in source
+///   order. A row is never dropped only because its line is outside the
+///   window of the part that stated it;
+/// - for a GraphQL field, a row that names a resolver function is kept over a
+///   row that names none.
 pub fn merge_part_answers(
     listed: &[ListedCandidate],
-    mut answers: Vec<(usize, FileAnalysisResult)>,
+    mut answers: Vec<PartAnswer>,
 ) -> FileAnalysisResult {
-    answers.sort_by_key(|(first_group, _)| *first_group);
+    answers.sort_by_key(|part| part.window);
     let place_in_source: HashMap<&str, usize> = candidate_groups(listed)
         .into_iter()
         .flatten()
         .enumerate()
         .map(|(place, position)| (listed[position].candidate_id.as_str(), place))
         .collect();
-    let place = |candidate_id: &str| {
-        place_in_source
-            .get(candidate_id)
-            .copied()
-            .unwrap_or(usize::MAX)
-    };
 
     let mut merged = FileAnalysisResult::default();
-    let mut mounts = HashSet::new();
-    let mut graphql_operations = HashSet::new();
-    let mut pubsub_operations = HashSet::new();
-    let mut graphql_consumer_locates = HashSet::new();
-    let mut dispatch_tables = HashSet::new();
-    for (_, part) in answers {
-        merged.endpoints.extend(part.endpoints);
-        merged.data_calls.extend(part.data_calls);
-        append_unseen_rows(&mut merged.mounts, &mut mounts, part.mounts);
-        append_unseen_rows(
-            &mut merged.graphql_operations,
-            &mut graphql_operations,
-            part.graphql_operations,
-        );
-        append_unseen_rows(
-            &mut merged.pubsub_operations,
-            &mut pubsub_operations,
-            part.pubsub_operations,
-        );
-        append_unseen_rows(
-            &mut merged.graphql_consumer_locates,
-            &mut graphql_consumer_locates,
-            part.graphql_consumer_locates,
-        );
-        append_unseen_rows(
-            &mut merged.dispatch_tables,
-            &mut dispatch_tables,
-            part.dispatch_tables,
-        );
+    let mut unlisted_endpoints = KeyedRows::new();
+    let mut unlisted_calls = KeyedRows::new();
+    let mut mounts = KeyedRows::new();
+    let mut graphql_operations = KeyedRows::new();
+    let mut pubsub_operations = KeyedRows::new();
+    let mut graphql_consumer_locates = KeyedRows::new();
+    let mut dispatch_tables = KeyedRows::new();
+    for PartAnswer { window, answer } in answers {
+        // Whether the part that states a row at `line` is the one whose
+        // window holds that line.
+        let held = |line: i64| -> u8 {
+            u8::from((i64::from(window.0)..=i64::from(window.1)).contains(&line))
+        };
+        for row in answer.endpoints {
+            if place_in_source.contains_key(row.candidate_id.as_str()) {
+                merged.endpoints.push(row);
+                continue;
+            }
+            let key = serde_json::to_string(&(
+                &row.candidate_id,
+                row.line_number,
+                &row.method,
+                &row.path,
+            ));
+            let rank = held(row.line_number.into());
+            unlisted_endpoints.keep(key, row, rank);
+        }
+        for row in answer.data_calls {
+            if place_in_source.contains_key(row.candidate_id.as_str()) {
+                merged.data_calls.push(row);
+                continue;
+            }
+            let key = serde_json::to_string(&(
+                &row.candidate_id,
+                row.line_number,
+                &row.method,
+                &row.target,
+            ));
+            let rank = held(row.line_number.into());
+            unlisted_calls.keep(key, row, rank);
+        }
+        for row in answer.mounts {
+            let key = serde_json::to_string(&(
+                row.line_number,
+                &row.parent_node,
+                &row.child_node,
+                &row.mount_path,
+            ));
+            let rank = held(row.line_number.into());
+            mounts.keep(key, row, rank);
+        }
+        for row in answer.pubsub_operations {
+            let key = serde_json::to_string(&(row.line_number, &row.topic, &row.role));
+            let rank = held(row.line_number.into());
+            pubsub_operations.keep(key, row, rank);
+        }
+        for row in answer.graphql_operations {
+            // A field has one row. One that names its resolver outranks one
+            // that names none, whichever window stated it.
+            let key = serde_json::to_string(&(&row.kind, &row.field));
+            let rank = 2 * u8::from(row.resolver_function.is_some())
+                + row.resolver_line.map_or(0, |line| held(line.into()));
+            graphql_operations.keep(key, row, rank);
+        }
+        for row in answer.graphql_consumer_locates {
+            // A locate states no line, and two parts that name different
+            // types for one document are two statements.
+            let key = serde_json::to_string(&row);
+            graphql_consumer_locates.keep(key, row, 0);
+        }
+        for row in answer.dispatch_tables {
+            let key = serde_json::to_string(&(
+                row.location,
+                &row.field,
+                &row.handler_name,
+                row.line_number,
+            ));
+            let rank = row.line_number.map_or(0, |line| held(line.into()));
+            dispatch_tables.keep(key, row, rank);
+        }
     }
     // Stable, so the rows of one candidate stay in the order their part gave.
-    merged.endpoints.sort_by_key(|row| place(&row.candidate_id));
+    merged
+        .endpoints
+        .sort_by_key(|row| place_in_source[row.candidate_id.as_str()]);
     merged
         .data_calls
-        .sort_by_key(|row| place(&row.candidate_id));
+        .sort_by_key(|row| place_in_source[row.candidate_id.as_str()]);
+    merged.endpoints.extend(unlisted_endpoints.into_rows());
+    merged.data_calls.extend(unlisted_calls.into_rows());
+    merged.mounts = mounts.into_rows();
+    merged.graphql_operations = graphql_operations.into_rows();
+    merged.pubsub_operations = pubsub_operations.into_rows();
+    merged.graphql_consumer_locates = graphql_consumer_locates.into_rows();
+    merged.dispatch_tables = dispatch_tables.into_rows();
     merged
 }
 
@@ -334,6 +417,37 @@ struct PartedFile<'a> {
     graphql_consumer_hints: &'a [String],
     wrapper_context: &'a [String],
     wrapper_imports: &'a BTreeMap<String, Vec<usize>>,
+}
+
+impl PartedFile<'_> {
+    /// Whether the file's prompt carries a GraphQL section, where a type can
+    /// be the thing a row locates.
+    fn has_graphql_section(&self) -> bool {
+        !self.graphql_producer_hints.is_empty() || !self.graphql_consumer_hints.is_empty()
+    }
+}
+
+/// How a file is asked, decided before its first request (carrick#2309).
+enum Asking {
+    /// In one request: its whole prompt is at or under the line.
+    Whole(AnalysisPrompt),
+    /// In parts, each prompt at or under the line.
+    Parts(Box<PartPlan>),
+    /// Not at all: the file has nothing in it.
+    Nothing,
+}
+
+/// The parts a file is asked in, each with its prompt, and what cutting a
+/// part again reads.
+struct PartPlan {
+    cut: SourceCut,
+    limits: Limits,
+    /// The most bytes one request may carry.
+    line: usize,
+    /// The attached modules each listed candidate names
+    /// ([`modules_named_by_candidates`]).
+    named: Option<Vec<BTreeSet<usize>>>,
+    parts: Vec<(SourcePart, AnalysisPrompt)>,
 }
 
 /// Every place a file's source names one of `imports`, as (where the name
@@ -442,6 +556,12 @@ pub struct FileCentricAnalysisResult {
     pub bundled_types: Option<String>,
     /// Type resolution result from sidecar
     pub type_resolution: Option<TypeResolutionResult>,
+    /// The functions a call of which is worth its request's parsed body
+    /// unchanged, by declaring module's canonical path and name
+    /// ([`RequestSummaryIndex::passes_body`], carrick#1601). Read again once
+    /// every service is analysed, where a call into another service's
+    /// function is settled (carrick#1146).
+    pub passes_body: HashSet<(PathBuf, String)>,
 }
 
 /// What a routing convention said about one file: whether it CLAIMED the file
@@ -517,11 +637,8 @@ pub struct ProcessingStats {
     /// Summary rows whose dispatch value was settled from their own body
     /// under the field the request line's row names (carrick#1555).
     pub summary_dispatch_settled: usize,
-    /// Model rows whose dispatch value no literal in their file witnesses and
-    /// that a wrapper's value replaced (carrick#2201).
-    pub dispatch_carried_over_guess: usize,
-    /// Model rows whose unwitnessed dispatch value was cleared because no
-    /// wrapper's value reached them (carrick#2201).
+    /// Model rows whose dispatch value no literal in their file witnesses,
+    /// cleared (carrick#2201).
     pub dispatch_guesses_cleared: usize,
     /// Pub/sub operations asserted deterministically from the AST and merged in
     /// because the file-analyzer's extraction omitted them (carrick#387). The
@@ -572,6 +689,12 @@ pub struct ProcessingStats {
     /// route nothing else states. Each is kept at the model's line with no
     /// span, rather than taking that call's span (carrick#1448).
     pub model_routes_kept_without_a_site: usize,
+    /// Model endpoint rows whose `candidate_id` names no listed site, kept at
+    /// the model's own line with no span because the file's source states the
+    /// route's path in a dispatch position: an equality operand, a `case`
+    /// test or a `startsWith` argument (carrick#2382). Also counted in
+    /// `model_only_rows`.
+    pub model_routes_kept_on_a_path_literal: usize,
     /// Model methods, targets and paths discarded because the source states
     /// something else at the same span. Each one is logged with both values.
     pub model_contradictions_discarded: usize,
@@ -586,14 +709,24 @@ pub struct ProcessingStats {
     /// kind: not a path argument, not a decorator, not the filename. Each one
     /// is logged with its method, path and file.
     pub model_endpoints_discarded_in_claimed_modules: usize,
+    /// Model endpoint rows dropped because the `candidate_id` they echoed
+    /// names no site the scanner listed and nothing deterministic states the
+    /// route (carrick#2382). Not part of the claimed-module count above: a
+    /// row is in one or the other. A route the model states from a
+    /// hand-written dispatch, with an id it made up, leaves the index here.
+    pub model_endpoints_dropped_unanchored: usize,
+    /// Where those rows were, `file:line METHOD path`, in the order they
+    /// were dropped, so the count can be reconciled against the file.
+    pub model_endpoints_dropped_unanchored_sites: Vec<String>,
     /// Model rows kept as rows of their own: the only record of a shape no
     /// deterministic source reads.
     pub model_only_rows: usize,
-    /// Candidates that carry a route-shaped literal argument and a readable
-    /// verb, and that neither the deterministic layer nor the model produced a
-    /// row for. A bare `x.verb("/lit", arg)` states no producer/consumer role,
-    /// so emitting it would need a classification rule the scanner does not
-    /// have; this counts the gap rather than guessing at it.
+    /// Offered HTTP candidates that carry a route-shaped literal (a request
+    /// verb is not required) and that neither the deterministic layer nor the
+    /// model produced a row for, or a mount on the same line. A bare
+    /// `x.verb("/lit", arg)` states no producer/consumer role, so emitting it
+    /// would need a classification rule the scanner does not have; this counts
+    /// the gap rather than guessing at it.
     pub unemitted_literal_candidates: usize,
     /// Where those sites are, `file:line`, in the order they were counted. A
     /// count of something nobody can point at is a number to argue with, not a
@@ -694,10 +827,6 @@ struct FileSymbols {
     /// The file's own request members, read for the files that import it
     /// (carrick#588).
     request_members: RequestMemberIndex,
-    /// Which member of this file reaches which single request (carrick#872),
-    /// read for the files that import it AND for its own same-file wrapper
-    /// sites. Says only a line, never a target.
-    dispatch_members: DispatchMemberIndex,
     /// Which import each local binding's value traces back to (carrick#666).
     /// Constrains the package-surface member join below.
     receiver_origins: ReceiverOrigins,
@@ -715,33 +844,6 @@ struct FileSymbols {
 struct MemberHome {
     path_str: String,
     request_line: u32,
-}
-
-/// Where the wrapper one call site delegates to writes its single request
-/// (carrick#872).
-///
-/// The site's own file states no dispatch value — the literal is in the
-/// wrapper — so the row emitted here is joined, once every file's rows are in,
-/// to whatever the model stated at `request_line` of `module`.
-#[derive(Debug, Clone)]
-struct DispatchSite {
-    /// The member name the site called. Provenance, for the debug line.
-    name: String,
-    /// Canonical path of the module that declares the member.
-    module: PathBuf,
-    /// 1-based line of the member's sole request, inside that module.
-    request_line: u32,
-}
-
-/// What [`FileOrchestrator::carry_wrapper_dispatch`] wrote.
-#[derive(Debug, Default)]
-struct CarriedDispatch {
-    /// Rows that took a wrapper's value.
-    carried: usize,
-    /// Of those, rows whose own value no literal in their file witnessed.
-    over_guess: usize,
-    /// (`file_results` key, site span) of every row that took a value.
-    sites: HashSet<(String, u32)>,
 }
 
 /// The literal witnesses of every file holding a row with a dispatch value,
@@ -779,6 +881,80 @@ impl DispatchWitnesses {
             Some(Some(witnesses)) => witnesses.witnessed(value),
             _ => true,
         }
+    }
+}
+
+/// The route paths a file's source states in a dispatch position
+/// (carrick#2382), read by [`compared_route_literals`]: a literal compared by
+/// equality, a `case` test, or a `startsWith` argument, directly or through a
+/// top-level constant.
+///
+/// The join keeps a model route whose echoed id names no listed site when
+/// this witness states its path. It records values, not byte spans, so it has
+/// no span base to agree with the candidate map on.
+#[derive(Debug, Default)]
+struct RouteLiteralWitness {
+    /// Values compared by equality or written as a `case` test.
+    equal: Vec<String>,
+    /// Values passed to `startsWith`.
+    prefixes: Vec<String>,
+}
+
+impl RouteLiteralWitness {
+    /// The witness in `content`, parsed with a source map of its own. `None`
+    /// when it does not parse, which states nothing. `file_path` decides the
+    /// syntax only.
+    fn of_source(file_path: &str, content: &str) -> Option<Self> {
+        let (_, module) = parse_standalone_module(Path::new(file_path), content)?;
+        let mut witness = Self::default();
+        for found in compared_route_literals(&module) {
+            let value = FileOrchestrator::canonicalize_route_path(&found.value);
+            match found.position {
+                ComparisonPosition::Equality | ComparisonPosition::Case => {
+                    witness.equal.push(value)
+                }
+                ComparisonPosition::StartsWith => witness.prefixes.push(value),
+            }
+        }
+        Some(witness)
+    }
+
+    /// Whether the source states `route_path`.
+    ///
+    /// By equality or `case`: the same number of segments, every literal
+    /// segment equal, and a parameter only where the row has one, so
+    /// `"/items"` states `/items` and `"/items/"` does not state `/items/:id`.
+    /// By `startsWith`, and only for a path with a parameter: the literal is
+    /// the path's literal segments before its first parameter, with or
+    /// without the trailing slash, so `"/items/"` states `/items/:id`. A path
+    /// whose first segment is a parameter has no witness.
+    fn states(&self, route_path: &str) -> bool {
+        let canonical = FileOrchestrator::canonicalize_route_path(route_path);
+        let segments: Vec<&str> = canonical.split('/').collect();
+        let is_param = |segment: &str| segment.starts_with(':') || segment.starts_with('*');
+        let Some(first_param) = segments.iter().position(|segment| is_param(segment)) else {
+            return self.equal.contains(&canonical);
+        };
+        if first_param <= 1 {
+            return false;
+        }
+        let equal = self.equal.iter().any(|value| {
+            let theirs: Vec<&str> = value.split('/').collect();
+            theirs.len() == segments.len()
+                && theirs.iter().zip(&segments).all(|(theirs, ours)| {
+                    match (is_param(theirs), is_param(ours)) {
+                        (true, true) => true,
+                        (false, false) => theirs == ours,
+                        _ => false,
+                    }
+                })
+        });
+        let prefix = segments[..first_param].join("/");
+        equal
+            || self
+                .prefixes
+                .iter()
+                .any(|value| value.strip_suffix('/').unwrap_or(value) == prefix)
     }
 }
 
@@ -1517,37 +1693,19 @@ impl FileOrchestrator {
         self
     }
 
-    /// Ask about a file in parts, after the cloud's verdict that its whole
-    /// answer does not fit one response (carrick#1898).
+    /// How `file` is asked, decided before its first request (carrick#2309).
     ///
-    /// The file's candidates are split into parts ([`candidate_parts`]) of at
-    /// most the number the verdict states, or [`MAX_PART_CANDIDATES`] when it
-    /// states none. Each part is asked on its own, and the answers are merged
-    /// into the one answer the file stores ([`merge_part_answers`]). A part whose own
-    /// answer is cut is halved by groups and its halves asked, down to a
-    /// single group; a single group that is cut loses the file with that
-    /// verdict. A part that fails any other way loses the file with that
-    /// failure. Either way nothing of the file's answer is kept, and when
-    /// several parts fail it is the first in source order that is reported.
-    ///
-    /// A file with no candidate has nothing to be split by, and is lost with
-    /// the verdict it was given.
-    async fn ask_in_parts(
+    /// A file whose whole prompt is at or under [`WHOLE_PROMPT_MAX_BYTES`] is
+    /// asked in one request, in the bytes it was always asked in. A file over
+    /// it is never sent whole: it is cut into parts ([`Self::plan_parts`])
+    /// under that line, and a file that cannot be cut under it is
+    /// [`FileTooLarge`].
+    fn asking(
         &self,
         file: &PartedFile<'_>,
         guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
-        verdict: crate::agent_service::AgentCallError,
-    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
-        // The verdict's own limit when it states one, read once: a part that
-        // is cut in its turn is halved, whatever its verdict states.
-        let limit = verdict.max_part_candidates().unwrap_or(MAX_PART_CANDIDATES);
-        let mut wave = candidate_parts(file.listed, limit);
-        if wave.is_empty() {
-            return Err(Box::new(verdict));
-        }
-        let named = modules_named_by_candidates(file);
-        // The request that was cut, to tell a part that would repeat it.
-        let whole = self.file_analyzer.prompt_for(
+    ) -> Result<Asking, FileTooLarge> {
+        let Some(whole) = self.file_analyzer.prompt_for(
             file.prompt_path,
             file.content,
             guidance,
@@ -1557,53 +1715,281 @@ impl FileOrchestrator {
             file.graphql_producer_hints,
             file.graphql_consumer_hints,
             file.wrapper_context,
+        ) else {
+            return Ok(Asking::Nothing);
+        };
+        if whole.text.len() <= WHOLE_PROMPT_MAX_BYTES {
+            return Ok(Asking::Whole(whole));
+        }
+        debug!(
+            "{}: its whole prompt is {} bytes, over the line of {}; asking it in parts",
+            file.prompt_path,
+            whole.text.len(),
+            WHOLE_PROMPT_MAX_BYTES
         );
+        self.plan_parts(file, guidance, WHOLE_PROMPT_MAX_BYTES)
+            .map(|plan| Asking::Parts(Box::new(plan)))
+    }
+
+    /// The parts `file` is asked in so that no request carries more than
+    /// `line` bytes (carrick#2309, carrick#2310).
+    ///
+    /// The file is cut into windows of its lines
+    /// ([`crate::agents::source_parts`]), each of at most
+    /// [`PART_WINDOW_BYTES`] and [`MAX_PART_CANDIDATES`] candidates, and each
+    /// part's prompt is fitted under the line ([`Self::fit`]). A file that
+    /// does not parse for the cut cannot be asked under the line.
+    fn plan_parts(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        line: usize,
+    ) -> Result<PartPlan, FileTooLarge> {
+        let too_large = FileTooLarge;
+        let cut = SourceCut::of(Path::new(file.prompt_path), file.content, file.listed)
+            .ok_or_else(|| too_large.clone())?;
+        let limits = Limits {
+            window_bytes: PART_WINDOW_BYTES,
+            context_bytes: PART_CONTEXT_BYTES,
+            candidates: MAX_PART_CANDIDATES,
+        };
+        let wave = cut.parts(&limits);
+        let mut plan = PartPlan {
+            named: modules_named_by_candidates(file),
+            cut,
+            limits,
+            line,
+            parts: Vec::new(),
+        };
+        for part in wave {
+            plan.parts.extend(self.fit(file, guidance, &plan, part)?);
+        }
+        Ok(plan)
+    }
+
+    /// `part` as the requests it is asked in under `plan.line`, in source
+    /// order (carrick#2309).
+    ///
+    /// - A window that holds no candidate and whose items are all
+    ///   declarations that run nothing (imports, re-exports, type aliases,
+    ///   interfaces, ambient declarations) states nothing the model is asked
+    ///   about, and is not sent. The exception is a file whose prompt carries
+    ///   a GraphQL section, where a type can be the thing located.
+    /// - A part whose prompt is at or under the line is one request.
+    /// - A part over it is halved by its bytes
+    ///   ([`SourceCut::halves_by_size`]) and each half fitted in turn.
+    /// - A part over it that cannot be halved, one item with no list to cut,
+    ///   is not sent when it holds no candidate: it states nothing the model
+    ///   is asked about, which is the rule that already skips a file with no
+    ///   candidate. When it holds one, the file is [`FileTooLarge`].
+    fn fit(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        plan: &PartPlan,
+        part: SourcePart,
+    ) -> Result<Vec<(SourcePart, AnalysisPrompt)>, FileTooLarge> {
+        let mut fitted = Vec::new();
+        let mut pending = vec![part];
+        // Last first, so the halves come off in source order.
+        while let Some(part) = pending.pop() {
+            if part.candidates.is_empty()
+                && !file.has_graphql_section()
+                && plan.cut.states_nothing(&part)
+            {
+                continue;
+            }
+            let Some(prompt) =
+                self.part_prompt(file, guidance, &plan.cut, &part, plan.named.as_deref())
+            else {
+                continue;
+            };
+            if prompt.text.len() <= plan.line {
+                fitted.push((part, prompt));
+                continue;
+            }
+            match plan.cut.halves_by_size(&part, &plan.limits) {
+                Some((front, back)) => pending.extend([back, front]),
+                None if part.candidates.is_empty() => debug!(
+                    "{}: lines {} are one item over the line of {} bytes and hold no candidate; not asked",
+                    file.prompt_path,
+                    part.label(),
+                    plan.line
+                ),
+                None => {
+                    return Err(FileTooLarge);
+                }
+            }
+        }
+        Ok(fitted)
+    }
+
+    /// Ask about a file in parts, after the cloud's verdict that its whole
+    /// answer does not fit one response (carrick#1898).
+    ///
+    /// The file is cut as [`Self::plan_parts`] cuts it, at most the
+    /// candidates the verdict states a part, or [`MAX_PART_CANDIDATES`] when
+    /// it states none, and asked as [`Self::ask_parts`] asks it. A file with
+    /// no candidate is cut by size alone.
+    ///
+    /// A file that is one window is the request that was cut. It is not sent
+    /// again: it is halved first. A file that does not parse here cannot be
+    /// cut, and is lost with the verdict it was given.
+    async fn ask_in_parts(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        verdict: crate::agent_service::AgentCallError,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        let Some(cut) = SourceCut::of(Path::new(file.prompt_path), file.content, file.listed)
+        else {
+            return Err(Box::new(verdict));
+        };
+        let limits = Limits {
+            window_bytes: PART_WINDOW_BYTES,
+            context_bytes: PART_CONTEXT_BYTES,
+            // The verdict's own limit when it states one, read once: a part
+            // that is cut in its turn is halved, whatever its verdict states.
+            candidates: verdict.max_part_candidates().unwrap_or(MAX_PART_CANDIDATES),
+        };
+        let mut wave = cut.parts(&limits);
+        if let [whole] = wave.as_slice() {
+            let Some((front, back)) = cut.halves(whole, &limits) else {
+                return Err(Box::new(verdict));
+            };
+            wave = vec![front, back];
+        }
+        let mut plan = PartPlan {
+            named: modules_named_by_candidates(file),
+            cut,
+            limits,
+            line: WHOLE_PROMPT_MAX_BYTES,
+            parts: Vec::new(),
+        };
+        for part in wave {
+            plan.parts.extend(self.fit(file, guidance, &plan, part)?);
+        }
         debug!(
             "{}: the answer does not fit one response; asking about its {} candidate(s) in {} part(s)",
             file.prompt_path,
             file.listed.len(),
-            wave.len()
+            plan.parts.len()
         );
+        self.ask_parts(file, guidance, plan).await
+    }
 
-        let mut answers: Vec<(usize, FileAnalysisResult)> = Vec::new();
+    /// Ask about a file in parts after the cloud's final verdict that its
+    /// whole request is too large to ask (carrick#2310): cut as a file over
+    /// the line is cut, under the limit the verdict states, and never under
+    /// the refused request's own size or more.
+    async fn ask_smaller(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        verdict: &crate::agent_service::AgentCallError,
+        refused_bytes: usize,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        let line = line_after_size_verdict(verdict, WHOLE_PROMPT_MAX_BYTES, refused_bytes);
+        debug!(
+            "{}: its whole request of {} bytes is too large to ask; asking it in parts of at most {} bytes",
+            file.prompt_path, refused_bytes, line
+        );
+        let plan = self.plan_parts(file, guidance, line)?;
+        self.ask_parts(file, guidance, plan).await
+    }
+
+    /// Ask every part of `plan` and merge the answers into the one answer the
+    /// file stores ([`merge_part_answers`], carrick#1898, carrick#2308).
+    ///
+    /// Each part shows its window and the declarations the window uses, and
+    /// not the file. A part whose own answer is cut is halved between its
+    /// items ([`SourceCut::halves`]) and its halves asked, down to a single
+    /// group of candidates; a part that cannot be halved loses the file with
+    /// that verdict. A part the cloud refuses as too large to ask is halved
+    /// by its bytes under the limit the refusal states (carrick#2310), and a
+    /// part that cannot be cut again loses the file as [`FileTooLarge`]. A
+    /// part that fails any other way loses the file with that failure. Either
+    /// way nothing of the file's answer is kept, and when several parts fail
+    /// it is the first in source order that is reported.
+    async fn ask_parts(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        mut plan: PartPlan,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        let mut answers: Vec<PartAnswer> = Vec::new();
+        let mut wave = std::mem::take(&mut plan.parts);
         while !wave.is_empty() {
-            let outcomes = futures::future::join_all(wave.iter().map(|part| {
-                self.ask_part(
-                    file,
-                    guidance,
-                    part,
-                    named.as_deref(),
-                    whole.as_ref(),
-                    &verdict,
-                )
-            }))
-            .await;
+            let labels: Vec<String> = wave.iter().map(|(part, _)| part.label()).collect();
+            let outcomes =
+                futures::future::join_all(wave.iter().zip(&labels).map(|((_, prompt), label)| {
+                    self.file_analyzer.analyze_part_prompt(
+                        file.prompt_path,
+                        label,
+                        prompt,
+                        guidance,
+                    )
+                }))
+                .await;
             // `join_all` answers in the order it was given the parts, which is
             // source order, so the failure kept is the first in the source
             // whichever request came back first.
-            let mut halves: Vec<CandidatePart> = Vec::new();
+            let mut again: Vec<SourcePart> = Vec::new();
             let mut lost: Option<Box<dyn std::error::Error>> = None;
-            for (part, outcome) in wave.iter().zip(outcomes) {
-                match outcome {
-                    Ok(answer) => answers.push((part.first_group, answer)),
-                    Err(error) if lost.is_some() => drop(error),
-                    Err(error) => match (cut_verdict(error.as_ref()).is_some(), part.halves()) {
-                        (true, Some((front, back))) => {
+            for ((part, prompt), outcome) in wave.into_iter().zip(outcomes) {
+                let error = match outcome {
+                    Ok(answer) => {
+                        answers.push(PartAnswer {
+                            window: part.window(),
+                            answer,
+                        });
+                        continue;
+                    }
+                    Err(_) if lost.is_some() => continue,
+                    Err(error) => error,
+                };
+                if cut_verdict(error.as_ref()).is_some() {
+                    match plan.cut.halves(&part, &plan.limits) {
+                        Some((front, back)) => {
                             debug!(
                                 "{}: the answer for part {} does not fit either; asking its halves",
                                 file.prompt_path,
                                 part.label()
                             );
-                            halves.extend([front, back]);
+                            again.extend([front, back]);
                         }
-                        _ => lost = Some(error),
-                    },
+                        None => lost = Some(error),
+                    }
+                } else if let Some(verdict) = size_verdict(error.as_ref()) {
+                    plan.line = line_after_size_verdict(verdict, plan.line, prompt.text.len());
+                    match plan.cut.halves_by_size(&part, &plan.limits) {
+                        Some((front, back)) => {
+                            debug!(
+                                "{}: part {} is too large to ask; asking its halves under {} bytes",
+                                file.prompt_path,
+                                part.label(),
+                                plan.line
+                            );
+                            again.extend([front, back]);
+                        }
+                        // One item with no list, holding no candidate: it
+                        // states nothing the model is asked about.
+                        None if part.candidates.is_empty() => {}
+                        None => lost = Some(Box::new(FileTooLarge)),
+                    }
+                } else {
+                    lost = Some(error);
                 }
             }
             if let Some(error) = lost {
                 return Err(error);
             }
-            wave = halves;
+            // Fitted once every refusal of this wave is read, so each half is
+            // held to the smallest limit the cloud has stated.
+            wave = Vec::new();
+            for part in again {
+                wave.extend(self.fit(file, guidance, &plan, part)?);
+            }
         }
         debug!(
             "{}: answered in {} part(s)",
@@ -1613,22 +1999,25 @@ impl FileOrchestrator {
         Ok(merge_part_answers(file.listed, answers))
     }
 
-    /// Ask about one part of a file: the file's own prompt, listing only the
-    /// part's candidates and carrying only the modules those candidates name
-    /// through an import (carrick#1898).
+    /// The prompt of one part of a file (carrick#1898, carrick#2308): the
+    /// file's own prompt, showing the part's window and what the window uses
+    /// in place of the file, listing only the part's candidates and only the
+    /// imports its shown lines name, and carrying only the modules its
+    /// candidates name through an import.
     ///
-    /// A part whose prompt is byte for byte the request that was cut is not
-    /// sent: its verdict is the one already given.
-    async fn ask_part(
+    /// A part that lists no candidate carries the modules its window names
+    /// through an import, and every part of a file with no candidate at all
+    /// carries every module the file imports: such a file is asked about
+    /// because it imports one.
+    fn part_prompt(
         &self,
         file: &PartedFile<'_>,
         guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
-        part: &CandidatePart,
+        cut: &SourceCut,
+        part: &SourcePart,
         named: Option<&[BTreeSet<usize>]>,
-        whole: Option<&crate::agents::file_analyzer_agent::AnalysisPrompt>,
-        verdict: &crate::agent_service::AgentCallError,
-    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
-        let positions = part.candidates();
+    ) -> Option<AnalysisPrompt> {
+        let positions = &part.candidates;
         let hints: Vec<String> = positions
             .iter()
             .map(|position| file.candidate_hints[*position].clone())
@@ -1637,37 +2026,60 @@ impl FileOrchestrator {
             .iter()
             .map(|position| file.candidate_contexts[*position].clone())
             .collect();
+        let shown = part.shown();
+        let shown_names = cut.names_on(&shown);
+        let places: Option<BTreeSet<usize>> = if file.listed.is_empty() {
+            // A file with no candidate records no name for its modules, and a
+            // module that cannot be shown to be unnamed is not left out.
+            None
+        } else if positions.is_empty() {
+            let window = ShownLines {
+                window: part.window(),
+                runs: vec![part.window()],
+                markers: false,
+            };
+            let window_names = cut.names_on(&window);
+            Some(
+                file.wrapper_imports
+                    .iter()
+                    .filter(|(name, _)| window_names.contains(name.as_str()))
+                    .flat_map(|(_, modules)| modules.iter().copied())
+                    .collect(),
+            )
+        } else {
+            named.map(|named| {
+                positions
+                    .iter()
+                    .flat_map(|position| named[*position].iter().copied())
+                    .collect()
+            })
+        };
         // In the context's own order, which is the modules' sorted order.
-        let modules: Vec<String> = match named {
-            Some(named) => positions
-                .iter()
-                .flat_map(|position| named[*position].iter().copied())
-                .collect::<BTreeSet<usize>>()
+        let modules: Vec<String> = match places {
+            Some(places) => places
                 .into_iter()
                 .map(|place| file.wrapper_context[place].clone())
                 .collect(),
             None => file.wrapper_context.to_vec(),
         };
-        let prompt = self.file_analyzer.prompt_for(
+        let imported_symbols: HashMap<String, ImportedSymbol> = file
+            .imported_symbols
+            .iter()
+            .filter(|(local, _)| shown_names.contains(local.as_str()))
+            .map(|(local, symbol)| (local.clone(), symbol.clone()))
+            .collect();
+        self.file_analyzer.prompt_for_part(
             file.prompt_path,
             file.content,
+            &shown,
             guidance,
             &hints,
             &contexts,
-            file.imported_symbols,
+            &imported_symbols,
             file.graphql_producer_hints,
             file.graphql_consumer_hints,
             &modules,
-        );
-        let Some(prompt) = prompt else {
-            return Err(Box::new(verdict.clone()));
-        };
-        if whole.is_some_and(|whole| whole.text == prompt.text) {
-            return Err(Box::new(verdict.clone()));
-        }
-        self.file_analyzer
-            .analyze_part_prompt(file.prompt_path, &part.label(), &prompt, guidance)
-            .await
+        )
     }
 
     /// Run AST-gated file-centric analysis on all provided files.
@@ -1756,6 +2168,10 @@ impl FileOrchestrator {
         // long as the cache lives (#478).
         let mut raw_model_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         let mut unread_prefixes: Vec<crate::registration_scope::UnreadPrefix> = Vec::new();
+        // Registration callbacks holding a registration the model stated no
+        // mount for (carrick#2303), decided once every file's rows are in.
+        let mut unstated_registrations: Vec<crate::registration_scope::UnstatedRegistrations> =
+            Vec::new();
         let mut stats = ProcessingStats::default();
         // Every path that reaches a prompt is reduced against this (see
         // `PendingFile::prompt_path`). The engine canonicalizes `repo_path`
@@ -1884,10 +2300,6 @@ impl FileOrchestrator {
             /// This file's OWN request members, keyed by name (carrick#588).
             /// Read for the files that import it, never for itself.
             request_members: RequestMemberIndex,
-            /// This file's OWN members that reach exactly one request, keyed
-            /// by name (carrick#872). Read for the files that import it, and
-            /// for its own same-file wrapper sites.
-            dispatch_members: DispatchMemberIndex,
             /// Which import each local binding's value traces back to
             /// (carrick#666), read at the package-surface member join.
             receiver_origins: ReceiverOrigins,
@@ -1903,12 +2315,6 @@ impl FileOrchestrator {
             /// stamped onto the rows that member DID produce, so a consumer
             /// listing can state what the join could not follow.
             unresolved_member_sites: Vec<(u32, String)>,
-            /// Call sites in this file that reach a wrapper whose body issues
-            /// one request, keyed by the site's call-expression start offset
-            /// (carrick#872). Read once every file's rows are in, to carry the
-            /// dispatch value the wrapper's own request states onto the row
-            /// emitted here.
-            dispatch_sites: HashMap<u32, DispatchSite>,
             /// What the deterministic layer states about this file, computed
             /// once every cross-file input it reads is in and before the model
             /// is called. These become the file's rows; the model's answer is
@@ -1920,6 +2326,24 @@ impl FileOrchestrator {
             /// Calls in this file that hand an inline function the instance
             /// it registers routes on (carrick#2092).
             registration_sites: Vec<crate::registration_scope::RegistrationSite>,
+        }
+
+        impl PendingFile {
+            /// What asking the file, whole or in parts, reads of it.
+            fn parted(&self) -> PartedFile<'_> {
+                PartedFile {
+                    prompt_path: &self.prompt_path,
+                    content: &self.content,
+                    listed: &self.listed,
+                    candidate_hints: &self.candidate_hints,
+                    candidate_contexts: &self.candidate_contexts,
+                    imported_symbols: &self.symbol_table.imported_symbols,
+                    graphql_producer_hints: &self.graphql_producer_hints,
+                    graphql_consumer_hints: &self.graphql_consumer_hints,
+                    wrapper_context: &self.wrapper_context,
+                    wrapper_imports: &self.wrapper_imports,
+                }
+            }
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -1974,13 +2398,17 @@ impl FileOrchestrator {
             stats: &mut ProcessingStats,
             member_deficits: &mut HashMap<String, u32>,
             resolved_member_rows: &mut HashMap<String, HashMap<u32, String>>,
-            dispatch_sites: &mut HashMap<String, HashMap<u32, DispatchSite>>,
             unread_prefixes: &mut Vec<crate::registration_scope::UnreadPrefix>,
+            unstated_registrations: &mut Vec<crate::registration_scope::UnstatedRegistrations>,
         ) {
             // A model row at a site whose callee provably sends nothing is
             // the model reading a request into a name (carrick#1555).
-            stats.summary_rows_withdrawn +=
-                FileOrchestrator::withdraw_silent_sites(adjusted, &pf.silent_sites);
+            stats.summary_rows_withdrawn += FileOrchestrator::withdraw_silent_sites(
+                adjusted,
+                &pf.silent_sites,
+                Path::new(&pf.path_str),
+                &pf.content,
+            );
             // Carry the wrapper's own request shape onto the sites that
             // delegate to it (carrick-cloud#386). Runs first among the
             // passes over the joined rows, because it tells a
@@ -2051,6 +2479,15 @@ impl FileOrchestrator {
             );
             stats.mount_prefixes_unread += unread.len();
             unread_prefixes.extend(unread);
+            // What a callback registers and the model did not state is
+            // decided against the rows of the file that declares it
+            // (carrick#2303), so the sites wait for every file.
+            unstated_registrations.extend(crate::registration_scope::UnstatedRegistrations::of(
+                adjusted,
+                &pf.registration_sites,
+                &pf.path_str,
+                &pf.prompt_path,
+            ));
 
             // Drop LLM-emitted pub/sub ops whose topic has no literal
             // witness in the file's source (carrick#311): the analyzer
@@ -2103,12 +2540,6 @@ impl FileOrchestrator {
                         .collect(),
                 );
             }
-            // carrick#872: which wrapper each site in this file delegates to.
-            // Read once every file's rows are in — the value is in the
-            // WRAPPER's file, whose rows may not exist yet.
-            if !pf.dispatch_sites.is_empty() {
-                dispatch_sites.insert(pf.path_str.clone(), std::mem::take(&mut pf.dispatch_sites));
-            }
         }
 
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
@@ -2138,10 +2569,6 @@ impl FileOrchestrator {
         // can be stamped on exactly those rows.
         let mut member_deficits: HashMap<String, u32> = HashMap::new();
         let mut resolved_member_rows: HashMap<String, HashMap<u32, String>> = HashMap::new();
-        // carrick#872, filled per file and read once every file is in: which
-        // spans in which file reach a wrapper whose body issues one request,
-        // and where that request is written.
-        let mut dispatch_sites: HashMap<String, HashMap<u32, DispatchSite>> = HashMap::new();
         // What the repo's validation schemas declare about the environment
         // (carrick#649), folded across every parseable file. Repo-wide because
         // an environment variable is process-global and the file declaring the
@@ -2433,6 +2860,7 @@ impl FileOrchestrator {
                             // composed ([`LateSummaryFile`]).
                             &BTreeMap::new(),
                             &EnvSchemaIndex::default(),
+                            false,
                         ),
                         &mut stats.deterministic_rows_emitted,
                     );
@@ -2567,12 +2995,10 @@ impl FileOrchestrator {
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
                 local_wrapper_calls: scan_result.local_wrapper_calls,
                 request_members: symbols.request_members,
-                dispatch_members: symbols.dispatch_members,
                 receiver_origins: symbols.receiver_origins,
                 registration_sites: symbols.registration_sites,
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
-                dispatch_sites: HashMap::new(),
                 resolved: Vec::new(),
                 silent_sites: BTreeSet::new(),
             });
@@ -2584,7 +3010,6 @@ impl FileOrchestrator {
         // another file would import. Keyed by canonical file path. The whole
         // (size-capped) file is the context snippet: wrappers are small client
         // modules, and slicing exact function spans buys little over the cap.
-        const WRAPPER_SNIPPET_MAX: usize = 4_000;
         let mut wrapper_map: HashMap<PathBuf, WrapperModule> = HashMap::new();
         for pf in &pending {
             // Rescued files (graphql/messaging fall-throughs) carry no HTTP
@@ -2646,15 +3071,9 @@ impl FileOrchestrator {
         // it. Seeded from the files already parsed for their symbol tables, so
         // the on-demand parse only runs for a module no analyzed file was.
         let mut member_cache: HashMap<PathBuf, RequestMemberIndex> = HashMap::new();
-        // The same modules read for a different question (carrick#872): which
-        // member reaches which single request. Filled at exactly the same
-        // points as `member_cache`, off the same parse, so the two never
-        // disagree about which modules were read.
-        let mut dispatch_cache: HashMap<PathBuf, DispatchMemberIndex> = HashMap::new();
         for pf in &pending {
             if let Ok(canonical) = Path::new(&pf.path_str).canonicalize() {
-                member_cache.insert(canonical.clone(), pf.request_members.clone());
-                dispatch_cache.insert(canonical, pf.dispatch_members.clone());
+                member_cache.insert(canonical, pf.request_members.clone());
             }
         }
 
@@ -2790,35 +3209,21 @@ impl FileOrchestrator {
                         }
                     }
                     let mut rings: Vec<Vec<(PathBuf, RequestMemberIndex)>> = Vec::new();
-                    // The dispatch index of the same modules, in the same ring
-                    // order, so the two joins answer from the same evidence.
-                    let mut dispatch_rings: Vec<Vec<(PathBuf, DispatchMemberIndex)>> = Vec::new();
                     for ring in [&nearest, &further] {
                         let mut indexes: Vec<(PathBuf, RequestMemberIndex)> = Vec::new();
-                        let mut dispatch_indexes: Vec<(PathBuf, DispatchMemberIndex)> = Vec::new();
                         for path in ring {
                             if !member_cache.contains_key(path) {
-                                let module = parse_file(path, &cm, &handler);
-                                let index = module
+                                let index = parse_file(path, &cm, &handler)
                                     .as_ref()
                                     .map(|module| collect_request_members(module, &cm))
                                     .unwrap_or_default();
-                                let dispatch = module
-                                    .as_ref()
-                                    .map(|module| collect_dispatch_members(module, &cm))
-                                    .unwrap_or_default();
                                 member_cache.insert(path.clone(), index);
-                                dispatch_cache.insert(path.clone(), dispatch);
                             }
                             if let Some(index) = member_cache.get(path) {
                                 indexes.push((path.clone(), index.clone()));
                             }
-                            if let Some(index) = dispatch_cache.get(path) {
-                                dispatch_indexes.push((path.clone(), index.clone()));
-                            }
                         }
                         rings.push(indexes);
-                        dispatch_rings.push(dispatch_indexes);
                     }
                     // The join's outcome, and the sites it declined
                     // (carrick#656) — both come back from the walk, because
@@ -2841,18 +3246,6 @@ impl FileOrchestrator {
                         pf.unresolved_member_sites.retain(|(site, _)| *site != span);
                         pf.resolved_members.insert(span, member);
                     }
-
-                    // Which wrapper each site delegates to, for the dispatch
-                    // carry (carrick#872). Same rings, same receiver rule, a
-                    // different index: a member the request-member join drops
-                    // for stating no route-shaped URL of its own still states
-                    // a line, and that line is where the model wrote the
-                    // dispatch value.
-                    pf.dispatch_sites = Self::resolve_dispatch_sites(
-                        &pf.candidate_map,
-                        dispatch_rings,
-                        &import_owners,
-                    );
 
                     // The same join across a workspace package boundary
                     // (carrick#666). Kept separate from the rings above rather
@@ -3023,7 +3416,8 @@ impl FileOrchestrator {
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: ctx,
-                // No candidate, so the file is never asked in parts and
+                // No candidate, so a part of the file, when it is over the
+                // line and asked in parts, names no module through one, and
                 // nothing reads which name reaches which module.
                 wrapper_imports: BTreeMap::new(),
                 wrapper_request_shape: rescued_shape,
@@ -3036,39 +3430,13 @@ impl FileOrchestrator {
                 // A rescued file raised no candidate of its own, so it is not
                 // read as anybody's wrapper and nothing joins onto it either.
                 request_members: RequestMemberIndex::default(),
-                dispatch_members: DispatchMemberIndex::default(),
                 receiver_origins: ReceiverOrigins::default(),
                 registration_sites: symbols.registration_sites,
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
-                dispatch_sites: HashMap::new(),
                 resolved: Vec::new(),
                 silent_sites: BTreeSet::new(),
             });
-        }
-
-        // The same-file half of the dispatch carry (carrick#872). A site that
-        // delegates to a wrapper declared in its OWN file raises no candidate
-        // at all — that is why `local_http_wrapper` exists — so the ring join
-        // above never sees it. Its wrapper is in this file's own index, and
-        // the value the wrapper writes is in this file's own extracted rows.
-        for pf in &mut pending {
-            let Ok(canonical) = Path::new(&pf.path_str).canonicalize() else {
-                continue;
-            };
-            for call in &pf.local_wrapper_calls {
-                let Some(member) = pf.dispatch_members.get(&call.wrapper_name) else {
-                    continue;
-                };
-                pf.dispatch_sites.insert(
-                    call.span_start,
-                    DispatchSite {
-                        name: call.wrapper_name.clone(),
-                        module: canonical.clone(),
-                        request_line: member.request_line,
-                    },
-                );
-            }
         }
 
         // Where every request member the scan read is declared (carrick#656).
@@ -3078,9 +3446,8 @@ impl FileOrchestrator {
         // on demand for the consumers that import it, never on its own
         // `PendingFile`.
         // Every file this scan will have rows for, by canonical path. Read by
-        // the member homes below and by the dispatch carry (carrick#872),
-        // which both have to turn a module path into the `file_results` key
-        // its rows are stored under.
+        // the member homes below, which have to turn a module path into the
+        // `file_results` key its rows are stored under.
         let analysed: HashMap<PathBuf, String> = pending
             .iter()
             .filter_map(|pf| {
@@ -3222,18 +3589,19 @@ impl FileOrchestrator {
                     crate::analysis_channel::degrade(service.as_deref().unwrap_or("this service"));
                     break;
                 };
-                if let Some(prompt) = self.file_analyzer.prompt_for(
-                    &pf.prompt_path,
-                    &pf.content,
-                    guidance,
-                    &pf.candidate_hints,
-                    &pf.candidate_contexts,
-                    &pf.symbol_table.imported_symbols,
-                    &pf.graphql_producer_hints,
-                    &pf.graphql_consumer_hints,
-                    &pf.wrapper_context,
-                ) {
-                    crate::analysis_channel::record(service.as_deref(), key, &prompt, &schema);
+                // One prompt a request the file would make: its whole prompt,
+                // or one a part when it is over the line (carrick#2309). A
+                // file that cannot be asked under the line records none, and
+                // the resume that follows decides the same.
+                let prompts: Vec<AnalysisPrompt> = match self.asking(&pf.parted(), guidance) {
+                    Ok(Asking::Whole(prompt)) => vec![prompt],
+                    Ok(Asking::Parts(plan)) => {
+                        plan.parts.into_iter().map(|(_, prompt)| prompt).collect()
+                    }
+                    Ok(Asking::Nothing) | Err(_) => Vec::new(),
+                };
+                for prompt in &prompts {
+                    crate::analysis_channel::record(service.as_deref(), key, prompt, &schema);
                     collecting = true;
                 }
             }
@@ -3241,23 +3609,32 @@ impl FileOrchestrator {
         } else if let Some(answers) = crate::analysis_channel::answers() {
             let mut unanswered: Vec<PendingFile> = Vec::with_capacity(to_dispatch.len());
             for pf in to_dispatch.drain(..) {
-                let replay = self
-                    .file_analyzer
-                    .prompt_for(
-                        &pf.prompt_path,
-                        &pf.content,
-                        guidance,
-                        &pf.candidate_hints,
-                        &pf.candidate_contexts,
-                        &pf.symbol_table.imported_symbols,
-                        &pf.graphql_producer_hints,
-                        &pf.graphql_consumer_hints,
-                        &pf.wrapper_context,
-                    )
-                    .and_then(|prompt| {
-                        answers.text_for(&crate::analysis_job::body_id(prompt.body()))
-                    })
-                    .map(|text| FileAnalyzerAgent::result_from_answer(&pf.prompt_path, text));
+                let answer_to = |prompt: &AnalysisPrompt| {
+                    answers
+                        .text_for(&crate::analysis_job::body_id(prompt.body()))
+                        .map(|text| FileAnalyzerAgent::result_from_answer(&pf.prompt_path, text))
+                };
+                // A file asked in parts is answered from the bundle only when
+                // every part is (carrick#2309); otherwise its parts are asked.
+                let replay = match self.asking(&pf.parted(), guidance) {
+                    Ok(Asking::Whole(prompt)) => answer_to(&prompt),
+                    Ok(Asking::Parts(plan)) => plan
+                        .parts
+                        .iter()
+                        .map(|(part, prompt)| {
+                            answer_to(prompt).map(|answer| {
+                                answer.map(|answer| PartAnswer {
+                                    window: part.window(),
+                                    answer,
+                                })
+                            })
+                        })
+                        .collect::<Option<Result<Vec<PartAnswer>, String>>>()
+                        .map(|answers| {
+                            answers.map(|answers| merge_part_answers(&pf.listed, answers))
+                        }),
+                    Ok(Asking::Nothing) | Err(_) => None,
+                };
                 match replay {
                     Some(Ok(result)) => collected.push((pf, result)),
                     Some(Err(error)) => {
@@ -3303,6 +3680,7 @@ impl FileOrchestrator {
                 unread_mount_prefixes: Vec::new(),
                 bundled_types: None,
                 type_resolution: None,
+                passes_body: HashSet::new(),
             });
         }
 
@@ -3341,45 +3719,41 @@ impl FileOrchestrator {
         crate::scan_health::record_files_attempted(to_dispatch.len());
         let dispatched: Vec<(PendingFile, Result<FileAnalysisResult, ModelAnswer>)> =
             futures::stream::iter(to_dispatch.into_iter().map(|pf| async move {
-                let whole = self
-                    .file_analyzer
-                    .analyze_file_with_candidates(
-                        &pf.prompt_path,
-                        &pf.content,
-                        guidance,
-                        &pf.candidate_hints,
-                        &pf.candidate_contexts,
-                        &pf.symbol_table.imported_symbols,
-                        &pf.graphql_producer_hints,
-                        &pf.graphql_consumer_hints,
-                        &pf.wrapper_context,
-                    )
-                    .await;
-                // A file is asked whole, and only the cloud's final verdict
-                // that its answer does not fit one response asks it again, in
-                // parts (carrick#1898). Every other outcome is what it was:
-                // an answer is the file's answer, and any other failure is
-                // the file's failure.
-                let asked = match whole {
-                    Err(error) => match cut_verdict(error.as_ref()).cloned() {
-                        Some(verdict) => {
-                            let file = PartedFile {
-                                prompt_path: &pf.prompt_path,
-                                content: &pf.content,
-                                listed: &pf.listed,
-                                candidate_hints: &pf.candidate_hints,
-                                candidate_contexts: &pf.candidate_contexts,
-                                imported_symbols: &pf.symbol_table.imported_symbols,
-                                graphql_producer_hints: &pf.graphql_producer_hints,
-                                graphql_consumer_hints: &pf.graphql_consumer_hints,
-                                wrapper_context: &pf.wrapper_context,
-                                wrapper_imports: &pf.wrapper_imports,
-                            };
-                            self.ask_in_parts(&file, guidance, verdict).await
+                let file = pf.parted();
+                // A file at or under the line is asked whole, and only the
+                // cloud's final verdict that its answer does not fit one
+                // response (carrick#1898) or that the request is too large to
+                // ask (carrick#2310) asks it again, in parts. A file over the
+                // line is asked in parts from its first request, and one that
+                // cannot be cut under it is not asked (carrick#2309). Every
+                // other outcome is what it was: an answer is the file's
+                // answer, and any other failure is the file's failure.
+                let asked: Result<FileAnalysisResult, Box<dyn std::error::Error>> = match self
+                    .asking(&file, guidance)
+                {
+                    Ok(Asking::Nothing) => Ok(FileAnalysisResult::default()),
+                    Ok(Asking::Parts(plan)) => self.ask_parts(&file, guidance, *plan).await,
+                    Err(too_large) => Err(Box::new(too_large)),
+                    Ok(Asking::Whole(prompt)) => {
+                        match self
+                            .file_analyzer
+                            .analyze_prompt(&pf.prompt_path, &prompt, guidance)
+                            .await
+                        {
+                            Err(error) => {
+                                if let Some(verdict) = cut_verdict(error.as_ref()).cloned() {
+                                    self.ask_in_parts(&file, guidance, verdict).await
+                                } else if let Some(verdict) = size_verdict(error.as_ref()).cloned()
+                                {
+                                    self.ask_smaller(&file, guidance, &verdict, prompt.text.len())
+                                        .await
+                                } else {
+                                    Err(error)
+                                }
+                            }
+                            answered => answered,
                         }
-                        None => Err(error),
-                    },
-                    answered => answered,
+                    }
                 };
                 let result = asked.map_err(|e| {
                     // Recorded here, where the error is still typed: this
@@ -3387,7 +3761,18 @@ impl FileOrchestrator {
                     // not call itself a success. A call a limit refused
                     // is excluded, because the model was never asked
                     // (carrick#555, `counts_as_lost_file`).
-                    if crate::scan_health::counts_as_lost_file(e.as_ref()) {
+                    if e.downcast_ref::<FileTooLarge>().is_some() {
+                        // Decided by the scanner from the file's bytes, so
+                        // the same on every scan of them: final, and never
+                        // described as something a re-run mends.
+                        crate::scan_health::record_unanalysed_file(
+                            &pf.path_str,
+                            &crate::scan_health::LossReason {
+                                code: FILE_TOO_LARGE_CODE.to_string(),
+                                is_final: true,
+                            },
+                        );
+                    } else if crate::scan_health::counts_as_lost_file(e.as_ref()) {
                         crate::scan_health::record_unanalysed_file(
                             &pf.path_str,
                             &crate::scan_health::analysis_failure_reason(e.as_ref()),
@@ -3440,7 +3825,50 @@ impl FileOrchestrator {
         // PHASE 1d, second half: the rows the request summaries state, now
         // that they are composed. Waiting here is waiting on the scan's last
         // asks for library semantics, which ran alongside the model's work.
-        let summaries = self.request_summaries.take().await;
+        let mut summaries = self.request_summaries.take().await;
+        // A call the source states as an endpoint registers a route, whatever
+        // else it is shaped like (carrick#2383): the request the summaries
+        // read at it is withdrawn, at the call and at every caller of the
+        // function it sits in. Every source counts: the layout, route data,
+        // decorators, and the model's rows at a site that can register one.
+        let mut registered: HashMap<PathBuf, BTreeSet<u32>> = HashMap::new();
+        for (pf, answer) in &analyzed {
+            let spans = registered.entry(PathBuf::from(&pf.path_str)).or_default();
+            spans.extend(
+                [
+                    &pf.route_endpoints,
+                    &pf.descriptor_endpoints,
+                    &pf.decorator_endpoints,
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|endpoint| endpoint.call_expression_span_start),
+            );
+            if let ModelAnswer::Answered(model) = answer {
+                spans.extend(model.endpoints.iter().filter_map(|endpoint| {
+                    pf.candidate_map
+                        .get(&endpoint.candidate_id)
+                        .filter(|candidate| {
+                            Self::candidate_can_register_a_route(candidate, endpoint.line_number)
+                        })
+                        .map(|candidate| candidate.span_start)
+                }));
+            }
+        }
+        for (path, result) in &file_results {
+            registered.entry(PathBuf::from(path)).or_default().extend(
+                result
+                    .endpoints
+                    .iter()
+                    .filter_map(|endpoint| endpoint.call_expression_span_start),
+            );
+        }
+        let withdrawn = summaries.withdraw_registrations(&registered);
+        if withdrawn > 0 {
+            debug!(
+                "Withdrew {withdrawn} request summary row(s) made by a call the source states as an endpoint"
+            );
+        }
         let no_summary_rows: BTreeMap<u32, Vec<SummaryRow>> = BTreeMap::new();
         for late in late_summary_files {
             let Some(summary_rows) = summaries.rows(&late.file_path) else {
@@ -3466,6 +3894,8 @@ impl FileOrchestrator {
                     &HashMap::new(),
                     summary_rows,
                     &env_schema,
+                    // Its rows skip the passes after the join.
+                    false,
                 ),
                 &mut stats.deterministic_rows_emitted,
             );
@@ -3494,6 +3924,7 @@ impl FileOrchestrator {
                 receiver_roles.get(&pf.path_str).unwrap_or(&empty_roles),
                 summaries.rows(file).unwrap_or(&no_summary_rows),
                 &env_schema,
+                true,
             );
         }
 
@@ -3520,10 +3951,19 @@ impl FileOrchestrator {
                         std::mem::take(&mut pf.resolved),
                         &mut stats.deterministic_rows_emitted,
                     );
+                    // Read only when an endpoint's id names no listed site,
+                    // the one case the join asks it about (carrick#2382).
+                    let path_literals = model
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| !pf.candidate_map.contains_key(&endpoint.candidate_id))
+                        .then(|| RouteLiteralWitness::of_source(&pf.path_str, &pf.content))
+                        .flatten();
                     Self::join_model_rows(
                         &mut adjusted,
                         model,
                         &pf.candidate_map,
+                        path_literals.as_ref(),
                         &overrules,
                         &pf.path_str,
                         pf.route_module_claimed,
@@ -3538,8 +3978,8 @@ impl FileOrchestrator {
                         &mut stats,
                         &mut member_deficits,
                         &mut resolved_member_rows,
-                        &mut dispatch_sites,
                         &mut unread_prefixes,
+                        &mut unstated_registrations,
                     );
 
                     stats.total_mounts += adjusted.mounts.len();
@@ -3619,8 +4059,8 @@ impl FileOrchestrator {
                         &mut stats,
                         &mut member_deficits,
                         &mut resolved_member_rows,
-                        &mut dispatch_sites,
                         &mut unread_prefixes,
+                        &mut unstated_registrations,
                     );
                     Self::count_unemitted_literal_candidates(
                         &deterministic,
@@ -3730,6 +4170,10 @@ impl FileOrchestrator {
             stats.model_routes_kept_without_a_site
         );
         debug!(
+            "  - Model routes kept at their own line on a path literal the file compares: {}",
+            stats.model_routes_kept_on_a_path_literal
+        );
+        debug!(
             "  - Model statements discarded as contradictions: {}",
             stats.model_contradictions_discarded
         );
@@ -3740,6 +4184,10 @@ impl FileOrchestrator {
         debug!(
             "  - Model endpoints discarded in convention-claimed modules: {}",
             stats.model_endpoints_discarded_in_claimed_modules
+        );
+        debug!(
+            "  - Model endpoints dropped, their id names no listed site: {}",
+            stats.model_endpoints_dropped_unanchored
         );
         debug!("  - Model-only rows: {}", stats.model_only_rows);
         debug!(
@@ -3765,26 +4213,11 @@ impl FileOrchestrator {
             debug!("  - Rows stating unfollowed member call sites: {stamped}");
         }
 
-        // PHASE 5b (carrick#872): carry the value a wrapper writes for a
-        // dispatching route onto the rows emitted at the sites that call it.
-        // Cross-file for the same reason as the pass above: the literal is in
-        // the wrapper's file and the row is in the consumer's, so neither
-        // file's own pass can see both. A model row's value stands only where
-        // its own file writes it (carrick#2201).
+        // PHASE 5b: settle the dispatch values summary rows send from their
+        // own bodies (carrick#1555), then clear every model value its own file
+        // does not write (carrick#2201).
         let witnesses = DispatchWitnesses::of(&file_results);
-        let carry = Self::settle_wrapper_dispatch(
-            &mut file_results,
-            &dispatch_sites,
-            &analysed,
-            &witnesses,
-            &mut stats,
-        );
-        if carry.carried > 0 {
-            debug!(
-                "  - Rows carrying a wrapper's dispatch value: {} ({} over an unwitnessed value)",
-                carry.carried, carry.over_guess
-            );
-        }
+        Self::settle_dispatch_values(&mut file_results, &witnesses, &mut stats);
         if stats.dispatch_guesses_cleared > 0 {
             debug!(
                 "  - Model dispatch values with no witness in their file, cleared: {}",
@@ -3914,6 +4347,27 @@ impl FileOrchestrator {
             );
         }
 
+        // PHASE 5f (carrick#2303): the mounts a registration callback makes
+        // and the model did not state, read from the source. Last before the
+        // graph, which reads the scopes and the unread prefixes this adds
+        // exactly as it reads the ones the per-file pass made.
+        let (source_mounts, unread) = crate::registration_scope::mount_unstated_registrations(
+            &mut file_results,
+            &unstated_registrations,
+            Path::new(""),
+        );
+        if source_mounts > 0 {
+            debug!(
+                "  - Mounts read from the source where the model stated none: {} (scopes with an \
+                 unread prefix: {})",
+                source_mounts,
+                unread.len()
+            );
+            stats.total_mounts += source_mounts;
+        }
+        stats.mount_prefixes_unread += unread.len();
+        unread_prefixes.extend(unread);
+
         // STEP 5: Build aggregated mount graph from all file results
         let (mount_graph, corroborated) = self.build_mount_graph_reading_scopes(
             &file_results,
@@ -3936,6 +4390,7 @@ impl FileOrchestrator {
             unread_mount_prefixes: unread_prefixes,
             bundled_types: None,
             type_resolution: None,
+            passes_body: summaries.passes_body_set().clone(),
         })
     }
 
@@ -4086,8 +4541,8 @@ impl FileOrchestrator {
                         file_path: file_path.to_string(),
                         line_number,
                         infer_kind,
-                        span_start: Some(Self::sidecar_position(source, start)),
-                        span_end: Some(Self::sidecar_position(source, end)),
+                        span_start: Some(crate::utils::sidecar_position(source, start)),
+                        span_end: Some(crate::utils::sidecar_position(source, end)),
                         expression_text: None,
                         expression_line: None,
                         alias: Some(alias),
@@ -5394,8 +5849,8 @@ impl FileOrchestrator {
             requests.push(InferRequestItem {
                 file_path: file.clone(),
                 line_number: declared.line,
-                span_start: Some(Self::sidecar_position(content, declared.lo)),
-                span_end: Some(Self::sidecar_position(content, declared.hi)),
+                span_start: Some(crate::utils::sidecar_position(content, declared.lo)),
+                span_end: Some(crate::utils::sidecar_position(content, declared.hi)),
                 expression_text: None,
                 expression_line: None,
                 infer_kind: InferKind::Expression,
@@ -5514,8 +5969,8 @@ impl FileOrchestrator {
                         Some(content) => {
                             spanned += 1;
                             (
-                                Some(Self::sidecar_position(content, lo)),
-                                Some(Self::sidecar_position(content, hi)),
+                                Some(crate::utils::sidecar_position(content, lo)),
+                                Some(crate::utils::sidecar_position(content, hi)),
                             )
                         }
                         // Unreachable while the source that produced the
@@ -5649,8 +6104,8 @@ impl FileOrchestrator {
         Some((
             declaring_file.clone(),
             line,
-            Self::sidecar_position(content, lo),
-            Self::sidecar_position(content, hi),
+            crate::utils::sidecar_position(content, lo),
+            crate::utils::sidecar_position(content, hi),
         ))
     }
 
@@ -6064,11 +6519,6 @@ impl FileOrchestrator {
         // requests go through a helper raises no HTTP candidate of its own, so
         // the wrapper map's candidate gate is the wrong filter for this.
         let request_members = collect_request_members(&module, cm);
-        // The same parse again (carrick#872): which member reaches which
-        // single request, for the dispatch carry. A separate index from the
-        // one above because it answers a different question and drops far
-        // less — see `crate::wrapper_dispatch`.
-        let dispatch_members = collect_dispatch_members(&module, cm);
         // Same parse again: the origins are read off the declarators the
         // extractors above already walked.
         let receiver_origins = collect_receiver_origins(&module);
@@ -6086,7 +6536,6 @@ impl FileOrchestrator {
             env_fallbacks: bindings.env_fallbacks,
             literal_bases: bindings.literal_bases,
             request_members,
-            dispatch_members,
             receiver_origins,
             registration_sites,
         }
@@ -7022,9 +7471,15 @@ impl FileOrchestrator {
         // one request.
         summary_rows: &BTreeMap<u32, Vec<SummaryRow>>,
         // What the service's validation schemas declare about each env var,
-        // for a summary row whose base another module's scope describes.
+        // for a summary row's base.
         env_schema: &EnvSchemaIndex,
+        // Whether a summary row whose base this file's scope read states
+        // that base here (carrick#2406). Not for a file whose rows skip the
+        // passes after the join, which is where such a base was stated
+        // before ([`Self::stamp_call_bases`]).
+        own_summary_bases: bool,
     ) -> Vec<Resolved> {
+        let own_fallbacks = own_summary_bases.then_some(env_fallbacks);
         // Keyed by the span START, which is the join key: a chained call
         // (`client.cancelRun(id).catch(fn)`) raises a candidate per link and
         // every link shares the receiver's start offset, so the links are one
@@ -7083,13 +7538,15 @@ impl FileOrchestrator {
                 summary_own_sites.push((
                     *start,
                     rows.iter()
-                        .map(|row| Self::summary_resolved(row, candidate, env_schema))
+                        .map(|row| {
+                            Self::summary_resolved(row, candidate, own_fallbacks, env_schema)
+                        })
                         .collect(),
                 ));
                 continue;
             }
             for (index, row) in rows.iter().enumerate() {
-                let resolved = Self::summary_resolved(row, candidate, env_schema);
+                let resolved = Self::summary_resolved(row, candidate, own_fallbacks, env_schema);
                 if index == 0 {
                     claim(resolved);
                 } else {
@@ -7505,15 +7962,29 @@ impl FileOrchestrator {
     /// the model's answer joins onto it by the same id; otherwise keyed by the
     /// site's own span, exactly as a same-file wrapper site is.
     ///
-    /// A row whose base another module's scope read (carrick#1568) carries
-    /// that module's defaults, and its base is stated from them here, as
-    /// that module's own rows state it: [`Self::stamp_call_bases`] leaves a
-    /// stated base alone, so the file the row sits in never describes it.
+    /// Its base is read from where the base piece ends (carrick#2406), not
+    /// from the target's spelling. A row whose base another module's scope
+    /// read (carrick#1568) looks its defaults up in that module's
+    /// (`base_fallbacks`), as that module's own rows do, so the file the row
+    /// sits in never describes it. Any other row looks them up in this
+    /// file's (`own_fallbacks`), and has no base stated here when that is
+    /// `None`.
     fn summary_resolved(
         row: &SummaryRow,
         candidate: Option<&CandidateTarget>,
+        own_fallbacks: Option<&EnvFallbackMap>,
         env_schema: &EnvSchemaIndex,
     ) -> Resolved {
+        let scope_fallbacks: Option<EnvFallbackMap> = row
+            .base_fallbacks
+            .as_ref()
+            .map(|fallbacks| fallbacks.clone().into_iter().collect());
+        let base = scope_fallbacks
+            .as_ref()
+            .or(own_fallbacks)
+            .and_then(|fallbacks| {
+                stated_base(&row.target, row.base_end.as_ref(), fallbacks, env_schema)
+            });
         let line = i32::try_from(row.line).unwrap_or(i32::MAX);
         let candidate_id = candidate
             .map(|candidate| candidate.candidate_id.clone())
@@ -7542,14 +8013,7 @@ impl FileOrchestrator {
                 primary_type_symbol: None,
                 type_import_source: None,
                 loopback_default_url: None,
-                base: row.base_fallbacks.as_ref().and_then(|fallbacks| {
-                    resolve_call_base(
-                        &row.target,
-                        &EnvAliasMap::new(),
-                        &fallbacks.clone().into_iter().collect(),
-                        env_schema,
-                    )
-                }),
+                base,
                 consumers_not_resolved: None,
                 // Settled once the field the target dispatches on is known:
                 // at the join, from the model's reading of which field that
@@ -7608,16 +8072,38 @@ impl FileOrchestrator {
     /// nothing (carrick#1555): the summary composed every call the callee
     /// makes and found no request. A model row there is the model reading a
     /// request into a name.
-    fn withdraw_silent_sites(result: &mut FileAnalysisResult, silent: &BTreeSet<u32>) -> usize {
+    ///
+    /// A model row with no span (its id joined no candidate) is placed by its
+    /// line (carrick#2281): at the one outermost call that opens there, when
+    /// the row's own text writes that call ([`crate::call_through::FileCalls`]).
+    /// `content` is the file the candidates' spans were read from; it is
+    /// parsed only when such a row is in the file.
+    pub(crate) fn withdraw_silent_sites(
+        result: &mut FileAnalysisResult,
+        silent: &BTreeSet<u32>,
+        path: &Path,
+        content: &str,
+    ) -> usize {
         if silent.is_empty() {
             return 0;
         }
+        let is_model =
+            |call: &DataCallResult| call.resolution_source == Some(ResolutionSource::Model);
+        let calls = result
+            .data_calls
+            .iter()
+            .any(|call| is_model(call) && call.call_expression_span_start.is_none())
+            .then(|| crate::call_through::FileCalls::parse(path, content))
+            .flatten();
         let before = result.data_calls.len();
         result.data_calls.retain(|call| {
-            call.resolution_source != Some(ResolutionSource::Model)
-                || !call
-                    .call_expression_span_start
-                    .is_some_and(|start| silent.contains(&start))
+            if !is_model(call) {
+                return true;
+            }
+            let start = call
+                .call_expression_span_start
+                .or_else(|| calls.as_ref().and_then(|calls| calls.written_at(call)));
+            !start.is_some_and(|start| silent.contains(&start))
         });
         before - result.data_calls.len()
     }
@@ -7702,6 +8188,16 @@ impl FileOrchestrator {
         Some(format!("{method} {path}"))
     }
 
+    /// The callee the AST read at a candidate's span: the member invoked, or
+    /// the bare callee when the call is not a member call. This is the only
+    /// text a call row publishes as its client (carrick#2387).
+    fn callee_text(candidate: &CandidateTarget) -> String {
+        candidate
+            .callee_property
+            .clone()
+            .unwrap_or_else(|| candidate.callee_object.clone())
+    }
+
     /// The row shape every candidate-backed deterministic call shares.
     ///
     /// `pattern_matched` is the client the scanner saw, which is what the row
@@ -7722,10 +8218,7 @@ impl FileOrchestrator {
                 "http-client".to_string()
             }
             ResolutionSource::RequestSpec => candidate.callee_object.clone(),
-            _ => candidate
-                .callee_property
-                .clone()
-                .unwrap_or_else(|| candidate.callee_object.clone()),
+            _ => Self::callee_text(candidate),
         };
         DataCallResult {
             candidate_id: candidate.candidate_id.clone(),
@@ -7808,21 +8301,6 @@ impl FileOrchestrator {
         }
     }
 
-    /// The ts-morph position of an SWC span into `content`: file-relative, and
-    /// counted in UTF-16 code units rather than bytes (carrick#805, carrick#806).
-    /// Every span the sidecar is sent passes through here — the receiver-type
-    /// request below, and the type layer's span locator in
-    /// [`collect_type_requests`](Self::collect_type_requests), which the capture
-    /// anchors are built from in turn. See
-    /// [`resolve_receiver_roles`](Self::resolve_receiver_roles) for why the
-    /// conversion sits at the request and not at the candidate.
-    fn sidecar_position(content: &str, span: u32) -> u32 {
-        crate::utils::utf16_offset(
-            content,
-            span.saturating_sub(crate::swc_scanner::SWC_SPAN_BASE) as usize,
-        )
-    }
-
     /// Ask the type sidecar what the receiver of every bare
     /// `x.verb("/lit", arg)` site is, and map the answers onto roles
     /// (carrick#695).
@@ -7893,8 +8371,11 @@ impl FileOrchestrator {
                 requests.push(InferRequestItem {
                     file_path: path_str.to_string(),
                     line_number: u32::try_from(candidate.line_number).unwrap_or(1).max(1),
-                    span_start: Some(Self::sidecar_position(content, candidate.span_start)),
-                    span_end: Some(Self::sidecar_position(content, candidate.span_end)),
+                    span_start: Some(crate::utils::sidecar_position(
+                        content,
+                        candidate.span_start,
+                    )),
+                    span_end: Some(crate::utils::sidecar_position(content, candidate.span_end)),
                     expression_text: None,
                     expression_line: None,
                     infer_kind: InferKind::ReceiverType,
@@ -8044,11 +8525,16 @@ impl FileOrchestrator {
     /// is logged and discarded. A model row whose `candidate_id` joins no
     /// candidate keeps no span, exactly as before, and is placed by its line.
     /// A model row with no deterministic twin is kept as its own row.
+    ///
+    /// `path_literals` is what the file's source compares a path against
+    /// (carrick#2382). `None` states nothing: an endpoint whose id names no
+    /// listed site is then dropped and counted.
     #[allow(clippy::too_many_arguments)]
     fn join_model_rows(
         result: &mut FileAnalysisResult,
         model: FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
+        path_literals: Option<&RouteLiteralWitness>,
         overrules: &[Resolved],
         file_path: &str,
         route_module_claimed: bool,
@@ -8072,7 +8558,8 @@ impl FileOrchestrator {
         // A dispatch table is a fact about a HANDLER, not about a candidate:
         // there is no deterministic row for it to be joined onto and no
         // candidate id to drop it for. It travels through with the mounts.
-        result.dispatch_tables = dispatch_tables;
+        result.dispatch_tables =
+            Self::tables_with_a_body(dispatch_tables, &endpoints, &result.endpoints, file_path);
 
         // --- the producer side -------------------------------------------
 
@@ -8112,10 +8599,28 @@ impl FileOrchestrator {
         // row with no case that restates a route the model also states as
         // cases is then dropped whichever order the model answered in, rather
         // than taking the route before its cases reach it.
+        //
+        // A `body` case on a method that carries no request body is not a case
+        // (carrick#2110). GET and HEAD send none, so what the handler switched
+        // on was read off the URL, and a query parameter belongs to the path
+        // (`dispatch::DispatchLocation`). The row loses the case before
+        // anything is compared with it, and the readings of one route are
+        // folded into one row first, keeping only the anchors they all state
+        // (`fold_bodyless_cases`), so every path below sees one row.
+        let (endpoints, bodyless_cases_dropped) = Self::fold_bodyless_cases(endpoints);
         let (cases, plain): (Vec<EndpointResult>, Vec<EndpointResult>) = endpoints
             .into_iter()
             .partition(|endpoint| endpoint.dispatch.is_some());
+        if bodyless_cases_dropped > 0 {
+            debug!(
+                "Dropped the body case from {} model endpoint row(s) in {}: the method carries \
+                 no request body",
+                bodyless_cases_dropped, file_path
+            );
+        }
         for mut endpoint in cases.into_iter().chain(plain) {
+            // Kept only on a path literal the file compares (carrick#2382).
+            let mut on_a_path_literal = false;
             // The id the model echoed, and whether the site it names could be
             // the one this route is registered at. A route registration is a
             // call that states a route path, or — for a route whose
@@ -8202,10 +8707,31 @@ impl FileOrchestrator {
                         // at the model's own line with no span, the way an
                         // unjoinable data call is kept.
                         Some(_) => None,
+                        // The id names no listed site, but the file compares
+                        // a path against this route's own path, which is how
+                        // a service with no router states a route
+                        // (carrick#2382). The row is kept the way the arm
+                        // above keeps one, at its own line with no span. The
+                        // method stays the model's reading: a guard on the
+                        // method cannot be tied to one branch. A file the
+                        // scanner listed no candidate for was sent whole
+                        // (carrick#462) and keeps the drop.
+                        None if !candidate_map.is_empty()
+                            && path_literals
+                                .is_some_and(|literals| literals.states(&endpoint.path)) =>
+                        {
+                            on_a_path_literal = true;
+                            None
+                        }
                         None => {
                             dropped.push(format!(
                                 "{} {} (candidate_id '{}')",
                                 endpoint.method, endpoint.path, endpoint.candidate_id
+                            ));
+                            stats.model_endpoints_dropped_unanchored += 1;
+                            stats.model_endpoints_dropped_unanchored_sites.push(format!(
+                                "{file_path}:{} {} {}",
+                                endpoint.line_number, endpoint.method, endpoint.path
                             ));
                             continue;
                         }
@@ -8219,6 +8745,20 @@ impl FileOrchestrator {
                     endpoint.call_expression_span_start = Some(candidate.span_start);
                     endpoint.call_expression_span_end = Some(candidate.span_end);
                     Self::settle_registration_literal(&mut endpoint, candidate, file_path, stats);
+                }
+                None if on_a_path_literal => {
+                    debug!(
+                        "Keeping the model's {} {} in {} at its own line {} with no span: \
+                         the id it echoed ('{}') names no listed site, and the file compares \
+                         a path against this route's path",
+                        endpoint.method,
+                        endpoint.path,
+                        file_path,
+                        endpoint.line_number,
+                        endpoint.candidate_id
+                    );
+                    endpoint.call_expression_span_start = None;
+                    endpoint.call_expression_span_end = None;
                 }
                 None => {
                     debug!(
@@ -8421,7 +8961,12 @@ impl FileOrchestrator {
                     stats.model_endpoints_discarded_in_claimed_modules += 1;
                     continue;
                 }
-                None => stats.model_only_rows += 1,
+                None => {
+                    stats.model_only_rows += 1;
+                    if on_a_path_literal {
+                        stats.model_routes_kept_on_a_path_literal += 1;
+                    }
+                }
             }
             result.endpoints.push(endpoint);
         }
@@ -8482,11 +9027,20 @@ impl FileOrchestrator {
                     call.line_number = candidate.line_number as i32;
                     call.call_expression_span_start = Some(candidate.span_start);
                     call.call_expression_span_end = Some(candidate.span_end);
+                    // The client the row displays is the callee the AST read
+                    // at this span, never the model's `pattern_matched`: the
+                    // model fills that field by copying the framework
+                    // guidance's samples (carrick#2387).
+                    call.pattern_matched = Self::callee_text(candidate);
                 }
                 // Preserved without a span, as before: an inline alias still
                 // resolves, and the row is the only record of a site the
                 // scanner raised no candidate for (a wrapper delegation).
-                None => unjoined += 1,
+                // With no callee read there is no client to name.
+                None => {
+                    unjoined += 1;
+                    call.pattern_matched = String::new();
+                }
             }
             calls.push(Some(call));
         }
@@ -8567,10 +9121,16 @@ impl FileOrchestrator {
             .values()
             .filter(|candidate| candidate.protocol == Protocol::Http)
             .filter(|candidate| {
-                matches!(candidate.request_shape, RequestShapeSignal::Known(_))
-                    && Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
-                        .is_some_and(|literal| Self::is_route_shaped(&literal))
+                Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
+                    .is_some_and(|literal| Self::is_route_shaped(&literal))
                     && !Self::row_at_span(result, candidate.span_start)
+                    // A mount (`app.use("/api", router)`) the model answered
+                    // has no span; its line is the only thing it shares with
+                    // the candidate.
+                    && !result
+                        .mounts
+                        .iter()
+                        .any(|mount| mount.line_number == candidate.line_number as i32)
             })
             .collect();
         // `candidate_map` is a HashMap, so the sites are ordered here rather
@@ -8684,7 +9244,11 @@ impl FileOrchestrator {
         // Everything determinism does not state.
         deterministic.candidate_id = model.candidate_id;
         deterministic.call_kind = model.call_kind;
-        if !model.pattern_matched.trim().is_empty() {
+        // The client text is the callee the scanner read, which the row
+        // already carries; the model's reading (callee-derived by
+        // `join_model_rows`, or empty) only fills a row that has none
+        // (carrick#2387).
+        if deterministic.pattern_matched.trim().is_empty() {
             deterministic.pattern_matched = model.pattern_matched;
         }
         deterministic.call_expression_text = model.call_expression_text;
@@ -9013,6 +9577,145 @@ impl FileOrchestrator {
             type_import_source: anchors.type_import_source,
             ..route.clone()
         }
+    }
+
+    /// Whether a model row states a `body` dispatch case on a method that
+    /// carries no request body (carrick#2110). GET and HEAD are the two HTTP
+    /// defines that way, so the field such a handler switches on is read off
+    /// the URL. A `header` case is a case on any method.
+    fn states_a_body_case_without_a_body(endpoint: &EndpointResult) -> bool {
+        endpoint
+            .dispatch
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.location == crate::dispatch::DispatchLocation::Body)
+            && Self::carries_no_body(&endpoint.method)
+    }
+
+    /// Fold the rows that lost a `body` case on a method with no request body
+    /// (carrick#2110) into one row per route, by [`Self::model_row_key`]. Every
+    /// other row passes through untouched and in order; a folded row sits
+    /// where the first of its readings did. Returns how many rows lost a case.
+    ///
+    /// Each branch of such a handler answers its own response, and one row
+    /// carries one type. An anchor is kept only where every folded reading
+    /// states the same one (text and line together, since one text at two
+    /// lines is two expressions); otherwise the row states none and its
+    /// consumers are unverifiable rather than judged against one branch.
+    fn fold_bodyless_cases(endpoints: Vec<EndpointResult>) -> (Vec<EndpointResult>, usize) {
+        let mut out: Vec<EndpointResult> = Vec::with_capacity(endpoints.len());
+        let mut folded: HashMap<String, usize> = HashMap::new();
+        let mut cleared = 0usize;
+        for mut endpoint in endpoints {
+            if !Self::states_a_body_case_without_a_body(&endpoint) {
+                out.push(endpoint);
+                continue;
+            }
+            endpoint.dispatch = None;
+            cleared += 1;
+            match folded.entry(Self::model_row_key(&endpoint)) {
+                std::collections::hash_map::Entry::Occupied(at) => {
+                    Self::keep_agreeing_anchors(&mut out[*at.get()], &endpoint);
+                }
+                std::collections::hash_map::Entry::Vacant(at) => {
+                    at.insert(out.len());
+                    out.push(endpoint);
+                }
+            }
+        }
+        (out, cleared)
+    }
+
+    /// Keep each type anchor of `into` only where `other` states the very
+    /// same one; clear it otherwise, so a reading that states none, or a
+    /// different one, leaves the row stating none.
+    fn keep_agreeing_anchors(into: &mut EndpointResult, other: &EndpointResult) {
+        if (&into.payload_expression_text, into.payload_expression_line)
+            != (
+                &other.payload_expression_text,
+                other.payload_expression_line,
+            )
+        {
+            into.payload_expression_text = None;
+            into.payload_expression_line = None;
+        }
+        if (
+            &into.response_expression_text,
+            into.response_expression_line,
+        ) != (
+            &other.response_expression_text,
+            other.response_expression_line,
+        ) {
+            into.response_expression_text = None;
+            into.response_expression_line = None;
+        }
+        if into.emission_style != other.emission_style {
+            into.emission_style = None;
+        }
+        if (&into.primary_type_symbol, &into.type_import_source)
+            != (&other.primary_type_symbol, &other.type_import_source)
+        {
+            into.primary_type_symbol = None;
+            into.type_import_source = None;
+        }
+    }
+
+    /// The dispatch tables a file's answer states, less a `body` table whose
+    /// cases no call can send (carrick#2110). The switch reads the URL when
+    /// the rows that reach it all serve methods with no request body: either
+    /// the table's own handler serves only those, or every row that states a
+    /// body case on the table's field is on one (the switch may sit in a
+    /// helper the route handler calls, which states no row of its own).
+    /// Where no row of this file says either, the table is kept.
+    ///
+    /// The join cannot see which route calls a helper, so it proves this only
+    /// for the whole file: every route the file states, the model's rows and
+    /// the deterministic ones alike, is on GET or HEAD. One route on any
+    /// other method may reach the switch with a body, case stated or not, and
+    /// then every table is kept (fail closed).
+    fn tables_with_a_body(
+        tables: Vec<crate::dispatch::DispatchTable>,
+        model_rows: &[EndpointResult],
+        stated_rows: &[EndpointResult],
+        file_path: &str,
+    ) -> Vec<crate::dispatch::DispatchTable> {
+        let mut routes = model_rows.iter().chain(stated_rows).peekable();
+        let only_bodyless_routes =
+            routes.peek().is_some() && routes.all(|route| Self::carries_no_body(&route.method));
+        if !only_bodyless_routes {
+            return tables;
+        }
+        tables
+            .into_iter()
+            .filter(|table| {
+                if table.location != crate::dispatch::DispatchLocation::Body {
+                    return true;
+                }
+                // A row has to speak for the table: its handler serves a
+                // route here, or a row states a body case on its field.
+                let reached = model_rows.iter().any(|row| {
+                    table.handler_name.as_deref() == Some(row.handler_name.as_str())
+                        || row.dispatch.as_ref().is_some_and(|case| {
+                            case.location == crate::dispatch::DispatchLocation::Body
+                                && case.field == table.field
+                        })
+                });
+                if reached {
+                    debug!(
+                        "Dropped the body dispatch table on '{}' in {}: every route the file \
+                         states is on a method that carries no request body",
+                        table.field, file_path
+                    );
+                }
+                !reached
+            })
+            .collect()
+    }
+
+    /// GET and HEAD: the two HTTP methods that carry no request body.
+    fn carries_no_body(method: &str) -> bool {
+        ["GET", "HEAD"]
+            .iter()
+            .any(|bodyless| method.eq_ignore_ascii_case(bodyless))
     }
 
     /// Whether `endpoint` restates a row the join has already kept for this
@@ -9403,79 +10106,6 @@ impl FileOrchestrator {
         resolved
     }
 
-    /// Join each candidate's callee name onto the wrapper whose body issues
-    /// the request it reaches (carrick#872).
-    ///
-    /// The same rings, the same nearest-ring-decides rule and the same
-    /// receiver constraint as [`Self::resolve_imported_members`], over
-    /// [`crate::wrapper_dispatch`]'s index instead of the request members. The
-    /// two indexes answer different questions, so a site can resolve here and
-    /// not there: a client whose URL is an opaque field states no route for the
-    /// request-member join to assert, and still states the line its request is
-    /// written on.
-    ///
-    /// Nothing is counted or reported for a site that does not resolve. This
-    /// join adds no row and changes no target: all it can do is carry a value
-    /// the model already stated one file away, so a miss leaves the site
-    /// exactly where it is.
-    ///
-    /// The rings stop where the request-member rings stop: at the repo's
-    /// relative import graph. A client another WORKSPACE PACKAGE publishes is
-    /// imported by package name, which names no module here, so a site that
-    /// reaches its wrapper through a published surface carries nothing yet —
-    /// the half `resolve_package_surface_members` answers for targets has no
-    /// counterpart here.
-    fn resolve_dispatch_sites(
-        candidate_map: &HashMap<String, CandidateTarget>,
-        rings: Vec<Vec<(PathBuf, DispatchMemberIndex)>>,
-        import_owners: &HashMap<String, Option<PathBuf>>,
-    ) -> HashMap<u32, DispatchSite> {
-        let rings: Vec<_> = rings
-            .into_iter()
-            .map(fold_indexes_with_conflicts)
-            .filter(|(members, conflicting)| !members.is_empty() || !conflicting.is_empty())
-            .collect();
-        if rings.is_empty() {
-            return HashMap::new();
-        }
-        let mut resolved: HashMap<u32, DispatchSite> = HashMap::new();
-        for candidate in candidate_map.values() {
-            let name = Self::member_call_name(candidate);
-            let mut owned = None;
-            for (members, conflicting) in &rings {
-                if conflicting.contains(name) {
-                    break;
-                }
-                if let Some(member) = members.get(name) {
-                    owned = Some(member);
-                    break;
-                }
-            }
-            let Some(owned) = owned else {
-                continue;
-            };
-            // A receiver that is itself imported must have been imported from
-            // the member's own module; a parameter, a local or a `this` chain
-            // carries no such constraint. Identical to the request-member join,
-            // for the same reason: `list` and `get` are what every client calls
-            // its methods.
-            if let Some(receiver_source) = import_owners.get(&candidate.callee_object)
-                && receiver_source.as_ref() != Some(&owned.module)
-            {
-                continue;
-            }
-            resolved.insert(
-                candidate.span_start,
-                DispatchSite {
-                    name: name.to_string(),
-                    module: owned.module.clone(),
-                    request_line: owned.member.request_line,
-                },
-            );
-        }
-        resolved
-    }
-
     /// The member name a candidate call site names: its callee property
     /// (`client.createArtifactUrl`), or its callee object when the call is a
     /// bare identifier. The same name the join keys on, written once so the
@@ -9613,152 +10243,25 @@ impl FileOrchestrator {
         stamped
     }
 
-    /// Carry the dispatch value a wrapper's own request states onto the rows
-    /// emitted at the sites that call it (carrick#872).
-    ///
-    /// The value is read from the wrapper's own rows at the line
-    /// [`crate::wrapper_dispatch`] said the wrapper's single request sits on:
-    /// a request-summary row's, whose value its own body writes, in
-    /// preference to the model's, and the model's only where the wrapper's
-    /// file witnesses it. Rows there stating two different values carry
-    /// nothing, and so does a wrapper with no value at all, which is the right
-    /// answer for a wrapper that takes its action as a parameter and for a
-    /// plain route alike.
-    ///
-    /// Read every value BEFORE writing any of them, so a row stamped by this
-    /// pass can never be read as another site's wrapper. Stamps `dispatch` and
-    /// nothing else: no target, no method, no key. A site row whose value its
-    /// own file witnesses keeps it: a literal at the site is a stronger
-    /// statement than one a delegation away. A value nothing in the site's
-    /// file writes is the model's guess (carrick#2201), and the wrapper's
-    /// value replaces it.
-    fn carry_wrapper_dispatch(
-        file_results: &mut HashMap<String, FileAnalysisResult>,
-        sites: &HashMap<String, HashMap<u32, DispatchSite>>,
-        analysed: &HashMap<PathBuf, String>,
-        witnesses: &DispatchWitnesses,
-    ) -> CarriedDispatch {
-        // (consumer file, site span, the wrapper's value, the member's name).
-        // Sorted, because the debug line this writes is read against a scan
-        // that must not reorder itself between runs.
-        let mut stamps: Vec<(&String, u32, Dispatch, &String)> = Vec::new();
-        let mut consumers: Vec<(&String, &HashMap<u32, DispatchSite>)> = sites.iter().collect();
-        consumers.sort_by_key(|(path, _)| *path);
-        for (path, spans) in consumers {
-            let mut ordered: Vec<(&u32, &DispatchSite)> = spans.iter().collect();
-            ordered.sort_by_key(|(span, _)| **span);
-            for (span, site) in ordered {
-                let Some(home_path) = analysed.get(&site.module) else {
-                    continue;
-                };
-                let Some(home) = file_results.get(home_path) else {
-                    continue;
-                };
-                let Ok(line) = i32::try_from(site.request_line) else {
-                    continue;
-                };
-                // The wrapper's own rows for that request. A file whose model
-                // answer never came, or whose request line nothing states a
-                // value for, carries nothing.
-                let at_line: Vec<&DataCallResult> = home
-                    .data_calls
-                    .iter()
-                    .filter(|call| {
-                        (call.line_number == line || call.call_expression_line == Some(line))
-                            && call.dispatch.as_ref().is_some_and(|dispatch| {
-                                call.resolution_source == Some(ResolutionSource::RequestSummary)
-                                    || witnesses.witnessed(home_path, &dispatch.value)
-                            })
-                    })
-                    .collect();
-                let summarised = at_line
-                    .iter()
-                    .any(|call| call.resolution_source == Some(ResolutionSource::RequestSummary));
-                let mut values: Vec<&Dispatch> = Vec::new();
-                for value in at_line
-                    .iter()
-                    .filter(|call| {
-                        !summarised
-                            || call.resolution_source == Some(ResolutionSource::RequestSummary)
-                    })
-                    .filter_map(|call| call.dispatch.as_ref())
-                {
-                    if !values.contains(&value) {
-                        values.push(value);
-                    }
-                }
-                let [dispatch] = values.as_slice() else {
-                    continue;
-                };
-                stamps.push((path, *span, (*dispatch).clone(), &site.name));
-            }
-        }
-
-        let stamps: Vec<(String, u32, Dispatch, String)> = stamps
-            .into_iter()
-            .map(|(path, span, dispatch, name)| (path.clone(), span, dispatch, name.clone()))
-            .collect();
-        let mut carry = CarriedDispatch::default();
-        for (path, span, dispatch, name) in stamps {
-            let Some(result) = file_results.get_mut(&path) else {
-                continue;
-            };
-            for data_call in &mut result.data_calls {
-                // A row the summaries state carries only the value its own
-                // body writes (carrick#1564 review, finding 9); a wrapper's
-                // model value is not that.
-                if data_call.call_expression_span_start != Some(span)
-                    || data_call.resolution_source == Some(ResolutionSource::RequestSummary)
-                {
-                    continue;
-                }
-                let guessed = match &data_call.dispatch {
-                    Some(stated) if witnesses.witnessed(&path, &stated.value) => continue,
-                    Some(_) => true,
-                    None => false,
-                };
-                debug!(
-                    "Carrying dispatch {}={} from {} onto {}:{}",
-                    dispatch.field, dispatch.value, name, path, data_call.line_number
-                );
-                data_call.dispatch = Some(dispatch.clone());
-                carry.carried += 1;
-                if guessed {
-                    carry.over_guess += 1;
-                }
-                carry.sites.insert((path.clone(), span));
-            }
-        }
-        carry
-    }
-
     /// PHASE 5b's dispatch values, in the order they depend on each other
     /// (carrick#2201):
     ///
     /// 1. The summary rows settle: the value a call through a declaration
     ///    sends, from its own body, under the field the request line's row
-    ///    names (carrick#1555). A wrapper's request row is often one of them,
-    ///    so this runs first, or the carry finds no value at its line.
-    /// 2. The carry stamps the wrapper's value onto the sites that call it
-    ///    (carrick#872), over a site value its file does not witness.
-    /// 3. Every model value still unwitnessed is cleared.
-    fn settle_wrapper_dispatch(
+    ///    names (carrick#1555). A site that reaches a wrapper is one of them,
+    ///    so the wrapper's value reaches the site here.
+    /// 2. Every model value still unwitnessed is cleared.
+    fn settle_dispatch_values(
         file_results: &mut HashMap<String, FileAnalysisResult>,
-        sites: &HashMap<String, HashMap<u32, DispatchSite>>,
-        analysed: &HashMap<PathBuf, String>,
         witnesses: &DispatchWitnesses,
         stats: &mut ProcessingStats,
-    ) -> CarriedDispatch {
+    ) {
         stats.summary_dispatch_settled = Self::settle_reached_dispatch(file_results);
-        let carry = Self::carry_wrapper_dispatch(file_results, sites, analysed, witnesses);
-        stats.dispatch_carried_over_guess = carry.over_guess;
-        stats.dispatch_guesses_cleared =
-            Self::clear_unwitnessed_dispatch(file_results, witnesses, &carry.sites);
-        carry
+        stats.dispatch_guesses_cleared = Self::clear_unwitnessed_dispatch(file_results, witnesses);
     }
 
     /// Clear the dispatch value on every model row whose file does not
-    /// witness it and that the carry did not replace (carrick#2201).
+    /// witness it (carrick#2201).
     ///
     /// The model reads a dispatch value off a call, and where the call is a
     /// client method it makes one up from the method's name. A value the
@@ -9770,7 +10273,6 @@ impl FileOrchestrator {
     fn clear_unwitnessed_dispatch(
         file_results: &mut HashMap<String, FileAnalysisResult>,
         witnesses: &DispatchWitnesses,
-        carried: &HashSet<(String, u32)>,
     ) -> usize {
         let mut cleared = 0;
         for (path, result) in file_results.iter_mut() {
@@ -9781,11 +10283,7 @@ impl FileOrchestrator {
                 let Some(dispatch) = &call.dispatch else {
                     continue;
                 };
-                if call
-                    .call_expression_span_start
-                    .is_some_and(|span| carried.contains(&(path.clone(), span)))
-                    || witnesses.witnessed(path, &dispatch.value)
-                {
+                if witnesses.witnessed(path, &dispatch.value) {
                     continue;
                 }
                 debug!(
@@ -9910,9 +10408,13 @@ impl FileOrchestrator {
     /// `base` — the target, the method and the canonical key are untouched, so
     /// this cannot move a call into or out of an operation.
     ///
-    /// A row already carrying a base is left alone: nothing upstream sets one
-    /// today, and if something starts to, the pass that read the call site is
-    /// the better witness than this re-reading of its target.
+    /// A row the request summaries state carries the base they read from its
+    /// end ([`Self::summary_resolved`], carrick#2406), and it is read again
+    /// here only where a pass after the summaries rewrote the target's base
+    /// slot ([`Self::resolve_target_bases`]): the end describes the piece
+    /// the summary wrote, not the rewrite. Any other row already carrying a
+    /// base is left alone, because the pass that read the call site is the
+    /// better witness than this re-reading of its target.
     fn stamp_call_bases(
         result: &mut FileAnalysisResult,
         aliases: &EnvAliasMap,
@@ -9920,7 +10422,16 @@ impl FileOrchestrator {
         env_schema: &EnvSchemaIndex,
     ) {
         for data_call in &mut result.data_calls {
-            if data_call.base.is_some() {
+            if data_call.resolution_source == Some(ResolutionSource::RequestSummary) {
+                let stated = data_call.base.as_ref().map(|base| base.written.clone());
+                if stated == written_base(&data_call.target) {
+                    continue;
+                }
+                debug!(
+                    "A summary row's base slot was rewritten after the summaries: reading {} from its target",
+                    data_call.target
+                );
+            } else if data_call.base.is_some() {
                 continue;
             }
             data_call.base =
@@ -11482,8 +11993,18 @@ impl FileOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The warning for a file that cannot be asked says it in these words.
+    #[test]
+    fn a_file_too_large_reads_as_the_approved_sentence() {
+        let lost = FileTooLarge;
+        assert_eq!(
+            lost.to_string(),
+            "the file is too large for Carrick to analyse, even split into parts"
+        );
+    }
     use crate::agents::file_analyzer_agent::{DataCallResult, EndpointResult, MountResult};
-    use crate::dispatch::DispatchLocation;
+    use crate::dispatch::{Dispatch, DispatchLocation};
 
     /// carrick#1294: a named GraphQL resolver is followed to the module that
     /// declares it, and the span sent for it is measured in THAT module's
@@ -13496,6 +14017,7 @@ export * from "./aFetch.js";"#,
                 ..Default::default()
             },
             &HashMap::new(),
+            None,
             &[],
             "src/client.ts",
             false,
@@ -13594,6 +14116,75 @@ export * from "./aFetch.js";"#,
             result.data_calls[1].resolution_source,
             Some(ResolutionSource::Model)
         );
+    }
+
+    /// A guidance sample the model copies into `pattern_matched` byte for
+    /// byte, whatever the call is (carrick#2387).
+    const GUIDANCE_SAMPLE: &str = "fetch('https://api.example.com/users')";
+
+    /// The model answers with a guidance sample as its `pattern_matched`. A
+    /// row it states alone publishes the callee the AST read at the span, a
+    /// row at no candidate publishes no client, and a fact row keeps its own
+    /// pattern on the join. Putting the model's text back on any of the three
+    /// fails here.
+    #[test]
+    fn a_published_client_is_the_ast_callee_never_the_models_pattern() {
+        let candidate = candidate_with_snippet("c1", Some("/api/orders"));
+        let candidate_map = HashMap::from([("c1".to_string(), candidate)]);
+        let model_row = |id: &str, target: &str, span: u32| DataCallResult {
+            candidate_id: id.to_string(),
+            pattern_matched: GUIDANCE_SAMPLE.to_string(),
+            ..model_call("GET", target, span, "Order")
+        };
+        let mut fact = stated_call("POST", "/api/links", 500);
+        fact.pattern_matched = "links.create(".to_string();
+        let mut result = FileAnalysisResult {
+            data_calls: vec![fact],
+            ..Default::default()
+        };
+        let mut stats = ProcessingStats::default();
+        FileOrchestrator::join_model_rows(
+            &mut result,
+            FileAnalysisResult {
+                data_calls: vec![
+                    // Joins the candidate: the site's callee is `get`.
+                    model_row("c1", "/api/orders", 0),
+                    // Joins no candidate: no callee was read.
+                    model_row("span:900-940", "/api/orphans", 900),
+                    // Twin of the fact row at span 500.
+                    DataCallResult {
+                        method: Some("POST".to_string()),
+                        ..model_row("span:500-540", "/api/links", 500)
+                    },
+                ],
+                ..Default::default()
+            },
+            &candidate_map,
+            None,
+            &[],
+            "src/client.ts",
+            false,
+            &mut stats,
+        );
+
+        let graph = FileOrchestrator::new(AgentService::new()).build_mount_graph(
+            &HashMap::from([("src/client.ts".to_string(), result)]),
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let client = |path: &str| {
+            graph
+                .data_calls
+                .iter()
+                .find(|call| call.target_url == path)
+                .unwrap_or_else(|| panic!("no row for {path}"))
+                .client
+                .clone()
+        };
+        assert_eq!(client("/api/orders"), "get");
+        assert_eq!(client("/api/orphans"), "");
+        assert_eq!(client("/api/links"), "links.create(");
     }
 
     /// A data call with no method at all — what extraction emits for a site
@@ -15231,11 +15822,14 @@ export * from "./aFetch.js";"#,
             call_body: at_caller.then_some(crate::forwarded_body::CallBody::Built),
             library_semantics: Vec::new(),
             base_fallbacks: None,
+            request_at: (std::path::PathBuf::from("src/availability.ts"), 40),
+            base_end: None,
         };
         for at_caller in [true, false] {
             let resolved = FileOrchestrator::summary_resolved(
                 &summary(at_caller),
                 None,
+                Some(&EnvFallbackMap::new()),
                 &EnvSchemaIndex::default(),
             );
             let ResolvedRow::Call(call) = resolved.row else {
@@ -18098,6 +18692,59 @@ export { routes };
         assert_eq!(stats.unemitted_literal_candidates, 0);
     }
 
+    /// carrick-cloud#2373: the sites of an unreadable same-module request
+    /// helper reach the model as candidates, so a site it leaves out is
+    /// counted and named instead of vanishing with every counter at 0.
+    #[test]
+    fn an_unanswered_site_of_a_request_helper_is_counted() {
+        let content = include_str!("../../tests/fixtures/unawaited-request-helper/client.ts");
+        let scanned = SwcScanner::new().scan_content(
+            std::path::Path::new("src/client.ts"),
+            content,
+            &[],
+            &[],
+        );
+        let candidates: HashMap<String, CandidateTarget> = scanned
+            .candidates
+            .into_iter()
+            .map(|candidate| (candidate.candidate_id.clone(), candidate))
+            .collect();
+        let line = |needle: &str| {
+            content
+                .lines()
+                .position(|l| l.contains(needle))
+                .map(|i| i + 1)
+                .expect("the fixture holds the site")
+        };
+
+        let (_, stats) = emit_and_join_with_receivers(
+            FileAnalysisResult::default(),
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/client.ts",
+            false,
+            &HashMap::new(),
+        );
+
+        let named = |needle: &str| format!("src/client.ts:{}", line(needle));
+        for needle in ["list: (o", "search: (q"] {
+            assert!(
+                stats.unemitted_literal_sites.contains(&named(needle)),
+                "`{needle}` must be counted: {:?}",
+                stats.unemitted_literal_sites
+            );
+        }
+        assert_eq!(
+            stats.unemitted_literal_candidates, 4,
+            "`list`, `search`, `create` and `track`'s fetch; `get` and `remove` write an interpolated template, which this count never read: {:?}",
+            stats.unemitted_literal_sites
+        );
+    }
+
     #[test]
     fn an_unclassified_receiver_leaves_the_site_exactly_as_it_was() {
         let candidates = bare_literal_map("thing", "/widgets");
@@ -18261,6 +18908,35 @@ export { routes };
             file_path,
             false,
             &HashMap::new(),
+            None,
+        )
+    }
+
+    /// The same seam with the source a file's path literals are read from
+    /// (carrick#2382).
+    fn emit_and_join_with_source(
+        model: FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+        route_endpoints: &[EndpointResult],
+        source: &str,
+        file_path: &str,
+        route_module_claimed: bool,
+    ) -> (FileAnalysisResult, ProcessingStats) {
+        let path_literals =
+            RouteLiteralWitness::of_source(file_path, source).expect("the source parses");
+        emit_and_join_core(
+            model,
+            candidate_map,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &LiteralBaseMap::new(),
+            route_endpoints,
+            file_path,
+            route_module_claimed,
+            &HashMap::new(),
+            Some(&path_literals),
         )
     }
 
@@ -18290,6 +18966,7 @@ export { routes };
             file_path,
             route_module_claimed,
             receiver_roles,
+            None,
         )
     }
 
@@ -18308,6 +18985,7 @@ export { routes };
         file_path: &str,
         route_module_claimed: bool,
         receiver_roles: &HashMap<u32, ReceiverRole>,
+        path_literals: Option<&RouteLiteralWitness>,
     ) -> (FileAnalysisResult, ProcessingStats) {
         let mut stats = ProcessingStats::default();
         let resolved = FileOrchestrator::resolve_candidates(
@@ -18324,6 +19002,7 @@ export { routes };
             receiver_roles,
             &BTreeMap::new(),
             &EnvSchemaIndex::default(),
+            true,
         );
         let mut result = FileAnalysisResult::default();
         let overrules = FileOrchestrator::emit_resolved_rows(
@@ -18335,6 +19014,7 @@ export { routes };
             &mut result,
             model,
             candidate_map,
+            path_literals,
             &overrules,
             file_path,
             route_module_claimed,
@@ -18412,6 +19092,256 @@ export { routes };
         // route's own payload, so it carries the type anchor.
         assert_eq!(result.endpoints[0].candidate_id, "happy");
         assert_eq!(stats.model_only_rows, 1);
+    }
+
+    /// A GET carries no request body, so a `body` case on one is not a case
+    /// (carrick#2110): two values a handler reads off the query string are one
+    /// route stated twice, folded into one row. Each branch answers its own
+    /// response and one row carries one type, so the row keeps a response
+    /// only where every branch states the same one: two different responses,
+    /// or one stated beside one not, leave it stating none (unverifiable),
+    /// never the first branch's. A `header` case on the same method, and a
+    /// `body` case on a method that carries one, stay cases. A route a method
+    /// with a body states twice keeps the first row as it was: the fold's
+    /// anchor rule is the bodyless fold's alone.
+    #[test]
+    fn a_body_case_on_a_method_with_no_body_is_dropped_and_the_rows_are_one() {
+        let case = |location: crate::dispatch::DispatchLocation, value: &str| {
+            Some(crate::dispatch::Dispatch {
+                location,
+                field: "mode".to_string(),
+                value: value.to_string(),
+            })
+        };
+        let (body, header) = (
+            crate::dispatch::DispatchLocation::Body,
+            crate::dispatch::DispatchLocation::Header,
+        );
+        let mut candidates = HashMap::new();
+        let mut rows = Vec::new();
+        let one_reading = [("simple", None), ("advanced", Some("report"))];
+        for (line, method, path, location, readings) in [
+            (
+                10i32,
+                "GET",
+                "/reports/:id",
+                Some(body),
+                [("simple", Some("summary")), ("advanced", Some("report"))],
+            ),
+            (20, "head", "/reports/:id", Some(body), one_reading),
+            (
+                25,
+                "GET",
+                "/totals",
+                Some(body),
+                [("simple", Some("totals")), ("advanced", Some("totals"))],
+            ),
+            (30, "GET", "/feed", Some(header), one_reading),
+            (40, "POST", "/reports", Some(body), one_reading),
+            (50, "POST", "/orders", None, one_reading),
+        ] {
+            let id = format!("site{line}");
+            let mut candidate = candidate_with_snippet(&id, Some(&format!("'{path}'")));
+            candidate.span_start = line as u32 * 10;
+            candidate.span_end = line as u32 * 10 + 5;
+            candidate.line_number = line as usize;
+            candidate.end_line = line as usize;
+            candidate.callee_object = "app".to_string();
+            candidate.callee_property = Some(method.to_ascii_lowercase());
+            candidates.insert(id.clone(), candidate);
+            for (value, response) in readings {
+                rows.push(EndpointResult {
+                    handler_declaration_line: None,
+                    registration_literal: None,
+                    view_module: false,
+                    candidate_id: id.clone(),
+                    line_number: line,
+                    owner_node: "app".to_string(),
+                    method: method.to_string(),
+                    path: path.to_string(),
+                    handler_name: "<anonymous>".to_string(),
+                    pattern_matched: "app.".to_string(),
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: response.map(str::to_string),
+                    response_expression_line: response.map(|_| line),
+                    emission_style: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                    resolution_source: None,
+                    dispatch: location.and_then(|location| case(location, value)),
+                });
+            }
+        }
+
+        let (result, _) = emit_and_join(
+            FileAnalysisResult {
+                endpoints: rows,
+                ..Default::default()
+            },
+            &candidates,
+            "src/reports.ts",
+        );
+
+        let mut kept: Vec<(i32, Option<String>, Option<&str>)> = result
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.line_number,
+                    endpoint.dispatch.as_ref().map(|case| case.key()),
+                    endpoint.response_expression_text.as_deref(),
+                )
+            })
+            .collect();
+        kept.sort();
+        let key = |location, value: &str| case(location, value).map(|case| case.key());
+        assert_eq!(
+            kept,
+            vec![
+                (10, None, None),
+                (20, None, None),
+                (25, None, Some("totals")),
+                (30, key(header, "advanced"), Some("report")),
+                (30, key(header, "simple"), None),
+                (40, key(body, "advanced"), Some("report")),
+                (40, key(body, "simple"), None),
+                (50, None, None),
+            ],
+        );
+    }
+
+    /// A `body` dispatch table whose cases no call can send (carrick#2110) is
+    /// not carried, and that is proven only when every route the file states
+    /// is GET or HEAD. One POST in the file, stated by the model with no case
+    /// or by the file layout, may call the same helper with a body, so every
+    /// table stays. A `header` table, and a body table no row speaks for,
+    /// always stay.
+    #[test]
+    fn a_body_dispatch_table_on_a_handler_with_no_body_is_dropped() {
+        let row = |method: &str, handler: &str, case: Option<&str>| EndpointResult {
+            handler_declaration_line: None,
+            registration_literal: None,
+            view_module: false,
+            candidate_id: format!("{method}-{handler}"),
+            line_number: 1,
+            owner_node: String::new(),
+            method: method.to_string(),
+            path: format!("/{handler}"),
+            handler_name: handler.to_string(),
+            pattern_matched: String::new(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            resolution_source: None,
+            dispatch: case.map(|field| crate::dispatch::Dispatch {
+                location: DispatchLocation::Body,
+                field: field.to_string(),
+                value: "a".to_string(),
+            }),
+        };
+        let table = |location: DispatchLocation, handler: Option<&str>, field: &str| {
+            crate::dispatch::DispatchTable {
+                location,
+                field: field.to_string(),
+                values: vec!["a".to_string(), "b".to_string()],
+                handler_name: handler.map(str::to_string),
+                file_path: String::new(),
+                line_number: None,
+                service_name: None,
+                repo_name: None,
+            }
+        };
+        // Each file: its model rows, its deterministic rows, and the tables
+        // that must survive (by handler and field) out of the three offered.
+        let offered = || {
+            vec![
+                table(DispatchLocation::Body, Some("reads"), "view"),
+                table(DispatchLocation::Header, Some("reads"), "view"),
+                table(DispatchLocation::Body, Some("helper"), "mode"),
+                table(DispatchLocation::Body, Some("elsewhere"), "other"),
+            ]
+        };
+        let every = [
+            (DispatchLocation::Body, "reads", "view"),
+            (DispatchLocation::Header, "reads", "view"),
+            (DispatchLocation::Body, "helper", "mode"),
+            (DispatchLocation::Body, "elsewhere", "other"),
+        ];
+        let header_and_unspoken = [
+            (DispatchLocation::Header, "reads", "view"),
+            (DispatchLocation::Body, "elsewhere", "other"),
+        ];
+        let files: Vec<(&str, Vec<EndpointResult>, Vec<EndpointResult>, &[_])> = vec![
+            // Every route is GET or HEAD: the handler's table and the
+            // helper's table (linked by the body case on `mode`) go.
+            (
+                "only GET and HEAD",
+                vec![
+                    row("GET", "reads", None),
+                    row("HEAD", "reads", None),
+                    row("GET", "anonymous", Some("mode")),
+                    row("GET", "anonymous", Some("mode")),
+                ],
+                vec![],
+                &header_and_unspoken,
+            ),
+            // A POST in the same file may call the helper, with no case
+            // stated: nothing proves the switch is GET-only.
+            (
+                "a POST with no case",
+                vec![
+                    row("GET", "reads", None),
+                    row("GET", "anonymous", Some("mode")),
+                    row("POST", "submit", None),
+                ],
+                vec![],
+                &every,
+            ),
+            // The POST is stated by the file layout, not by the model.
+            (
+                "a deterministic POST",
+                vec![
+                    row("GET", "reads", None),
+                    row("GET", "anonymous", Some("mode")),
+                ],
+                vec![row("POST", "POST", None)],
+                &every,
+            ),
+        ];
+        for (label, model_rows, stated_rows, survive) in files {
+            let kept: Vec<(DispatchLocation, String, String)> =
+                FileOrchestrator::tables_with_a_body(
+                    offered(),
+                    &model_rows,
+                    &stated_rows,
+                    "src/reports.ts",
+                )
+                .into_iter()
+                .map(|table| {
+                    (
+                        table.location,
+                        table.handler_name.unwrap_or_default(),
+                        table.field,
+                    )
+                })
+                .collect();
+            let survive: Vec<(DispatchLocation, String, String)> = survive
+                .iter()
+                .map(|(location, handler, field)| {
+                    (*location, handler.to_string(), field.to_string())
+                })
+                .collect();
+            assert_eq!(kept, survive, "{label}");
+        }
     }
 
     /// Two routers declared in one file and mounted at different prefixes
@@ -18800,17 +19730,237 @@ export { routes };
         };
         let mut candidate_map = HashMap::new();
         candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
-        let (result, _) = emit_and_join(result, &candidate_map, "src/app.ts");
+        let (result, stats) = emit_and_join(result, &candidate_map, "src/app.ts");
         assert_eq!(result.endpoints.len(), 1);
         assert_eq!(result.endpoints[0].path, "/known");
+        // carrick#2382: the drop is counted and named, not only logged.
+        assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
+        assert_eq!(
+            stats.model_endpoints_dropped_unanchored_sites,
+            vec!["src/app.ts:12 GET /invented".to_string()]
+        );
 
         // Route 2: force-analyzed, no candidates offered at all.
         let forced = FileAnalysisResult {
             endpoints: vec![endpoint_with_candidate("/a", "c1")],
             ..Default::default()
         };
-        let (forced, _) = emit_and_join(forced, &HashMap::new(), "src/forced.ts");
+        let (forced, stats) = emit_and_join(forced, &HashMap::new(), "src/forced.ts");
         assert!(forced.endpoints.is_empty());
+        assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
+    }
+
+    // --- carrick#2382: a made-up id kept on a path literal the file compares -
+
+    /// One listed candidate that states no route path: a call the handler
+    /// makes, so no route row can anchor on it.
+    fn one_listed_call() -> HashMap<String, CandidateTarget> {
+        HashMap::from([("c1".to_string(), candidate_with_snippet("c1", None))])
+    }
+
+    /// A model route at line 3 with an id that names no listed site.
+    fn route_with_a_made_up_id(method: &str, path: &str) -> EndpointResult {
+        let mut row = endpoint_with_candidate(path, "endpoint:made-up");
+        row.method = method.to_string();
+        row.line_number = 3;
+        row
+    }
+
+    fn join_on_source(
+        rows: Vec<EndpointResult>,
+        candidates: &HashMap<String, CandidateTarget>,
+        source: &str,
+    ) -> (FileAnalysisResult, ProcessingStats) {
+        emit_and_join_with_source(
+            FileAnalysisResult {
+                endpoints: rows,
+                ..Default::default()
+            },
+            candidates,
+            &[],
+            source,
+            "src/worker.ts",
+            false,
+        )
+    }
+
+    /// Each comparison form the language writes a route with keeps the row,
+    /// at the model's own line with no span, as the listed-id arm keeps one.
+    #[test]
+    fn a_made_up_id_route_is_kept_when_the_file_compares_a_path_against_it() {
+        for (source, method, path) in [
+            ("if (pathname === \"/items\") {}", "GET", "/items"),
+            (
+                "switch (pathname) { case \"/health\": break; }",
+                "GET",
+                "/health",
+            ),
+            (
+                "if (pathname.startsWith(\"/items/\")) {}",
+                "DELETE",
+                "/items/:id",
+            ),
+            (
+                "if (pathname.startsWith(ITEM_PREFIX)) {}\nconst ITEM_PREFIX = \"/items/\";",
+                "DELETE",
+                "/items/:id",
+            ),
+            ("if (pathname === `/items`) {}", "POST", "/items"),
+        ] {
+            let (result, stats) = join_on_source(
+                vec![route_with_a_made_up_id(method, path)],
+                &one_listed_call(),
+                source,
+            );
+            assert_eq!(result.endpoints.len(), 1, "{source}");
+            let row = &result.endpoints[0];
+            assert_eq!((row.method.as_str(), row.path.as_str()), (method, path));
+            assert_eq!(row.line_number, 3, "the model's own line: {source}");
+            assert_eq!(row.call_expression_span_start, None, "{source}");
+            assert_eq!(row.call_expression_span_end, None, "{source}");
+            assert_eq!(row.resolution_source, Some(ResolutionSource::Model));
+            assert_eq!(stats.model_routes_kept_on_a_path_literal, 1, "{source}");
+            assert_eq!(stats.model_only_rows, 1, "{source}");
+            assert_eq!(stats.model_routes_kept_without_a_site, 0, "{source}");
+            assert_eq!(stats.model_endpoints_dropped_unanchored, 0, "{source}");
+        }
+    }
+
+    /// A path the file states nowhere in a dispatch position is no witness,
+    /// so the row is dropped and counted as before.
+    #[test]
+    fn a_made_up_id_route_with_no_compared_path_literal_is_dropped_and_counted() {
+        for (source, path) in [
+            ("export default {};", "/items"),
+            ("await fetch(\"/items\", { method: \"POST\" });", "/items"),
+            ("const routes = { \"/items\": list };", "/items"),
+            ("if (pathname === \"/items/\") {}", "/items/:id"),
+            ("if (pathname.startsWith(\"/\")) {}", "/:id"),
+            ("if (pathname === \"/:id\") {}", "/:id"),
+            (
+                "const P = \"/items\";\nfunction f(P) { return pathname === P; }",
+                "/items",
+            ),
+        ] {
+            let (result, stats) = join_on_source(
+                vec![route_with_a_made_up_id("GET", path)],
+                &one_listed_call(),
+                source,
+            );
+            assert!(result.endpoints.is_empty(), "{source}");
+            assert_eq!(stats.model_endpoints_dropped_unanchored, 1, "{source}");
+            assert_eq!(
+                stats.model_endpoints_dropped_unanchored_sites,
+                vec![format!("src/worker.ts:3 GET {path}")],
+                "{source}"
+            );
+            assert_eq!(stats.model_routes_kept_on_a_path_literal, 0, "{source}");
+        }
+    }
+
+    /// A force-analyzed file offered no candidate (carrick#462), so a witness
+    /// does not keep its rows: the drop and its count stay.
+    #[test]
+    fn a_force_analyzed_file_keeps_the_drop_whatever_its_source_compares() {
+        let (result, stats) = join_on_source(
+            vec![route_with_a_made_up_id("GET", "/items")],
+            &HashMap::new(),
+            "if (pathname === \"/items\") {}",
+        );
+        assert!(result.endpoints.is_empty());
+        assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
+        assert_eq!(stats.model_routes_kept_on_a_path_literal, 0);
+    }
+
+    /// In a module a routing convention claimed, the witness never admits a
+    /// row the convention's route set excludes (carrick#703): the row is
+    /// discarded there and counted as a claimed-module discard, not a drop.
+    #[test]
+    fn a_witnessed_made_up_id_route_in_a_claimed_module_is_discarded_by_the_convention() {
+        let derived = synthetic_endpoint("GET", "/settings/builds");
+        let (result, stats) = emit_and_join_with_source(
+            FileAnalysisResult {
+                endpoints: vec![route_with_a_made_up_id("POST", "/api/build-settings")],
+                ..Default::default()
+            },
+            &one_listed_call(),
+            std::slice::from_ref(&derived),
+            "if (pathname === \"/api/build-settings\") {}",
+            "app/routes/settings.builds.tsx",
+            true,
+        );
+        assert_eq!(result.endpoints.len(), 1, "{:?}", result.endpoints);
+        assert_eq!(result.endpoints[0].path, "/settings/builds");
+        assert_eq!(stats.model_endpoints_discarded_in_claimed_modules, 1);
+        assert_eq!(stats.model_endpoints_dropped_unanchored, 0);
+        assert_eq!(stats.model_routes_kept_on_a_path_literal, 0);
+        assert_eq!(stats.model_only_rows, 0);
+    }
+
+    /// A case of a body-dispatching handler with a made-up id is kept as a
+    /// model case row, the way the listed-id arm keeps one (carrick#2048).
+    #[test]
+    fn a_witnessed_made_up_id_case_is_kept_as_a_model_case_row() {
+        let mut case = route_with_a_made_up_id("PATCH", "/things");
+        case.dispatch = Some(crate::dispatch::Dispatch {
+            location: crate::dispatch::DispatchLocation::Body,
+            field: "action".to_string(),
+            value: "archive".to_string(),
+        });
+        let (result, stats) = join_on_source(
+            vec![case],
+            &one_listed_call(),
+            "if (url.pathname === \"/things\") {}",
+        );
+        assert_eq!(result.endpoints.len(), 1);
+        let row = &result.endpoints[0];
+        assert_eq!(row.resolution_source, Some(ResolutionSource::Model));
+        assert_eq!(
+            row.dispatch.as_ref().map(|d| d.value.as_str()),
+            Some("archive")
+        );
+        assert_eq!(row.call_expression_span_start, None);
+        assert_eq!(stats.model_routes_kept_on_a_path_literal, 1);
+    }
+
+    /// carrick#2382: a candidate that holds a route literal and states no
+    /// readable verb (a redirect, a bare call) is a gap the same as a verb
+    /// call is. A mount the model answered on its line is not a gap.
+    #[test]
+    fn a_route_literal_candidate_without_a_readable_verb_is_counted_unless_a_mount_answers_it() {
+        use crate::wrapper_request_shape::RequestShapeSignal;
+        for shape in [
+            RequestShapeSignal::NotARequest,
+            RequestShapeSignal::Unreadable,
+        ] {
+            let mut candidate = candidate_with_snippet("c1", Some("\"/login\""));
+            candidate.request_shape = shape;
+            let candidates = HashMap::from([("c1".to_string(), candidate)]);
+            let (_, stats) = emit_and_join(FileAnalysisResult::default(), &candidates, "src/a.ts");
+            assert_eq!(stats.unemitted_literal_candidates, 1);
+            assert_eq!(
+                stats.unemitted_literal_sites,
+                vec!["src/a.ts:12".to_string()]
+            );
+        }
+
+        let candidates = HashMap::from([(
+            "c1".to_string(),
+            candidate_with_snippet("c1", Some("\"/api\"")),
+        )]);
+        let mounted = FileAnalysisResult {
+            mounts: vec![crate::agents::file_analyzer_agent::MountResult {
+                line_number: 12,
+                parent_node: "app".to_string(),
+                child_node: "router".to_string(),
+                mount_path: "/api".to_string(),
+                import_source: None,
+                pattern_matched: "app.use".to_string(),
+            }],
+            ..Default::default()
+        };
+        let (_, stats) = emit_and_join(mounted, &candidates, "src/a.ts");
+        assert_eq!(stats.unemitted_literal_candidates, 0);
     }
 
     fn request_spec_candidate(id: &str, method: &str, url: &str) -> CandidateTarget {
@@ -19783,8 +20933,8 @@ export { routes };
         );
     }
 
-    /// The literal witnesses each named file states, for the dispatch carry
-    /// and clear (carrick#2201).
+    /// The literal witnesses each named file states, for the dispatch clear
+    /// (carrick#2201).
     fn witnesses(files: &[(&str, &[&str])]) -> DispatchWitnesses {
         DispatchWitnesses(
             files
@@ -19810,30 +20960,6 @@ export { routes };
         })
     }
 
-    /// `consumer.ts` calls the wrapper at span 100, whose single request is
-    /// line 19 of `client.ts`.
-    fn carry_into_consumer(
-        file_results: &mut HashMap<String, FileAnalysisResult>,
-        witnesses: &DispatchWitnesses,
-    ) -> CarriedDispatch {
-        FileOrchestrator::carry_wrapper_dispatch(
-            file_results,
-            &HashMap::from([(
-                "consumer.ts".to_string(),
-                HashMap::from([(
-                    100,
-                    DispatchSite {
-                        name: "searchByIntent".to_string(),
-                        module: PathBuf::from("/repo/client.ts"),
-                        request_line: 19,
-                    },
-                )]),
-            )]),
-            &HashMap::from([(PathBuf::from("/repo/client.ts"), "client.ts".to_string())]),
-            witnesses,
-        )
-    }
-
     /// A wrapper file whose request line holds `rows`, and a consumer whose
     /// site row states `site`.
     fn wrapper_and_site(
@@ -19855,162 +20981,11 @@ export { routes };
         ])
     }
 
-    fn wrapper_row(value: &str, source: ResolutionSource) -> DataCallResult {
-        let mut row = call_with_span(19, "${this.gatewayUrl}", Some(400));
-        row.dispatch = action(value);
-        row.resolution_source = Some(source);
-        row
-    }
-
     fn site_value(file_results: &HashMap<String, FileAnalysisResult>) -> Option<&str> {
         file_results["consumer.ts"].data_calls[0]
             .dispatch
             .as_ref()
             .map(|d| d.value.as_str())
-    }
-
-    /// carrick#872: the value the wrapper's own request states reaches the row
-    /// at the site that calls the wrapper, and nothing else on that row moves.
-    #[test]
-    fn carry_wrapper_dispatch_stamps_the_site_row_from_the_wrapper_s_row() {
-        let mut file_results = wrapper_and_site(
-            vec![wrapper_row("search-by-intent", ResolutionSource::Model)],
-            None,
-        );
-
-        let carry = carry_into_consumer(
-            &mut file_results,
-            &witnesses(&[("client.ts", &["search-by-intent"]), ("consumer.ts", &[])]),
-        );
-
-        assert_eq!((carry.carried, carry.over_guess), (1, 0));
-        assert_eq!(site_value(&file_results), Some("search-by-intent"));
-        assert_eq!(
-            file_results["consumer.ts"].data_calls[0].target, "/rpc/gateway",
-            "the carry states a value, never a target"
-        );
-    }
-
-    /// A wrapper whose own request states no value — a plain route, or one
-    /// whose action is a parameter — carries nothing, and the site is left
-    /// exactly where it was.
-    #[test]
-    fn carry_wrapper_dispatch_carries_nothing_from_a_wrapper_with_no_value() {
-        let mut row = call_with_span(19, "${this.gatewayUrl}", Some(400));
-        row.resolution_source = Some(ResolutionSource::Model);
-        let mut file_results = wrapper_and_site(vec![row], None);
-
-        let carry = carry_into_consumer(&mut file_results, &witnesses(&[]));
-
-        assert_eq!(carry.carried, 0);
-        assert_eq!(site_value(&file_results), None);
-    }
-
-    /// A row the request summaries state carries only the value its own body
-    /// writes, so a wrapper's model value is never carried onto it, even where
-    /// it states none (carrick#1564 review, finding 9).
-    #[test]
-    fn carry_wrapper_dispatch_leaves_a_row_the_source_states() {
-        let mut file_results = wrapper_and_site(
-            vec![wrapper_row("findSimilar", ResolutionSource::Model)],
-            None,
-        );
-        file_results.get_mut("consumer.ts").unwrap().data_calls[0].resolution_source =
-            Some(ResolutionSource::RequestSummary);
-
-        let carry = carry_into_consumer(
-            &mut file_results,
-            &witnesses(&[("client.ts", &["findSimilar"])]),
-        );
-
-        assert_eq!(carry.carried, 0);
-        assert_eq!(site_value(&file_results), None);
-    }
-
-    /// A site whose own file writes its value keeps it: a literal at the site
-    /// is a stronger statement than one a delegation away.
-    #[test]
-    fn carry_wrapper_dispatch_keeps_a_witnessed_site_value() {
-        let mut file_results = wrapper_and_site(
-            vec![wrapper_row("search-by-intent", ResolutionSource::Model)],
-            action("list-external-calls"),
-        );
-
-        let carry = carry_into_consumer(
-            &mut file_results,
-            &witnesses(&[
-                ("client.ts", &["search-by-intent"]),
-                ("consumer.ts", &["list-external-calls"]),
-            ]),
-        );
-
-        assert_eq!(carry.carried, 0);
-        assert_eq!(site_value(&file_results), Some("list-external-calls"));
-    }
-
-    /// carrick#2201: a site value no literal in the site's file writes is the
-    /// model's guess from the method name, and the wrapper's value replaces it.
-    #[test]
-    fn carry_wrapper_dispatch_replaces_an_unwitnessed_site_value() {
-        let mut file_results = wrapper_and_site(
-            vec![wrapper_row("search-by-intent", ResolutionSource::Model)],
-            action("searchByIntent"),
-        );
-
-        let carry = carry_into_consumer(
-            &mut file_results,
-            &witnesses(&[("client.ts", &["search-by-intent"]), ("consumer.ts", &[])]),
-        );
-
-        assert_eq!((carry.carried, carry.over_guess), (1, 1));
-        assert_eq!(site_value(&file_results), Some("search-by-intent"));
-        assert!(
-            carry.sites.contains(&("consumer.ts".to_string(), 100)),
-            "the clear must not undo the carried value"
-        );
-    }
-
-    /// carrick#2201: at the wrapper's request line, the request summary's
-    /// value (its own body's) is carried in preference to the model's.
-    #[test]
-    fn carry_wrapper_dispatch_prefers_the_request_summary_row() {
-        let mut file_results = wrapper_and_site(
-            vec![
-                wrapper_row("get-everything", ResolutionSource::Model),
-                wrapper_row("get-cross-repo-data", ResolutionSource::RequestSummary),
-            ],
-            None,
-        );
-
-        let carry = carry_into_consumer(
-            &mut file_results,
-            &witnesses(&[("client.ts", &["get-everything", "get-cross-repo-data"])]),
-        );
-
-        assert_eq!(carry.carried, 1);
-        assert_eq!(site_value(&file_results), Some("get-cross-repo-data"));
-    }
-
-    /// carrick#2201: rows at the wrapper's request line that state two
-    /// different values leave the wrapper's value unknown, so nothing is
-    /// carried.
-    #[test]
-    fn carry_wrapper_dispatch_carries_nothing_from_two_values() {
-        let mut file_results = wrapper_and_site(
-            vec![
-                wrapper_row("refresh-index", ResolutionSource::Model),
-                wrapper_row("refresh-cache", ResolutionSource::Model),
-            ],
-            None,
-        );
-
-        let carry = carry_into_consumer(
-            &mut file_results,
-            &witnesses(&[("client.ts", &["refresh-index", "refresh-cache"])]),
-        );
-
-        assert_eq!(carry.carried, 0);
-        assert_eq!(site_value(&file_results), None);
     }
 
     /// One model row at span 100 of `consumer.ts` stating `value`, cleared
@@ -20025,7 +21000,6 @@ export { routes };
         let cleared = FileOrchestrator::clear_unwitnessed_dispatch(
             &mut file_results,
             &witnesses(&[("consumer.ts", literals)]),
-            &HashSet::new(),
         );
         let after = file_results["consumer.ts"].data_calls[0]
             .dispatch
@@ -20034,7 +21008,7 @@ export { routes };
         (cleared, after)
     }
 
-    /// carrick#2201: an unwitnessed model value no wrapper reaches is cleared.
+    /// carrick#2201: an unwitnessed model value is cleared.
     #[test]
     fn clear_unwitnessed_dispatch_clears_a_value_the_file_never_writes() {
         assert_eq!(
@@ -20052,12 +21026,11 @@ export { routes };
         );
     }
 
-    /// carrick#2201: the wrapper's request row is a request summary, which
-    /// holds its body's value only once the summary rows settle. Settling runs
-    /// before the carry, so the site's guess is replaced by that value rather
-    /// than cleared.
+    /// carrick#2201: a request summary row holds its body's value once the
+    /// summary rows settle, under the field a row for the same route names;
+    /// the model's guess at a site whose file writes no value is then cleared.
     #[test]
-    fn settle_wrapper_dispatch_carries_a_value_the_summary_settles() {
+    fn settle_dispatch_values_settles_a_summary_value_and_clears_a_guess() {
         let mut request = call_with_span(19, "${config.apiEndpoint}/rpc/gateway", Some(400));
         request.method = Some("POST".to_string());
         request.resolution_source = Some(ResolutionSource::RequestSummary);
@@ -20068,33 +21041,26 @@ export { routes };
             Some("POST".to_string());
 
         let mut stats = ProcessingStats::default();
-        let carry = FileOrchestrator::settle_wrapper_dispatch(
+        FileOrchestrator::settle_dispatch_values(
             &mut file_results,
-            &HashMap::from([(
-                "consumer.ts".to_string(),
-                HashMap::from([(
-                    100,
-                    DispatchSite {
-                        name: "getAllRepoData".to_string(),
-                        module: PathBuf::from("/repo/client.ts"),
-                        request_line: 19,
-                    },
-                )]),
-            )]),
-            &HashMap::from([(PathBuf::from("/repo/client.ts"), "client.ts".to_string())]),
             &witnesses(&[("consumer.ts", &[])]),
             &mut stats,
         );
 
-        assert_eq!((carry.carried, carry.over_guess), (1, 1));
-        assert_eq!(site_value(&file_results), Some("get-cross-repo-data"));
+        assert_eq!(
+            file_results["client.ts"].data_calls[0]
+                .dispatch
+                .as_ref()
+                .map(|d| d.value.as_str()),
+            Some("get-cross-repo-data")
+        );
+        assert_eq!(site_value(&file_results), None);
         assert_eq!(
             (
                 stats.summary_dispatch_settled,
-                stats.dispatch_carried_over_guess,
                 stats.dispatch_guesses_cleared
             ),
-            (1, 1, 0)
+            (1, 1)
         );
     }
 
@@ -22967,124 +23933,16 @@ export async function POST(request: Request): Promise<Response> {
             .collect()
     }
 
-    /// The candidate ids each part holds, part by part.
-    fn ids_by_part(listed: &[ListedCandidate], parts: &[CandidatePart]) -> Vec<Vec<String>> {
-        parts
-            .iter()
-            .map(|part| {
-                part.candidates()
-                    .into_iter()
-                    .map(|position| listed[position].candidate_id.clone())
-                    .collect()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn candidates_that_share_a_start_stay_in_one_part() {
-        // Two singles, a chain of three links, one single. At three a part,
-        // the chain cannot join the two singles, and it is not cut to fit.
-        let listed = listed_at(&[(10, 20), (30, 40), (50, 90), (50, 80), (50, 70), (100, 110)]);
-        let parts = candidate_parts(&listed, 3);
-        assert_eq!(
-            parts,
-            [
-                CandidatePart {
-                    first_group: 0,
-                    groups: vec![vec![0], vec![1]],
-                },
-                CandidatePart {
-                    first_group: 2,
-                    groups: vec![vec![2, 3, 4]],
-                },
-                CandidatePart {
-                    first_group: 3,
-                    groups: vec![vec![5]],
-                },
-            ]
-        );
-        assert!(
-            parts.iter().all(|part| part.candidates().len() <= 3),
-            "no part holds more than the limit"
-        );
-    }
-
-    #[test]
-    fn a_group_larger_than_the_limit_is_a_part_on_its_own() {
-        let listed = listed_at(&[(1, 5), (10, 90), (10, 80), (10, 70), (10, 60), (95, 99)]);
-        let sizes: Vec<usize> = candidate_parts(&listed, 2)
-            .iter()
-            .map(|part| part.candidates().len())
-            .collect();
-        assert_eq!(sizes, [1, 4, 1]);
-    }
-
-    #[test]
-    fn a_file_with_no_candidates_has_no_parts() {
-        assert!(candidate_parts(&[], MAX_PART_CANDIDATES).is_empty());
-    }
-
-    /// The parts are runs in SOURCE order, whatever order the prompt lists
-    /// the candidates in, and they are the same parts for the same
-    /// candidates listed in any order.
-    #[test]
-    fn the_parts_depend_on_the_candidates_and_not_on_the_order_they_are_listed_in() {
-        let in_source_order = listed_at(&[(10, 20), (30, 40), (30, 35), (50, 60), (70, 80)]);
-        let expected = ids_by_part(&in_source_order, &candidate_parts(&in_source_order, 2));
-        assert_eq!(
-            expected,
-            [
-                vec!["span:10-20"],
-                vec!["span:30-40", "span:30-35"],
-                vec!["span:50-60", "span:70-80"],
-            ]
-        );
-
-        // The same candidates, listed late ones first.
-        let listed = listed_at(&[(70, 80), (30, 40), (10, 20), (50, 60), (30, 35)]);
-        let parts = candidate_parts(&listed, 2);
-        let mut by_part = ids_by_part(&listed, &parts);
-        let mut expected_sets = expected.clone();
-        for ids in by_part.iter_mut().chain(expected_sets.iter_mut()) {
-            ids.sort();
-        }
-        assert_eq!(by_part, expected_sets, "the same candidates in each part");
-        // Within a part, the prompt's own listing order is kept.
-        assert_eq!(parts[2].candidates(), [0, 3]);
-        assert_eq!(
-            candidate_parts(&listed, 2),
-            parts,
-            "and the same on every call"
-        );
-    }
-
-    #[test]
-    fn a_part_is_halved_at_its_middle_group_down_to_one_group() {
-        let listed = listed_at(&[(1, 2), (3, 9), (3, 8), (10, 11), (12, 13), (14, 15)]);
-        let whole = candidate_parts(&listed, MAX_PART_CANDIDATES);
-        assert_eq!(whole.len(), 1);
-        assert_eq!(whole[0].label(), "0000-0004");
-
-        let (front, back) = whole[0].halves().expect("five groups halve");
-        assert_eq!(front.groups, [vec![0], vec![1, 2]]);
-        assert_eq!(back.groups, [vec![3], vec![4], vec![5]]);
-        assert_eq!((front.first_group, back.first_group), (0, 2));
-        assert_eq!(
-            (front.label(), back.label()),
-            ("0000-0001".into(), "0002-0004".into())
-        );
-
-        let (single, chain) = front.halves().expect("two groups halve");
-        assert_eq!((single.groups.len(), chain.groups.len()), (1, 1));
-        assert!(single.halves().is_none(), "one group is not halved");
-        assert!(
-            chain.halves().is_none(),
-            "a group of two candidates is one group, and is not separated"
-        );
-    }
-
     fn part_answer(value: serde_json::Value) -> FileAnalysisResult {
         serde_json::from_value(value).expect("a part answer")
+    }
+
+    /// `answer` as the part whose window is `window` gave it.
+    fn answered(window: (u32, u32), answer: &FileAnalysisResult) -> PartAnswer {
+        PartAnswer {
+            window,
+            answer: answer.clone(),
+        }
     }
 
     fn route_row(candidate_id: &str, path: &str) -> serde_json::Value {
@@ -23143,8 +24001,8 @@ export async function POST(request: Request): Promise<Response> {
             "/unlisted-by-second",
         ];
         for answers in [
-            vec![(0, first.clone()), (2, second.clone())],
-            vec![(2, second), (0, first)],
+            vec![answered((1, 4), &first), answered((5, 9), &second)],
+            vec![answered((5, 9), &second), answered((1, 4), &first)],
         ] {
             let merged = merge_part_answers(&listed, answers);
             let paths: Vec<&str> = merged
@@ -23173,8 +24031,8 @@ export async function POST(request: Request): Promise<Response> {
             ],
         }));
         for answers in [
-            vec![(0, first.clone()), (1, second.clone())],
-            vec![(1, second), (0, first)],
+            vec![answered((1, 4), &first), answered((5, 9), &second)],
+            vec![answered((5, 9), &second), answered((1, 4), &first)],
         ] {
             let merged = merge_part_answers(&listed, answers);
             let children: Vec<&str> = merged
@@ -23185,14 +24043,182 @@ export async function POST(request: Request): Promise<Response> {
             assert_eq!(
                 children,
                 ["shared", "only-first", "only-second"],
-                "each exact row once, in the order the parts state them in source order"
+                "each row once, in the order the parts state them in source order"
             );
             assert_eq!(
                 merged.pubsub_operations.len(),
                 2,
-                "a row that differs in any field is a row of its own"
+                "a row that states another role is a row of its own"
             );
         }
+    }
+
+    /// carrick#2308: two parts that state the same row disagree only in what
+    /// they could see. The part whose window holds the row's line saw the
+    /// row itself; another part saw it as a declaration its window uses.
+    #[test]
+    fn of_two_parts_that_state_a_row_the_one_whose_window_holds_its_line_is_kept() {
+        let mount = |line: i32, seen_by: &str| {
+            serde_json::json!({
+                "line_number": line,
+                "parent_node": "table",
+                "child_node": "child",
+                "mount_path": "/",
+                "import_source": null,
+                "pattern_matched": seen_by,
+            })
+        };
+        let topic = |line: i32, seen_by: &str| {
+            serde_json::json!({
+                "topic": "ready", "role": "publisher", "line_number": line, "broker": seen_by,
+            })
+        };
+        // Line 7 is in the second part's window. Line 40 is in neither.
+        let first = part_answer(serde_json::json!({
+            "mounts": [mount(7, "first"), mount(40, "first")],
+            "endpoints": [], "data_calls": [],
+            "pubsub_operations": [topic(7, "first"), topic(40, "first")],
+            "dispatch_tables": [
+                { "location": "body", "field": "action", "values": ["a"], "line_number": 7 },
+            ],
+        }));
+        let second = part_answer(serde_json::json!({
+            "mounts": [mount(40, "second"), mount(7, "second")],
+            "endpoints": [], "data_calls": [],
+            "pubsub_operations": [topic(40, "second"), topic(7, "second")],
+            "dispatch_tables": [
+                { "location": "body", "field": "action", "values": ["a", "b"], "line_number": 7 },
+            ],
+        }));
+        for answers in [
+            vec![answered((1, 4), &first), answered((5, 9), &second)],
+            vec![answered((5, 9), &second), answered((1, 4), &first)],
+        ] {
+            let merged = merge_part_answers(&[], answers);
+            let mounts: Vec<(i32, &str)> = merged
+                .mounts
+                .iter()
+                .map(|row| (row.line_number, row.pattern_matched.as_str()))
+                .collect();
+            assert_eq!(
+                mounts,
+                [(7, "second"), (40, "first")],
+                "the window that holds the line, else the first part in source order"
+            );
+            let topics: Vec<(i32, Option<&str>)> = merged
+                .pubsub_operations
+                .iter()
+                .map(|row| (row.line_number, row.broker.as_deref()))
+                .collect();
+            assert_eq!(topics, [(7, Some("second")), (40, Some("first"))]);
+            let [table] = merged.dispatch_tables.as_slice() else {
+                panic!("one table: {:?}", merged.dispatch_tables);
+            };
+            assert_eq!(table.values, ["a", "b"]);
+        }
+    }
+
+    /// A row is never dropped only because its line is outside the window of
+    /// the one part that stated it.
+    #[test]
+    fn a_row_stated_once_is_kept_wherever_its_line_is() {
+        let only = part_answer(serde_json::json!({
+            "mounts": [{
+                "line_number": 900, "parent_node": "table", "child_node": "far",
+                "mount_path": "/far", "import_source": null, "pattern_matched": ".use(",
+            }],
+            "endpoints": [route_row("line:900", "/far")],
+            "data_calls": [],
+            "pubsub_operations": [{ "topic": "far", "role": "subscriber", "line_number": 900 }],
+        }));
+        let merged = merge_part_answers(&[], vec![answered((1, 4), &only)]);
+        assert_eq!(
+            (
+                merged.mounts.len(),
+                merged.endpoints.len(),
+                merged.pubsub_operations.len()
+            ),
+            (1, 1, 1)
+        );
+    }
+
+    /// A route or call row that echoes no listed candidate is one of a set
+    /// too: two parts that state the same one state it once.
+    #[test]
+    fn a_route_row_that_echoes_no_listed_candidate_is_kept_once() {
+        let listed = listed_at(&[(10, 20)]);
+        let first = part_answer(serde_json::json!({
+            "mounts": [], "data_calls": [],
+            "endpoints": [route_row("span:10-20", "/a"), route_row("line:99", "/unlisted")],
+        }));
+        let second = part_answer(serde_json::json!({
+            "mounts": [], "data_calls": [],
+            "endpoints": [route_row("line:99", "/unlisted"), route_row("line:99", "/other")],
+        }));
+        let merged = merge_part_answers(
+            &listed,
+            vec![answered((5, 9), &second), answered((1, 4), &first)],
+        );
+        let paths: Vec<&str> = merged
+            .endpoints
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        assert_eq!(paths, ["/a", "/unlisted", "/other"]);
+    }
+
+    #[test]
+    fn a_graphql_row_that_names_a_resolver_is_kept_over_one_that_names_none() {
+        let located = serde_json::json!({
+            "kind": "query", "field": "order",
+            "resolver_function": null, "resolver_line": null,
+            "primary_type_symbol": null, "type_import_source": null,
+            "backing_type_symbol": "Order",
+        });
+        let resolved = |line: i32, name: &str| {
+            serde_json::json!({
+                "kind": "query", "field": "order",
+                "resolver_function": name, "resolver_line": line,
+                "primary_type_symbol": "Order", "type_import_source": null,
+            })
+        };
+        let graphql = |rows: Vec<serde_json::Value>| {
+            part_answer(serde_json::json!({
+                "mounts": [], "endpoints": [], "data_calls": [], "graphql_operations": rows,
+            }))
+        };
+        // The first part saw no function return the field. The second holds
+        // the resolver. A third saw the resolver as a declaration it uses.
+        let first = graphql(vec![located]);
+        let second = graphql(vec![resolved(7, "resolveOrder")]);
+        let third = graphql(vec![resolved(7, "seenFromAfar")]);
+        for answers in [
+            vec![
+                answered((1, 4), &first),
+                answered((5, 9), &second),
+                answered((10, 12), &third),
+            ],
+            vec![
+                answered((10, 12), &third),
+                answered((5, 9), &second),
+                answered((1, 4), &first),
+            ],
+        ] {
+            let merged = merge_part_answers(&[], answers);
+            let [row] = merged.graphql_operations.as_slice() else {
+                panic!("one row a field: {:?}", merged.graphql_operations);
+            };
+            assert_eq!(row.resolver_function.as_deref(), Some("resolveOrder"));
+        }
+        // With no window holding the resolver, the first part that names one.
+        let merged = merge_part_answers(
+            &[],
+            vec![answered((1, 4), &first), answered((10, 12), &third)],
+        );
+        assert_eq!(
+            merged.graphql_operations[0].resolver_function.as_deref(),
+            Some("seenFromAfar")
+        );
     }
 
     /// The spans of the calls in `source` that start with `callee`, one a

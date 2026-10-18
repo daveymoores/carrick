@@ -1,0 +1,6 @@
+{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": [],
+  "notes": "One service whose receivers are bound from factory calls."
+}

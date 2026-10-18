@@ -1,0 +1,12 @@
+{
+  "name": "@acme/api",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@acme/cjs": "workspace:*",
+    "@acme/events": "workspace:*",
+    "@acme/legacy": "workspace:*",
+    "@acme/orphan": "workspace:*",
+    "@acme/shapes": "workspace:*"
+  }
+}

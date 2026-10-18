@@ -269,6 +269,38 @@ pub(crate) fn request_options_argument(call: &CallExpr) -> Option<(usize, &Objec
     found
 }
 
+/// Whether a verb-spelled call provably names no route (carrick#2384).
+///
+/// `store.delete("k")`, `cache.get(0)` and `map.set()` are spelled like a
+/// request, and a store's or a map's `delete` is overwhelmingly one of them.
+/// What a request sends to is a route or a URL, so a call whose first argument
+/// is a literal with no `/` in it, or that has no first argument at all, is
+/// not read as the request its spelling suggests; the caller counts it as a
+/// request whose verb it cannot state. An argument the source does not spell
+/// out (a binding, a member, a template with an interpolation) is not decided
+/// here: a wrapper's `client.get(path)` forwards its caller's route.
+///
+/// Only [`call_request_verb`] applies it. [`call_request_shape`] feeds the
+/// per-file propagation (carrick-cloud#386), which skips a module whose shape
+/// is unreadable instead of letting it disagree, so an `Unreadable` there would
+/// move rows that module used to hold back.
+fn names_no_route(call: &CallExpr) -> bool {
+    let Some(first) = call.args.first() else {
+        return true;
+    };
+    if first.spread.is_some() {
+        return false;
+    }
+    match &*first.expr {
+        Expr::Lit(Lit::Str(text)) => !text.value.to_string_lossy().contains('/'),
+        Expr::Lit(Lit::Num(_) | Lit::Bool(_) | Lit::Null(_)) => true,
+        Expr::Tpl(tpl) => {
+            tpl.exprs.is_empty() && tpl.quasis.iter().all(|quasi| !quasi.raw.contains('/'))
+        }
+        _ => false,
+    }
+}
+
 /// Read what one call site says about its module's request shape.
 ///
 /// `callee_property` is the property the call was made through (`post` in
@@ -344,6 +376,9 @@ pub fn call_request_verb(call: &CallExpr, callee_property: Option<&str>) -> Requ
     let options = request_options_argument(call);
     if verb.is_none() && options.is_none() {
         return RequestShapeSignal::NotARequest;
+    }
+    if verb.is_some() && options.is_none() && names_no_route(call) {
+        return RequestShapeSignal::Unreadable;
     }
     let method = match options {
         // The difference from `call_request_shape`, and the whole reason this

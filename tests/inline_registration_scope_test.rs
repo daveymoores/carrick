@@ -674,6 +674,335 @@ async fn two_handlers_for_one_documented_path_are_not_merged() {
     );
 }
 
+// --- a case on a method that carries no body (carrick#2110) ---------------
+//
+// `reports.ts` holds four shapes behind one plugin. The model states each
+// value a handler switches on as a dispatch case, and a case has only two
+// locations, so a field read off the query string of a GET arrives as `body`.
+
+/// A dispatch case the model states: `(location, field, value)`.
+type Case<'a> = (&'a str, &'a str, &'a str);
+
+/// The model's answer for `src/reports.ts`: one row per `(needle on the
+/// registration's line, which registration on that line, method, path,
+/// case)`.
+fn reports(rows: &[(&str, usize, &str, &str, Option<Case>)]) -> (String, FileAnalysisResult) {
+    let file = "src/reports.ts";
+    let scanned = SwcScanner::new().scan_content(&root().join(file), &source(file), &[], &[]);
+    let endpoints: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(needle, nth, method, path, case)| {
+            let line = line_of(file, needle);
+            let mut on_line: Vec<_> = scanned
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.line_number == line)
+                .collect();
+            on_line.sort_by_key(|candidate| candidate.span_start);
+            let mut row = serde_json::json!({
+                "candidate_id": on_line[*nth].candidate_id,
+                "line_number": line,
+                "owner_node": "app",
+                "method": method,
+                "path": path,
+                "handler_name": "anonymous",
+                "pattern_matched": "app.",
+                "payload_expression_text": null,
+                "payload_expression_line": null,
+                "response_expression_text": null,
+                "response_expression_line": null,
+                "primary_type_symbol": null,
+                "type_import_source": null
+            });
+            if let Some((location, field, value)) = case {
+                row["dispatch"] =
+                    serde_json::json!({ "location": location, "field": field, "value": value });
+            }
+            row
+        })
+        .collect();
+    let result: FileAnalysisResult = serde_json::from_value(serde_json::json!({
+        "mounts": [],
+        "endpoints": endpoints,
+        "data_calls": [],
+    }))
+    .expect("a canned answer");
+    (root().join(file).to_string_lossy().into_owned(), result)
+}
+
+/// The registering file for `reports.ts`, its outer registration unstated.
+fn reports_scope() -> (String, FileAnalysisResult) {
+    answer(
+        "src/documented-modes.ts",
+        &[(
+            "api.register(reportRoutes)",
+            "api",
+            "reportRoutes",
+            "",
+            Some("./reports"),
+        )],
+        &[],
+    )
+}
+
+/// Every row serving `method full_path`, as (file, label, case value).
+fn rows_serving(
+    result: &FileCentricAnalysisResult,
+    method: &str,
+    full_path: &str,
+) -> Vec<(String, String, Option<String>)> {
+    let mut rows: Vec<_> = result
+        .mount_graph
+        .get_resolved_endpoints()
+        .iter()
+        .filter(|endpoint| {
+            endpoint.method == method
+                && carrick_match::paths_match(&endpoint.full_path, full_path)
+                && endpoint.full_path.split('/').count() == full_path.split('/').count()
+        })
+        .map(|endpoint| {
+            let file = endpoint
+                .file_location
+                .rsplit_once("/src/")
+                .map(|(_, file)| file.split(':').next().unwrap_or(file).to_string())
+                .unwrap_or_default();
+            (
+                file,
+                format!("{:?}", endpoint.resolution_source),
+                endpoint.dispatch.as_ref().map(|case| case.value.clone()),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn serving(file: &str, label: &str, case: Option<&str>) -> (String, String, Option<String>) {
+    (
+        file.to_string(),
+        label.to_string(),
+        case.map(str::to_string),
+    )
+}
+
+/// A GET carries no request body, so the two modes are one route stated
+/// twice, and the documented operation has one handler row to fold onto.
+#[tokio::test]
+#[serial]
+async fn a_documented_get_read_as_two_body_cases_is_one_operation() {
+    let mode = |value| Some(("body", "mode", value));
+    let result = analyze(vec![
+        reports_scope(),
+        reports(&[
+            (
+                "app.get('/reports/:id',",
+                0,
+                "GET",
+                "/reports/:id",
+                mode("advanced"),
+            ),
+            (
+                "app.get('/reports/:id',",
+                0,
+                "GET",
+                "/reports/:id",
+                mode("simple"),
+            ),
+        ]),
+        docs("src/docs-reports.ts"),
+    ])
+    .await;
+    assert_eq!(
+        rows_serving(&result, "GET", "/api/v1/reports/:id"),
+        vec![serving("reports.ts", "Some(DescriptorRoute)", None)],
+        "one handler row with no case, which the documented operation folds onto"
+    );
+}
+
+/// Losing a case never merges two routes: the rows that become one agree on
+/// owner, method and path, and a shared line is not part of that.
+#[tokio::test]
+#[serial]
+async fn two_routes_on_one_line_stay_two_rows_when_their_cases_go() {
+    let view = |value| Some(("body", "view", value));
+    let needle = "app.get('/reports/:id/lines'";
+    let result = analyze(vec![
+        reports_scope(),
+        reports(&[
+            (needle, 0, "GET", "/reports/:id/lines", view("flat")),
+            (needle, 0, "GET", "/reports/:id/lines", view("grouped")),
+            (needle, 1, "GET", "/reports/:id/notes", view("flat")),
+            (needle, 1, "GET", "/reports/:id/notes", view("grouped")),
+        ]),
+        docs("src/docs-reports.ts"),
+    ])
+    .await;
+    for path in ["/api/v1/reports/:id/lines", "/api/v1/reports/:id/notes"] {
+        assert_eq!(
+            rows_serving(&result, "GET", path),
+            vec![serving("reports.ts", "Some(DescriptorRoute)", None)],
+            "{path}"
+        );
+    }
+}
+
+/// A GET does carry headers and a POST does carry a body, so both keep one
+/// row per case (carrick#831). Nothing documents these two routes, so the
+/// scope's prefix stays unread.
+#[tokio::test]
+#[serial]
+async fn a_header_case_on_a_get_and_a_body_case_on_a_post_stay_cases() {
+    let result = analyze(vec![
+        reports_scope(),
+        reports(&[
+            (
+                "app.get('/feed'",
+                0,
+                "GET",
+                "/feed",
+                Some(("header", "x-feed-kind", "full")),
+            ),
+            (
+                "app.get('/feed'",
+                0,
+                "GET",
+                "/feed",
+                Some(("header", "x-feed-kind", "short")),
+            ),
+            (
+                "app.post('/reports'",
+                0,
+                "POST",
+                "/reports",
+                Some(("body", "action", "archive")),
+            ),
+            (
+                "app.post('/reports'",
+                0,
+                "POST",
+                "/reports",
+                Some(("body", "action", "create")),
+            ),
+        ]),
+    ])
+    .await;
+    assert_eq!(
+        rows_serving(&result, "GET", "/feed"),
+        vec![
+            serving("reports.ts", "Some(Model)", Some("full")),
+            serving("reports.ts", "Some(Model)", Some("short")),
+        ]
+    );
+    assert_eq!(
+        rows_serving(&result, "POST", "/reports"),
+        vec![
+            serving("reports.ts", "Some(Model)", Some("archive")),
+            serving("reports.ts", "Some(Model)", Some("create")),
+        ]
+    );
+}
+
+// --- a registering file the model states no row for (carrick#2303) --------
+//
+// The model's answer for the registering file is empty. The source still
+// states the callback, the instance it is handed and what it registers on
+// that instance, so the scope and its mounts are read from the source.
+
+/// A registering file the model stated nothing for.
+fn empty(file: &str) -> (String, FileAnalysisResult) {
+    docs(file)
+}
+
+#[tokio::test]
+#[serial]
+async fn a_scope_the_model_left_empty_takes_the_prefix_its_service_documents() {
+    let result = analyze(vec![
+        empty("src/documented.ts"),
+        item_detail(),
+        docs("src/docs.ts"),
+    ])
+    .await;
+    assert_eq!(handler_serves(&result), set(&["GET /api/v1/items/:id"]));
+    assert_eq!(result.stats.mount_prefixes_corroborated, 1);
+    assert_eq!(result.stats.mount_prefixes_unread, 0);
+    assert_eq!(
+        item_rows(&result),
+        vec![(
+            "item-detail.ts".to_string(),
+            "Some(DescriptorRoute)".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_scope_the_model_left_empty_and_nothing_documents_records_its_prefix_unread() {
+    let result = analyze(vec![empty("src/documented.ts"), item_detail()]).await;
+    assert_eq!(handler_serves(&result), set(&["GET /items/:id"]));
+    assert_eq!(result.stats.mount_prefixes_corroborated, 0);
+    assert_eq!(result.stats.mount_prefixes_unread, 1);
+    let line = line_of("src/documented.ts", "app.register(");
+    assert_eq!(
+        result
+            .unread_mount_prefixes
+            .iter()
+            .map(|record| record.scope_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![format!("api@src/documented.ts:{line}").as_str()]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_stated_inner_mount_is_not_stated_twice() {
+    // The model stated the inner registration and not the outer one. The
+    // source read finds the same call, and the model's row is the one kept.
+    let result = analyze(vec![unstated("src/documented.ts"), item_detail()]).await;
+    let mounts = result.mount_graph.get_mounts();
+    let inner: Vec<_> = mounts
+        .iter()
+        .filter(|edge| edge.child == "itemDetailRoutes")
+        .collect();
+    assert_eq!(inner.len(), 1, "{mounts:?}");
+    assert_eq!(mounts.len(), 2, "the scope and its one mount: {mounts:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_function_that_registers_nothing_is_not_a_mount() {
+    // `onError` is imported and passed first to a call on the scope's
+    // parameter, exactly as a plugin is. Its module also declares a router
+    // whose routes hang from a parameter of the same name, so only the span
+    // of the function that was passed tells the two apart.
+    let status = answer(
+        "src/errors.ts",
+        &[],
+        &[("app.get('/status'", "app", "GET", "/status")],
+    );
+    let index = answer(
+        "src/status-index.ts",
+        &[(
+            "server.register(statusRoutes",
+            "server",
+            "statusRoutes",
+            "/internal",
+            Some("./errors"),
+        )],
+        &[],
+    );
+    let result = analyze(vec![empty("src/not-a-plugin.ts"), status, index]).await;
+    let mounts = result.mount_graph.get_mounts();
+    assert!(
+        mounts
+            .iter()
+            .all(|edge| edge.child == "statusRoutes" && edge.parent == "server"),
+        "{mounts:?}"
+    );
+    assert_eq!(served(&result), set(&["GET /internal/status"]));
+    assert!(result.unread_mount_prefixes.is_empty());
+    assert_eq!(result.stats.mount_prefixes_unread, 0);
+}
+
 #[test]
 fn the_fixture_root_is_on_disk() {
     assert!(Path::new(&root()).join("src/nullish.ts").is_file());

@@ -243,6 +243,40 @@ export interface InferRequest extends BaseRequest {
   requests: InferRequestItem[];
   /** Agent-generated extraction config for machinery unwrapping */
   extraction_config?: ExtractionConfig;
+  /**
+   * carrick#2111: the type the model named for a producer's response, by the
+   * alias of the request that reads the same response. The inferrer answers
+   * how each relates to what it read (`InferredType.model_symbol_relation`).
+   */
+  model_symbols?: ModelSymbol[];
+}
+
+/** A type the model named for the row `alias` is for (carrick#2111). */
+export interface ModelSymbol {
+  alias: string;
+  symbol_name: string;
+  /** The file the model says declares or exports it. */
+  source_file: string;
+}
+
+/**
+ * carrick#2111: how the type the model named for a producer's response
+ * relates to the compiler's type of what the handler sends. The compiler
+ * decides, by assignability both ways (`symbol-relation.ts`).
+ *
+ * Reported only where both resolve and the read holds no `any` or `unknown`.
+ * No entry means nothing was compared, and the model's symbol stands.
+ */
+export interface ModelSymbolRelation {
+  /**
+   * `same`: one type. `list`: the read is a list of the symbol, `depth`
+   * levels. `member`: the symbol is one member of the read's union.
+   * `nullable`: the read is the symbol or `null`/`undefined`. `different`:
+   * anything else.
+   */
+  relation: 'same' | 'list' | 'member' | 'nullable' | 'different';
+  /** List levels of the read around the symbol; present for `list`. */
+  depth?: number;
 }
 
 /**
@@ -275,6 +309,23 @@ export interface AddProgramFilesRequest extends BaseRequest {
   action: 'add_program_files';
   /** Absolute paths, or relative to the init'd root. */
   files: string[];
+}
+
+/**
+ * Write one row for each call, member access, comparison and identifier in
+ * each of a service's source files to a gzip JSON-lines file (carrick#2405).
+ * Record-only: nothing in a scan reads the file yet.
+ */
+export interface PositionRowsRequest extends BaseRequest {
+  action: 'position_rows';
+  /** Absolute paths of the service's source files, in the order written. */
+  files: string[];
+  /** The scanned repo's root: every path in the file is relative to it. */
+  scan_root: string;
+  /** Where the rows file goes. Written beside it under a temporary name, then renamed. */
+  out_path: string;
+  /** The service the rows are for, written in the header. */
+  service: string;
 }
 
 /**
@@ -383,6 +434,28 @@ export interface BoundName {
   bound: 'maker' | 'scope';
 }
 
+/**
+ * The function or client a call runs (label structure v2, carrick#2434): a
+ * slot of the call itself, or, with `bound: 'maker'`, a slot of the call that
+ * made the receiver (a mutation object whose `mutate` runs the function its
+ * maker was given).
+ */
+export interface RunsSlot extends ClaimSlot {
+  bound?: 'maker';
+}
+
+/**
+ * What a receive op's handler is handed (label structure v2, carrick#2434):
+ * its parameter `param` is an instance of the package's export `export`, on
+ * `side` of the connection (a server's connection handler is given the
+ * server end of a socket).
+ */
+export interface Yields {
+  param: number;
+  export: string;
+  side: string;
+}
+
 /** The closed role list; the role alone picks the checks a claim needs. */
 export type LibraryRole =
   | 'http_client'
@@ -436,6 +509,8 @@ export type LibraryClaim =
       /** A definition's id or a queue's name: bound to every op that names `{ bound: 'maker' }`. */
       name?: ClaimSlot;
       handler?: ClaimSlot;
+      /** The function or client the maker runs (label v2). */
+      runs?: ClaimSlot;
       key_labels?: Record<string, KeyLabel>;
       name_scope?: NameScope;
       picker?: string;
@@ -475,6 +550,18 @@ export type LibraryClaim =
       method?: string;
       /** HTTP: where the method sits. */
       method_key?: ClaimSlot;
+      /**
+       * HTTP (label v2): the method sent when the call names none. Beside
+       * `method_key`, the default when that option is absent; alone, the one
+       * method the call sends whatever its member is called.
+       */
+      method_default?: string;
+      /** HTTP (label v2): where the base URL the path joins sits. */
+      base?: ClaimSlot;
+      /** Label v2: the function or client the op runs. */
+      runs?: RunsSlot;
+      /** Label v2, `receive` only: what the handler is handed. */
+      yields?: Yields;
     }
   | {
       /** A name the library emits itself, spelled in one of `member`'s parameters. */
@@ -552,7 +639,8 @@ export type SidecarRequest =
   | HealthRequest
   | ShutdownRequest
   | ListProgramFilesRequest
-  | AddProgramFilesRequest;
+  | AddProgramFilesRequest
+  | PositionRowsRequest;
 
 /**
  * Request for a specific symbol to be bundled
@@ -760,6 +848,34 @@ export interface ShutdownResponse extends BaseResponse {
   status: 'success';
 }
 
+/** Response for position_rows: what was written, counted. */
+export interface PositionRowsResponse extends BaseResponse {
+  result?: PositionRowsCounts;
+  errors?: string[];
+}
+
+export interface PositionRowsCounts {
+  /** Source files in the request, each one line of the file. */
+  files: number;
+  rows: number;
+  /** Rows whose position resolved to a symbol. */
+  resolved: number;
+  /** Rows whose type is `any` (flag 1). */
+  any: number;
+  /** Rows whose type is the compiler's error type (flag 2). */
+  error_type: number;
+  /** `impl` rows: implementations of a bodyless declaration, or one past the cap (carrick#2430). */
+  impl: number;
+  /** `jsx` rows: one per JSX opening or self-closing element. */
+  jsx: number;
+  /** The rows file's size on disk, compressed. */
+  bytes: number;
+  /** Time spent building programs and reading files into them. */
+  load_ms: number;
+  /** Time spent walking the files and writing the rows. */
+  walk_ms: number;
+}
+
 /**
  * Response for list_program_files action
  */
@@ -949,6 +1065,7 @@ export type SidecarResponse =
   | ShutdownResponse
   | ListProgramFilesResponse
   | AddProgramFilesResponse
+  | PositionRowsResponse
   | ErrorResponse;
 
 /**
@@ -1067,6 +1184,12 @@ export interface InferredType {
    * stated, or when the only annotation is further away than the read.
    */
   stated_body?: StatedBody;
+  /**
+   * carrick#2111, a producer's response read only: how the type the model
+   * named for this row relates to the type read here. Absent where the model
+   * named none, or nothing could be compared.
+   */
+  model_symbol_relation?: ModelSymbolRelation;
   /**
    * carrick#1836: the declarations behind the names `type_string` prints that
    * the request's file does not resolve. The printer writes names bare where

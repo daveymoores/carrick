@@ -1,0 +1,8 @@
+{
+  "name": "listeners-and-sends",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "invented-app": "1.0.0"
+  }
+}

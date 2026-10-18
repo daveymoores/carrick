@@ -736,6 +736,159 @@ async fn a_pr_result_names_the_functions_the_pr_changed() {
     );
 }
 
+/// Run the built binary over `repo` as the GitHub Action does on a
+/// `pull_request` event: from inside the checkout, with the path it is given,
+/// offline. Returns the result the run posted.
+fn action_pr_result(repo: &Path, path: &str, scratch: &Path) -> serde_json::Value {
+    let store = scratch.join("store");
+    let out = scratch.join("pr-result.json");
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_file(&out);
+    std::fs::create_dir_all(&store).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    cmd.arg(path)
+        .current_dir(repo)
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_SKIP_INTENTS", "1")
+        .env("CARRICK_LOCAL_STORAGE_DIR", &store)
+        .env("CARRICK_PR_RESULT_OUT", &out)
+        .env("GITHUB_EVENT_NAME", "pull_request")
+        .env("GITHUB_REF", "refs/pull/7/merge");
+    // A runner's own values would name this repo and a base commit the
+    // fixture does not have.
+    for var in [
+        "GITHUB_REPOSITORY",
+        "GITHUB_EVENT_PATH",
+        "GITHUB_RUN_ID",
+        "GITHUB_ACTIONS",
+        "CI",
+        "CARRICK_OUTPUT_JSON",
+        "CARRICK_LOCAL_STORAGE_ISOLATE",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    ] {
+        cmd.env_remove(var);
+    }
+    let run = cmd.output().expect("failed to spawn carrick");
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.status.success(), "{output}");
+    let posted = std::fs::read_to_string(&out)
+        .unwrap_or_else(|error| panic!("the PR run posted no result ({error}):\n{output}"));
+    serde_json::from_str(&posted).unwrap()
+}
+
+/// A PR scan names the functions the PR changed when it runs as the GitHub
+/// Action runs it: the path is `.`, the checkout is the PR's merge commit,
+/// and the config has a service whose directory is `.` beside one in a
+/// subdirectory. The walk of that first service lists `././src/label.ts`,
+/// which is the file git names `src/label.ts`. The block is the same when the
+/// same checkout is scanned by its absolute path.
+#[tokio::test]
+async fn an_action_run_names_the_functions_of_a_service_at_the_repo_root() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, _, _) = setup();
+    let repo = written_repo(
+        tmp.path(),
+        "portal",
+        &[
+            (
+                "carrick.json",
+                r#"{ "services": [
+                    { "name": "web", "directory": "." },
+                    { "name": "edge", "directory": "workers/edge" }
+                ] }"#,
+            ),
+            ("package.json", r#"{ "name": "portal", "private": true }"#),
+            (
+                "src/label.ts",
+                "export function title(name: string): string {\n  return name.trim();\n}\n",
+            ),
+            (
+                "src/old.ts",
+                "export function retired(): number {\n  return 0;\n}\n",
+            ),
+            (
+                "workers/edge/package.json",
+                r#"{ "name": "edge", "private": true }"#,
+            ),
+            (
+                "workers/edge/src/index.ts",
+                "export function route(path: string): string {\n  return path;\n}\n",
+            ),
+        ],
+    );
+    git(&repo, &["branch", "-M", "main"]);
+
+    // The PR: one function appended to a file of the root service, one file
+    // of it deleted, one function of the nested service edited.
+    git(&repo, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        repo.join("src/label.ts"),
+        "export function title(name: string): string {\n  return name.trim();\n}\n\n\
+         export function minutes(words: number): number {\n  return Math.ceil(words / 200);\n}\n",
+    )
+    .unwrap();
+    std::fs::remove_file(repo.join("src/old.ts")).unwrap();
+    std::fs::write(
+        repo.join("workers/edge/src/index.ts"),
+        "export function route(path: string): string {\n  return path.toLowerCase();\n}\n",
+    )
+    .unwrap();
+    commit(&repo, "pr");
+
+    // Main moves on, and the checkout is the merge of the two, as
+    // `refs/pull/<n>/merge` is.
+    git(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("NOTES.md"), "main moved\n").unwrap();
+    commit(&repo, "main moves");
+    let main_at = head(&repo);
+    git(&repo, &["merge", "-q", "--no-ff", "-m", "merge", "feature"]);
+
+    let scratch = tmp.path().join("action");
+    let relative = action_pr_result(&repo, ".", &scratch);
+    assert_eq!(relative["baseline"]["base_sha"], main_at.as_str());
+    let block = &relative["functions"];
+    let mut listed: Vec<(String, String, String)> = block["changed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no functions.changed in {relative:#}"))
+        .iter()
+        .map(|entry| {
+            (
+                entry["file"].as_str().unwrap().to_string(),
+                entry["name"].as_str().unwrap().to_string(),
+                entry["change"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    listed.sort();
+    let entry = |file: &str, name: &str, change: &str| {
+        (file.to_string(), name.to_string(), change.to_string())
+    };
+    assert_eq!(
+        listed,
+        vec![
+            entry("src/label.ts", "minutes", "added"),
+            entry("workers/edge/src/index.ts", "route", "edited"),
+        ],
+        "{block:#}"
+    );
+    assert_eq!(
+        block["removed"],
+        serde_json::json!([{ "file": "src/old.ts", "name": "retired" }]),
+        "{block:#}"
+    );
+
+    let absolute = action_pr_result(&repo, repo.to_str().unwrap(), &scratch);
+    assert_eq!(
+        absolute["functions"], relative["functions"],
+        "the path the scan is given does not change what the PR changed"
+    );
+}
+
 /// Main's side failing in any way costs the run nothing but the comparison:
 /// the findings it posts are byte for byte the ones a run with no prior index
 /// posts, apart from why neither could compare. (The payload's `delta`

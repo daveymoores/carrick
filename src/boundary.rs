@@ -91,10 +91,12 @@ pub struct ServiceBoundary {
     /// Files the analyzer was asked about and never answered for. Their rows
     /// are whatever the deterministic layer stated and nothing more.
     pub files_lost: Counted,
-    /// Candidates carrying a route-shaped literal and a readable verb that
-    /// neither layer produced a row for. A bare `x.verb("/lit", arg)` states no
-    /// producer/consumer role, so the scanner counts the gap rather than
-    /// guessing at it (the 2026-09-05 ruling).
+    /// Offered HTTP candidates carrying a route-shaped literal (a readable
+    /// verb is not required) that no layer produced a row for and no mount
+    /// answers. A bare `x.verb("/lit", arg)` states no producer/consumer role,
+    /// so the scanner counts the gap rather than guessing at it (the
+    /// 2026-09-05 ruling; widened beyond verb calls in carrick#2382, so the
+    /// number rises at that release without any row being lost).
     pub unemitted_literal_candidates: usize,
     /// Where those sites are, `file:line`, up to [`MAX_REASONS`] of them. The
     /// count above stays a count and keeps its type — the cloud's MCP server
@@ -147,6 +149,13 @@ pub struct ServiceBoundary {
     /// different thing about the same row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_endpoints_discarded_in_claimed_modules: Option<usize>,
+    /// Model endpoint rows dropped because the id they echoed names no site
+    /// the scanner listed and nothing in the file states the route
+    /// (carrick#2382). Not part of the claimed-module count: a row is in one
+    /// or the other. The reasons are `file:line METHOD path`. `None` on a blob
+    /// from a scanner that did not count it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_endpoints_dropped_unanchored: Option<Counted>,
     /// Indexed routes the index can serve no response shape for, so nothing on
     /// the producer side of a compatibility check. Routes counted in
     /// `routes_without_body` are not in this count.
@@ -193,6 +202,18 @@ pub struct ServiceBoundary {
     /// cross-service check failed before it could be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_limits_run_out: Option<crate::time_limits::TimeLimitsRunOut>,
+    /// Library packages this scan ended without after waiting for the
+    /// store's builds (carrick#2496): the library rows through them are
+    /// missing and the next scan asks again. `Some(0)` when the store was
+    /// asked and nothing was left; `None` when it was not asked, and on a
+    /// blob from a scanner that did not count it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_packages_pending: Option<usize>,
+    /// Library packages the store answered `skipped` with `build_failed`
+    /// (carrick#2496): named in the summary, not waited on. Counted beside
+    /// `library_packages_pending`, with the same `None` and `Some(0)` reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_packages_failed: Option<usize>,
 }
 
 impl ServiceBoundary {
@@ -229,6 +250,12 @@ impl ServiceBoundary {
             .map(|site| site.replace(&prefix, ""))
             .collect();
         sites.truncate(MAX_REASONS);
+        let dropped_unanchored = stats
+            .model_endpoints_dropped_unanchored_sites
+            .iter()
+            .map(|site| site.replace(&prefix, ""))
+            .collect();
+        let library_counts = crate::scan_health::library_packages_for(data.service_name.as_deref());
         Self {
             candidates_withheld_changed_files: None,
             commit_hash: data.commit_hash.clone(),
@@ -248,6 +275,10 @@ impl ServiceBoundary {
             model_endpoints_discarded_in_claimed_modules: Some(
                 stats.model_endpoints_discarded_in_claimed_modules,
             ),
+            model_endpoints_dropped_unanchored: Some(Counted::new(
+                stats.model_endpoints_dropped_unanchored,
+                dropped_unanchored,
+            )),
             routes_without_response_type,
             routes_without_body: Some(routes_without_body),
             calls_without_expected_type: operations_without_a_type(data, ManifestRole::Consumer),
@@ -259,6 +290,8 @@ impl ServiceBoundary {
             // Known once the cross-service check has run; see
             // `fold_time_limits`.
             time_limits_run_out: None,
+            library_packages_pending: library_counts.map(|(pending, _)| pending),
+            library_packages_failed: library_counts.map(|(_, failed)| failed),
         }
     }
 
@@ -270,6 +303,19 @@ impl ServiceBoundary {
     /// the run at once, after each service's own analysis.
     pub fn fold_time_limits(&mut self, cost: &crate::time_limits::TimeLimitsRunOut) {
         self.time_limits_run_out.get_or_insert_default().merge(cost);
+    }
+
+    /// Read the call counts again once the scan has settled this service's
+    /// call-through rows (carrick#1146): `corrected` of its model rows took
+    /// the operation their call reaches, and are no longer the model's alone.
+    ///
+    /// Separate from [`Self::collect`] for the same reason as
+    /// [`Self::fold_sdk_unresolved`]: the rows are settled over every service
+    /// of the run at once, after each service's own analysis.
+    pub fn fold_settled_calls(&mut self, data: &CloudRepoData, corrected: usize) {
+        self.model_only_rows = self.model_only_rows.saturating_sub(corrected);
+        self.unknown_call_paths = unknown_call_paths(data);
+        self.calls_without_expected_type = operations_without_a_type(data, ManifestRole::Consumer);
     }
 
     /// Fold in what the cross-repo SDK join could not resolve for this service.
@@ -328,7 +374,7 @@ impl ServiceBoundary {
         );
         if self.unemitted_literal_candidates > 0 {
             out.push(format!(
-                "  {} bare route-literal call site(s) left unclassified{}",
+                "  {} route-literal call site(s) left unclassified{}",
                 self.unemitted_literal_candidates,
                 first_site(
                     &self.unemitted_literal_sites,
@@ -347,6 +393,15 @@ impl ServiceBoundary {
         {
             out.push(format!(
                 "  {discarded} model endpoint(s) dropped in modules a routing convention claims"
+            ));
+        }
+        if let Some(dropped) = &self.model_endpoints_dropped_unanchored
+            && !dropped.is_zero()
+        {
+            out.push(format!(
+                "  {} route(s) found by analysis but left out of the index: their registration site could not be located{}",
+                dropped.total,
+                first_reason(dropped)
             ));
         }
         // One reason, once. `types_degraded` names the stage and the error;
@@ -553,6 +608,26 @@ fn untyped_operations(
             typed_operations.insert(key);
         }
     }
+    // A call through a declaration states no request at its own line, so no
+    // type is asked for there (carrick#1146): where the manifest anchors
+    // nothing at such a row, there is no expected type to be missing. A
+    // call-through row the manifest does anchor is read like any other call.
+    let calls_through: HashSet<(String, &str)> = match role {
+        ManifestRole::Producer => HashSet::new(),
+        ManifestRole::Consumer => data
+            .mount_graph
+            .iter()
+            .flat_map(|graph| graph.get_data_calls())
+            .filter(|call| call.role == Some(crate::mount_graph::ConsumerRole::WrapperCall))
+            .map(|call| {
+                (
+                    crate::operation::OperationKey::http(&call.method, call.canonical_path.clone())
+                        .canonical(),
+                    call.file_location.as_str(),
+                )
+            })
+            .collect(),
+    };
     operations.iter().filter_map(move |operation| {
         let location = operation.file_path.to_string_lossy();
         let (file, line) = match location.rsplit_once(':') {
@@ -562,6 +637,9 @@ fn untyped_operations(
         let key = operation.key.canonical();
         let site = (key.clone(), file.to_string());
         if typed.contains(&site) {
+            return None;
+        }
+        if !anchored.contains(&site) && calls_through.contains(&(key.clone(), location.as_ref())) {
             return None;
         }
         if role == ManifestRole::Producer
@@ -953,6 +1031,10 @@ mod tests {
             errors: vec![format!(
                 "Failed to analyze {repo_path}/src/dead.ts: gateway timeout"
             )],
+            model_endpoints_dropped_unanchored: 1,
+            model_endpoints_dropped_unanchored_sites: vec![format!(
+                "{repo_path}/src/worker.ts:14 GET /metrics"
+            )],
             ..Default::default()
         };
 
@@ -960,6 +1042,14 @@ mod tests {
         assert_eq!(
             boundary.files_lost.reasons,
             vec!["Failed to analyze src/dead.ts: gateway timeout".to_string()]
+        );
+        // carrick#2382: the dropped rows are named relative to the repo.
+        assert_eq!(
+            boundary.model_endpoints_dropped_unanchored,
+            Some(Counted::new(
+                1,
+                vec!["src/worker.ts:14 GET /metrics".to_string()]
+            ))
         );
     }
 
@@ -994,6 +1084,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
         let data = CloudRepoData {
             endpoints: vec![
@@ -1075,6 +1166,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
         let mut graph = MountGraph::new();
         graph.data_calls.push(DataFetchingCall {
@@ -1179,9 +1271,56 @@ mod tests {
         let lines = boundary.lines("gateway");
         assert!(
             lines.iter().any(|line| line
-                .contains("2 bare route-literal call site(s) left unclassified")
+                .contains("2 route-literal call site(s) left unclassified")
                 && line.contains("e.g. apps/gateway/main.ts:11")),
             "{lines:?}"
+        );
+    }
+
+    /// carrick#2382: a model endpoint dropped for an id that names no listed
+    /// site is counted and named, and a blob from a scanner that did not count
+    /// it reads as `None`, not as zero.
+    #[test]
+    fn a_dropped_model_endpoint_is_printed_and_an_old_blob_reads_as_not_counted() {
+        let mut boundary = ServiceBoundary {
+            commit_hash: "0123456".to_string(),
+            model_endpoints_dropped_unanchored: Some(Counted::new(
+                2,
+                vec!["src/worker.ts:14 GET /metrics".to_string()],
+            )),
+            ..Default::default()
+        };
+        let lines = boundary.lines("worker");
+        assert!(
+            lines.contains(
+                &"  2 route(s) found by analysis but left out of the index: their registration site could not be located (e.g. src/worker.ts:14 GET /metrics)"
+                    .to_string()
+            ),
+            "{lines:?}"
+        );
+        let json = serde_json::to_string(&boundary).unwrap();
+        assert!(
+            json.contains("\"model_endpoints_dropped_unanchored\":{\"total\":2,"),
+            "{json}"
+        );
+
+        boundary.model_endpoints_dropped_unanchored = Some(Counted::default());
+        assert_eq!(
+            boundary.lines("worker").len(),
+            1,
+            "a counted zero prints nothing"
+        );
+
+        let mut old: serde_json::Value = serde_json::to_value(&boundary).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("model_endpoints_dropped_unanchored");
+        let parsed: ServiceBoundary = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.model_endpoints_dropped_unanchored, None);
+        assert!(
+            !serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("model_endpoints_dropped_unanchored")
         );
     }
 
@@ -1295,5 +1434,30 @@ mod tests {
                 ),
             "{lines:?}"
         );
+    }
+
+    /// carrick#2496. A boundary written before the count existed reads back as
+    /// not counted and writes nothing; a counted one (zero included, "asked,
+    /// none left") writes the number under its own name.
+    #[test]
+    fn library_packages_pending_is_additive_and_absent_is_not_zero() {
+        let old = serde_json::to_value(ServiceBoundary::default()).unwrap();
+        assert!(old.get("library_packages_pending").is_none());
+        assert!(old.get("library_packages_failed").is_none());
+        let read: ServiceBoundary = serde_json::from_value(old).unwrap();
+        assert_eq!(read.library_packages_pending, None);
+        assert_eq!(read.library_packages_failed, None);
+        for count in [0usize, 3] {
+            let boundary = ServiceBoundary {
+                library_packages_pending: Some(count),
+                library_packages_failed: Some(count + 1),
+                ..Default::default()
+            };
+            let value = serde_json::to_value(&boundary).unwrap();
+            assert_eq!(value["library_packages_pending"], count);
+            assert_eq!(value["library_packages_failed"], count + 1);
+            let read: ServiceBoundary = serde_json::from_value(value).unwrap();
+            assert_eq!(read, boundary);
+        }
     }
 }

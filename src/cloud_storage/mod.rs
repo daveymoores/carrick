@@ -28,6 +28,7 @@ pub(crate) use aws_storage::{
 };
 mod local_dir_storage;
 mod tee_storage;
+pub(crate) use local_dir_storage::blob_stem;
 pub use local_dir_storage::{CACHE_DIR_ENV, ISOLATE_ENV, LocalDirStorage, PEERS_ENV};
 pub use tee_storage::{LAPTOP_SCAN_ENV, TeeStorage, laptop_scan_requested};
 
@@ -837,6 +838,20 @@ pub struct CloudRepoData {
     /// does not state dispatch tables", never as "this service has none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_tables: Option<Vec<crate::dispatch::DispatchTable>>,
+    /// Calls the scan saw but could not name (carrick#2438): a library call
+    /// whose path, event name or method the code does not state. Labelled
+    /// leads for the agent, never rows; nothing in matching, the type check,
+    /// the findings or the PR result reads them. At most
+    /// [`crate::possible_calls::MAX_PER_SERVICE`] per service.
+    ///
+    /// Written only when `CARRICK_SITE_QUESTIONS=1`. Additive and optional:
+    /// `None` is "this scan did not write the field" (the switch was off, or
+    /// the blob predates it), never "no possible calls".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub possible_calls: Option<Vec<crate::possible_calls::PossibleCall>>,
+    /// How many possible calls were left out past the cap. Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub possible_calls_omitted: Option<u32>,
 }
 
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
@@ -1030,6 +1045,8 @@ impl CloudRepoData {
             // see `crate::boundary::ServiceBoundary::collect`.
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }
     }
 }
@@ -1239,6 +1256,7 @@ pub fn mount_graph_to_api_details(
             handler_span: endpoint.handler_span,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         })
         .collect();
 
@@ -1270,6 +1288,7 @@ pub fn mount_graph_to_api_details(
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         })
         .collect();
 
@@ -1501,6 +1520,18 @@ pub trait CloudStorage {
     fn name_pending_on_final_write(&self, _pending_services: &[String]) -> bool {
         false
     }
+
+    /// State the repo's full declared service set for this run
+    /// (carrick-cloud#909): every service the run's config resolution
+    /// produced, before `--changed-only` and any service filter, each as the
+    /// `service_name` that service's own write sends (`None` where it sends
+    /// none). The cloud retires the repo's rows whose service is not in it.
+    ///
+    /// Called once, only by a run that resolved its set from a clean tree. A
+    /// backend that talks to the cloud carries it on its write actions and on
+    /// the close of a run that wrote nothing because no service changed; the
+    /// default ignores it, and a backend that WRAPS one must forward it.
+    fn note_declared_services(&self, _declared: &[Option<String>]) {}
 
     /// Whether this backend can store more than one service per git repo
     /// without collision. The production index keys on
@@ -1897,6 +1928,7 @@ mod tests {
             file_results: HashMap::new(),
             raw_model_results: HashMap::new(),
             stats: Default::default(),
+            passes_body: Default::default(),
         };
 
         let data = CloudRepoData::from_multi_agent_results(
@@ -1995,6 +2027,7 @@ mod tests {
                 handler_span: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
+                inference: None,
             }];
             data.mount_graph = Some(graph);
             data
@@ -2579,6 +2612,8 @@ mod tests {
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            possible_calls: None,
+            possible_calls_omitted: None,
         }
     }
 
@@ -3106,6 +3141,7 @@ mod tests {
             handler_span: None,
             name_scope: None,
             library_semantics: Vec::new(),
+            inference: None,
         };
         let mut data = empty_repo("org/web", Some("web"));
         data.calls = vec![

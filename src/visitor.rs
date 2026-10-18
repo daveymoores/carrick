@@ -3,7 +3,8 @@ extern crate swc_ecma_parser;
 
 use crate::receiver_origin::origin_root;
 use crate::receiver_type::{
-    ReceiverTypes, annotated_type_ident, class_field_types, constructed_type_ident,
+    CalledType, FactoryCall, ReceiverTypes, TypedCall, annotated_type_ident, called_type,
+    class_field_types, constructed_type_ident, factory_call,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -328,6 +329,15 @@ pub struct ReceiverBinding {
     /// A declared class settles resolution even when that class is unavailable.
     pub declared: bool,
     pub origin: Option<String>,
+    /// The factory call a `const` receiver is initialised by, when nothing
+    /// declares the receiver's class and the callee is not itself a parameter
+    /// or a destructured name (carrick#1146).
+    pub factory: Option<FactoryCall>,
+    /// The same `const` receiver when the function it calls is a VALUE whose
+    /// declared type is a function type: a parameter `make: MakeClient` or
+    /// an annotated local (carrick#1561). The type, not the name, says what
+    /// the call returns.
+    pub typed_factory: Option<TypedCall>,
 }
 
 /// SWC gives each lexical binding a distinct Id, including unknown and
@@ -339,12 +349,24 @@ struct LexicalBinding {
     declared_id: Option<Id>,
     origin_root: Option<Id>,
     direct_span: Option<swc_common::Span>,
+    /// `const x = f(…)` or `const x = await f(…)`: the binding `f` names and
+    /// whether the call is awaited (carrick#1146).
+    factory: Option<(Id, bool)>,
+    /// Bound by a pattern position rather than a declarator of its own: a
+    /// parameter, a destructured name, a catch clause. Its value is whatever
+    /// the caller or the destructured object supplies.
+    pattern_bound: bool,
+    /// What the binding's type annotation says a call of it returns
+    /// (carrick#1561).
+    called_type: Option<CalledType>,
 }
 
 #[derive(Default)]
 struct LexicalReceivers {
     bindings: HashMap<Id, LexicalBinding>,
     calls: HashMap<swc_common::Span, Id>,
+    /// Whether the declarators being walked belong to a `const` declaration.
+    in_const: bool,
 }
 
 impl LexicalReceivers {
@@ -369,6 +391,13 @@ impl LexicalReceivers {
                 if previous.direct_span != binding.direct_span {
                     previous.direct_span = None;
                 }
+                if previous.factory != binding.factory {
+                    previous.factory = None;
+                }
+                if previous.called_type != binding.called_type {
+                    previous.called_type = None;
+                }
+                previous.pattern_bound |= binding.pattern_bound;
             })
             .or_insert(binding);
     }
@@ -387,6 +416,33 @@ impl LexicalReceivers {
         };
         let mut receiver = binding.receiver.clone();
         receiver.declared = binding.declared_id.is_some();
+        // A callee bound by a pattern is a value handed in, not the function
+        // a same-named declaration or import would resolve to.
+        receiver.factory = binding
+            .factory
+            .as_ref()
+            .filter(|_| !receiver.declared)
+            .filter(|(callee, _)| {
+                self.bindings
+                    .get(callee)
+                    .is_none_or(|callee| !callee.pattern_bound)
+            })
+            .map(|(callee, awaited)| FactoryCall {
+                callee: callee.0.to_string(),
+                awaited: *awaited,
+            });
+        // A callee declared as a function type states its return by that
+        // type, whether it is handed in or bound locally.
+        receiver.typed_factory = binding
+            .factory
+            .as_ref()
+            .filter(|_| !receiver.declared)
+            .and_then(|(callee, awaited)| {
+                Some(TypedCall {
+                    called: self.bindings.get(callee)?.called_type.clone()?,
+                    awaited: *awaited,
+                })
+            });
         let mut current = binding;
         let mut seen = HashSet::new();
         while receiver.origin.is_none() {
@@ -421,6 +477,8 @@ impl Visit for LexicalReceivers {
                         imported_name: Some(ident.sym.to_string()),
                         declared: false,
                         local_member: None,
+                        factory: None,
+                        typed_factory: None,
                         origin: (!import.type_only && !type_only)
                             .then(|| import.src.value.to_string_lossy().into_owned()),
                     },
@@ -443,6 +501,8 @@ impl Visit for LexicalReceivers {
                     imported_name: Some(decl.id.sym.to_string()),
                     declared: false,
                     local_member: None,
+                    factory: None,
+                    typed_factory: None,
                     origin: Some(external.expr.value.to_string_lossy().into_owned()),
                 },
                 ..Default::default()
@@ -474,6 +534,15 @@ impl Visit for LexicalReceivers {
         class.visit_children_with(self);
     }
 
+    fn visit_var_decl(&mut self, decl: &VarDecl) {
+        let outer = std::mem::replace(&mut self.in_const, decl.kind == VarDeclKind::Const);
+        for declarator in &decl.decls {
+            self.in_const = decl.kind == VarDeclKind::Const;
+            declarator.visit_with(self);
+        }
+        self.in_const = outer;
+    }
+
     fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
         // `const m = require("./m")`, `const { x } = require("./m")`: a
         // binding introduced from another module, which is what an import
@@ -496,6 +565,8 @@ impl Visit for LexicalReceivers {
                                 imported_name: Some(binding.local.id.sym.to_string()),
                                 declared: false,
                                 local_member: None,
+                                factory: None,
+                                typed_factory: None,
                                 origin: Some(specifier.clone()),
                             },
                             ..Default::default()
@@ -526,6 +597,13 @@ impl Visit for LexicalReceivers {
                         Some(Expr::Object(object)) => Some(object.span),
                         _ => None,
                     },
+                    factory: declarator
+                        .init
+                        .as_deref()
+                        .filter(|_| self.in_const)
+                        .and_then(factory_call)
+                        .map(|(callee, awaited)| (callee.to_id(), awaited)),
+                    called_type: ident.type_ann.as_deref().and_then(called_type),
                     ..Default::default()
                 },
             );
@@ -546,6 +624,8 @@ impl Visit for LexicalReceivers {
                     .as_deref()
                     .and_then(annotated_type_ident)
                     .map(Ident::to_id),
+                called_type: ident.type_ann.as_deref().and_then(called_type),
+                pattern_bound: true,
                 ..Default::default()
             },
         );
@@ -1791,6 +1871,44 @@ impl FunctionDefinitionExtractor {
         }
     }
 
+    /// Index the function-valued members of a module-scope `const` object the
+    /// module exports by name rather than in its declaration: `const worker =
+    /// { async fetch(req) {} }; export default worker`, `export { worker }`,
+    /// `export { worker as handler }`, `module.exports = worker` (carrick#2396).
+    ///
+    /// The object is the module's surface exactly as `export const worker = {
+    /// … }` is, so its members are keyed `worker.<member>` the same way, and an
+    /// importer resolves them through the binding's local name whatever it was
+    /// exported as. Runs after the module walk because the export may be
+    /// written before or after the declaration, and only over top-level
+    /// statements: `export const` declarations are collected where they are
+    /// declared, and a `const` inside a function is not the module's to offer.
+    /// `let` and `var` are skipped, since a later assignment can replace them.
+    fn collect_exported_local_objects(&mut self, module: &Module) {
+        for item in &module.body {
+            let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
+                continue;
+            };
+            if var.kind != VarDeclKind::Const {
+                continue;
+            }
+            for decl in &var.decls {
+                let Pat::Ident(ident) = &decl.name else {
+                    continue;
+                };
+                let name = ident.id.sym.to_string();
+                if !self.exported_names.contains(&name) {
+                    continue;
+                }
+                if let Some(init) = &decl.init
+                    && let Expr::Object(object) = crate::swc_scanner::unwrap_expr(init)
+                {
+                    self.collect_exported_object_members(&name, object, 0);
+                }
+            }
+        }
+    }
+
     /// The export a CommonJS assignment writes to, if it writes to one.
     ///
     /// `exports.handler` and `module.exports.handler` are the named export
@@ -1832,7 +1950,7 @@ impl FunctionDefinitionExtractor {
     /// function the module declared elsewhere: that already has a definition at
     /// its own key, and what the assignment adds is that the module offers it.
     fn record_cjs_export(&mut self, name: String, value: &Expr) {
-        match value {
+        match crate::swc_scanner::unwrap_expr(value) {
             Expr::Arrow(arrow) => {
                 self.insert_arrow_definition(name.clone(), arrow);
                 self.exported_names.insert(name);
@@ -1869,7 +1987,7 @@ impl Visit for FunctionDefinitionExtractor {
                         // exported object's function members are part of the
                         // module's surface (carrick#830).
                         if let Some(init) = &decl.init
-                            && let Expr::Object(object) = &**init
+                            && let Expr::Object(object) = crate::swc_scanner::unwrap_expr(init)
                         {
                             self.collect_exported_object_members(&name, object, 0);
                         }
@@ -1944,7 +2062,9 @@ impl Visit for FunctionDefinitionExtractor {
 
     /// Track `export default foo` (expression)
     fn visit_export_default_expr(&mut self, export: &ExportDefaultExpr) {
-        match &*export.expr {
+        // `export default { … } satisfies Handler` and `export default
+        // (worker)` export what they wrap (carrick#2396).
+        match crate::swc_scanner::unwrap_expr(&export.expr) {
             Expr::Ident(ident) => {
                 self.exported_names.insert(ident.sym.to_string());
             }
@@ -2132,6 +2252,7 @@ impl Visit for FunctionDefinitionExtractor {
     /// a call that belongs to no function still has an owner (carrick#965).
     fn visit_module(&mut self, module: &Module) {
         module.visit_children_with(self);
+        self.collect_exported_local_objects(module);
         self.record_module_scope_callees(module);
         self.finalize_call_owners();
         self.prune_empty_module_scope();

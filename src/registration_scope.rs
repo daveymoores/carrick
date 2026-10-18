@@ -20,10 +20,22 @@
 //!
 //! A prefix the source does not state as a literal is recorded as unread and
 //! never guessed. Nothing here reads a framework, a library or an option name.
+//!
+//! The scope does not depend on a model row inside the callback
+//! (carrick#2303). Phase 1 also reads every call on the callback's parameter
+//! that passes an imported or locally declared function first, and once every
+//! file's rows are in ([`mount_unstated_registrations`]) each one the model
+//! stated no mount for becomes a mount row, where the function it names
+//! registers on its own first parameter.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
-use swc_common::{SourceMap, SourceMapper, Spanned, sync::Lrc};
+use swc_common::{
+    SourceMap, SourceMapper, Spanned,
+    errors::{ColorConfig, Handler},
+    sync::Lrc,
+};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
@@ -31,6 +43,7 @@ use tracing::debug;
 use crate::agents::file_analyzer_agent::{FileAnalysisResult, MountResult};
 use crate::binding_scope::{BindingKey, ident_key};
 use crate::graphql_document_sites::unwrap_expression;
+use crate::import_bindings::BindingResolver;
 use crate::request_summary::literal_specifier;
 
 /// How many bindings a prefix read may follow before it gives up.
@@ -75,6 +88,26 @@ pub struct RegistrationSite {
     /// The source text of the first other argument, quoted when the prefix
     /// it may carry is recorded as unread.
     pub options_text: Option<String>,
+    /// What the callback registers on the instance it is handed, in source
+    /// order (carrick#2303).
+    pub inner_registrations: Vec<InnerRegistration>,
+}
+
+/// A call `P.m(F, …)` inside a registration callback, where `P` is the
+/// callback's first parameter and `F` an identifier bound to an import or to
+/// a function this file declares. Whether `F` registers anything is not
+/// something this file says: see [`mount_unstated_registrations`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InnerRegistration {
+    /// The call's start line.
+    pub line: u32,
+    /// `m`, kept for the emitted row's `pattern_matched`.
+    pub method: String,
+    /// `F`, as this file names it.
+    pub identifier: String,
+    /// The specifier `F` is imported from, as written; `None` for a function
+    /// this file declares.
+    pub import_source: Option<String>,
 }
 
 /// A registration scope whose prefix the source does not state as a literal.
@@ -184,6 +217,55 @@ pub fn collect_registration_sites(
     finder.sites
 }
 
+/// Reads the calls a registration callback makes on its own first parameter
+/// (carrick#2303). The parameter and the function passed are both read by
+/// binding, so a name the callback or a block inside it declares again is
+/// never taken for either.
+struct InnerFinder<'s> {
+    source_map: &'s Lrc<SourceMap>,
+    values: &'s DeclaredValues,
+    param: BindingKey,
+    found: Vec<InnerRegistration>,
+}
+
+impl Visit for InnerFinder<'_> {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        call.visit_children_with(self);
+        let Callee::Expr(callee) = &call.callee else {
+            return;
+        };
+        let Expr::Member(member) = unwrap_expression(callee) else {
+            return;
+        };
+        let Expr::Ident(receiver) = unwrap_expression(&member.obj) else {
+            return;
+        };
+        let MemberProp::Ident(method) = &member.prop else {
+            return;
+        };
+        if ident_key(receiver) != self.param {
+            return;
+        }
+        let Some(first) = call.args.first().filter(|arg| arg.spread.is_none()) else {
+            return;
+        };
+        let Expr::Ident(passed) = unwrap_expression(&first.expr) else {
+            return;
+        };
+        let key = ident_key(passed);
+        let import_source = self.values.imports.get(&key).cloned();
+        if import_source.is_none() && !self.values.functions.contains(&key) {
+            return; // a value this file binds some other way names no function
+        }
+        self.found.push(InnerRegistration {
+            line: u32::try_from(self.source_map.lookup_char_pos(call.span.lo).line).unwrap_or(0),
+            method: method.sym.to_string(),
+            identifier: passed.sym.to_string(),
+            import_source,
+        });
+    }
+}
+
 /// Finds the sites. Without `values` it only finds them (their arguments
 /// read as unread); with them it reads each argument value.
 struct SiteFinder<'s> {
@@ -226,7 +308,7 @@ impl SiteFinder<'_> {
         let MemberProp::Ident(method) = &member.prop else {
             return;
         };
-        let mut inline: Vec<(swc_common::Span, String)> = Vec::new();
+        let mut inline: Vec<(&Expr, &BindingIdent)> = Vec::new();
         let mut others: Vec<&Expr> = Vec::new();
         for arg in &call.args {
             if arg.spread.is_some() {
@@ -240,16 +322,27 @@ impl SiteFinder<'_> {
             match first_param {
                 // An inline function with no plain first parameter hands out
                 // no instance this pass can name.
-                Some(Some(Pat::Ident(param))) => {
-                    inline.push((arg.expr.span(), param.id.sym.to_string()))
-                }
+                Some(Some(Pat::Ident(param))) => inline.push((&arg.expr, param)),
                 Some(_) => return,
                 None => others.push(&arg.expr),
             }
         }
-        let [(span, param)] = inline.as_slice() else {
+        let [(callback, param)] = inline.as_slice() else {
             return;
         };
+        let span = callback.span();
+        let mut inner_registrations = Vec::new();
+        if let Some(values) = self.values {
+            let mut inner = InnerFinder {
+                source_map: self.source_map,
+                values,
+                param: ident_key(&param.id),
+                found: Vec::new(),
+            };
+            callback.visit_with(&mut inner);
+            inner.found.sort_by_key(|found| found.line);
+            inner_registrations = inner.found;
+        }
         let mut option_values = Vec::new();
         for expr in &others {
             match unwrap_expression(expr) {
@@ -274,11 +367,12 @@ impl SiteFinder<'_> {
             line: self.line(call.span.lo),
             receiver: receiver.sym.to_string(),
             method: method.sym.to_string(),
-            param: param.clone(),
+            param: param.id.sym.to_string(),
             body_start_line: self.line(span.lo),
             body_end_line: self.line(span.hi),
             option_values,
             options_text: others.first().map(|expr| self.snippet(expr)),
+            inner_registrations,
         });
     }
 }
@@ -296,6 +390,11 @@ impl Visit for SiteFinder<'_> {
 #[derive(Default)]
 struct DeclaredValues {
     values: HashMap<BindingKey, Expr>,
+    /// The value imports of the module, by the binding each declares.
+    imports: HashMap<BindingKey, String>,
+    /// The bindings that name a function this module declares: a function
+    /// declaration, or a declarator initialised with a function.
+    functions: HashSet<BindingKey>,
 }
 
 impl DeclaredValues {
@@ -337,7 +436,35 @@ impl Visit for DeclaredValues {
                 self.bind(&declarator.name, declarator.init.as_deref());
             }
         }
+        for declarator in &decl.decls {
+            if let (Pat::Ident(name), Some(init)) = (&declarator.name, &declarator.init)
+                && matches!(unwrap_expression(init), Expr::Arrow(_) | Expr::Fn(_))
+            {
+                self.functions.insert(ident_key(&name.id));
+            }
+        }
         decl.visit_children_with(self);
+    }
+
+    fn visit_fn_decl(&mut self, decl: &FnDecl) {
+        self.functions.insert(ident_key(&decl.ident));
+        decl.visit_children_with(self);
+    }
+
+    fn visit_import_decl(&mut self, import: &ImportDecl) {
+        if import.type_only {
+            return;
+        }
+        let specifier = import.src.value.to_string_lossy().into_owned();
+        for named in &import.specifiers {
+            let local = match named {
+                ImportSpecifier::Named(named) if !named.is_type_only => &named.local,
+                ImportSpecifier::Default(default) => &default.local,
+                // A namespace binds a module, never one function of it.
+                _ => continue,
+            };
+            self.imports.insert(ident_key(local), specifier.clone());
+        }
     }
 
     fn visit_param(&mut self, param: &Param) {
@@ -447,13 +574,7 @@ pub fn apply_registration_scopes(
             u32::try_from(line)
                 .is_ok_and(|line| line >= site.body_start_line && line <= site.body_end_line)
         };
-        // A call that itself registers a route hands its callback a request,
-        // not an instance: `router.get('/me', async (c) => c.get('user'))`.
-        if result.endpoints.iter().any(|endpoint| {
-            u32::try_from(endpoint.line_number) == Ok(site.line)
-                && endpoint.owner_node == site.receiver
-                && is_served_path(&endpoint.path)
-        }) {
+        if registers_a_route(result, site) {
             continue;
         }
         let registrations: Vec<usize> = result
@@ -581,6 +702,322 @@ pub fn apply_registration_scopes(
         );
     }
     unread
+}
+
+/// A call that itself registers a route hands its callback a request, not an
+/// instance: `router.get('/me', async (c) => c.get('user'))`.
+fn registers_a_route(result: &FileAnalysisResult, site: &RegistrationSite) -> bool {
+    result.endpoints.iter().any(|endpoint| {
+        u32::try_from(endpoint.line_number) == Ok(site.line)
+            && endpoint.owner_node == site.receiver
+            && is_served_path(&endpoint.path)
+    })
+}
+
+/// One file's registration sites, kept until every file's rows are in
+/// (carrick#2303): whether a function passed inside a callback registers
+/// anything is read from the rows of the file that declares it.
+#[derive(Debug, Clone)]
+pub struct UnstatedRegistrations {
+    /// The `file_results` key of the registering file.
+    file_key: String,
+    /// Its repo-relative path, as a scope id writes it.
+    file: String,
+    sites: Vec<RegistrationSite>,
+}
+
+impl UnstatedRegistrations {
+    /// The sites of one file, when its joined rows leave at least one inner
+    /// registration without a mount at its line. A file whose every inner
+    /// registration the model stated holds nothing to decide.
+    pub fn of(
+        result: &FileAnalysisResult,
+        sites: &[RegistrationSite],
+        file_key: &str,
+        file: &str,
+    ) -> Option<Self> {
+        sites
+            .iter()
+            .flat_map(|site| &site.inner_registrations)
+            .any(|inner| !mount_stated_at(result, inner.line))
+            .then(|| Self {
+                file_key: file_key.to_string(),
+                file: file.to_string(),
+                sites: sites.to_vec(),
+            })
+    }
+}
+
+/// Whether the file's rows hold a mount on `line`: the model's own, or one
+/// this pass has already emitted.
+fn mount_stated_at(result: &FileAnalysisResult, line: u32) -> bool {
+    result
+        .mounts
+        .iter()
+        .any(|mount| u32::try_from(mount.line_number) == Ok(line))
+}
+
+/// Where a declared function starts and ends, and the name of its first
+/// parameter.
+struct FunctionHead {
+    first_param: String,
+    start_line: u32,
+    end_line: u32,
+}
+
+/// The functions a module declares by name, read on demand: only the modules
+/// an unstated inner registration names are parsed.
+struct FunctionHeads {
+    source_map: Lrc<SourceMap>,
+    handler: Handler,
+    by_file: HashMap<PathBuf, Vec<(String, Option<FunctionHead>)>>,
+}
+
+impl FunctionHeads {
+    fn new() -> Self {
+        let source_map: Lrc<SourceMap> = Default::default();
+        // Quiet: a module that does not parse declares nothing this reads.
+        let handler =
+            Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(source_map.clone()));
+        Self {
+            source_map,
+            handler,
+            by_file: HashMap::new(),
+        }
+    }
+
+    /// The one function `file` declares as `name`, when its first parameter
+    /// is a plain name. A name the module declares twice is not decided.
+    fn head(&mut self, file: &Path, name: &str) -> Option<&FunctionHead> {
+        if !self.by_file.contains_key(file) {
+            let mut collector = HeadCollector {
+                source_map: &self.source_map,
+                heads: Vec::new(),
+            };
+            if let Some(module) = crate::parser::parse_file(file, &self.source_map, &self.handler) {
+                module.visit_with(&mut collector);
+            }
+            let heads = collector.heads;
+            self.by_file.insert(file.to_path_buf(), heads);
+        }
+        let mut named = self
+            .by_file
+            .get(file)?
+            .iter()
+            .filter(|(declared, _)| declared == name);
+        let (_, head) = named.next()?;
+        if named.next().is_some() {
+            return None;
+        }
+        head.as_ref()
+    }
+}
+
+struct HeadCollector<'s> {
+    source_map: &'s Lrc<SourceMap>,
+    heads: Vec<(String, Option<FunctionHead>)>,
+}
+
+impl HeadCollector<'_> {
+    fn record(&mut self, name: &Ident, first_param: Option<&Pat>, span: swc_common::Span) {
+        let line =
+            |pos| u32::try_from(self.source_map.lookup_char_pos(pos).line).unwrap_or(u32::MAX);
+        let head = match first_param {
+            Some(Pat::Ident(param)) => Some(FunctionHead {
+                first_param: param.id.sym.to_string(),
+                start_line: line(span.lo),
+                end_line: line(span.hi),
+            }),
+            _ => None,
+        };
+        self.heads.push((name.sym.to_string(), head));
+    }
+}
+
+impl Visit for HeadCollector<'_> {
+    fn visit_fn_decl(&mut self, decl: &FnDecl) {
+        let function = &decl.function;
+        self.record(
+            &decl.ident,
+            function.params.first().map(|param| &param.pat),
+            function.span,
+        );
+        decl.visit_children_with(self);
+    }
+
+    fn visit_fn_expr(&mut self, function: &FnExpr) {
+        // `export default function name(app) {}` and any other named function
+        // expression: the name is a declaration only where the module exports
+        // it, which is what the caller's resolver has already decided.
+        if let Some(name) = &function.ident {
+            let inner = &function.function;
+            self.record(
+                name,
+                inner.params.first().map(|param| &param.pat),
+                inner.span,
+            );
+        }
+        function.visit_children_with(self);
+    }
+
+    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
+        if let (Pat::Ident(name), Some(init)) = (&declarator.name, &declarator.init) {
+            match unwrap_expression(init) {
+                Expr::Arrow(arrow) => self.record(&name.id, arrow.params.first(), arrow.span),
+                Expr::Fn(function) if function.ident.is_none() => self.record(
+                    &name.id,
+                    function.function.params.first().map(|param| &param.pat),
+                    function.function.span,
+                ),
+                _ => {}
+            }
+        }
+        declarator.visit_children_with(self);
+    }
+}
+
+/// State the mounts a registration callback makes and the model did not
+/// (carrick#2303). Returns how many mount rows the files gained, and the
+/// scopes this made whose prefix the source does not state as a literal.
+///
+/// An inner registration `P.m(F)` becomes a mount row of its file when both
+/// hold:
+///
+/// * the file's rows hold no mount at that line, so a model row always wins
+///   and nothing is stated twice;
+/// * `F` resolves to a function whose first parameter is a plain name, and at
+///   least one stated route or mount inside that function's span hangs from
+///   that parameter. A function that registers nothing on its first parameter
+///   (an error handler, a hook) is not mounted.
+///
+/// The second reads another file's rows, which is why this runs once every
+/// file's rows are in, and to a fixed point: a function whose only
+/// registration is itself an unstated scope heads a row after its own file is
+/// read. Each file that gained a row then goes through
+/// [`apply_registration_scopes`] again, which is what makes the callback a
+/// scope and corrects or emits its outer registration. The second run only
+/// acts on the new rows: a scope the first run made has its registration row
+/// at the site's line with a literal path, so that row is found, kept and
+/// records nothing, and the rows already hanging from the scope id no longer
+/// hang from the parameter's name.
+///
+/// `file_root` is the directory the `file_results` keys resolve against on
+/// disk. No method, option, library or framework name is read.
+pub fn mount_unstated_registrations(
+    file_results: &mut HashMap<String, FileAnalysisResult>,
+    pending: &[UnstatedRegistrations],
+    file_root: &Path,
+) -> (usize, Vec<UnreadPrefix>) {
+    let mut unread = Vec::new();
+    if pending.is_empty() {
+        return (0, unread);
+    }
+    let key_by_canonical: HashMap<PathBuf, String> = file_results
+        .keys()
+        .filter_map(|key| Some((file_root.join(key).canonicalize().ok()?, key.clone())))
+        .collect();
+    let mut order: Vec<&UnstatedRegistrations> = pending.iter().collect();
+    order.sort_by(|a, b| a.file_key.cmp(&b.file_key));
+
+    // The resolver the mount graph reads a mount's child through, so a
+    // function this decides is one the graph can attribute routes to.
+    let mut resolver = BindingResolver::new();
+    let mut heads = FunctionHeads::new();
+    let mut emitted = 0usize;
+    loop {
+        let mut progressed = false;
+        for file in &order {
+            let Some(result) = file_results.get(&file.file_key) else {
+                continue;
+            };
+            let Ok(importer) = file_root.join(&file.file_key).canonicalize() else {
+                continue;
+            };
+            let mut rows: Vec<MountResult> = Vec::new();
+            for site in &file.sites {
+                if registers_a_route(result, site) {
+                    continue;
+                }
+                for inner in &site.inner_registrations {
+                    if mount_stated_at(result, inner.line) {
+                        continue;
+                    }
+                    let (declaring, name) = match &inner.import_source {
+                        // By the name this file gives it, as the graph reads
+                        // the emitted row's child: an import the graph cannot
+                        // follow (one renamed on the way in) is not decided.
+                        Some(specifier) => {
+                            let Some(resolved) =
+                                resolver.resolve(&importer, specifier, &inner.identifier)
+                            else {
+                                continue;
+                            };
+                            let Some(name) = resolved.local_name else {
+                                continue; // an export with no name to find
+                            };
+                            (resolved.file, name)
+                        }
+                        None => (importer.clone(), inner.identifier.clone()),
+                    };
+                    let Some(declaring_rows) = key_by_canonical
+                        .get(&declaring)
+                        .and_then(|key| file_results.get(key))
+                    else {
+                        continue;
+                    };
+                    let Some(head) = heads.head(&declaring, &name) else {
+                        continue;
+                    };
+                    let inside = |line: i32| {
+                        u32::try_from(line)
+                            .is_ok_and(|line| line >= head.start_line && line <= head.end_line)
+                    };
+                    let registers = declaring_rows.mounts.iter().any(|mount| {
+                        mount.parent_node == head.first_param && inside(mount.line_number)
+                    }) || declaring_rows.endpoints.iter().any(|endpoint| {
+                        endpoint.owner_node == head.first_param
+                            && is_served_path(&endpoint.path)
+                            && inside(endpoint.line_number)
+                    });
+                    if !registers {
+                        continue;
+                    }
+                    rows.push(MountResult {
+                        line_number: i32::try_from(inner.line).unwrap_or(i32::MAX),
+                        parent_node: site.param.clone(),
+                        child_node: inner.identifier.clone(),
+                        mount_path: String::new(),
+                        import_source: inner.import_source.clone(),
+                        pattern_matched: format!("{}.{}(", site.param, inner.method),
+                    });
+                }
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            let Some(result) = file_results.get_mut(&file.file_key) else {
+                continue;
+            };
+            for row in &rows {
+                debug!(
+                    "Mount read from the source at {}:{}: {} registers {} and the model stated \
+                     no mount there",
+                    file.file, row.line_number, row.parent_node, row.child_node
+                );
+            }
+            let before = result.mounts.len();
+            result.mounts.extend(rows);
+            unread.extend(apply_registration_scopes(result, &file.sites, &file.file));
+            // The inner mounts, and the outer registration when the second
+            // run had to emit it.
+            emitted += result.mounts.len() - before;
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    (emitted, unread)
 }
 
 #[cfg(test)]
@@ -732,6 +1169,66 @@ mod tests {
         );
         assert_eq!((site.body_start_line, site.body_end_line), (2, 4));
         assert_eq!(site.options_text.as_deref(), Some("{ prefix: '/p' }"));
+    }
+
+    /// The inner registrations of the one site in `source`.
+    fn inner_of(source: &str) -> Vec<InnerRegistration> {
+        let found = sites(source);
+        let [site] = found.as_slice() else {
+            panic!("one site, got {found:?}");
+        };
+        site.inner_registrations.clone()
+    }
+
+    fn inner(line: u32, method: &str, identifier: &str, import: Option<&str>) -> InnerRegistration {
+        InnerRegistration {
+            line,
+            method: method.to_string(),
+            identifier: identifier.to_string(),
+            import_source: import.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_callback_records_the_functions_it_passes_to_its_parameter() {
+        let source = "import { items as itemRoutes } from './items';\nimport orders from './orders';\nfunction local(app) {}\nconst arrow = async (app) => {};\napp.register(async (api) => {\n  await api.register(itemRoutes);\n  api.use(orders, { audit: true });\n  api.register(local);\n  api.register(arrow);\n});";
+        assert_eq!(
+            inner_of(source),
+            vec![
+                inner(6, "register", "itemRoutes", Some("./items")),
+                inner(7, "use", "orders", Some("./orders")),
+                inner(8, "register", "local", None),
+                inner(9, "register", "arrow", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_value_that_names_no_function_is_not_recorded() {
+        // A string, a call's result, a const holding neither a function nor
+        // an import, a type-only import and a namespace: none names a
+        // function this file can point at.
+        let source = "import type { T } from './t';\nimport * as all from './all';\nconst options = { a: 1 };\napp.register(async (api) => {\n  api.addHook('onRequest', handler);\n  api.register(make());\n  api.decorate(options);\n  api.register(T);\n  api.register(all);\n  api.register(undeclared);\n});";
+        assert_eq!(inner_of(source), vec![]);
+    }
+
+    #[test]
+    fn a_call_on_another_binding_of_the_parameters_name_is_not_recorded() {
+        // The inner callback declares `api` again: its calls are its own. The
+        // call on some other instance is no one's.
+        let source = "import { items } from './items';\napp.register(async (api) => {\n  other.register(items);\n  api.group(async (api) => {\n    api.register(items);\n  });\n});";
+        let found = sites(source);
+        let outer = found.iter().find(|site| site.line == 2).expect("outer");
+        let inner = found.iter().find(|site| site.line == 4).expect("inner");
+        assert!(outer.inner_registrations.is_empty(), "{outer:?}");
+        assert_eq!(inner.inner_registrations.len(), 1);
+        assert_eq!(inner.inner_registrations[0].line, 5);
+    }
+
+    #[test]
+    fn a_shadowed_import_name_is_not_the_import() {
+        let source = "import { items } from './items';\napp.register(async (api) => {\n  const items = load();\n  api.register(items);\n});";
+        assert_eq!(inner_of(source), vec![]);
     }
 
     #[test]

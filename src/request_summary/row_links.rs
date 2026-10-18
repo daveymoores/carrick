@@ -1,0 +1,453 @@
+//! What each import binding of a service reaches, as the compiler's
+//! per-position rows say (carrick#2413 slice B).
+//!
+//! Without rows, the module-scope names ([`super::library_sites::LinkedNames`]),
+//! instances ([`super::LinkedClients`]) and getters another module declares
+//! are reached by name: the call graph's resolution names the first module,
+//! and each table follows the modules that re-export it, up to
+//! [`super::MAX_REEXPORT_HOPS`]. One specifier anywhere in the service that
+//! names nothing the scan can find turns every imported reading off
+//! (carrick#2402).
+//!
+//! With rows, each use of an imported local has an `ident` row naming the
+//! declaration it reaches, through every re-export, alias and workspace
+//! package the compiler follows. Every use must name the same declaration.
+//! It joins the declaring file's tables at the line that file records for
+//! the name ([`super::FileIr::declared_at`]). What a namespace publishes,
+//! and what a module loaded by a literal specifier publishes, are still the
+//! module graph's: no row lists a module's exports.
+//!
+//! An import whose declaration no row gives may still be any module of the
+//! service. It changes nothing when it is only called or read; when it may
+//! change what it holds ([`super::BindingUse::may_change`]), or a file loads
+//! a module by a computed specifier, every exported object, instance and
+//! published getter is contested ([`RowLinks::open`]).
+
+use super::*;
+use crate::position_rows::{Kind, PositionIndex};
+
+/// What one import binding reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RowLink {
+    /// A module-scope binding a file of the service declares: the file (as
+    /// walked) and the name its tables key the binding by.
+    Declared(PathBuf, String),
+    /// A declaration in a file of the service that is no module-scope
+    /// binding its tables record: a CommonJS export's property, a member of
+    /// a namespace declaration, a destructured `const`.
+    Unrecorded,
+    /// A whole module, with what it publishes as the module graph says.
+    Module(Vec<PublishedBinding>),
+    /// A declaration outside the repository: the default library or a
+    /// package, with the package the compiler names for it
+    /// (carrick#2413 slice E).
+    Outside(Option<String>),
+    /// A declaration in a file of the repository that is not one of the
+    /// service's: another workspace package, or code an alias names.
+    OtherService,
+    /// The rows do not say.
+    Hole(HoleReason),
+}
+
+impl RowLink {
+    /// Whether the import reaches a declaration of the repository, whatever
+    /// its specifier says (carrick#2413 slice E): then it is no package's
+    /// client.
+    pub(crate) fn in_repo(&self) -> bool {
+        matches!(
+            self,
+            RowLink::Declared(..)
+                | RowLink::Unrecorded
+                | RowLink::Module(_)
+                | RowLink::OtherService
+        )
+    }
+}
+
+/// Why every exported object, instance and published getter of a service is
+/// contested ([`RowLinks::open`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Open {
+    /// An import whose declaration no row gives may change what it holds.
+    UnreadImport,
+    /// A file loads a module by a specifier it computes.
+    ComputedLoad,
+}
+
+/// Every import binding of a service, with what it reaches.
+#[derive(Debug, Default)]
+pub(crate) struct RowLinks {
+    links: HashMap<(PathBuf, String), RowLink>,
+    open: Option<Open>,
+    /// Bindings whose row names a recorded name at another line than the
+    /// declaring file records it on.
+    line_disagreements: usize,
+}
+
+impl RowLinks {
+    /// What each import of `files` reaches, as `positions` says.
+    pub(crate) fn of(
+        files: &HashMap<PathBuf, FileIr>,
+        bindings: &ImportedBindings,
+        positions: &PositionIndex,
+    ) -> Self {
+        let mut links = RowLinks::default();
+        let mut paths: Vec<&PathBuf> = files.keys().collect();
+        paths.sort();
+        for file in paths {
+            let ir = &files[file];
+            if ir.computed_load {
+                links.open.get_or_insert(Open::ComputedLoad);
+            }
+            let uses: HashMap<&str, Vec<(u32, u32)>> = ir.import_uses().collect();
+            let mut locals: Vec<&String> = ir.imported.keys().collect();
+            locals.sort();
+            for local in locals {
+                let link = match uses.get(local.as_str()) {
+                    Some(spans) => links.link_of(files, bindings, positions, file, local, spans),
+                    // Used only where no row is written (a JSX tag, a
+                    // re-export by name).
+                    None => RowLink::Hole(HoleReason::RowsMissing),
+                };
+                if matches!(link, RowLink::Hole(_)) && ir.imported[local].may_change() {
+                    links.open = Some(Open::UnreadImport);
+                }
+                links.links.insert((file.clone(), local.clone()), link);
+            }
+        }
+        links
+    }
+
+    /// What `local`, imported in `file` and used at `spans`, reaches.
+    fn link_of(
+        &mut self,
+        files: &HashMap<PathBuf, FileIr>,
+        bindings: &ImportedBindings,
+        positions: &PositionIndex,
+        file: &Path,
+        local: &str,
+        spans: &[(u32, u32)],
+    ) -> RowLink {
+        type Named<'r> = (
+            Option<&'r str>,
+            Option<u32>,
+            Option<&'r str>,
+            Option<&'r str>,
+        );
+        let mut agreed: Option<Named<'_>> = None;
+        for (lo, hi) in spans {
+            let row = match positions.declaration(file, *lo, *hi, Kind::Ident, true) {
+                Ok(row) => row,
+                Err(reason) => return RowLink::Hole(reason),
+            };
+            let named = (
+                row.decl_file(),
+                row.decl_line(),
+                row.symbol(),
+                row.decl_package(),
+            );
+            match agreed {
+                None => agreed = Some(named),
+                Some(earlier) if earlier == named => {}
+                Some(_) => return RowLink::Hole(HoleReason::RowsMissing),
+            }
+        }
+        let package = agreed.and_then(|(_, _, _, package)| package.map(str::to_string));
+        let Some((Some(decl_file), decl_line, Some(symbol), _)) = agreed else {
+            return RowLink::Outside(package);
+        };
+        if decl_file.starts_with("lib:")
+            || decl_file.starts_with("pkg:")
+            || decl_file.split('/').any(|part| part == "node_modules")
+        {
+            return RowLink::Outside(package);
+        }
+        let declaring = positions.path_of(decl_file);
+        let Some(declared) = files.get(&declaring) else {
+            return RowLink::OtherService;
+        };
+        if declaring == file {
+            // Every use names a declaration of the importing file itself:
+            // a name declared again over the import, not the import.
+            return RowLink::Unrecorded;
+        }
+        // A module's own symbol is named by its file (carrick#2419).
+        if symbol == decl_file {
+            return match bindings.get(file, local) {
+                Some(ImportedBinding::Module(published)) => RowLink::Module(published.clone()),
+                _ => RowLink::Hole(HoleReason::RowsMissing),
+            };
+        }
+        match declared.declared_at.get(symbol) {
+            Some((line, key)) if Some(*line) == decl_line => {
+                RowLink::Declared(declaring, key.clone())
+            }
+            Some(_) => {
+                self.line_disagreements += 1;
+                RowLink::Hole(HoleReason::RowsMissing)
+            }
+            None => RowLink::Unrecorded,
+        }
+    }
+
+    /// What `local`, imported in `file`, reaches. `None` for a name the file
+    /// does not import.
+    pub(crate) fn get(&self, file: &Path, local: &str) -> Option<&RowLink> {
+        self.links.get(&(file.to_path_buf(), local.to_string()))
+    }
+
+    /// Whether every exported object, instance and published getter of the
+    /// service is contested, since a use no row follows may change it.
+    pub(crate) fn open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// One line for the run log: the links by kind, the holes by reason,
+    /// and why the service's exported values are contested, if they are.
+    pub(crate) fn describe(&self) -> String {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for link in self.links.values() {
+            let key = match link {
+                RowLink::Declared(..) => "declared".to_string(),
+                RowLink::Unrecorded => "unrecorded".to_string(),
+                RowLink::Module(_) => "module".to_string(),
+                RowLink::Outside(_) => "outside".to_string(),
+                RowLink::OtherService => "other_service".to_string(),
+                RowLink::Hole(reason) => format!(
+                    "hole:{}",
+                    serde_json::to_value(reason)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_string))
+                        .unwrap_or_default()
+                ),
+            };
+            *counts.entry(key).or_default() += 1;
+        }
+        format!(
+            "{} import binding(s) {counts:?}, {} on another line; exported values contested: {}",
+            self.links.len(),
+            self.line_disagreements,
+            match self.open {
+                None => "no",
+                Some(Open::UnreadImport) => "an import no row follows may change one",
+                Some(Open::ComputedLoad) => "a module is loaded by a computed specifier",
+            }
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::fixture_walk::Walked;
+    use super::super::library_sites::{LibrarySite, MemberUse, MemberWire, library_sites};
+    use super::*;
+
+    /// Every use reads as a claimed maker or op.
+    fn on_wire(_: &str, _: &MemberUse) -> MemberWire {
+        MemberWire::OnWire
+    }
+
+    /// One service of `tests/fixtures/position-rows-names/`, with `edit`
+    /// applied to its tree (paths under `services/names`; empty text removes the
+    /// file), read by discovery with the rows the real sidecar walks
+    /// (`with_rows`) or with none, as a run without `CARRICK_POSITION_ROWS`.
+    fn walked(edit: &[(&str, &str)], with_rows: bool) -> Option<Walked> {
+        super::super::fixture_walk::walked(
+            "position-rows-names",
+            "services/names",
+            "names",
+            edit,
+            with_rows,
+        )
+    }
+
+    trait Reads {
+        fn sites(&self) -> Vec<LibrarySite>;
+        fn link(&self, file: &str, local: &str) -> Option<RowLink>;
+    }
+
+    impl Reads for Walked {
+        fn sites(&self) -> Vec<LibrarySite> {
+            library_sites(&self.inputs).sites
+        }
+
+        fn link(&self, file: &str, local: &str) -> Option<RowLink> {
+            let (path, _) = self
+                .inputs
+                .files
+                .iter()
+                .find(|(path, _)| path.ends_with(file))
+                .expect("the file is read");
+            self.inputs.links.as_ref()?.get(path, local).cloned()
+        }
+    }
+
+    /// What `bus.publish(…)` at `use.ts:line` is handed as its topic.
+    fn topic(sites: &[LibrarySite], line: u32) -> Option<String> {
+        let site = sites
+            .iter()
+            .find(|site| {
+                site.file.ends_with("src/use.ts")
+                    && site.line == line
+                    && site.member.as_deref() == Some("publish")
+            })
+            .unwrap_or_else(|| panic!("no publish site at use.ts:{line}: {sites:#?}"));
+        site.literal(0, None).map(str::to_string)
+    }
+
+    /// The `add` site at `use.ts:line`, if the instance is read through.
+    fn add_at(sites: &[LibrarySite], line: u32) -> Option<&LibrarySite> {
+        sites.iter().find(|site| {
+            site.file.ends_with("src/use.ts")
+                && site.line == line
+                && site.member.as_deref() == Some("add")
+        })
+    }
+
+    /// Everything `use.ts` reads through its imports, by name.
+    fn reads(walked: &Walked) -> Vec<(&'static str, Option<String>)> {
+        let sites = walked.sites();
+        vec![
+            ("TOPICS.orders", topic(&sites, 8)),
+            ("PREFIX", topic(&sites, 9)),
+            ("BROKEN", topic(&sites, 10)),
+            ("ALIASED.send", topic(&sites, 11)),
+            ("LEGACY.send", topic(&sites, 12)),
+            (
+                "emails",
+                add_at(&sites, 13).and_then(|site| site.literal(0, None).map(str::to_string)),
+            ),
+            (
+                "getQueue",
+                add_at(&sites, 15)
+                    .filter(|site| site.contest(on_wire).is_none())
+                    .and_then(|site| site.literal(0, None).map(str::to_string)),
+            ),
+        ]
+    }
+
+    fn read(name: &'static str, text: &str) -> (&'static str, Option<String>) {
+        (name, Some(text.to_string()))
+    }
+
+    /// carrick#2402: an import the scan cannot follow, only called, turns
+    /// every imported reading off without rows. With rows each import reads
+    /// as the declaration its rows name, through `export *`, a `paths`
+    /// alias and a constant whose type did not resolve, and an import only
+    /// called contests nothing. A CommonJS export's property is no
+    /// module-scope binding the declaring file records, so it stays unread.
+    #[test]
+    fn an_unrelated_unfollowable_import_turns_off_nothing_the_rows_name() {
+        let Some(off) = walked(&[], false) else {
+            return;
+        };
+        let unread: Vec<_> = reads(&off)
+            .into_iter()
+            .filter(|(_, text)| text.is_some())
+            .collect();
+        assert!(unread.is_empty(), "read without rows: {unread:?}");
+
+        let on = walked(&[], true).unwrap();
+        assert_eq!(
+            reads(&on),
+            vec![
+                read("TOPICS.orders", "orders.created"),
+                read("PREFIX", "svc"),
+                read("BROKEN", "broken.topic"),
+                read("ALIASED.send", "aliased.send"),
+                ("LEGACY.send", None),
+                read("emails", "welcome"),
+                read("getQueue", "later"),
+            ]
+        );
+        assert!(!on.inputs.links.as_ref().unwrap().open());
+        assert_eq!(on.link("src/use.ts", "LEGACY"), Some(RowLink::Unrecorded));
+        assert!(matches!(
+            on.link("src/other.ts", "setup"),
+            Some(RowLink::Hole(HoleReason::UnresolvedImport))
+        ));
+    }
+
+    /// Without the unfollowable import, both read the same: the rows change
+    /// nothing a service the scan can follow reads.
+    #[test]
+    fn a_service_the_scan_can_follow_reads_the_same_with_rows() {
+        let Some(off) = walked(&[("src/other.ts", "")], false) else {
+            return;
+        };
+        let on = walked(&[("src/other.ts", "")], true).unwrap();
+        assert_eq!(reads(&on), reads(&off));
+        assert_eq!(reads(&on)[0], read("TOPICS.orders", "orders.created"));
+    }
+
+    /// An import no row follows that may change what it holds (here, handed
+    /// on), or a load by a computed specifier, may reach any exported
+    /// object or instance: those read nothing. Text cannot change, so it
+    /// still reads.
+    #[test]
+    fn a_use_no_row_follows_that_may_change_an_object_contests_every_one() {
+        for edit in [
+            (
+                "src/other.ts",
+                "import { thing } from \"undeclared-pkg\";\nexport const value = thing;\n",
+            ),
+            (
+                "src/dynamic.ts",
+                "export function load(name: string) {\n  return import(name);\n}\n",
+            ),
+        ] {
+            let Some(on) = walked(&[edit], true) else {
+                return;
+            };
+            assert!(on.inputs.links.as_ref().unwrap().open(), "{edit:?}");
+            assert_eq!(
+                reads(&on),
+                vec![
+                    ("TOPICS.orders", None),
+                    read("PREFIX", "svc"),
+                    read("BROKEN", "broken.topic"),
+                    ("ALIASED.send", None),
+                    ("LEGACY.send", None),
+                    ("emails", None),
+                    ("getQueue", None),
+                ],
+                "{edit:?}"
+            );
+        }
+    }
+
+    /// A module that writes an object through its import, or a namespace
+    /// import of its module used as a value, may change it: that object is
+    /// unread, with rows as without, and nothing else is.
+    #[test]
+    fn a_module_that_may_change_one_object_contests_only_that_one() {
+        for (edit, contested) in [
+            (
+                (
+                    "src/writer.ts",
+                    "import { ALIASED } from \"@lib/aliased\";\nexport function mutate() {\n  ALIASED.send = \"changed\";\n}\n",
+                ),
+                "ALIASED.send",
+            ),
+            (
+                (
+                    "src/all.ts",
+                    "import * as topics from \"./topics\";\nexport const every = topics;\n",
+                ),
+                "TOPICS.orders",
+            ),
+        ] {
+            let Some(on) = walked(&[edit], true) else {
+                return;
+            };
+            assert!(!on.inputs.links.as_ref().unwrap().open(), "{edit:?}");
+            for (name, text) in reads(&on) {
+                if name == contested || name == "LEGACY.send" {
+                    assert_eq!(text, None, "{name} with {edit:?}");
+                } else {
+                    assert!(text.is_some(), "{name} with {edit:?}");
+                }
+            }
+        }
+    }
+}

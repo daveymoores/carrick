@@ -101,6 +101,7 @@ use swc_common::{Span, Spanned};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use super::row_links::{RowLink, RowLinks};
 use super::{
     BindingUse, BindingUses, ClassFields, ClientBinding, ClientInstance, ClientRef, FileIr, FnIr,
     LinkedClients, MadeBy, ModuleScope, OwnCallee, Reader, RequestSummaryInputs, Scope, Site,
@@ -148,6 +149,12 @@ pub struct SiteObject {
     /// The keys whose value is text with a parameter in it, as
     /// [`SiteArg::holes`].
     pub(super) holes: BTreeMap<String, Vec<TextPiece>>,
+    /// Key -> the keys of its value, when the value is an object literal or
+    /// a serialised one (`{ payload: JSON.stringify({ job }) }`,
+    /// carrick#2453). Such a key is in `fields` with no text: a serialised
+    /// object is not a string the source writes. Same drop rules as
+    /// `fields`.
+    pub objects: BTreeMap<String, SiteObject>,
 }
 
 impl SiteArg {
@@ -199,6 +206,7 @@ impl SiteArg {
                 fields: BTreeMap::new(),
                 open: object.open,
                 holes: BTreeMap::new(),
+                objects: object.objects.clone(),
             };
             for (key, value) in &object.fields {
                 let (text, holes) = match object.holes.get(key) {
@@ -249,7 +257,7 @@ fn fill_pieces(pieces: &[TextPiece], passed: &[SiteArg]) -> Option<Vec<TextPiece
 /// the name is written in, by position, or what a module-scope binding holds
 /// (carrick#1562).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(super) enum TextPiece {
+pub enum TextPiece {
     Lit(String),
     Param(usize),
     /// A constant, an entry of a constant object (`TOPICS.orders`), or what
@@ -261,14 +269,14 @@ pub(super) enum TextPiece {
 
 /// A module-scope binding a name is read through (carrick#1562).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(super) struct NamedRef {
+pub struct NamedRef {
     /// The file's own name for the binding: a module-scope `const` or
     /// function of the file, or an import binding.
-    binding: String,
+    pub binding: String,
     /// The entries walked into it (`["users", "byId"]`).
-    path: Vec<String>,
+    pub path: Vec<String>,
     /// The builder's arguments, each as text pieces, when it is called.
-    args: Option<Vec<Vec<TextPiece>>>,
+    pub args: Option<Vec<Vec<TextPiece>>>,
 }
 
 /// What a module-scope binding holds, as a name reads it (carrick#1562): a
@@ -700,8 +708,8 @@ pub(super) const MAX_MAKERS: usize = 4;
 /// service's functions that fills a name that function's library call takes
 /// from a parameter ([`LibrarySite::origin`]).
 pub fn library_sites(inputs: &RequestSummaryInputs) -> LibrarySites {
-    let clients = LinkedClients::link(&inputs.files, &inputs.bindings);
-    let names = LinkedNames::link(&inputs.files, &inputs.bindings);
+    let clients = LinkedClients::link(&inputs.files, &inputs.bindings, inputs.links.as_ref());
+    let names = LinkedNames::link(&inputs.files, &inputs.bindings, inputs.links.as_ref());
     let callers = Callers::index(inputs);
     let mut sites = Vec::new();
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
@@ -858,13 +866,41 @@ impl<'a> GetterHolders<'a> {
             bindings: &inputs.bindings,
             held: HashMap::new(),
             unaccounted: HashSet::new(),
-            unfollowable: !inputs.bindings.unresolved_in().is_empty(),
+            unfollowable: match &inputs.links {
+                Some(links) => links.open(),
+                None => !inputs.bindings.unresolved_in().is_empty(),
+            },
         };
         if inputs.files.values().all(|ir| ir.getters.is_empty()) {
             return linked;
         }
         for (file, ir) in &inputs.files {
             for (local, used) in &ir.imported {
+                // With rows, an import is the declaration its rows name
+                // (carrick#2413 slice B).
+                if let Some(links) = &inputs.links {
+                    match links.get(file, local) {
+                        Some(RowLink::Declared(at, name))
+                            if inputs
+                                .files
+                                .get(at)
+                                .is_some_and(|declaring| declaring.getters.contains_key(name)) =>
+                        {
+                            linked
+                                .held
+                                .entry((at.clone(), name.clone()))
+                                .or_default()
+                                .push(GetterBinding {
+                                    file,
+                                    used,
+                                    member: None,
+                                });
+                        }
+                        Some(RowLink::Module(published)) => linked.namespace(file, used, published),
+                        _ => {}
+                    }
+                    continue;
+                }
                 match inputs.bindings.get(file, local) {
                     Some(super::ImportedBinding::Binding { file: at, name }) => {
                         match linked.reach(at, name) {
@@ -1234,8 +1270,8 @@ impl SiteReader<'_> {
     /// The function of the service the call at `site` in `file` reaches,
     /// when the call graph resolved it: this call's, never the one before it
     /// in a chain, which starts where it does.
-    fn resolves(&self, file: &Path, site: &Site) -> Option<&(PathBuf, String)> {
-        self.inputs.sites.target_at(file, site.lo, site.hi)
+    fn resolves(&self, file: &Path, site: &Site) -> Option<(PathBuf, String)> {
+        self.inputs.call_target(file, site.lo, site.hi)
     }
 
     /// The instance `client` (held in `file`) holds, where a package's maker
@@ -1282,8 +1318,8 @@ impl SiteReader<'_> {
         let Some(returned) = self
             .inputs
             .files
-            .get(target_file)
-            .and_then(|ir| ir.functions.get(key))
+            .get(&target_file)
+            .and_then(|ir| ir.functions.get(&key))
             .and_then(|function| function.returned.as_ref())
         else {
             return Vec::new();
@@ -1299,7 +1335,7 @@ impl SiteReader<'_> {
         };
         let mut out: Vec<Made> = Vec::new();
         for product in &returned.makers {
-            let mut inner = self.made(target_file, product, depth + 1);
+            let mut inner = self.made(&target_file, product, depth + 1);
             if inner.is_empty() {
                 return Vec::new();
             }
@@ -1413,13 +1449,20 @@ impl SiteReader<'_> {
 /// reaches its module through a namespace import or loads it some other way,
 /// and, read in another module, where the scan can follow every module of
 /// the service (as for an imported instance, [`LinkedClients`]).
+///
+/// With the compiler's rows (`links`, carrick#2413 slice B), an import is
+/// read as the declaration its rows name, and only a constant object is
+/// turned off service-wide, when a use no row follows may change one
+/// ([`RowLinks::open`]): text and a builder's return cannot change.
 pub(super) struct LinkedNames<'a> {
     files: &'a HashMap<PathBuf, FileIr>,
     bindings: &'a super::ImportedBindings,
+    links: Option<&'a RowLinks>,
     /// Constant objects some module's use may change, by declaring module
     /// and name.
     contested: HashSet<(PathBuf, String)>,
-    /// Some module names a specifier the scan cannot follow.
+    /// Some module names a specifier the scan cannot follow; with rows, a
+    /// use no row follows may change an exported object.
     unfollowable: bool,
 }
 
@@ -1427,10 +1470,15 @@ impl<'a> LinkedNames<'a> {
     pub(super) fn link(
         files: &'a HashMap<PathBuf, FileIr>,
         bindings: &'a super::ImportedBindings,
+        links: Option<&'a RowLinks>,
     ) -> Self {
+        if let Some(links) = links {
+            return Self::link_rows(files, bindings, links);
+        }
         let mut linked = LinkedNames {
             files,
             bindings,
+            links: None,
             contested: HashSet::new(),
             unfollowable: !bindings.unresolved_in().is_empty(),
         };
@@ -1476,14 +1524,93 @@ impl<'a> LinkedNames<'a> {
                 }
             }
         }
-        // A namespace import, or a module loaded some other way, may reach
-        // any object its module publishes in any way.
-        for (file, name) in every {
-            if let Some((declared, NameValue::Map(_))) = linked.declared(&file, &name, 0) {
-                linked.contested.insert(declared);
+        linked.contest_every(every);
+        linked
+    }
+
+    /// [`Self::link`] over the rows: each import is the declaration its rows
+    /// name, with no re-export followed by name.
+    fn link_rows(
+        files: &'a HashMap<PathBuf, FileIr>,
+        bindings: &'a super::ImportedBindings,
+        links: &'a RowLinks,
+    ) -> Self {
+        let mut linked = LinkedNames {
+            files,
+            bindings,
+            links: Some(links),
+            contested: HashSet::new(),
+            unfollowable: links.open(),
+        };
+        let mut every: Vec<(PathBuf, String)> = Vec::new();
+        for (file, ir) in files {
+            for (local, used) in &ir.imported {
+                match links.get(file, local) {
+                    Some(RowLink::Declared(at, name)) => {
+                        if let Some(value @ NameValue::Map(_)) = files
+                            .get(at)
+                            .and_then(|declaring| declaring.names.get(name))
+                            && !used.keeps_entries(value)
+                        {
+                            linked.contested.insert((at.clone(), name.clone()));
+                        }
+                    }
+                    Some(RowLink::Module(published)) => {
+                        every.extend(
+                            published
+                                .iter()
+                                .map(|binding| (binding.file.clone(), binding.name.clone())),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            for specifier in &ir.loads {
+                if let Some(super::ImportedBinding::Module(published)) =
+                    bindings.load(file, specifier)
+                {
+                    every.extend(
+                        published
+                            .iter()
+                            .map(|binding| (binding.file.clone(), binding.name.clone())),
+                    );
+                }
             }
         }
+        linked.contest_every(every);
         linked
+    }
+
+    /// A namespace import, or a module loaded some other way, may reach any
+    /// object its module publishes in any way. What it publishes is the
+    /// module graph's answer, with or without rows.
+    fn contest_every(&mut self, every: Vec<(PathBuf, String)>) {
+        for (file, name) in every {
+            if let Some((declared, NameValue::Map(_))) = self.declared(&file, &name, 0) {
+                self.contested.insert(declared);
+            }
+        }
+    }
+
+    /// What `name` in `file` holds, with the module and name that declare
+    /// it: the file's own name, or, for an import, the declaration its rows
+    /// name ([`RowLinks`]) or, without rows, the one [`Self::declared`]
+    /// follows to by name.
+    fn reached(&self, file: &Path, name: &str) -> Option<((PathBuf, String), &'a NameValue)> {
+        let Some(links) = self.links else {
+            return self.declared(file, name, 0);
+        };
+        let ir = self.files.get(file)?;
+        if let Some(value) = ir.names.get(name) {
+            return Some(((file.to_path_buf(), name.to_string()), value));
+        }
+        match links.get(file, name)? {
+            RowLink::Declared(at, declared) => {
+                let value = self.files.get(at)?.names.get(declared)?;
+                Some(((at.clone(), declared.clone()), value))
+            }
+            _ => None,
+        }
     }
 
     /// What `name` in `file` holds, following a module that re-exports an
@@ -1543,10 +1670,15 @@ impl<'a> LinkedNames<'a> {
             }
             let ir = self.files.get(file)?;
             let own = ir.names.contains_key(&named.binding);
-            if !own && self.unfollowable {
+            if !own && self.unfollowable && self.links.is_none() {
                 return None;
             }
-            let ((declared_in, declared), value) = self.declared(file, &named.binding, 0)?;
+            let ((declared_in, declared), value) = self.reached(file, &named.binding)?;
+            // With rows, only an object can be changed by a use no row
+            // follows.
+            if !own && self.unfollowable && matches!(value, NameValue::Map(_)) {
+                return None;
+            }
             if self
                 .contested
                 .contains(&(declared_in.clone(), declared.clone()))
@@ -1578,6 +1710,66 @@ impl<'a> LinkedNames<'a> {
             push_pieces(&mut out, read);
         }
         Some(out)
+    }
+
+    /// Whether the binding `name` in `file` is known to hold no text: the
+    /// module that declares it, followed through the modules that re-export
+    /// it, declares it as something other than a name (a function, a
+    /// builder not called, an instance, a router). A package's binding, a
+    /// namespace's, or one the scan cannot follow may hold anything, so is
+    /// not known (carrick#2386).
+    ///
+    /// With rows, an import is the declaration its rows name: one the
+    /// declaring file records as something other than a name holds no text,
+    /// and one it records nowhere is not known.
+    pub(super) fn holds_no_text(&self, file: &Path, name: &str) -> bool {
+        if let Some(links) = self.links {
+            let holds_none = |ir: &FileIr, name: &str| match ir.names.get(name) {
+                Some(value) => matches!(value, NameValue::Builder(_)),
+                None => true,
+            };
+            let Some(ir) = self.files.get(file) else {
+                return false;
+            };
+            if ir.names.contains_key(name) || !ir.imported.contains_key(name) {
+                return holds_none(ir, name);
+            }
+            return match links.get(file, name) {
+                Some(RowLink::Declared(at, declared)) => self
+                    .files
+                    .get(at)
+                    .is_some_and(|declaring| holds_none(declaring, declared)),
+                _ => false,
+            };
+        }
+        let mut at = (file.to_path_buf(), name.to_string());
+        for _ in 0..=super::MAX_REEXPORT_HOPS {
+            let Some(ir) = self.files.get(&at.0) else {
+                return false;
+            };
+            match ir.names.get(&at.1) {
+                Some(NameValue::Builder(_)) => return true,
+                Some(_) => return false,
+                None => {}
+            }
+            if !ir.imported.contains_key(&at.1) {
+                return true;
+            }
+            match self.bindings.get(&at.0, &at.1) {
+                Some(super::ImportedBinding::Binding { file, name }) => {
+                    at = (file.clone(), name.clone());
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// `pieces`, read in `file`, as one text: `None` unless every named
+    /// piece reads as text ([`Self::resolve`]). What a guard compares a
+    /// value against, when it names a constant (carrick#2386).
+    pub(super) fn text(&self, file: &Path, pieces: &[TextPiece]) -> Option<String> {
+        split_text(self.resolve(file, pieces, 0)).0
     }
 
     /// `arg`, read in `file`, with every named piece read
@@ -1640,9 +1832,9 @@ impl<'a> Callers<'a> {
             by_target: &mut HashMap<(PathBuf, String), Vec<Caller<'a>>>,
         ) {
             for call in &ir.calls {
-                if let Some(target) = inputs.sites.target_at(file, call.site.lo, call.site.hi) {
+                if let Some(target) = inputs.call_target(file, call.site.lo, call.site.hi) {
                     by_target
-                        .entry(target.clone())
+                        .entry(target)
                         .or_default()
                         .push(Caller { file, call, key });
                 }
@@ -2848,10 +3040,59 @@ pub(super) fn site_arg(expr: &Expr, scope: &Scope<'_>) -> SiteArg {
         text,
         object: match expr {
             Expr::Object(object) => Some(site_object(object, scope)),
+            // A payload written as `JSON.stringify({ ... })` states the
+            // keys of the object it serialises (carrick#2453).
+            Expr::Call(call) => serialised_object(call, scope),
             _ => None,
         },
         function: matches!(expr, Expr::Arrow(_) | Expr::Fn(_)),
         holes,
+    }
+}
+
+/// What a serialiser call states: `JSON.stringify(x)`, or with a replacer
+/// and a space, states `x`. A spread first argument states nothing. The one
+/// place the call is read, for the send side's value reader
+/// ([`Reader::eval`]) and for [`site_arg`] (carrick#2453). Until a library
+/// claim carries it, the language global is read the way `fetch` is.
+pub(super) fn serialised_operand(call: &CallExpr) -> Option<&Expr> {
+    if !super::is_member_call(call, "JSON", "stringify") {
+        return None;
+    }
+    let arg = call.args.first()?;
+    arg.spread.is_none().then_some(&*arg.expr)
+}
+
+/// The keys of the object a serialiser call serialises: an object literal,
+/// or a name bound to a module `const` object literal the file never writes
+/// through. A call result, a parameter or any other expression has none.
+fn serialised_object(call: &CallExpr, scope: &Scope<'_>) -> Option<SiteObject> {
+    match unwrap_expression(serialised_operand(call)?) {
+        Expr::Object(object) => Some(site_object(object, scope)),
+        Expr::Call(inner) => serialised_object(inner, scope),
+        Expr::Ident(ident) => {
+            let key = ident_key(ident);
+            // A binding the function or a block declares again is not the
+            // module's.
+            if scope.params.contains(&Some(key.clone()))
+                || scope.locals.contains_key(&key)
+                || scope.texts.contains_key(&key)
+            {
+                return None;
+            }
+            let object = scope.module.object_lits.get(&key)?;
+            Some(site_object(object, &Scope::module(scope.module)))
+        }
+        _ => None,
+    }
+}
+
+/// The keys of `expr` when it is an object literal or a serialised one.
+fn nested_object(expr: &Expr, scope: &Scope<'_>) -> Option<SiteObject> {
+    match unwrap_expression(expr) {
+        Expr::Object(object) => Some(site_object(object, scope)),
+        Expr::Call(call) => serialised_object(call, scope),
+        _ => None,
     }
 }
 
@@ -2889,6 +3130,7 @@ fn site_object(object: &ObjectLit, scope: &Scope<'_>) -> SiteObject {
     let open = |out: &mut SiteObject| {
         out.fields.clear();
         out.holes.clear();
+        out.objects.clear();
         out.open = true;
     };
     let put = |out: &mut SiteObject, key: String, pieces: Option<Vec<TextPiece>>| {
@@ -2897,6 +3139,7 @@ fn site_object(object: &ObjectLit, scope: &Scope<'_>) -> SiteObject {
             Some(holes) => out.holes.insert(key.clone(), holes),
             None => out.holes.remove(&key),
         };
+        out.objects.remove(&key);
         out.fields.insert(key, text);
     };
     for prop in &object.props {
@@ -2909,7 +3152,12 @@ fn site_object(object: &ObjectLit, scope: &Scope<'_>) -> SiteObject {
         };
         match &**prop {
             Prop::KeyValue(kv) => match prop_name(&kv.key) {
-                Some(key) => put(&mut out, key, text_pieces(&kv.value, scope)),
+                Some(key) => {
+                    put(&mut out, key.clone(), text_pieces(&kv.value, scope));
+                    if let Some(nested) = nested_object(&kv.value, scope) {
+                        out.objects.insert(key, nested);
+                    }
+                }
                 None => open(&mut out),
             },
             Prop::Shorthand(ident) => put(
@@ -5792,7 +6040,11 @@ mod tests {
         assert_eq!(name(13), None, "an object another module writes through");
         assert_eq!(name(14), None, "an object whose inner object is aliased");
         assert_eq!(name(15), None, "a builder handed a parameter");
-        assert_eq!(name(16), None, "a function that does more than return");
+        assert_eq!(
+            name(16).as_deref(),
+            Some("two.z"),
+            "a function that declares a constant before its return (carrick#2447)"
+        );
         assert_eq!(name(17).as_deref(), Some("users"));
         let filled = site(&sites, "src/caller.ts", 2, Some("publish"));
         assert_eq!(filled.literal(0, None), Some("svc.filled"));
@@ -5950,5 +6202,132 @@ mod tests {
                 .all(|site| !(site.file.ends_with("src/use.ts") && site.line == 4)),
             "{sites:#?}"
         );
+    }
+
+    /// The keys a send's argument states, read at the first send of a
+    /// one-file module.
+    fn payload_arg(source: &str) -> SiteArg {
+        let sites = sites_of(&[("src/send.ts", source)]);
+        let send = sites
+            .iter()
+            .find(|site| site.member.as_deref() == Some("send"))
+            .unwrap_or_else(|| panic!("no send site: {sites:#?}"));
+        send.args[0].clone()
+    }
+
+    /// The nested object under `key`, as the payload states it.
+    fn nested<'a>(arg: &'a SiteArg, key: &str) -> &'a SiteObject {
+        arg.object
+            .as_ref()
+            .and_then(|object| object.objects.get(key))
+            .unwrap_or_else(|| panic!("no nested {key}: {arg:#?}"))
+    }
+
+    /// `{ Payload: JSON.stringify({ job: CONST, id }) }` keeps the payload's
+    /// keys one level down, `job` holding the constant's text, and the
+    /// serialised key is no text (carrick#2453).
+    #[test]
+    fn a_serialised_object_key_keeps_its_keys() {
+        let arg = payload_arg(
+            "import { Client, Invoke } from \"@fixture/rpc\";\n\
+             const client = new Client();\n\
+             const EMBED_JOB = \"embed\";\n\
+             export async function go(id: string) {\n\
+             \x20 await client.send({ Target: \"fn\", Payload: JSON.stringify({ job: EMBED_JOB, id }) });\n\
+             }\n",
+        );
+        let payload = nested(&arg, "Payload");
+        assert_eq!(payload.fields["job"].as_deref(), Some("embed"));
+        assert!(payload.fields.contains_key("id"));
+        assert_eq!(arg.object.as_ref().unwrap().fields["Payload"], None);
+    }
+
+    /// A serialised object as the argument is read as the literal would be,
+    /// with or without a replacer and a space.
+    #[test]
+    fn a_serialised_argument_reads_as_its_object() {
+        for call in [
+            "JSON.stringify({ type: \"join\", room })",
+            "JSON.stringify({ type: \"join\", room }, null, 2)",
+        ] {
+            let arg = payload_arg(&format!(
+                "import {{ Socket }} from \"@fixture/ws\";\n\
+                 const socket = new Socket();\n\
+                 export function join(room: string) {{\n\
+                 \x20 socket.send({call});\n\
+                 }}\n"
+            ));
+            let object = arg.object.expect("the serialised keys");
+            assert_eq!(object.fields["type"].as_deref(), Some("join"), "{call}");
+            assert!(object.fields.contains_key("room"), "{call}");
+            assert_eq!(arg.text, None);
+        }
+    }
+
+    /// A spread inside the serialised object makes it open, and a spread
+    /// argument serialises nothing.
+    #[test]
+    fn a_spread_in_a_serialised_object_opens_it() {
+        let arg = payload_arg(
+            "import { Socket } from \"@fixture/ws\";\n\
+             const socket = new Socket();\n\
+             export function go(rest: object) {\n\
+             \x20 socket.send(JSON.stringify({ type: \"a\", ...rest, room: \"r\" }));\n\
+             }\n",
+        );
+        let object = arg.object.expect("the serialised keys");
+        assert!(object.open);
+        assert!(!object.fields.contains_key("type"));
+        assert_eq!(object.fields["room"].as_deref(), Some("r"));
+
+        let spread = payload_arg(
+            "import { Socket } from \"@fixture/ws\";\n\
+             const socket = new Socket();\n\
+             export function go(args: object[]) {\n\
+             \x20 socket.send(JSON.stringify(...args));\n\
+             }\n",
+        );
+        assert_eq!(spread.object, None);
+    }
+
+    /// A serialised name bound to a `const` object reads its keys; one the
+    /// file writes through, a call result and a parameter read none.
+    #[test]
+    fn a_serialised_name_reads_a_const_object_only_when_nothing_changes_it() {
+        let named = payload_arg(
+            "import { Socket } from \"@fixture/ws\";\n\
+             const socket = new Socket();\n\
+             const event = { type: \"join\" };\n\
+             export function go() {\n\
+             \x20 socket.send(JSON.stringify(event));\n\
+             }\n",
+        );
+        assert_eq!(
+            named.object.expect("keys").fields["type"].as_deref(),
+            Some("join")
+        );
+
+        let written = payload_arg(
+            "import { Socket } from \"@fixture/ws\";\n\
+             const socket = new Socket();\n\
+             const event = { type: \"join\" };\n\
+             export function go() {\n\
+             \x20 event.room = \"r\";\n\
+             \x20 socket.send(JSON.stringify(event));\n\
+             }\n",
+        );
+        assert_eq!(written.object, None);
+
+        for operand in ["build()", "event"] {
+            let arg = payload_arg(&format!(
+                "import {{ Socket }} from \"@fixture/ws\";\n\
+                 const socket = new Socket();\n\
+                 declare function build(): object;\n\
+                 export function go(event: object) {{\n\
+                 \x20 socket.send(JSON.stringify({operand}));\n\
+                 }}\n"
+            ));
+            assert_eq!(arg.object, None, "{operand}");
+        }
     }
 }

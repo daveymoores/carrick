@@ -47,6 +47,7 @@ import type {
   LibraryClaim,
   LibraryRole,
   LibrarySurface,
+  RunsSlot,
   SemanticsCheck,
   SemanticsModule,
   SemanticsResult,
@@ -68,6 +69,9 @@ const HTTP_METHODS: ReadonlySet<string> = new Set([
   'HEAD',
   'OPTIONS',
 ]);
+
+/** The methods a route may register: every request method, and `ALL` for a member that registers each. */
+const ROUTE_METHODS: ReadonlySet<string> = new Set([...HTTP_METHODS, 'ALL']);
 
 /**
  * Interfaces whose members every value of that kind inherits. A key found only
@@ -110,6 +114,22 @@ const RUNTIME_TYPE_PACKAGES: ReadonlySet<string> = new Set([
  */
 const RUNTIME_MODULE = /^node:/;
 
+/**
+ * A key for the language's own library (carrick#2445): `lib:<lib file>`
+ * (`lib:lib.dom.d.ts`) names the globals that default-library file declares.
+ * Its installed version is the compiler's, so the store keys it
+ * `lib:lib.dom.d.ts@<typescript version>`. A global has no specifier: the
+ * probe reads it as `globalThis.<name>`, and its home is the default-library
+ * file set (`DEFAULT_LIBRARY_HOME`).
+ */
+const DEFAULT_LIBRARY = /^lib:/;
+
+/**
+ * The owner a home names for every default-library file. No package name
+ * holds a `:`, so only a `lib:` key's home ever holds it.
+ */
+const DEFAULT_LIBRARY_HOME = 'lib:';
+
 /** A dependency range that names the service's own source, not a registry release. */
 const LOCAL_RANGE = /^(workspace|file|link|portal):/;
 
@@ -143,6 +163,12 @@ interface RoleRules {
   message: boolean;
   /** The op kinds it can check. */
   ops: ReadonlySet<string>;
+  /**
+   * Label structure v2 (carrick#2434): the method words an op's `method`,
+   * `method_key` and `method_default` may name. Without it, an op carrying
+   * any of them is `claim_invalid`.
+   */
+  methods?: ReadonlySet<string>;
 }
 
 const HTTP_RULES: RoleRules = { http: true, message: false, ops: new Set(['request']) };
@@ -151,6 +177,18 @@ const MESSAGE_RULES: RoleRules = {
   message: true,
   ops: new Set(['send', 'receive', 'request']),
 };
+/**
+ * An `http_client` export whose claims in the request use a label v2 field
+ * (`hasV2Field`) is read as the store's other roles are: its makers, `of`
+ * and `on`, paths and the name-slot rules, plus the method fields. An export
+ * whose claims use none keeps the #1564 checks exactly (`HTTP_RULES`).
+ */
+const HTTP_V2_RULES: RoleRules = { http: false, message: true, ops: new Set(['request']), methods: HTTP_METHODS };
+/**
+ * A server framework's route members: a `receive` op whose name is the path,
+ * the method from the member's own name (`get` registers GET) or from a slot.
+ */
+const SERVER_RULES: RoleRules = { http: false, message: true, ops: new Set(['receive']), methods: ROUTE_METHODS };
 
 /**
  * The role table: the role alone picks the checks. A role this build does
@@ -163,9 +201,20 @@ const ROLE_TABLE: Readonly<Record<LibraryRole, RoleRules | undefined>> = {
   in_process_bus: MESSAGE_RULES,
   socket: MESSAGE_RULES,
   graphql_client: undefined,
-  server_framework: undefined,
+  server_framework: SERVER_RULES,
   none: undefined,
 };
+
+/**
+ * Whether a claim uses a field label structure v2 added (carrick#2434). An
+ * `http_client` export with one such claim in the request is read under
+ * `HTTP_V2_RULES`.
+ */
+function hasV2Field(claim: LibraryClaim): boolean {
+  if (claim.kind === 'make') return claim.runs !== undefined;
+  if (claim.kind !== 'op') return false;
+  return claim.method_default !== undefined || claim.base !== undefined || claim.runs !== undefined || claim.yields !== undefined;
+}
 
 /** How one check came out, before it is stamped with its claim and receiver. */
 type Outcome =
@@ -242,6 +291,8 @@ interface MessageReceiver extends Holder {
   makerBindsName: boolean;
   /** The receiver came through a scope member (`{ bound: 'scope' }` reads it). */
   scoped: boolean;
+  /** The maker overloads this instance is read through: what `runs: { bound: 'maker' }` reads. */
+  makerHolding?: readonly ts.Signature[];
 }
 
 /** A check's outcome, and for a maker or scope claim the overloads it holds on. */
@@ -367,6 +418,13 @@ export class LibraryClaimsVerifier {
     const factoryKeys = new Map<string, Set<string>>();
     // The roles each (package, export) is given across the request.
     const roles = new Map<string, Set<LibraryRole>>();
+    // The `http_client` exports read under the label v2 rules.
+    const v2Exports = new Set<string>();
+    for (const check of checks) {
+      if (check.role === 'http_client' && hasV2Field(check.claim)) v2Exports.add(exportKey(check));
+    }
+    const rulesFor = (check: LibraryCheck): RoleRules | undefined =>
+      check.role === 'http_client' && v2Exports.has(exportKey(check)) ? HTTP_V2_RULES : ROLE_TABLE[check.role];
     for (const check of checks) {
       const key = exportKey(check);
       if (!importIndex.has(key)) {
@@ -387,7 +445,7 @@ export class LibraryClaimsVerifier {
     }
     const importLines = importKeys.map((key, i) => {
       const [pkg, name] = JSON.parse(key) as [string, string];
-      return importLine(pkg, name, `__carrick_e${i}`);
+      return probeLine(pkg, name, `__carrick_e${i}`);
     });
     // One statement per receiver a message check's maker or scope claim
     // builds, after the imports: that receiver built with no argument and no
@@ -397,7 +455,7 @@ export class LibraryClaimsVerifier {
     const builtLines: string[] = [];
     const builtIndex = new Map<string, number>();
     for (const check of checks) {
-      if (!ROLE_TABLE[check.role]?.message) continue;
+      if (!rulesFor(check)?.message) continue;
       const built = builtReceiver(check);
       if (built === undefined) continue;
       const key = builtKey(check, built);
@@ -424,8 +482,8 @@ export class LibraryClaimsVerifier {
       const httpReceivers = new Map<string, Read<ts.Type>>();
       const judged = new Map<number, Judged>();
 
-      const declarationOf = (check: LibraryCheck) =>
-        file.statements[importIndex.get(exportKey(check))!] as ts.ImportDeclaration;
+      /** The probe's import of the check's export, or its read of a global (`probeLine`). */
+      const statementOf = (check: LibraryCheck) => file.statements[importIndex.get(exportKey(check))!];
 
       /** The probe's no-argument build of `receiver` on the check's export, resolved. */
       const atDefaults = (check: LibraryCheck, receiver: string): ts.Signature | undefined => {
@@ -438,7 +496,9 @@ export class LibraryClaimsVerifier {
         const key = `${runtimeModules}\u0000${check.package}`;
         let moduleRead = moduleReads.get(key);
         if (!moduleRead) {
-          moduleRead = reader.readModule(check.package, declarationOf(check), runtimeModules);
+          moduleRead = DEFAULT_LIBRARY.test(check.package)
+            ? reader.readDefaultLibrary(check.package)
+            : reader.readModule(check.package, statementOf(check) as ts.ImportDeclaration, runtimeModules);
           moduleReads.set(key, moduleRead);
         }
         return moduleRead;
@@ -448,7 +508,9 @@ export class LibraryClaimsVerifier {
         const key = exportKey(check);
         let exportRead = exportReads.get(key);
         if (!exportRead) {
-          exportRead = reader.readExport(declarationOf(check));
+          exportRead = DEFAULT_LIBRARY.test(check.package)
+            ? reader.readGlobal(check.package, statementOf(check))
+            : reader.readExport(statementOf(check) as ts.ImportDeclaration);
           exportReads.set(key, exportRead);
         }
         return exportRead;
@@ -466,6 +528,7 @@ export class LibraryClaimsVerifier {
         const receiverPath = parseReceiver(check.receiver)!;
         let types: readonly ts.Type[] = [exported.type];
         let makerBindsName = false;
+        let makerHolding: readonly ts.Signature[] | undefined;
         if (receiverPath.maker) {
           const maker = receiverPath.maker;
           const makers = checks
@@ -479,12 +542,14 @@ export class LibraryClaimsVerifier {
                 other.claim.form === maker.form &&
                 other.claim.member === maker.member
             );
-          const made = holdingReturns(
-            makers.map(({ i }) => judge(i)),
-            atDefaults(check, receiverPath.base)
-          );
+          const makerJudgements = makers.map(({ i }) => judge(i));
+          const made = holdingReturns(makerJudgements, atDefaults(check, receiverPath.base));
           if ('reason' in made) return { reason: made.reason === 'unresolved' ? 'maker_unresolved' : 'maker_unverified' };
           types = made.value;
+          makerHolding = makerJudgements.reduce<readonly ts.Signature[]>(
+            (common, judgement) => common.filter(sig => judgement.holding!.includes(sig)),
+            makerJudgements[0].holding!
+          );
           makerBindsName = makers.some(({ other }) => other.claim.kind === 'make' && other.claim.name !== undefined);
         }
         if (receiverPath.scope !== undefined) {
@@ -516,6 +581,7 @@ export class LibraryClaimsVerifier {
             home: reader.homeOf(check.package, [exported.target, ...typeSymbols(type)]),
             makerBindsName,
             scoped: receiverPath.scope !== undefined,
+            makerHolding,
           })),
         };
       };
@@ -550,7 +616,7 @@ export class LibraryClaimsVerifier {
 
       const judgeCheck = (index: number): Judged => {
         const check = checks[index];
-        const rules = ROLE_TABLE[check.role];
+        const rules = rulesFor(check);
         if (!rules) return { outcome: unchecked('role_unsupported') };
         // An export given two roles is classified two ways; neither is a fact.
         if ((roles.get(exportKey(check))?.size ?? 0) > 1) return { outcome: unchecked('role_conflict') };
@@ -593,7 +659,7 @@ export class LibraryClaimsVerifier {
         const builtAtDefaults = built === undefined ? undefined : atDefaults(check, built);
         const holding: ts.Signature[] = [];
         for (const receiver of receivers.value) {
-          const result = reader.judgeMessage(receiver, check.claim, builtAtDefaults);
+          const result = reader.judgeMessage(receiver, check.claim, rules, builtAtDefaults);
           if (result.outcome.verdict !== 'verified') return result;
           holding.push(...(result.holding ?? []));
         }
@@ -649,15 +715,24 @@ export class LibraryClaimsVerifier {
     if (packages.length === 0) return { surfaces: [], surface_sha256: fullSurfaceSha256([]) };
     // Each specifier twice: as a namespace, which holds its named exports, and
     // as a default import, which is how a module that exports a value whole
-    // (`export =`) is imported as `default`.
-    const imports = packages.flatMap((pkg, i) => [
-      `import * as __carrick_ns${i} from ${JSON.stringify(pkg)};`,
-      importLine(pkg, 'default', `__carrick_d${i}`),
-    ]);
-    const probeOf = (file: ts.SourceFile, i: number): SurfaceProbe => ({
-      namespace: file.statements[2 * i] as ts.ImportDeclaration,
-      defaultImport: file.statements[2 * i + 1] as ts.ImportDeclaration,
+    // (`export =`) is imported as `default`. A `lib:` key imports nothing: its
+    // globals are read from the file it names.
+    const imports: string[] = [];
+    const importAt = packages.map((pkg, i) => {
+      if (DEFAULT_LIBRARY.test(pkg)) return undefined;
+      const at = imports.length;
+      imports.push(`import * as __carrick_ns${i} from ${JSON.stringify(pkg)};`, importLine(pkg, 'default', `__carrick_d${i}`));
+      return at;
     });
+    const probeOf = (file: ts.SourceFile, i: number): SurfaceProbe => {
+      const at = importAt[i];
+      return at === undefined
+        ? { defaultLibrary: packages[i] }
+        : {
+            namespace: file.statements[at] as ts.ImportDeclaration,
+            defaultImport: file.statements[at + 1] as ts.ImportDeclaration,
+          };
+    };
 
     const makers = this.readProbe(fromDir, imports, (_checker, reader, file) =>
       packages.map((pkg, i) => reader.makersOf(pkg, probeOf(file, i), only[pkg]))
@@ -669,7 +744,7 @@ export class LibraryClaimsVerifier {
     packages.forEach((pkg, i) => {
       for (const { export: name, receivers } of makers[i]) {
         const local = `__carrick_e${importLines.length}`;
-        importLines.push(importLine(pkg, name, local));
+        importLines.push(probeLine(pkg, name, local));
         for (const receiver of receivers) {
           const expression = receiverExpression(local, receiver);
           if (expression === undefined) continue;
@@ -711,11 +786,10 @@ export class LibraryClaimsVerifier {
   }
 }
 
-/** A specifier's two imports in the surface probe (see `listSurface`). */
-interface SurfaceProbe {
-  namespace: ts.ImportDeclaration;
-  defaultImport: ts.ImportDeclaration;
-}
+/** A specifier's two imports in the surface probe (see `listSurface`), or the `lib:` key it names. */
+type SurfaceProbe =
+  | { namespace: ts.ImportDeclaration; defaultImport: ts.ImportDeclaration }
+  | { defaultLibrary: string };
 
 /** One value export a surface lists: its name, the declaration it names and its type. */
 interface ListedExport {
@@ -887,6 +961,18 @@ function typeSymbols(type: ts.Type): (ts.Symbol | undefined)[] {
   return symbols;
 }
 
+/**
+ * The probe's read of one export, bound to `local`: its import, or for a
+ * `lib:` key the global itself, as `globalThis` holds it. A block-scoped
+ * global (`declare const`) is not on `globalThis`; no default-library file
+ * declares one.
+ */
+function probeLine(pkg: string, name: string, local: string): string {
+  if (!DEFAULT_LIBRARY.test(pkg)) return importLine(pkg, name, local);
+  const access = IDENTIFIER.test(name) ? `.${name}` : `[${JSON.stringify(name)}]`;
+  return `const ${local} = globalThis${access};`;
+}
+
 /** The probe's import of one export, bound to `local`. */
 function importLine(pkg: string, name: string, local: string): string {
   const specifier = JSON.stringify(pkg);
@@ -932,7 +1018,7 @@ function readLocalRanges(fromDir: string): ReadonlyMap<string, string> {
 }
 
 /** A part of a message claim. `base` and `prefix` are a maker's string parts. */
-type PartName = 'name' | 'base' | 'prefix' | 'payload' | 'handler' | 'ack';
+type PartName = 'name' | 'base' | 'prefix' | 'payload' | 'handler' | 'ack' | 'method' | 'runs';
 
 /** Where the parts of a message claim sit, and which argument holds which keys. */
 interface ClaimLayout {
@@ -1106,6 +1192,59 @@ class DeclarationReader {
     return target === file && this.isInstalledFile(file.fileName);
   }
 
+  /**
+   * A `lib:` key: the default-library file it names, as the program's own
+   * `lib` setting loads it, read by the compiler that built the program. A
+   * file the program does not load is no module reason: each global answers
+   * `export_missing` (`readGlobal`).
+   */
+  readDefaultLibrary(pkg: string): ModuleRead {
+    const entry: SemanticsModule = { package: pkg, installed_version: ts.version };
+    const file = this.defaultLibraryFile(pkg);
+    if (file) entry.resolved_file = file.fileName;
+    return { entry };
+  }
+
+  /** The default-library file a `lib:` key names, when the program loads it. */
+  private defaultLibraryFile(pkg: string): ts.SourceFile | undefined {
+    const name = pkg.slice('lib:'.length);
+    return this.program
+      .getSourceFiles()
+      .find(file => this.program.isSourceFileDefaultLibrary(file) && path.basename(file.fileName) === name);
+  }
+
+  /**
+   * `T` for a global (`probeLine`'s `globalThis` read): the type the probe's
+   * local gets, and the global it names. The global must be a value the
+   * key's lib file declares; one only another file declares (the runtime's
+   * types, the service) is missing from it.
+   */
+  readGlobal(pkg: string, statement: ts.Statement | undefined): Read<ExportRead> {
+    const declaration =
+      statement && ts.isVariableStatement(statement) ? statement.declarationList.declarations[0] : undefined;
+    const access = declaration?.initializer;
+    const name =
+      access && ts.isPropertyAccessExpression(access)
+        ? access.name
+        : access && ts.isElementAccessExpression(access)
+          ? access.argumentExpression
+          : undefined;
+    const target = name ? this.checker.getSymbolAtLocation(name) : undefined;
+    const file = this.defaultLibraryFile(pkg);
+    if (
+      !declaration ||
+      !target ||
+      !file ||
+      !(target.flags & ts.SymbolFlags.Value) ||
+      !(target.declarations ?? []).some(each => each.getSourceFile() === file)
+    ) {
+      return { reason: 'export_missing' };
+    }
+    const type = this.checker.getTypeAtLocation(declaration.name);
+    if (this.isOpenTop(type)) return { reason: 'export_untyped' };
+    return { value: { type, target } };
+  }
+
   /** `T`: the type the probe's import gets, and the declaration it names. */
   readExport(declaration: ts.ImportDeclaration): Read<ExportRead> {
     const clause = declaration.importClause;
@@ -1209,6 +1348,8 @@ class DeclarationReader {
     symbols: readonly (ts.Symbol | undefined)[],
     base?: ReadonlySet<string>
   ): ReadonlySet<string> {
+    // A global's home is the default-library file set, and only that.
+    if (DEFAULT_LIBRARY.test(pkg)) return base ?? new Set([DEFAULT_LIBRARY_HOME]);
     const named = packageNameOf(pkg);
     const home = new Set<string>(base ?? [named, typesPackageOf(named)]);
     const runtime =
@@ -1232,6 +1373,7 @@ class DeclarationReader {
   }
 
   private isOwnFile(file: ts.SourceFile, home: ReadonlySet<string>): boolean {
+    if (this.program.isSourceFileDefaultLibrary(file)) return home.has(DEFAULT_LIBRARY_HOME);
     const owner = this.packageOf(file);
     return owner !== undefined && home.has(owner);
   }
@@ -1513,14 +1655,14 @@ class DeclarationReader {
    * overloads it holds on. `built` is the probe's no-argument build of the
    * receiver a maker or scope claim makes (see `returnOf`).
    */
-  judgeMessage(receiver: MessageReceiver, claim: LibraryClaim, built?: ts.Signature): Judged {
+  judgeMessage(receiver: MessageReceiver, claim: LibraryClaim, rules: RoleRules, built?: ts.Signature): Judged {
     switch (claim.kind) {
       case 'make':
         return this.judgeMake(receiver, claim, built);
       case 'scope':
         return this.judgeScope(receiver, claim, built);
       case 'op':
-        return { outcome: this.judgeOp(receiver, claim) };
+        return { outcome: this.judgeOp(receiver, claim, rules) };
       case 'reserved':
         return { outcome: this.judgeReserved(receiver, claim) };
     }
@@ -1537,7 +1679,13 @@ class DeclarationReader {
    * `handler` slot; a queue (`new Queue("emails")`) one with a positional name.
    */
   private judgeMake(receiver: MessageReceiver, claim: MakeClaim, built?: ts.Signature): Judged {
-    const layout = this.layout({ base: claim.base, prefix: claim.prefix, name: claim.name, handler: claim.handler });
+    const layout = this.layout({
+      base: claim.base,
+      prefix: claim.prefix,
+      name: claim.name,
+      handler: claim.handler,
+      runs: claim.runs,
+    });
     if ('failure' in layout) return { outcome: layout.failure };
     const callee = this.ownCallee(receiver, [], claim.member, claim.form);
     if ('failure' in callee) return { outcome: callee.failure };
@@ -1589,31 +1737,174 @@ class DeclarationReader {
    * instance's maker claim has a `name` slot, or the receiver came through a
    * scope.
    */
-  private judgeOp(receiver: MessageReceiver, claim: OpClaim): Outcome {
-    if (claim.method !== undefined || claim.method_key !== undefined || claim.options !== undefined) {
+  private judgeOp(receiver: MessageReceiver, claim: OpClaim, rules: RoleRules): Outcome {
+    const method = this.methodOutcome(claim, rules);
+    if (method) return method;
+    // What a handler is handed is read on a receive op's handler only.
+    if (claim.yields !== undefined && (claim.op !== 'receive' || claim.handler === undefined)) {
       return unchecked('claim_invalid');
     }
     const name = claim.name;
-    // A send carries a payload: a name alone on `send(data)` is the data.
-    if (name === undefined || (claim.op === 'send' && claim.payload === undefined)) return unchecked('claim_invalid');
+    // A send carries a payload: a name alone on `send(data)` is the data. An
+    // op that runs a function or client it is handed takes its name from
+    // what it runs, and one that hands its handler a receiver (a server's
+    // connection event) names nothing on the wire itself, so neither needs a
+    // name of its own.
+    const nameless = claim.runs !== undefined || claim.yields !== undefined;
+    if ((name === undefined && !nameless) || (claim.op === 'send' && claim.payload === undefined)) {
+      return unchecked('claim_invalid');
+    }
     let nameSlot: ClaimSlot | undefined;
-    if ('bound' in name) {
+    if (name === undefined) {
+      nameSlot = undefined;
+    } else if ('bound' in name) {
       if (name.bound === 'maker' ? !receiver.makerBindsName : !receiver.scoped) return failed('name_unbound');
     } else {
       nameSlot = name;
     }
-    const layout = this.layout({ name: nameSlot, payload: claim.payload, handler: claim.handler, ack: claim.ack });
+    const runs = claim.runs;
+    const boundRuns = runs?.bound === 'maker' ? runs : undefined;
+    if (boundRuns && !receiver.makerHolding) return failed('runs_unbound');
+    const layout = this.layout({
+      name: nameSlot,
+      payload: claim.payload,
+      handler: claim.handler,
+      ack: claim.ack,
+      base: claim.base,
+      method: claim.method_key,
+      runs: runs && !boundRuns ? { arg: runs.arg, ...(runs.key === undefined ? {} : { key: runs.key }) } : undefined,
+    });
     if ('failure' in layout) return layout.failure;
     const callee = this.ownCallee(receiver, claim.path ?? [], claim.member, 'call');
     if ('failure' in callee) return callee.failure;
     const labels = claim.key_labels ?? {};
     let best: RankedFailure | undefined;
+    let held = false;
     for (const signature of callee.signatures) {
-      const result = this.messageSignatureOutcome(signature, layout.value, labels);
-      if (result.rank === Infinity) return VERIFIED;
+      let result = this.messageSignatureOutcome(signature, layout.value, labels);
+      if (result.rank === Infinity && claim.yields !== undefined) {
+        const given = this.yieldsOutcome(signature, claim.handler!, claim.yields, receiver);
+        if (given) result = { rank: 5, outcome: given };
+      }
+      if (result.rank === Infinity) {
+        held = true;
+        break;
+      }
       best = furthest(best, result.rank, result.outcome);
     }
-    return best!.outcome;
+    if (!held) return best!.outcome;
+    if (boundRuns) return this.boundRunsOutcome(receiver.makerHolding!, boundRuns);
+    return VERIFIED;
+  }
+
+  /**
+   * The method fields of an op (label structure v2, carrick#2434), under the
+   * role's method words. Without method words (the message roles), an op
+   * carrying `method`, `method_key`, `options`, `method_default` or `base` is
+   * `claim_invalid`, as before. With them:
+   * - `method` is the member's own name, upper-cased (ASCII only), and a
+   *   method word: `get` registers or sends GET (`method_not_member_verb`);
+   * - `method_key` is where the method sits, a slot that accepts a string or
+   *   a method literal (read with the call's other parts);
+   * - `method_default` is a method word (`method_not_word`): beside
+   *   `method_key`, the method when that option is absent; alone, the one
+   *   method the call sends. Beside `method`, it says nothing new and is
+   *   `claim_invalid`, as is `method` beside `method_key`;
+   * - `options` belongs to the #1564 checks and is `claim_invalid`.
+   * Undefined when the fields hold so far; their slots are read with the
+   * call's other parts.
+   */
+  private methodOutcome(claim: OpClaim, rules: RoleRules): Outcome | undefined {
+    const words = rules.methods;
+    if (!words) {
+      const any =
+        claim.method !== undefined ||
+        claim.method_key !== undefined ||
+        claim.options !== undefined ||
+        claim.method_default !== undefined ||
+        claim.base !== undefined;
+      return any ? unchecked('claim_invalid') : undefined;
+    }
+    if (claim.options !== undefined) return unchecked('claim_invalid');
+    if (claim.method !== undefined && (claim.method_key !== undefined || claim.method_default !== undefined)) {
+      return unchecked('claim_invalid');
+    }
+    if (claim.method !== undefined) {
+      if (claim.member === null || claim.method !== asciiUpperCase(claim.member) || !words.has(claim.method)) {
+        return failed('method_not_member_verb');
+      }
+    }
+    if (claim.method_default !== undefined && !words.has(claim.method_default)) return failed('method_not_word');
+    return undefined;
+  }
+
+  /**
+   * `runs: { bound: 'maker', arg, key }`: some overload the instance's maker
+   * holds on takes a function with a declared signature there (the function
+   * a mutation object's `mutate` runs is the one its maker was given).
+   */
+  private boundRunsOutcome(holding: readonly ts.Signature[], runs: RunsSlot): Outcome {
+    let best: RankedFailure | undefined;
+    for (const signature of holding) {
+      let declared = this.keyParameterAt(signature, runs.arg);
+      if (declared !== undefined && runs.key !== undefined) {
+        const property = this.declaredProperty(declared, runs.key);
+        if (!property) {
+          best = furthest(best, 2, failed('key_missing'));
+          continue;
+        }
+        declared = this.checker.getTypeOfSymbol(property);
+      }
+      const failure = this.runsFailure(declared);
+      if (!failure) return VERIFIED;
+      best = furthest(best, 3, failure);
+    }
+    return best?.outcome ?? failed('param_missing');
+  }
+
+  /** A `runs` slot: a function with a declared signature, as a handler is, under its own reasons. */
+  private runsFailure(declared: Slot | undefined): Outcome | undefined {
+    const failure = this.handlerFailure(declared);
+    if (!failure || failure.verdict === 'verified') return failure;
+    const reason = failure.reason.replace(/^handler_/, 'runs_');
+    return failure.verdict === 'failed' ? failed(reason) : unchecked(reason);
+  }
+
+  /**
+   * `yields: { param, export, side }` on a receive op: some signature of the
+   * handler this overload takes declares a parameter at `param` whose type
+   * is the package's own export named `export` (a class, or the interface
+   * an instance has), declared in the receiver's home packages. `side` is
+   * `client` or `server` (`yields_side_invalid`). Undefined when it holds.
+   */
+  private yieldsOutcome(
+    signature: ts.Signature,
+    handler: ClaimSlot,
+    yields: { param: number; export: string; side: string },
+    receiver: Holder
+  ): Outcome | undefined {
+    if (yields.side !== 'client' && yields.side !== 'server') return failed('yields_side_invalid');
+    let declared = this.keyParameterAt(signature, handler.arg);
+    if (declared !== undefined && handler.key !== undefined) {
+      const property = this.declaredProperty(declared, handler.key);
+      declared = property ? this.checker.getTypeOfSymbol(property) : undefined;
+    }
+    if (declared === undefined) return failed('param_missing');
+    const slot = this.throughConditional(this.throughConstraint(declared));
+    if (slot === VARIADIC) return unchecked('handler_untyped');
+    for (const part of this.parts(slot)) {
+      for (const handed of part.getCallSignatures()) {
+        const given = this.parameterAt(handed, yields.param);
+        if (given === undefined || given === VARIADIC) continue;
+        const named = typeSymbols(given).some(
+          symbol =>
+            symbol?.getName() === yields.export &&
+            (symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), receiver.home))
+        );
+        if (named) return undefined;
+      }
+    }
+    return failed('yields_not_export');
   }
 
   /**
@@ -1674,6 +1965,12 @@ class DeclarationReader {
    */
   private messageSignatureOutcome(signature: ts.Signature, layout: ClaimLayout, labels: KeyLabels): RankedFailure {
     for (const [arg, part] of layout.positional) {
+      if (part === 'method') {
+        const declared = this.keyParameterAt(signature, arg);
+        if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
+        if (!this.acceptsMethod(declared)) return { rank: 1, outcome: this.slotFailure(declared, 'method_not_string') };
+        continue;
+      }
       if (part !== 'name' && part !== 'base' && part !== 'prefix') continue;
       const declared = this.keyParameterAt(signature, arg);
       if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
@@ -1694,8 +1991,9 @@ class DeclarationReader {
       }
     }
     for (const [arg, part] of layout.positional) {
-      if (part !== 'handler' && part !== 'ack') continue;
-      const failure = this.handlerFailure(this.keyParameterAt(signature, arg));
+      if (part !== 'handler' && part !== 'ack' && part !== 'runs') continue;
+      const declared = this.keyParameterAt(signature, arg);
+      const failure = part === 'runs' ? this.runsFailure(declared) : this.handlerFailure(declared);
       if (failure) return { rank: 3, outcome: failure };
     }
     const views = new Map<number, ts.Type>();
@@ -1739,6 +2037,17 @@ class DeclarationReader {
         if (part === 'payload' && this.isFunctionSlot(type)) {
           failure = { rank: 3, outcome: failed('payload_is_function') };
           break;
+        }
+        if (part === 'method' && !this.acceptsMethod(type)) {
+          failure = { rank: 3, outcome: this.slotFailure(type, 'method_not_string') };
+          break;
+        }
+        if (part === 'runs') {
+          const bad = this.runsFailure(type);
+          if (bad) {
+            failure = { rank: 3, outcome: bad };
+            break;
+          }
         }
         if (part === 'handler' || part === 'ack') {
           const bad = this.handlerFailure(type);
@@ -2240,7 +2549,8 @@ class DeclarationReader {
     this.setPackage(pkg);
     // Runtime modules on: a `node:` specifier is listed from the runtime's
     // types package, as the message roles read it.
-    const moduleRead = this.readModule(pkg, probe.namespace, true);
+    const moduleRead =
+      'defaultLibrary' in probe ? this.readDefaultLibrary(pkg) : this.readModule(pkg, probe.namespace, true);
     const surface: LibrarySurface = { package: pkg, truncated: 0, exports: [] };
     if (moduleRead.entry.resolved_file) surface.resolved_file = moduleRead.entry.resolved_file;
     if (moduleRead.entry.installed_version) surface.installed_version = moduleRead.entry.installed_version;
@@ -2300,7 +2610,7 @@ class DeclarationReader {
    */
   makersOf(pkg: string, probe: SurfaceProbe, only: readonly string[] | undefined): { export: string; receivers: string[] }[] {
     this.setPackage(pkg);
-    if (this.readModule(pkg, probe.namespace, true).reason) return [];
+    if ('namespace' in probe && this.readModule(pkg, probe.namespace, true).reason) return [];
     return (this.listedExports(probe, only) ?? [])
       .filter(({ type }) => !this.isOpenTop(type))
       .map(({ name, target, type }) => ({
@@ -2320,6 +2630,7 @@ class DeclarationReader {
    * resolves to no module symbol.
    */
   private listedExports(probe: SurfaceProbe, only: readonly string[] | undefined): ListedExport[] | undefined {
+    if ('defaultLibrary' in probe) return this.listedGlobals(probe.defaultLibrary, only);
     const moduleSymbol = this.checker.getSymbolAtLocation(probe.namespace.moduleSpecifier);
     if (!moduleSymbol) return undefined;
     const wanted = (name: string) => only === undefined || only.includes(name);
@@ -2346,6 +2657,26 @@ class DeclarationReader {
       if (!('reason' in read)) listed.push({ name: 'default', target: read.value.target, type: read.value.type });
     }
     return listed.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  }
+
+  /**
+   * The value globals a `lib:` key's file declares (every one, or only those
+   * `only` names), sorted by name, each with its declared type: none when the
+   * program's `lib` setting does not load the file.
+   */
+  private listedGlobals(pkg: string, only: readonly string[] | undefined): ListedExport[] {
+    const file = this.defaultLibraryFile(pkg);
+    if (!file) return [];
+    return this.checker
+      .getSymbolsInScope(this.probe, ts.SymbolFlags.Value)
+      .filter(
+        symbol =>
+          (symbol.flags & ts.SymbolFlags.Prototype) === 0 &&
+          (only === undefined || only.includes(symbol.getName())) &&
+          (symbol.declarations ?? []).some(declaration => declaration.getSourceFile() === file)
+      )
+      .map(symbol => ({ name: symbol.getName(), target: symbol, type: this.checker.getTypeOfSymbol(symbol) }))
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }
 
   /**
@@ -2941,15 +3272,19 @@ class DeclarationReader {
 
   /**
    * What a factory builds says nothing: the type itself, or any branch of a
-   * conditional return type, does.
+   * conditional return type, does. A conditional whose branches lead back to
+   * itself (a recursive alias) is read once: `seen` holds the conditionals
+   * on the way down, and one met again says nothing new.
    */
-  returnSaysNothing(type: ts.Type): boolean {
+  returnSaysNothing(type: ts.Type, seen: Set<ts.Node> = new Set()): boolean {
     if (this.saysNothing(type)) return true;
     return this.parts(type).some(part => {
       if (!(part.flags & ts.TypeFlags.Conditional)) return false;
       const node = (part as ts.ConditionalType).root.node;
+      if (seen.has(node)) return false;
+      seen.add(node);
       return [node.trueType, node.falseType].some(branch =>
-        this.returnSaysNothing(this.checker.getTypeFromTypeNode(branch))
+        this.returnSaysNothing(this.checker.getTypeFromTypeNode(branch), seen)
       );
     });
   }

@@ -13,8 +13,8 @@ assert a site's method and path from it. A client that talks to one RPC-style
 route does not: it assembles the whole URL once, in the constructor, and keeps
 it in a field. Every request in `src/api-client.ts` is `fetch(this.gatewayUrl,
 …)`, which states no route-shaped argument at all, so the request-member index
-drops all of them — and every consumer here would resolve to nothing if the
-dispatch carry read that index. It reads its own, which asserts no target.
+drops all of them. The request summaries read the URL through the
+constructor instead (carrick#1555), and the sites take their values from them.
 
 ## The shape
 
@@ -38,8 +38,8 @@ dispatch carry read that index. It reads its own, which asserts no target.
   which is the shape with no receiver constraint on the join.
 - `src/local.ts` is the same-file half: a module-function wrapper called with
   its path as an argument, whose body writes the action literal. The site raises
-  no candidate at all, so its row is the same-file wrapper pass's own
-  (`resolution_source: same_file_wrapper`) and the carry stamps a value onto it.
+  no candidate at all, so its row comes from the wrapper's summary
+  (`resolution_source: request_summary`), with the value the wrapper writes.
 
 ## The answer key
 
@@ -51,16 +51,15 @@ dispatch carry read that index. It reads its own, which asserts no target.
 | `refresh.ts:4` `client.refreshEverything()` | two rows, `action=invalidate-cache` and `action=rebuild-index` — one per request the member sends (carrick#1555) |
 | `local.ts:11` `postToGateway("/rpc/gateway", payload)` | `action=store-metadata` |
 | `factory.ts:7` `client.getAllRepoData()` | `action=get-cross-repo-data`, over the cassette's unwitnessed `get-all-repo-data` (carrick#2201) |
-| `factory.ts:8` `client.refreshEverything()` | none: the cassette's `refresh-everything` is unwitnessed and the member reaches two requests, so it is cleared |
-| `factory.ts:9` `client.send("purge-cache", {})` | `action=purge-cache`, which the site writes, kept |
+| `factory.ts:8` `client.refreshEverything()` | two rows, `action=invalidate-cache` and `action=rebuild-index`, as at `refresh.ts:4`; the cassette's unwitnessed `refresh-everything` is gone |
+| `factory.ts:9` `client.send("purge-cache", {})` | `action=purge-cache`, the argument the site passes as the `action` `send` posts (carrick#2411) |
 
 `src/factory.ts` (carrick#2201) gets its client from a function-typed factory
-(`make: MakeClient`), so no summary row covers its sites and the model's rows
-stand. Its cassette states a value at each site, as the model does when it
-reads one from a method name. A value stands only where the site's file
-writes it: otherwise the wrapper's value replaces it, or it is cleared.
-`send` takes its action as a parameter and writes none, so it carries
-nothing.
+(`make: MakeClient`). Its cassette states a value at each site, as the model
+does when it reads one from a method name. A value stands only where the
+site's file writes it: otherwise the wrapper's value replaces it, or it is
+cleared. `send` writes no value of its own: its body posts its `action`
+parameter, and the call at `:9` fills it with `purge-cache`.
 
 ## The cassette
 

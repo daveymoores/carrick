@@ -1,5 +1,150 @@
 # Changelog
 
+## [0.3.119](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.118...carrick-v0.3.119) (2026-10-18)
+
+
+### Features
+
+* **library-store:** ask every network role when site questions are on ([#2436](https://github.com/carrick-tools/carrick/issues/2436)) ([#2503](https://github.com/carrick-tools/carrick/issues/2503)) ([fca47c3](https://github.com/carrick-tools/carrick/commit/fca47c350c8edf5de0d88bc3722757c6a9bec5b3))
+* **library-store:** ask the store for the language's own library (lib: keys) ([#2504](https://github.com/carrick-tools/carrick/issues/2504)) ([#2509](https://github.com/carrick-tools/carrick/issues/2509)) ([6c0e6db](https://github.com/carrick-tools/carrick/commit/6c0e6db0cbf930c25e3e2d527c98f3afa17adfa4))
+* **sidecar:** library claims and listings for the default library's globals (lib: keys) ([#2502](https://github.com/carrick-tools/carrick/issues/2502)) ([68c7bcb](https://github.com/carrick-tools/carrick/commit/68c7bcbe9186938da74ba3cbaded073cc701fca2))
+
+
+### Bug Fixes
+
+* **discovery:** a member call on a factory's instance reaches the store's op ([#2506](https://github.com/carrick-tools/carrick/issues/2506)) ([#2507](https://github.com/carrick-tools/carrick/issues/2507)) ([a025e5c](https://github.com/carrick-tools/carrick/commit/a025e5cac8762bbc9e91f05815b8d393a482c7c6))
+* **discovery:** match a row by name only when its package publishes that name; read an export= target as default ([#2508](https://github.com/carrick-tools/carrick/issues/2508)) ([#2511](https://github.com/carrick-tools/carrick/issues/2511)) ([067fd3a](https://github.com/carrick-tools/carrick/commit/067fd3acdb7eaee284fab533b3363b5be8289147))
+
+## [0.3.118](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.117...carrick-v0.3.118) (2026-10-17)
+
+
+### Features
+
+* **scanner:** a large file is asked in windows under a 250,000-byte line, and the cloud's size verdict cuts a request smaller ([#2308](https://github.com/carrick-tools/carrick/issues/2308), [#2309](https://github.com/carrick-tools/carrick/issues/2309), [#2310](https://github.com/carrick-tools/carrick/issues/2310)) ([#2476](https://github.com/carrick-tools/carrick/issues/2476)) ([a33c2dd](https://github.com/carrick-tools/carrick/commit/a33c2dda4651f26bea495c9c38d4e2403aa275bb))
+* **scanner:** a scan waits for the library packages the store is building ([#2496](https://github.com/carrick-tools/carrick/issues/2496)) ([#2498](https://github.com/carrick-tools/carrick/issues/2498)) ([f9d17ee](https://github.com/carrick-tools/carrick/commit/f9d17ee6383bd08d7821d7debe73dec18e7c7905))
+* **scanner:** a site answer is in band only when every asked slot is ([#2495](https://github.com/carrick-tools/carrick/issues/2495)) ([b69d157](https://github.com/carrick-tools/carrick/commit/b69d157e6065bc5ca176a22d203ab8997f6d8262))
+* **scanner:** call targets from compiler rows and discovery for every protocol ([#2413](https://github.com/carrick-tools/carrick/issues/2413) D/E, [#2431](https://github.com/carrick-tools/carrick/issues/2431)) ([#2479](https://github.com/carrick-tools/carrick/issues/2479)) ([f6767f6](https://github.com/carrick-tools/carrick/commit/f6767f640565962421c65db1ea00e868eeaeff49))
+* **scanner:** possible_calls on the index blob (Part of [#2438](https://github.com/carrick-tools/carrick/issues/2438)) ([#2487](https://github.com/carrick-tools/carrick/issues/2487)) ([9d1b632](https://github.com/carrick-tools/carrick/commit/9d1b6324603c389cdb1ff572aea251f630d48dd0))
+* **scanner:** report a discovered call where its name is decided, and keep a record per site ([#2433](https://github.com/carrick-tools/carrick/issues/2433), [#2435](https://github.com/carrick-tools/carrick/issues/2435)) ([#2478](https://github.com/carrick-tools/carrick/issues/2478)) ([efb4575](https://github.com/carrick-tools/carrick/commit/efb4575402b687b732285246587a0e860c6831dc))
+* **scanner:** send the repo's declared service set on each write (Part of carrick-cloud[#909](https://github.com/carrick-tools/carrick/issues/909)) ([#2481](https://github.com/carrick-tools/carrick/issues/2481)) ([61d509c](https://github.com/carrick-tools/carrick/commit/61d509c86ebb1457fb557a0af66deb910148f66a))
+* **scanner:** site answers become rows and fold with the reader's rows, behind CARRICK_SITE_QUESTIONS (Part of [#2439](https://github.com/carrick-tools/carrick/issues/2439)) ([#2493](https://github.com/carrick-tools/carrick/issues/2493)) ([ce4bc2f](https://github.com/carrick-tools/carrick/commit/ce4bc2f2b757ed6898897cca8b1365abe41d6568))
+* **scanner:** site record states an env base, carries the concept's syntax kinds, uses lane 2's wire types ([#2441](https://github.com/carrick-tools/carrick/issues/2441)) ([#2484](https://github.com/carrick-tools/carrick/issues/2484)) ([6ae11fb](https://github.com/carrick-tools/carrick/commit/6ae11fb4ecf893ae9b324969f34a33118c164877))
+* **scanner:** with rows, read imported names, instances and getters as the declaration the compiler names ([#2413](https://github.com/carrick-tools/carrick/issues/2413) slice B) ([#2467](https://github.com/carrick-tools/carrick/issues/2467)) ([25781e9](https://github.com/carrick-tools/carrick/commit/25781e970360417b81d76d7cf1ddb3faebd4d345))
+* **sidecar:** impl rows for a member whose symbol has no declaration, asked at the use site ([#2430](https://github.com/carrick-tools/carrick/issues/2430), [#2441](https://github.com/carrick-tools/carrick/issues/2441)) ([#2475](https://github.com/carrick-tools/carrick/issues/2475)) ([059c6f2](https://github.com/carrick-tools/carrick/commit/059c6f2c2f55bd00cd13d9b7e65ba29e05168319))
+* **sidecar:** per-position rows v2: impl rows name what implements a bodyless declaration, jsx rows record each element ([#2430](https://github.com/carrick-tools/carrick/issues/2430)) ([#2473](https://github.com/carrick-tools/carrick/issues/2473)) ([9eb2696](https://github.com/carrick-tools/carrick/commit/9eb2696885294b030ff073f8fe0241730c2ae09d))
+* **site-questions:** the site-question wire contract and client ([#2437](https://github.com/carrick-tools/carrick/issues/2437)) ([#2471](https://github.com/carrick-tools/carrick/issues/2471)) ([36cfc04](https://github.com/carrick-tools/carrick/commit/36cfc04d51c93694438403312e56817ab54cf428))
+
+
+### Bug Fixes
+
+* **scanner:** a service whose only losses are final is complete, not pending ([#2488](https://github.com/carrick-tools/carrick/issues/2488)) ([#2491](https://github.com/carrick-tools/carrick/issues/2491)) ([64fa795](https://github.com/carrick-tools/carrick/commit/64fa795f76b41820667c747e7dea9339ad972574))
+* **scanner:** final-only services read as complete; plainer too-large-file warning ([#2494](https://github.com/carrick-tools/carrick/issues/2494)) ([a101859](https://github.com/carrick-tools/carrick/commit/a101859f47b236c1993b8bed949657494daa6946))
+* **sidecar:** returnSaysNothing tracks the conditionals it has walked ([#2500](https://github.com/carrick-tools/carrick/issues/2500)) ([3eba3b0](https://github.com/carrick-tools/carrick/commit/3eba3b0ade5c36b1229bed0fb30f7fe3d5fc4f9e))
+
+
+### CI/CD
+
+* split the slowest test shard (no test dropped) ([#2470](https://github.com/carrick-tools/carrick/issues/2470)) ([eef3c3e](https://github.com/carrick-tools/carrick/commit/eef3c3eba0019a4059e9fa77b53e8c174ef33aa0))
+
+## [0.3.117](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.116...carrick-v0.3.117) (2026-10-17)
+
+
+### Features
+
+* **boundary:** count dropped model endpoints, widen unemitted literal count ([#2389](https://github.com/carrick-tools/carrick/issues/2389)) ([135ea32](https://github.com/carrick-tools/carrick/commit/135ea32a32b43b7245e9c6df337a5b3ce5028d60))
+* **scanner:** a call fills a body's spread of the callee's parameter ([#2411](https://github.com/carrick-tools/carrick/issues/2411)) ([#2412](https://github.com/carrick-tools/carrick/issues/2412)) ([cad25f3](https://github.com/carrick-tools/carrick/commit/cad25f3cd1b8941012350a433b6599f90e5fa79e))
+* **scanner:** a call proven to send nothing states no call row, whoever stated it ([#2281](https://github.com/carrick-tools/carrick/issues/2281) slice 1) ([#2393](https://github.com/carrick-tools/carrick/issues/2393)) ([c7e7b79](https://github.com/carrick-tools/carrick/commit/c7e7b795a2160102f7dcaf737c6aa7201c13b4a9))
+* **scanner:** a class only its own file constructs reads each constructor parameter as the value passed ([#2452](https://github.com/carrick-tools/carrick/issues/2452) slice 1) ([#2455](https://github.com/carrick-tools/carrick/issues/2455)) ([c484c67](https://github.com/carrick-tools/carrick/commit/c484c67f8088ff640efd9105214ad855799542ff))
+* **scanner:** a library site reads the keys of a payload written as JSON.stringify(&lt;object&gt;) ([#2453](https://github.com/carrick-tools/carrick/issues/2453)) ([#2458](https://github.com/carrick-tools/carrick/issues/2458)) ([ab9f7b3](https://github.com/carrick-tools/carrick/commit/ab9f7b3494bf94e78c24b6d170d32264112e1b35))
+* **scanner:** a model row at a call through the repo's own code takes the request the call reaches ([#1146](https://github.com/carrick-tools/carrick/issues/1146) slice B) ([#2329](https://github.com/carrick-tools/carrick/issues/2329)) ([bb28117](https://github.com/carrick-tools/carrick/commit/bb281171d96ba4485d577db7e694c56cf3369f56))
+* **scanner:** a request-summary row's base is read from its end ([#2406](https://github.com/carrick-tools/carrick/issues/2406) slice B) ([#2410](https://github.com/carrick-tools/carrick/issues/2410)) ([76bfb65](https://github.com/carrick-tools/carrick/commit/76bfb659c8e1c744058e48dd49f65fa75fc224b7))
+* **scanner:** compose a request URL from parts whose values the source states ([#2457](https://github.com/carrick-tools/carrick/issues/2457)) ([67d6898](https://github.com/carrick-tools/carrick/commit/67d68986b51de59f8ec7b0f4e8b5b90b2030e419))
+* **scanner:** keep a made-up-id route on a path literal the file compares ([#2382](https://github.com/carrick-tools/carrick/issues/2382) slice 2) ([#2392](https://github.com/carrick-tools/carrick/issues/2392)) ([6a50ef0](https://github.com/carrick-tools/carrick/commit/6a50ef0d717de9651bcc5902d49fe0bd4632708c))
+* **scanner:** name guards, constant names and hop context on the receive-side chains ([#2386](https://github.com/carrick-tools/carrick/issues/2386) slice B2a) ([#2401](https://github.com/carrick-tools/carrick/issues/2401)) ([f006ea5](https://github.com/carrick-tools/carrick/commit/f006ea5d3081c7a6ac5cdecbdf3af34f9d876981))
+* **scanner:** named calls, constructions and library receivers on the receive-side chains ([#2386](https://github.com/carrick-tools/carrick/issues/2386) slice B2b) ([#2403](https://github.com/carrick-tools/carrick/issues/2403)) ([7257290](https://github.com/carrick-tools/carrick/commit/7257290cce80d326ff3f5c3574c78af12763c202))
+* **scanner:** offer unawaited calls into a same-module request helper (carrick-cloud[#2373](https://github.com/carrick-tools/carrick/issues/2373)) ([#2425](https://github.com/carrick-tools/carrick/issues/2425)) ([73f10c7](https://github.com/carrick-tools/carrick/commit/73f10c70207764a3ba21863768c48da6c098cfcd))
+* **scanner:** read a base URL from factory options held in a constant ([#2451](https://github.com/carrick-tools/carrick/issues/2451) slice 1) ([#2456](https://github.com/carrick-tools/carrick/issues/2456)) ([1847a5a](https://github.com/carrick-tools/carrick/commit/1847a5ab372a57b209a262f3e2a83399ec52432f))
+* **scanner:** receive-side guard summaries on the request-summary IR ([#2386](https://github.com/carrick-tools/carrick/issues/2386) slice B) ([#2400](https://github.com/carrick-tools/carrick/issues/2400)) ([a619af7](https://github.com/carrick-tools/carrick/commit/a619af73a015dc838c4b23d89efc83ea06b6132d))
+* **scanner:** send-side opaque pieces carry the receive side's ends ([#2406](https://github.com/carrick-tools/carrick/issues/2406) slice A) ([#2408](https://github.com/carrick-tools/carrick/issues/2408)) ([4f9912d](https://github.com/carrick-tools/carrick/commit/4f9912d67b1bf22701ec7900ff6933fdce1892db))
+* **scanner:** walk every service before the loop, each setup after its own walk ([#2413](https://github.com/carrick-tools/carrick/issues/2413) slice G1) ([#2443](https://github.com/carrick-tools/carrick/issues/2443)) ([a861123](https://github.com/carrick-tools/carrick/commit/a861123d63dadd610eda2b9705787e2cde4f6454))
+* **scanner:** walk the compiler rows first and read them before discovery ([#2413](https://github.com/carrick-tools/carrick/issues/2413) slice A) ([#2417](https://github.com/carrick-tools/carrick/issues/2417)) ([5b8daf0](https://github.com/carrick-tools/carrick/commit/5b8daf0d001f49cca455ced60ae07c75e31d42e9))
+* **sidecar:** a member with no declaration names the type that owns it ([#2448](https://github.com/carrick-tools/carrick/issues/2448)) ([#2468](https://github.com/carrick-tools/carrick/issues/2468)) ([e76e6b3](https://github.com/carrick-tools/carrick/commit/e76e6b36b639baf84b740833fffab875df82c8bb))
+* **sidecar:** label structure v2 in the verifier and the scanner's reader ([#2434](https://github.com/carrick-tools/carrick/issues/2434)) ([#2444](https://github.com/carrick-tools/carrick/issues/2444)) ([9039887](https://github.com/carrick-tools/carrick/commit/90398870f0c053b05559ef306a9b865ad58fa3a3))
+* **sidecar:** position rows name the export a require() binding in a TypeScript file refers to ([#2464](https://github.com/carrick-tools/carrick/issues/2464)) ([1384bfb](https://github.com/carrick-tools/carrick/commit/1384bfb0758e0612d47b7afa3bd241ed93eb7a45))
+* **sidecar:** record-only per-position compiler rows for each service ([#2405](https://github.com/carrick-tools/carrick/issues/2405)) ([#2409](https://github.com/carrick-tools/carrick/issues/2409)) ([15eb90e](https://github.com/carrick-tools/carrick/commit/15eb90e41fc04c555565fc16b0723a8fa5822df1))
+* **sidecar:** type referenced workspace packages from source under their own options, as an editor does ([#2418](https://github.com/carrick-tools/carrick/issues/2418)) ([#2423](https://github.com/carrick-tools/carrick/issues/2423)) ([a43251e](https://github.com/carrick-tools/carrick/commit/a43251e62283223ac73c55cc568ca8982e4f7c34))
+* **sidecar:** walk the JS files no owner program takes ([#2413](https://github.com/carrick-tools/carrick/issues/2413) slice 0b) ([#2420](https://github.com/carrick-tools/carrick/issues/2420)) ([ee3a833](https://github.com/carrick-tools/carrick/commit/ee3a833af0b2f183778108de5958f293ef0e2294))
+
+
+### Bug Fixes
+
+* **request-summary:** a call the source states as an endpoint is no request ([#2388](https://github.com/carrick-tools/carrick/issues/2388)) ([b99ac2d](https://github.com/carrick-tools/carrick/commit/b99ac2dd0b1afbd089b9aa6e74f3749da79d9b69)), closes [#2383](https://github.com/carrick-tools/carrick/issues/2383)
+* **scanner:** a call row's client is the AST callee, never the model's pattern_matched ([#2394](https://github.com/carrick-tools/carrick/issues/2394)) ([25ebdb7](https://github.com/carrick-tools/carrick/commit/25ebdb7c7972163220ff8d57ed6e5b254c162e29))
+* **scanner:** drop a leading BOM before converting an SWC span for the sidecar ([#2415](https://github.com/carrick-tools/carrick/issues/2415)) ([87ef89f](https://github.com/carrick-tools/carrick/commit/87ef89f5ae52f278a86c270fc2611c5aa5a0027b)), closes [#2407](https://github.com/carrick-tools/carrick/issues/2407)
+* **scanner:** index exported object members in every export form and reach them through a default import ([#2396](https://github.com/carrick-tools/carrick/issues/2396)) ([#2398](https://github.com/carrick-tools/carrick/issues/2398)) ([a8ff8ef](https://github.com/carrick-tools/carrick/commit/a8ff8ef385f0fb5c3a32d50626aec8fce978e2db))
+* **scanner:** the wrapper-method fold reads the function a call reaches, not the module (Refs [#2384](https://github.com/carrick-tools/carrick/issues/2384)) ([#2395](https://github.com/carrick-tools/carrick/issues/2395)) ([76764c3](https://github.com/carrick-tools/carrick/commit/76764c3452482c3de8c09d55ecc9fc25c4aed2f5))
+* **sidecar:** a located error send on a row away from its handler is not the route's response ([#2463](https://github.com/carrick-tools/carrick/issues/2463)) ([#2469](https://github.com/carrick-tools/carrick/issues/2469)) ([8971817](https://github.com/carrick-tools/carrick/commit/897181712137f709c0c0e259e1db6782461aa369))
+* **sidecar:** a located error-status send is not the route's response ([#2459](https://github.com/carrick-tools/carrick/issues/2459)) ([c66169f](https://github.com/carrick-tools/carrick/commit/c66169fbddde3649682b4a804eadacc5f1a03c18))
+* **sidecar:** a pub/sub pair where only one side is the whole message is not compared ([#2462](https://github.com/carrick-tools/carrick/issues/2462)) ([c1f0c5e](https://github.com/carrick-tools/carrick/commit/c1f0c5ef54975835e19bd74e914106d6e2b10823))
+* **sidecar:** name a module symbol in a position row by its file, never an absolute path ([#2419](https://github.com/carrick-tools/carrick/issues/2419)) ([#2446](https://github.com/carrick-tools/carrick/issues/2446)) ([afa6368](https://github.com/carrick-tools/carrick/commit/afa6368429b61620cc488d98b56784cdeff28e31))
+* **sidecar:** retype check ignores unused declarations its own rewrite creates ([#2426](https://github.com/carrick-tools/carrick/issues/2426)) ([#2450](https://github.com/carrick-tools/carrick/issues/2450)) ([f0423a1](https://github.com/carrick-tools/carrick/commit/f0423a1fb4ad8f905922318ce3bd19f8707290b1))
+
+
+### Refactoring
+
+* **scanner:** delete the wrapper_dispatch carry ([#1561](https://github.com/carrick-tools/carrick/issues/1561)) ([#2416](https://github.com/carrick-tools/carrick/issues/2416)) ([e1fb184](https://github.com/carrick-tools/carrick/commit/e1fb18486d0fe6f40c6a03e044d3a4a826591067))
+
+## [0.3.116](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.115...carrick-v0.3.116) (2026-10-14)
+
+
+### Features
+
+* **call-graph:** a receiver bound from a factory call takes the class the factory states ([#2328](https://github.com/carrick-tools/carrick/issues/2328)) ([5fb814b](https://github.com/carrick-tools/carrick/commit/5fb814b8754239f5efe398e6393787321117f72a)), closes [#1146](https://github.com/carrick-tools/carrick/issues/1146)
+
+
+### Bug Fixes
+
+* **deps:** bump rustls to 0.23.46 for RUSTSEC-2026-0346..0349 ([#2376](https://github.com/carrick-tools/carrick/issues/2376)) ([7f36fd7](https://github.com/carrick-tools/carrick/commit/7f36fd798c391793dc5f2391c68e52706ba5eedf))
+* **git_state:** compare commit trees without reading file contents ([#2366](https://github.com/carrick-tools/carrick/issues/2366)) ([3f9aac7](https://github.com/carrick-tools/carrick/commit/3f9aac71f05d1e42ed2dfed70fdac3e61fef5a88))
+* **join:** a body case on a GET or HEAD route is not a dispatch case ([#2324](https://github.com/carrick-tools/carrick/issues/2324)) ([efa9c00](https://github.com/carrick-tools/carrick/commit/efa9c002cc47d9aad9fe4fece65cc1a3208f9c6e))
+* **sidecar:** a call located by its first line binds the call on its own line ([#2330](https://github.com/carrick-tools/carrick/issues/2330)) ([9c7d484](https://github.com/carrick-tools/carrick/commit/9c7d484c06dd3f1e9692bca8c570fe40165726c2)), closes [#2114](https://github.com/carrick-tools/carrick/issues/2114)
+* **sidecar:** a call result deferred on a type parameter is read through its branches ([#2336](https://github.com/carrick-tools/carrick/issues/2336)) ([af0c7f4](https://github.com/carrick-tools/carrick/commit/af0c7f44d1315b02b740fd0fbc7462f3d94b0199)), closes [#1841](https://github.com/carrick-tools/carrick/issues/1841)
+* **sidecar:** a later expression answers for a call only when it restates the value ([#2332](https://github.com/carrick-tools/carrick/issues/2332)) ([3961c39](https://github.com/carrick-tools/carrick/commit/3961c3942256d31af939cc4e58bdcf86433d23a3))
+* **sidecar:** a literal already asserted as const is not marked again by the unwidened reading ([#2344](https://github.com/carrick-tools/carrick/issues/2344)) ([800660f](https://github.com/carrick-tools/carrick/commit/800660f35d5cea98d04360e5edb6cb539a39ad4c)), closes [#2343](https://github.com/carrick-tools/carrick/issues/2343)
+* **sidecar:** a narrowed unknown and object state no shape ([#2337](https://github.com/carrick-tools/carrick/issues/2337)) ([62e8457](https://github.com/carrick-tools/carrick/commit/62e8457624a8b3ff9cc3c40854da3891247ad6e8)), closes [#2116](https://github.com/carrick-tools/carrick/issues/2116)
+* **sidecar:** a published mismatch is judged again with the producer's unwidened response ([#2333](https://github.com/carrick-tools/carrick/issues/2333)) ([4b7b608](https://github.com/carrick-tools/carrick/commit/4b7b60863dca4d8f1a242c3ca0f90c66c77830e5))
+* **sidecar:** a registration whose handler reads nothing takes no request body ([#2340](https://github.com/carrick-tools/carrick/issues/2340)) ([4dcbf9c](https://github.com/carrick-tools/carrick/commit/4dcbf9c5b25f8ae548752c30f169fcc1bfde9bb9))
+* **sidecar:** the capture reads its anchors in a program that holds the project's augmentation files ([#2327](https://github.com/carrick-tools/carrick/issues/2327)) ([e783397](https://github.com/carrick-tools/carrick/commit/e783397d6929cbd86e20c2ebf4ad500a04992d4a))
+* **sidecar:** the compiler arbitrates a producer's model symbol against the read ([#2335](https://github.com/carrick-tools/carrick/issues/2335)) ([266a8fd](https://github.com/carrick-tools/carrick/commit/266a8fde3886a22142de82968f1d923b1cd1ffab))
+
+## [0.3.115](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.114...carrick-v0.3.115) (2026-10-14)
+
+
+### Bug Fixes
+
+* **cache:** a root named `.` or by a relative path keeps the manifest hash already stored for it ([#2315](https://github.com/carrick-tools/carrick/issues/2315)) ([b826fdc](https://github.com/carrick-tools/carrick/commit/b826fdcdc40c1d6f56e74916c1400a589f2f2cce)), closes [#2314](https://github.com/carrick-tools/carrick/issues/2314)
+* **changed-only:** a stored type extraction problem is owed work ([#2302](https://github.com/carrick-tools/carrick/issues/2302)) ([6711cca](https://github.com/carrick-tools/carrick/commit/6711cca1e9bb38eec3215087468d792131df7c72))
+* **derive:** a workspace member with no source is no service, and does not fail the scan ([#2305](https://github.com/carrick-tools/carrick/issues/2305)) ([0bd06b4](https://github.com/carrick-tools/carrick/commit/0bd06b4b762895f0dc62fc12107a7bdf7ef0e7f6)), closes [#2298](https://github.com/carrick-tools/carrick/issues/2298)
+* **parser:** a file without a source extension is not handed to the script parser ([#2320](https://github.com/carrick-tools/carrick/issues/2320)) ([3f7d712](https://github.com/carrick-tools/carrick/commit/3f7d71219faa950de3cb56a3be5ce25ba8a2caec)), closes [#2300](https://github.com/carrick-tools/carrick/issues/2300)
+* **scan:** index gaps go to the debug log, not the scan output a person reads ([#2345](https://github.com/carrick-tools/carrick/issues/2345)) ([b49f57d](https://github.com/carrick-tools/carrick/commit/b49f57d2c5a186b962eb487e8dd093614e8732df))
+* **scope:** read a registration scope and its mounts from the source when the model states no row ([#2311](https://github.com/carrick-tools/carrick/issues/2311)) ([d5c9310](https://github.com/carrick-tools/carrick/commit/d5c931061c73438c101d4c6f41356fda238c3c46))
+* **sidecar:** follow a re-export into a package of the checkout linked through node_modules ([#2306](https://github.com/carrick-tools/carrick/issues/2306)) ([22735f4](https://github.com/carrick-tools/carrick/commit/22735f44126bc5b2e1dfe06a9df62fac6cccbf46)), closes [#2304](https://github.com/carrick-tools/carrick/issues/2304)
+
+## [0.3.114](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.113...carrick-v0.3.114) (2026-10-12)
+
+
+### Features
+
+* **findings:** a PR result names the functions the PR added, edited or removed ([#2289](https://github.com/carrick-tools/carrick/issues/2289)) ([d688ac9](https://github.com/carrick-tools/carrick/commit/d688ac9a1d88dd1f2345eed7c6655f7023123665))
+* **findings:** a PR result names the index it compared with and counts what it checked ([#2288](https://github.com/carrick-tools/carrick/issues/2288)) ([6134eaa](https://github.com/carrick-tools/carrick/commit/6134eaa8653f6a150376761c892696dad1a042ac))
+* **findings:** a PR run marks each dependency conflict against main ([#2286](https://github.com/carrick-tools/carrick/issues/2286)) ([366b979](https://github.com/carrick-tools/carrick/commit/366b979a487453f5f3fbff652562967fa933f645))
+
+
+### Bug Fixes
+
+* **deps:** update quinn-proto to 0.11.19 for five security advisories ([#2292](https://github.com/carrick-tools/carrick/issues/2292)) ([#2293](https://github.com/carrick-tools/carrick/issues/2293)) ([f17c046](https://github.com/carrick-tools/carrick/commit/f17c0463dab0546117f3214dfec6924b8867841b))
+* **findings:** a PR scan of `.` names the functions of a service at the repo root ([#2295](https://github.com/carrick-tools/carrick/issues/2295)) ([9f0b16a](https://github.com/carrick-tools/carrick/commit/9f0b16a8d000d1e6fc2631e88ce8c62fc640b78e))
+
 ## [0.3.113](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.112...carrick-v0.3.113) (2026-10-11)
 
 

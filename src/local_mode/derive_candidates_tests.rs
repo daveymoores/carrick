@@ -198,13 +198,9 @@ fn each_service_lists_the_env_vars_and_origins_its_source_reads() {
                 ]
             }],
             "truncated": { "env": 0, "origins": 0 }
-        },
-        "docs": {
-            "files_read": 0,
-            "env": [],
-            "origins": [],
-            "truncated": { "env": 0, "origins": 0 }
         }
+        // `services/docs` holds a manifest and no source file, so it is no
+        // service and has no candidates (carrick#2298).
     });
     assert_eq!(
         serde_json::Value::Object(candidates_by_service(dir.path())),
@@ -255,14 +251,17 @@ fn no_service_string_is_an_absolute_path() {
 /// Without `--candidates` the document is the one derive printed before the
 /// flag existed, byte for byte: `carrick init` writes it to
 /// `.carrick/proposal.json`.
+///
+/// `services/docs` holds no source file, so since carrick#2298 it is no
+/// service: the document names it in `notes` and nowhere else.
 #[test]
 fn without_the_flag_derive_prints_what_it_printed_before() {
     let dir = tempfile::tempdir().unwrap();
     write_repo(dir.path(), FIXTURE);
     let golden = concat!(
-        r#"{"missing":[],"parent_proposal":null,"repos":[{"config":{"services":[{"directory":"apps/web","externalDomains":[],"externalEnvVars":[],"internalDomains":[],"internalEnvVars":[],"serviceName":"web"},{"directory":"services/api","externalDomains":[],"externalEnvVars":[],"internalDomains":[],"internalEnvVars":[],"serviceName":"api"},{"directory":"services/docs","externalDomains":[],"externalEnvVars":[],"internalDomains":[],"internalEnvVars":[],"serviceName":"docs"}]},"#,
-        r#""not_installed":[],"notes":["Workspace packages are proposed as services. Review service boundaries and shared source includes in carrick.json."],"path":"<ROOT>","reason":"npm workspaces","#,
-        r#""services":[{"bin":false,"deploy_config":[],"directory":"apps/web","exports":false,"externalDomains":[],"externalEnvVars":[],"internalDomains":[],"internalEnvVars":[],"main":false,"private":true,"serviceName":"web","workspace_dependents":[]},{"bin":false,"deploy_config":[],"directory":"services/api","exports":false,"externalDomains":[],"externalEnvVars":[],"internalDomains":[],"internalEnvVars":[],"main":false,"private":true,"serviceName":"api","workspace_dependents":[]},{"bin":false,"deploy_config":[],"directory":"services/docs","exports":false,"externalDomains":[],"externalEnvVars":[],"internalDomains":[],"internalEnvVars":[],"main":false,"private":true,"serviceName":"docs","workspace_dependents":[]}],"warnings":[]}],"#,
+        r#"{"missing":[],"parent_proposal":null,"repos":[{"config":{"services":[{"directory":"apps/web","externalDomains":[],"externalEnvVars":[],"internalDomains":[],"internalEnvVars":[],"serviceName":"web"},{"directory":"services/api","externalDomains":[],"externalEnvVars":[],"internalDomains":[],"internalEnvVars":[],"serviceName":"api"}]},"#,
+        r#""not_installed":[],"notes":["Workspace packages are proposed as services. Review service boundaries and shared source includes in carrick.json.","skipped_no_source: services/docs"],"path":"<ROOT>","reason":"npm workspaces","#,
+        r#""services":[{"bin":false,"deploy_config":[],"directory":"apps/web","exports":false,"externalDomains":[],"externalEnvVars":[],"internalDomains":[],"internalEnvVars":[],"main":false,"private":true,"serviceName":"web","workspace_dependents":[]},{"bin":false,"deploy_config":[],"directory":"services/api","exports":false,"externalDomains":[],"externalEnvVars":[],"internalDomains":[],"internalEnvVars":[],"main":false,"private":true,"serviceName":"api","workspace_dependents":[]}],"warnings":[]}],"#,
         r#""repos_added":[],"repos_detected_by":"workspace manifest","repos_excluded":[],"schema":"carrick.derive/0","workspace":"<ROOT>"}"#,
     );
     assert_eq!(printed(dir.path(), false), golden);

@@ -186,6 +186,8 @@ impl CloudStorage for MockStorage {
                     scanner_build: None,
                     boundary: None,
                     dispatch_tables: None,
+                    possible_calls: None,
+                    possible_calls_omitted: None,
                 },
                 CloudRepoData {
                     repo_name: "repo-b".to_string(),
@@ -223,6 +225,8 @@ impl CloudStorage for MockStorage {
                     scanner_build: None,
                     boundary: None,
                     dispatch_tables: None,
+                    possible_calls: None,
+                    possible_calls_omitted: None,
                 },
             ];
             result.extend(mock_repos);

@@ -72,7 +72,7 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
       ? ` (${(boundary.unemitted_literal_candidates ?? 0) > 1 ? "e.g. " : ""}${sites[0]})`
       : "";
     out.push(
-      `  ${boundary.unemitted_literal_candidates} bare route-literal call site(s) left unclassified${where}`,
+      `  ${boundary.unemitted_literal_candidates} route-literal call site(s) left unclassified${where}`,
     );
   }
   if ((boundary.model_only_rows ?? 0) > 0) {
@@ -85,6 +85,10 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
       `  ${boundary.model_endpoints_discarded_in_claimed_modules} model endpoint(s) dropped in modules a routing convention claims`,
     );
   }
+  push(
+    boundary.model_endpoints_dropped_unanchored,
+    "route(s) found by analysis but left out of the index: their registration site could not be located",
+  );
   // One event, one line: the stage when the scan recorded one, otherwise the
   // sentence it wrote about the same event (carrick#997 item 3).
   if (boundary.types_degraded) {

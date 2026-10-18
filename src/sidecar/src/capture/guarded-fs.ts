@@ -151,6 +151,17 @@ export class WriteGuard {
     fs.unlinkSync(p);
   }
 
+  /**
+   * Move a file into place: both directory entries change, so both are
+   * checked as a delete is. A write that must never be read half-done is
+   * written beside its target and renamed over it.
+   */
+  rename(from: string, to: string): void {
+    this.check(from, entry(from), 'move');
+    this.check(to, entry(to), 'move onto');
+    fs.renameSync(from, to);
+  }
+
   symlink(target: string, linkPath: string, type?: fs.symlink.Type): void {
     this.check(linkPath, entry(linkPath), 'link');
     fs.symlinkSync(target, linkPath, type);

@@ -271,6 +271,8 @@ fn copy_dir(src: &Path, dst: &Path) {
 struct Scan {
     output: String,
     code: Option<i32>,
+    /// Every line of the run's own debug log (`~/.carrick/logs`).
+    log: String,
 }
 
 impl Scan {
@@ -290,12 +292,28 @@ impl Scan {
             .filter_map(|line| {
                 let rest = &line[line.find(prefix)? + prefix.len()..];
                 let (service, verdict) = rest.split_once(' ')?;
-                verdict
-                    .starts_with(&format!("{how} ("))
+                (verdict == how || verdict.starts_with(&format!("{how} (")))
                     .then(|| service.to_string())
             })
             .collect()
     }
+}
+
+/// Every line under `home/.carrick/logs`.
+fn read_logs(home: &Path) -> String {
+    let mut log = String::new();
+    let mut dirs = vec![home.join(".carrick/logs")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                log.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+    log
 }
 
 /// A workspace with its scan cassettes and the store a scan writes to.
@@ -316,8 +334,11 @@ impl Workspace {
     }
 
     fn scan_with(&self, store: &Path, flags: &[&str], env: &[(&str, &str)]) -> Scan {
+        let home = self._tmp.path().join("home");
+        let _ = std::fs::remove_dir_all(&home);
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
         cmd.envs(env.iter().copied());
+        cmd.env("HOME", &home);
         cmd.arg(&self.repo)
             .args(["--repo", REPO])
             .args(flags)
@@ -352,6 +373,7 @@ impl Workspace {
                 String::from_utf8_lossy(&result.stderr)
             ),
             code: result.status.code(),
+            log: read_logs(&home),
         }
     }
 
@@ -678,6 +700,179 @@ fn a_stored_blob_that_cannot_vouch_analyses_its_service() {
         assert_eq!(scan.code, Some(0), "{}", scan.output);
         assert_analysed(&scan, &["worker"]);
     }
+}
+
+/// The cassette path the mock reads the extraction config from.
+const EXTRACTION_CONFIG: &str = "framework-guidance/extraction_config.json";
+
+/// An answer with no rule list: the extraction config fails to arrive.
+const NO_RULE_LIST: &str = "{}\n";
+
+fn blob_path(store: &Path, service: &str) -> PathBuf {
+    std::fs::read_dir(store)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension().is_some_and(|ext| ext == "json")
+                && serde_json::from_str::<serde_json::Value>(
+                    &std::fs::read_to_string(path).unwrap(),
+                )
+                .is_ok_and(|blob| blob["service_name"] == service)
+        })
+        .unwrap()
+}
+
+/// `api`'s blob as a scan at A writes it when the extraction config does not
+/// arrive: its types resolved with machinery wrappers left wrapped.
+fn api_blob_without_its_config() -> &'static str {
+    static BLOB: OnceLock<String> = OnceLock::new();
+    BLOB.get_or_init(|| {
+        let workspace = case();
+        write(&workspace.cassettes, EXTRACTION_CONFIG, NO_RULE_LIST);
+        let store = workspace
+            .repo
+            .parent()
+            .unwrap()
+            .join("store-without-config");
+        std::fs::create_dir_all(&store).unwrap();
+        let scan = workspace.scan_into(&store, &[]);
+        assert_eq!(scan.code, Some(0), "{}", scan.output);
+        let blob = std::fs::read_to_string(blob_path(&store, "api")).unwrap();
+        assert!(
+            blob.contains("machinery unwrapping disabled this run"),
+            "the scan records that the config did not arrive:\n{}",
+            scan.output
+        );
+        blob
+    })
+}
+
+/// The store at A, except that `api`'s extraction config did not arrive.
+fn case_where_api_lacks_its_config() -> Workspace {
+    let workspace = case();
+    std::fs::write(
+        blob_path(&workspace.store, "api"),
+        api_blob_without_its_config(),
+    )
+    .unwrap();
+    workspace
+}
+
+fn touch_web(workspace: &Workspace) {
+    let checkout = workspace.read("apps/web/src/checkout.ts");
+    workspace.edit(
+        "apps/web/src/checkout.ts",
+        &format!("{checkout}// A change to web alone.\n"),
+    );
+}
+
+/// A person reading the scan is not told why a service was analysed again
+/// when the reason is a gap in its stored index; the debug log is.
+fn assert_reason_only_in_the_log(scan: &Scan, service: &str) {
+    assert!(
+        !scan.output.contains("stored_incomplete")
+            && !scan.output.contains("without its extraction config"),
+        "{}",
+        scan.output
+    );
+    assert!(
+        scan.output
+            .contains(&format!("scope: {service} analysed\n")),
+        "the scope line stays, without its reason: {}",
+        scan.output
+    );
+    assert!(
+        scan.log.contains(&format!(
+            "scope: {service} analysed (stored_incomplete: the stored index was written without its extraction config)"
+        )),
+        "{}",
+        scan.log
+    );
+}
+
+/// carrick#2301: a stored blob whose extraction config did not arrive owes
+/// that work. A change to `web` alone analyses `api` too, the config is asked
+/// for again, and `api`'s types are captured with it. `worker`, whose blob
+/// records no such problem, is carried.
+#[test]
+fn a_service_stored_without_its_extraction_config_is_analysed_again() {
+    let workspace = case_where_api_lacks_its_config();
+    touch_web(&workspace);
+    let head = workspace.commit("B");
+    let scan = workspace.scan(&["--changed-only"]);
+    assert_eq!(scan.code, Some(0), "{}", scan.output);
+    assert_analysed(&scan, &["api", "web"]);
+    assert_reason_only_in_the_log(&scan, "api");
+    let blobs = workspace.blobs();
+    assert_eq!(blobs["api"]["commit_hash"], head.as_str());
+    assert_eq!(
+        blobs["api"]["type_extraction_status"],
+        serde_json::Value::Null,
+        "the config arrived, so the blob records no problem: {}",
+        scan.output
+    );
+    assert_eq!(
+        blobs["api"]["boundary"]["type_extraction_status"],
+        serde_json::Value::Null
+    );
+    assert!(
+        verdicts(&blobs["web"]).contains("\"compatible\""),
+        "web's verdict is read from api's types as captured this run: {}",
+        verdicts(&blobs["web"])
+    );
+}
+
+/// carrick#2301: when the config fails to arrive again the blob keeps saying
+/// so, and the next scan asks once more. `worker` is carried throughout.
+#[test]
+fn an_extraction_config_that_fails_again_is_asked_for_on_the_next_scan() {
+    let workspace = case_where_api_lacks_its_config();
+    write(&workspace.cassettes, EXTRACTION_CONFIG, NO_RULE_LIST);
+    touch_web(&workspace);
+    workspace.commit("B");
+    let scan = workspace.scan(&["--changed-only"]);
+    assert_eq!(scan.code, Some(0), "{}", scan.output);
+    assert_analysed(&scan, &["api", "web"]);
+    let status = &workspace.blobs()["api"]["type_extraction_status"];
+    assert!(
+        status
+            .as_str()
+            .is_some_and(|status| status.contains("machinery unwrapping disabled this run")),
+        "{status}: {}",
+        scan.output
+    );
+
+    workspace.edit("README.md", "Changed.\n");
+    workspace.commit("C");
+    let scan = workspace.scan(&["--changed-only"]);
+    assert_eq!(scan.code, Some(0), "{}", scan.output);
+    // `web` was analysed at B with the config its blob kept from A, so it
+    // asked for none, recorded no problem, and is carried here.
+    assert_analysed(&scan, &["api"]);
+    assert_reason_only_in_the_log(&scan, "api");
+}
+
+/// carrick#2301, what must not change: a status recorded beside an extraction
+/// config (a capture that produced no stub) is nothing an analysis repairs,
+/// so its service is carried.
+#[test]
+fn a_stored_status_beside_an_extraction_config_is_carried() {
+    let workspace = case();
+    let path = blob_path(&workspace.store, "worker");
+    let mut blob: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        blob["cached_extraction_config"].is_object(),
+        "worker's blob keeps the config it was analysed with"
+    );
+    blob["type_extraction_status"] =
+        serde_json::json!("v2 type capture degraded: no stub package was produced");
+    std::fs::write(&path, serde_json::to_string_pretty(&blob).unwrap()).unwrap();
+    touch_web(&workspace);
+    workspace.commit("B");
+    let scan = workspace.scan(&["--changed-only"]);
+    assert_eq!(scan.code, Some(0), "{}", scan.output);
+    assert_analysed(&scan, &["web"]);
 }
 
 /// Case 13: an import nothing accounts for analyses its service on every
