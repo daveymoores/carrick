@@ -63,6 +63,14 @@ pub enum UnreadReason {
     /// (carrick#2515). The reader has no phrase for it yet: it keeps the
     /// row and the word, and shows no `why`.
     NoOpClaim,
+    /// A site answer says a route is registered here and names no request
+    /// method it serves (carrick#2517): a member that mounts an application
+    /// under a prefix reads this way. No route is written for it.
+    NoMethod,
+    /// A site answer says a route is registered here, and the scan cannot
+    /// tell which router it hangs from, so the prefix it is mounted under is
+    /// unknown (carrick#2517). No route is written for it.
+    OwnerUnknown,
 }
 
 /// The slot the code does not state, and why.

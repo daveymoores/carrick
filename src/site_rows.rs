@@ -247,6 +247,33 @@ fn key_of(
     })
 }
 
+/// Why an HTTP route a site answer states cannot be written as an endpoint
+/// (carrick#2517), or `None` for any other row.
+///
+/// - **No method.** A route is keyed on its method; with none, or a word no
+///   route is registered under, [`OperationKey::http`] would write `UNKNOWN`.
+///   A member that mounts an application under a prefix answers this way.
+/// - **No owner.** A route's served path is its registration's path under
+///   every prefix its router is mounted at. The reader composes it from the
+///   router each row hangs from (`owner_node`, which
+///   [`crate::registration_scope::apply_registration_scopes`] re-points to a
+///   [`crate::registration_scope::scope_id`] inside an inline plugin) when it
+///   resolves the mount graph. A site carries no router: its record names the
+///   call and the library member it reaches, not the instance it is made on,
+///   and the mount graph is resolved before site rows are read. Written
+///   as it stands, a route under a prefix would lose it, and in band it
+///   would replace the reader's prefixed row at the same line. It stays a
+///   possible call until a site can name its router.
+fn unwritable_route(kind: &str, side: RowSide, method: Option<&str>) -> Option<UnreadReason> {
+    if kind != "http" || side != RowSide::Endpoint {
+        return None;
+    }
+    if !method.is_some_and(crate::type_manifest::is_producer_method) {
+        return Some(UnreadReason::NoMethod);
+    }
+    Some(UnreadReason::OwnerUnknown)
+}
+
 /// The decided site a record was built for.
 fn site_of<'d>(decided: &'d Decided, anchors: &TypeAnchors) -> Option<&'d DecidedSite> {
     decided.sites.iter().find(|site| {
@@ -311,6 +338,10 @@ pub fn of(
         let namespace = namespace_slot
             .as_ref()
             .and_then(|namespace| namespace.text.clone());
+        if let Some(reason) = unwritable_route(&kind_text, side, method.as_deref()) {
+            out.leads.push(lead(reason));
+            continue;
+        }
         let Some((key, name_scope)) = key_of(
             &kind_text,
             name_text,

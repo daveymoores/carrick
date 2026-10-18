@@ -662,3 +662,139 @@ fn inference_on_the_wire() {
     let old: ApiEndpointDetails = serde_json::from_value(value).unwrap();
     assert_eq!(old.inference, None);
 }
+
+// ---------------------------------------------------------------------------
+// Routes a site answer cannot write (carrick#2517).
+
+/// A made-up server framework's member at `file`, labelled `receive`: what a
+/// member that mounts a sub-application looks like when its label calls it
+/// a receive.
+fn route_site(file: &str, member: &str) -> DecidedSite {
+    let mut site = site(file, "server_framework", "receive", "App");
+    site.end.package = "@fixture/serve".to_string();
+    site.end.member = Some(member.to_string());
+    site
+}
+
+/// The answers for `site`: only its method, as `value` at confidence 1 with
+/// both orders agreeing.
+fn method_answer(site: &DecidedSite, value: Option<&str>) -> SiteAnswers {
+    let mut answers = SiteAnswers::default();
+    let record = record(site, &[], &[Slot::Method]);
+    answers.answered.insert(
+        site_id(&record.anchors),
+        Answered {
+            method: Some(SlotAnswer {
+                value: value.map(|text| SlotValue::Text(text.to_string())),
+                confidence: 1.0,
+                orders_agree: true,
+            }),
+            ..Answered::default()
+        },
+    );
+    answers
+}
+
+/// One site's rows: kind, role and name forced, method `forced` or asked.
+fn route_rows(site: &DecidedSite, method: Option<&str>, answers: &SiteAnswers) -> SiteRows {
+    let mut forced = vec![
+        (Slot::Kind, "http"),
+        (Slot::Role, "handles"),
+        (Slot::Name, "/items/:id"),
+    ];
+    let asked: &[Slot] = match method {
+        Some(method) => {
+            forced.push((Slot::Method, method));
+            &[]
+        }
+        None => &[Slot::Method],
+    };
+    let decided = Decided {
+        sites: vec![site.clone()],
+        ..Decided::default()
+    };
+    of(&decided, &[record(site, &forced, asked)], &[], answers)
+}
+
+/// A route answer that names no method, or a word no route is registered
+/// under, writes no endpoint (it would be keyed `UNKNOWN`): it is a possible
+/// call with its own reason.
+#[test]
+fn a_route_answer_with_no_method_is_a_lead_not_an_endpoint() {
+    for value in [None, Some("UNKNOWN"), Some("")] {
+        let site = route_site("src/mount.ts", "attach");
+        let rows = route_rows(&site, None, &method_answer(&site, value));
+        assert!(rows.rows.is_empty(), "{value:?}: {:?}", rows.rows);
+        assert_eq!(
+            lead_reason(&rows.leads, "src/mount.ts"),
+            Some(UnreadReason::NoMethod),
+            "{value:?}"
+        );
+        let lead = rows
+            .leads
+            .iter()
+            .find(|lead| lead.file_path == "src/mount.ts");
+        assert_eq!(lead.and_then(|lead| lead.kind.as_deref()), Some("http"));
+        assert_eq!(lead.and_then(|lead| lead.role.as_deref()), Some("producer"));
+    }
+}
+
+/// A route a site answer states, forced or answered in the band, names no
+/// router, so the prefix it is mounted under is unknown. It writes no
+/// endpoint, and the reader's row at the same registration, which carries
+/// its prefix, stands as it was.
+#[test]
+fn a_route_with_no_router_is_a_lead_and_the_readers_prefixed_row_stands() {
+    let file = "src/sub-app.ts";
+    let site = route_site(file, "get");
+    let forced = route_rows(&site, Some("GET"), &SiteAnswers::default());
+    let answered = route_rows(&site, None, &method_answer(&site, Some("GET")));
+    for rows in [forced, answered] {
+        assert!(rows.rows.is_empty(), "{:?}", rows.rows);
+        assert_eq!(
+            lead_reason(&rows.leads, file),
+            Some(UnreadReason::OwnerUnknown)
+        );
+        let reader = blob_row(
+            OperationKey::http("GET", "/v1/items/:id"),
+            file,
+            LINE,
+            Some(ResolutionSource::Model),
+        );
+        let before = serde_json::to_string(&vec![reader.clone()]).unwrap();
+        let mut endpoints = vec![reader];
+        let fold = fold_rows(&mut Vec::new(), &mut endpoints, &rows, Path::new("."), make);
+        assert_eq!(serde_json::to_string(&endpoints).unwrap(), before);
+        assert!(fold.stated.is_empty() && fold.withdrawn.is_empty());
+    }
+}
+
+/// Receive-side rows with no prefix to lose are written as before: a
+/// subscriber whose kind, role and name are forced.
+#[test]
+fn a_receive_row_with_no_prefix_is_still_written() {
+    let rows = rows();
+    let topic = row(&rows, "src/forced-topic.ts").expect("the subscriber is a row");
+    assert_eq!(topic.side, RowSide::Endpoint);
+    assert_eq!(topic.key, OperationKey::pubsub("item.added"));
+}
+
+/// Off, the fold leaves a route table byte for byte as it was, whatever the
+/// rows say.
+#[test]
+fn off_a_route_site_leaves_the_route_table_byte_identical() {
+    let file = "src/sub-app.ts";
+    let site = route_site(file, "get");
+    let mut rows = route_rows(&site, Some("GET"), &SiteAnswers::default());
+    rows.enabled = false;
+    let mut endpoints = vec![blob_row(
+        OperationKey::http("GET", "/v1/items/:id"),
+        file,
+        LINE,
+        Some(ResolutionSource::Model),
+    )];
+    let before = serde_json::to_string(&endpoints).unwrap();
+    let fold = fold_rows(&mut Vec::new(), &mut endpoints, &rows, Path::new("."), make);
+    assert_eq!(serde_json::to_string(&endpoints).unwrap(), before);
+    assert!(fold.leads.is_empty());
+}
