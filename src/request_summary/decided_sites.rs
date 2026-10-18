@@ -849,6 +849,33 @@ pub(crate) fn relative(root: &Path, file: &Path) -> String {
         .join("/")
 }
 
+/// The lowest call of a walk whose slot value states an HTTP route with
+/// its parameters as path parameters (carrick#2519): the request
+/// summaries' composition ([`render_target`]: an optional base, a literal
+/// segment, every parameter a whole segment). A parameter that is the whole
+/// path, or text glued after a base, states no route, so it stays open.
+#[derive(Clone)]
+struct Stated<'a> {
+    down: Vec<Placed<'a>>,
+    name: Vec<Piece>,
+    args: BTreeSet<usize>,
+}
+
+impl<'a> Stated<'a> {
+    fn of(
+        down: &[Placed<'a>],
+        name: &[Piece],
+        args: &BTreeSet<usize>,
+        end: &LabelledEnd,
+    ) -> Option<Self> {
+        (end.role == "http_client" && render_target(name).is_some()).then(|| Stated {
+            down: down.to_vec(),
+            name: name.to_vec(),
+            args: args.clone(),
+        })
+    }
+}
+
 struct Walk<'a, 'i> {
     calls: &'i Calls<'a>,
     root: &'i Path,
@@ -940,26 +967,33 @@ impl<'a> Walk<'a, '_> {
     /// its own body reads it) still holds a parameter: each caller of its
     /// definition fills it, and the lowest caller left with none is the
     /// site. `path` holds the definitions already passed: a cycle ends.
+    ///
+    /// Where the walk ends with the parameter unfilled (an entry point, or a
+    /// callback's parameter), an HTTP request whose value already stated a
+    /// route on the way up ([`Stated`]) is a site at the lowest call that
+    /// stated it, as the request summaries state it at its own line
+    /// (carrick#2519). Any other open end is a lead.
     fn up(
         &mut self,
         down: &[Placed<'a>],
         pieces: &[Piece],
         end: &LabelledEnd,
         path: &mut Vec<(PathBuf, String)>,
+        stated: Option<&Stated<'a>>,
     ) {
         let placed = down[0];
         let Some(own) = to_definition(pieces, placed.depth) else {
-            self.lead(&placed, end, Undecided::CallbackParameter);
+            self.open_end(&placed, end, Undecided::CallbackParameter, stated);
             return;
         };
         let Some(key) = placed.key else {
             // Module level holds no parameter of its own.
-            self.lead(&placed, end, Undecided::NameNeverBound);
+            self.open_end(&placed, end, Undecided::NameNeverBound, stated);
             return;
         };
         let callers = self.calls.callers_of(placed.file, key);
         if callers.is_empty() {
-            self.lead(&placed, end, Undecided::NameNeverBound);
+            self.open_end(&placed, end, Undecided::NameNeverBound, stated);
             return;
         }
         let here = (placed.file.to_path_buf(), key.to_string());
@@ -972,12 +1006,31 @@ impl<'a> Walk<'a, '_> {
             let mut longer = vec![*caller];
             longer.extend_from_slice(down);
             if holds_parameter(&value) {
-                self.up(&longer, &value, end, path);
+                let args = parameter_positions(&own);
+                let lowest = stated
+                    .cloned()
+                    .or_else(|| Stated::of(&longer, &value, &args, end));
+                self.up(&longer, &value, end, path, lowest.as_ref());
             } else {
                 self.site(&longer, end, value, parameter_positions(&own));
             }
         }
         path.pop();
+    }
+
+    /// An open end of a walk: the site the value stated on the way up, or
+    /// else a lead at `placed`.
+    fn open_end(
+        &mut self,
+        placed: &Placed<'a>,
+        end: &LabelledEnd,
+        why: Undecided,
+        stated: Option<&Stated<'a>>,
+    ) {
+        match stated {
+            Some(stated) => self.site(&stated.down, end, stated.name.clone(), stated.args.clone()),
+            None => self.lead(placed, end, why),
+        }
     }
 
     /// One site per key of the handler table the labelled call is handed in
@@ -1096,7 +1149,9 @@ pub fn decided_sites(
         }
         let Some(chain) = place_chain(&calls, root, site, &last) else {
             walked.push(format!("{}:{}", site.file, site.line));
-            walk.up(&[last], &at_end, end, &mut Vec::new());
+            let args = BTreeSet::from([slot.arg]);
+            let stated = Stated::of(&[last], &at_end, &args, end);
+            walk.up(&[last], &at_end, end, &mut Vec::new(), stated.as_ref());
             continue;
         };
         // Compose up the chain: values[k] is the slot at chain[k], as the
@@ -1116,8 +1171,20 @@ pub fn decided_sites(
                     filled(&own, chain[k].call)
                 });
         }
+        // The lowest call of the chain whose value states a route.
+        let stated = (0..n).rev().find_map(|k| {
+            values[k]
+                .as_ref()
+                .filter(|pieces| holds_parameter(pieces))
+                .and_then(|pieces| Stated::of(&chain[k..], pieces, &args[k], end))
+        });
         let Some(top) = values[0].clone() else {
-            walk.lead(&chain[0], end, Undecided::CallbackParameter);
+            walk.open_end(
+                &chain[0],
+                end,
+                Undecided::CallbackParameter,
+                stated.as_ref(),
+            );
             continue;
         };
         if !holds_parameter(&top) {
@@ -1136,7 +1203,7 @@ pub fn decided_sites(
             .is_some_and(|key| entered.contains(&(chain[0].file.to_path_buf(), key.to_string())));
         if !covered {
             walked.push(format!("{}:{}", site.file, site.line));
-            walk.up(&chain, &top, end, &mut Vec::new());
+            walk.up(&chain, &top, end, &mut Vec::new(), stated.as_ref());
         }
     }
     walked.sort();
@@ -2166,5 +2233,84 @@ pub(crate) mod tests {
         );
         // A send names no handler.
         assert_eq!(site("/items").handler, None);
+    }
+
+    pub(crate) const PATHS: &str = "src/slots/paths.ts";
+
+    /// The fetches of `slots/paths.ts`, each its own discovery site, decided.
+    pub(crate) fn paths_decided() -> (Decided, String) {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let text = std::fs::read_to_string(root.join(PATHS)).unwrap();
+        let label = fetch_label();
+        let sites: Vec<_> = [
+            "fetch(`${process.env.API}${path}`, { method })",
+            "fetch(url)",
+            "fetch(`${API}${path}`)",
+            "fetch(`/accounts/${id}`)",
+            "fetch(path)",
+        ]
+        .iter()
+        .map(|call| bottom(&end_for(&label, PATHS, &text, call), "fetch"))
+        .collect();
+        (decided_sites(&inputs, &root, &sites, &[label]), text)
+    }
+
+    /// A request whose path keeps a parameter up to a function nothing calls
+    /// is a site at the lowest call where the summaries' composition states
+    /// a route, each such parameter a path parameter (carrick#2519): through
+    /// a wrapper that adds an environment base, and through a local URL on a
+    /// base the constructor sets. A wrapper's whole-path parameter is still
+    /// filled by each caller, a whole segment a caller states stays at that
+    /// caller, and a whole path no caller states stays a lead.
+    #[test]
+    fn a_path_parameter_in_a_whole_segment_is_a_site_where_the_route_is_stated() {
+        let (decided, text) = paths_decided();
+        let line = |needle: &str| line_of(&text, needle);
+        let sites: Vec<(u32, Option<String>)> = decided
+            .sites
+            .iter()
+            .filter(|site| site.file == PATHS)
+            .map(|site| (site.line, site.name_text()))
+            .collect();
+        for (at, name) in [
+            (
+                line("send(`/tasks/"),
+                "${process.env.API}/tasks/${taskId}/status",
+            ),
+            (
+                line("fetch(url)"),
+                "${this.baseUrl}/resources/${resourceId}/files/${fileId}",
+            ),
+            (line("get(\"/orders\")"), "${process.env.API}/orders"),
+            (line("get(\"/refunds\")"), "${process.env.API}/refunds"),
+            (line("readOne(\"me\")"), "/accounts/me"),
+        ] {
+            assert!(
+                sites.contains(&(at, Some(name.to_string()))),
+                "{at} {name} in {sites:?}"
+            );
+        }
+        assert_eq!(sites.len(), 5, "{sites:?}");
+        // The method the caller writes reaches the composed site.
+        let status = decided
+            .sites
+            .iter()
+            .find(|site| site.line == line("send(`/tasks/"))
+            .unwrap();
+        assert_eq!(status.name_args, BTreeSet::from([0]));
+        assert!(
+            matches!(&status.method, Some(MethodValue::Pieces(pieces)) if pieces == &vec![Piece::Lit("PUT".into())]),
+            "{:?}",
+            status.method
+        );
+        assert_eq!(
+            decided
+                .leads
+                .iter()
+                .map(|lead| (lead.line, lead.reason))
+                .collect::<Vec<_>>(),
+            vec![(line("fetch(path)"), Undecided::NameNeverBound)]
+        );
     }
 }

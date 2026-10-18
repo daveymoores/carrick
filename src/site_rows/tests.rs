@@ -12,7 +12,7 @@ use crate::request_summary::decided_sites::{
     Decided, DecidedSite, HandlerAt, LabelledEnd, PayloadBinding, SiteLabel,
 };
 use crate::request_summary::site_record::{
-    AnchorAt, Bucket, HandlerAnchor, SiteRecord, TypeAnchors,
+    AnchorAt, Basis, Bucket, HandlerAnchor, SiteRecord, TypeAnchors,
 };
 use crate::site_questions::{SiteAnswer, SiteAnswers, SiteState, Slot, parse_response};
 
@@ -119,6 +119,18 @@ fn record(site: &DecidedSite, forced: &[(Slot, &str)], asked: &[Slot]) -> SiteRe
                 param_name: Some("message".to_string()),
             }),
         },
+        // A forced name is the code's; every other forced slot the label's.
+        basis: forced
+            .keys()
+            .map(|slot| {
+                let basis = if *slot == Slot::Name {
+                    Basis::Code
+                } else {
+                    Basis::Label
+                };
+                (*slot, basis)
+            })
+            .collect(),
         lead: None,
     }
 }
@@ -843,4 +855,107 @@ fn off_a_route_site_leaves_the_route_table_byte_identical() {
         assert!(fold.leads.is_empty());
         assert_eq!(fold.route_kept_reader, 0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Corroboration (carrick#2520): a row on a label-only slot with a name the
+// model answered stands only beside a reader row that agrees on its key.
+
+/// Label forces kind, role and method; the model answers the name; no
+/// reader row stands at the line: no row, and the site is a possible call,
+/// `uncorroborated`.
+#[test]
+fn a_label_only_row_with_a_model_name_and_no_reader_is_uncorroborated() {
+    let mut calls = Vec::new();
+    let fold = fold_one("src/http.ts", &mut calls, &mut Vec::new());
+    assert!(at_site(&calls, "src/http.ts").is_empty(), "{calls:?}");
+    assert!(fold.stated.is_empty());
+    assert_eq!(
+        lead_reason(&fold.leads, "src/http.ts"),
+        Some(UnreadReason::Uncorroborated)
+    );
+}
+
+/// The same labels with a name the code states: a row, no reader needed.
+#[test]
+fn a_code_stated_name_needs_no_reader() {
+    let rows = rows();
+    assert!(!row(&rows, "src/forced-http.ts").unwrap().needs_reader);
+    let mut calls = Vec::new();
+    let fold = fold_one("src/forced-http.ts", &mut calls, &mut Vec::new());
+    assert_eq!(
+        at_site(&calls, "src/forced-http.ts"),
+        vec![(
+            OperationKey::http("POST", "/v1/items"),
+            Some(ResolutionSource::RequestSummary),
+            None
+        )]
+    );
+    assert_eq!(lead_reason(&fold.leads, "src/forced-http.ts"), None);
+}
+
+/// A reader row at the line agreeing on the key corroborates the row: the
+/// fold keeps one row there. A reader row naming another operation does
+/// not: the reader stands and the site is `uncorroborated`.
+#[test]
+fn an_agreeing_reader_row_corroborates() {
+    let file = "src/http.ts";
+    let reader = |path: &str| {
+        blob_row(
+            OperationKey::http("GET", path),
+            file,
+            LINE,
+            Some(ResolutionSource::Model),
+        )
+    };
+    let mut calls = vec![reader("/v1/orders")];
+    let fold = fold_one(file, &mut calls, &mut Vec::new());
+    let here = at_site(&calls, file);
+    assert_eq!(here.len(), 1, "{here:?}");
+    assert_eq!(here[0].0, OperationKey::http("GET", "/v1/orders"));
+    assert_eq!(lead_reason(&fold.leads, file), None);
+
+    let mut calls = vec![reader("/v2/invoices")];
+    let fold = fold_one(file, &mut calls, &mut Vec::new());
+    assert_eq!(
+        at_site(&calls, file),
+        vec![(
+            OperationKey::http("GET", "/v2/invoices"),
+            Some(ResolutionSource::Model),
+            None
+        )]
+    );
+    assert_eq!(
+        lead_reason(&fold.leads, file),
+        Some(UnreadReason::Uncorroborated)
+    );
+}
+
+/// Agreement reads a base written as a value and a segment written as a
+/// value as the reader's parameter: `${base}/tasks/${id}` agrees with
+/// `/tasks/:taskId`; another method, or no literal segment in common, does
+/// not.
+#[test]
+fn agreement_reads_written_values_as_parameters() {
+    let site = OperationKey::http("PUT", "${process.env.API}/tasks/${taskId}/status");
+    assert!(agrees(
+        &OperationKey::http("PUT", "/tasks/:id/status"),
+        &site
+    ));
+    assert!(!agrees(
+        &OperationKey::http("GET", "/tasks/:id/status"),
+        &site
+    ));
+    assert!(!agrees(
+        &OperationKey::http("PUT", "/files/:id/status2"),
+        &site
+    ));
+    assert!(agrees(
+        &OperationKey::pubsub("order.settled"),
+        &OperationKey::pubsub("order.settled")
+    ));
+    assert!(!agrees(
+        &OperationKey::pubsub("order.settled"),
+        &OperationKey::pubsub("order.placed")
+    ));
 }

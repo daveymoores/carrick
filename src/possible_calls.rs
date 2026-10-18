@@ -71,6 +71,10 @@ pub enum UnreadReason {
     /// tell which router it hangs from, so the prefix it is mounted under is
     /// unknown (carrick#2517). No route is written for it.
     OwnerUnknown,
+    /// A site answer's row rests on a slot only the store's label forced,
+    /// the code does not state its name, and no row the file reader stated
+    /// at the line agrees (carrick#2520). No row is written for it.
+    Uncorroborated,
 }
 
 /// The slot the code does not state, and why.
