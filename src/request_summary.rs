@@ -393,9 +393,11 @@ pub struct ObjValue {
     /// A spread of the rest of a destructured parameter (`const { path,
     /// ...rest } = config`, carrick#2519), as the first thing the object
     /// holds: the parameter's position and the keys the destructuring takes
-    /// out. Only a decided site's option key (its method) reads this; the
-    /// body a request sends does not, so no body row moves.
-    pub under_rest: Option<(usize, BTreeSet<String>)>,
+    /// out, with how many functions out the parameter is (0: this one's;
+    /// a closure reads its enclosing function's, carrick#1949). Only a
+    /// decided site's option key (its method) reads this; the body a request
+    /// sends does not, so no body row moves.
+    pub under_rest: Option<(u8, usize, BTreeSet<String>)>,
 }
 
 impl ObjValue {
@@ -3170,6 +3172,8 @@ struct Captured {
     /// as the caller wrote them ([`Scope::key_objects`]), with how many
     /// functions out each is and its position there (carrick#1949).
     objects: HashMap<BindingKey, (u8, usize)>,
+    /// [`Scope::rest_of`], each one function further out.
+    rests: HashMap<BindingKey, (u8, usize, BTreeSet<String>)>,
     /// Literal text only: a hole is a parameter of the enclosing function,
     /// which the function written inside it is not called with.
     texts: HashMap<BindingKey, Vec<library_sites::TextPiece>>,
@@ -3618,7 +3622,7 @@ struct Scope<'a> {
     /// position and every key the pattern takes out (carrick#2519): it holds
     /// the caller's other keys. Never a binding declared twice or assigned
     /// again.
-    rest_of: HashMap<BindingKey, (usize, BTreeSet<String>)>,
+    rest_of: HashMap<BindingKey, (u8, usize, BTreeSet<String>)>,
     /// The plain parameters whose keys the body may read as the caller wrote
     /// them (`options.url`, `const { url } = options`): never one the body
     /// assigns again, nor one whose name the file writes through.
@@ -4257,7 +4261,7 @@ impl Reader<'_> {
         let mut scope = Scope {
             params: Vec::new(),
             keyed: HashMap::new(),
-            rest_of: HashMap::new(),
+            rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
             outer_objects: captured.objects.clone(),
             locals: captured.values.clone(),
@@ -4312,7 +4316,7 @@ impl Reader<'_> {
         let mut scope = Scope {
             params: Vec::new(),
             keyed: HashMap::new(),
-            rest_of: HashMap::new(),
+            rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
             outer_objects: captured.objects.clone(),
             locals: captured.values.clone(),
@@ -4430,7 +4434,7 @@ impl Reader<'_> {
                         && !reassigned.names.contains(&rest.0)
                         && declared.binding_count(&rest) == 1
                     {
-                        scope.rest_of.insert(rest, (index, taken));
+                        scope.rest_of.insert(rest, (0, index, taken));
                     }
                     if let (Pat::Object(object), Some(init)) = (&declarator.name, &declarator.init)
                         && let Expr::Ident(source) =
@@ -4975,7 +4979,11 @@ impl Reader<'_> {
 
     /// The parameter position and the keys taken out, when `expr` names the
     /// rest of a destructured parameter ([`Scope::rest_of`], carrick#2519).
-    fn rest_of_param(&self, expr: &Expr, scope: &Scope<'_>) -> Option<(usize, BTreeSet<String>)> {
+    fn rest_of_param(
+        &self,
+        expr: &Expr,
+        scope: &Scope<'_>,
+    ) -> Option<(u8, usize, BTreeSet<String>)> {
         match crate::graphql_document_sites::unwrap_expression(expr) {
             Expr::Ident(ident) => scope.rest_of.get(&ident_key(ident)).cloned(),
             _ => None,
@@ -6306,9 +6314,21 @@ impl CallWalker<'_, '_, '_> {
                 objects.insert(key.clone(), (1, index));
             }
         }
+        let rests = self
+            .scope
+            .rest_of
+            .iter()
+            .map(|(key, (depth, index, taken))| {
+                (
+                    key.clone(),
+                    (depth.saturating_add(1), *index, taken.clone()),
+                )
+            })
+            .collect();
         Captured {
             values,
             objects,
+            rests,
             texts: self
                 .scope
                 .texts

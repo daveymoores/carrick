@@ -727,12 +727,12 @@ fn written_at(call: &CallIr, arg: usize, key: Option<&str>) -> MethodValue {
             // (carrick#2519): it holds the caller's key unless the pattern
             // took the key out.
             (None, None) => match &object.under_rest {
-                Some((index, taken)) if !taken.contains(key) => {
-                    MethodValue::Pieces(vec![Piece::ParamKey(
-                        *index,
-                        key.to_string(),
-                        key.to_string(),
-                    )])
+                Some((depth, index, taken)) if !taken.contains(key) => {
+                    let own = Piece::ParamKey(*index, key.to_string(), key.to_string());
+                    MethodValue::Pieces(vec![match depth {
+                        0 => own,
+                        out => Piece::Outer(*out, Box::new(own)),
+                    }])
                 }
                 _ => MethodValue::Pieces(vec![Piece::Unknown]),
             },

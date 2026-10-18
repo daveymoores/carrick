@@ -95,9 +95,15 @@ export function removeNote(id: string): Promise<Response> {
   return sendNote({ path: `/notes/${id}`, method: "DELETE" });
 }
 
+function traced<T>(run: () => T): T {
+  return run();
+}
+
 function closeWith(path: string, init?: { method?: string; retries?: number }) {
   const { retries, ...requestInit } = init ?? {};
-  return fetch(`${process.env.API}${path}`, { ...requestInit, credentials: "include" });
+  return traced(() =>
+    fetch(`${process.env.API}${path}`, { ...requestInit, credentials: "include" }),
+  );
 }
 
 export function closeNote(id: string): Promise<Response> {
