@@ -50,7 +50,9 @@ import {
 } from "../update.ts";
 import { findCarrick, globalCommand, installedVersion, type GlobalCarrick } from "../global-install.ts";
 import { recordedCliVersion } from "./outdated.ts";
-import { repoRoots } from "./repos.ts";
+import { repoIdentity, repoRoots } from "./repos.ts";
+import { readCredential } from "../auth/credentials.ts";
+import { resolveRepos } from "../auth/read.ts";
 import { excludedRepos } from "./workspace-file.ts";
 import {
   expectedCarrickHooks,
@@ -472,6 +474,44 @@ export function pinnedActionRef(ref: string | undefined): string | null {
   );
 }
 
+/** Who builds this workspace's index. Only a read that says "cloud" is cloud. */
+export type IndexLane = "cloud" | "laptop";
+
+/** What the lane read needs; every part is replaceable so a test reaches no network. */
+export type LaneDeps = {
+  credential: () => { token: string } | null;
+  resolve: typeof resolveRepos;
+  repoName: (root: string) => string | null;
+};
+
+const realLaneDeps: LaneDeps = {
+  credential: () => readCredential(),
+  resolve: resolveRepos,
+  repoName: (root) => repoIdentity(root).name,
+};
+
+/**
+ * The lane of the signed-in workspace, from one `resolve-repos` read.
+ *
+ * No credential, no repo with a GitHub remote, a failed read, a missing field
+ * or any other value is the laptop lane: doctor then prints what it always
+ * has. The read never fails doctor. Only the names of the repos Carrick
+ * indexes here are sent (carrick#1338).
+ */
+export async function readLane(repos: ConfiguredRepo[], deps: LaneDeps = realLaneDeps): Promise<IndexLane> {
+  try {
+    const saved = deps.credential();
+    if (saved === null) return "laptop";
+    const names = repos.filter((repo) => repo.config !== null).map((repo) => deps.repoName(repo.root));
+    const here = names.filter((name): name is string => name !== null);
+    if (here.length === 0) return "laptop";
+    const identity = await deps.resolve(saved.token, here);
+    return identity.workspace.index_builder === "cloud" ? "cloud" : "laptop";
+  } catch {
+    return "laptop";
+  }
+}
+
 /**
  * The CI workflow of every configured repo, against the template this package
  * renders.
@@ -479,7 +519,7 @@ export function pinnedActionRef(ref: string | undefined): string | null {
  * Only repos with a `carrick.json` are asked for one: a sibling clone that
  * Carrick does not index owes CI nothing.
  */
-export function checkWorkflow(repos: ConfiguredRepo[]): Line[] {
+export function checkWorkflow(repos: ConfiguredRepo[], lane: IndexLane = "laptop"): Line[] {
   const lines: Line[] = [];
   let matched = 0;
   for (const repo of repos) {
@@ -489,9 +529,20 @@ export function checkWorkflow(repos: ConfiguredRepo[]): Line[] {
     try {
       body = fs.readFileSync(file, "utf8");
     } catch {
+      // Where Carrick rescans every push itself, a missing workflow is the
+      // expected state (carrick#2219).
+      if (lane === "cloud") continue;
       lines.push(
         warn(
           `${repo.label}: no ${WORKFLOW_PATH}, so pushes to the default branch do not re-index it. Write one with \`carrick templates workflow\`.`,
+        ),
+      );
+      continue;
+    }
+    if (lane === "cloud") {
+      lines.push(
+        say(
+          `${repo.label}: Carrick now scans this repo in its own cloud runners on every push, so ${WORKFLOW_PATH} is no longer needed and only uses CI minutes. You can delete it.`,
         ),
       );
       continue;
@@ -1079,7 +1130,11 @@ function print(out: InitOutput, lines: Line[]): void {
   }
 }
 
-export async function doctor(argv: string[], out: InitOutput = createOutput()): Promise<number> {
+export async function doctor(
+  argv: string[],
+  out: InitOutput = createOutput(),
+  laneDeps: LaneDeps = realLaneDeps,
+): Promise<number> {
   const parsed = parseArgs(argv);
   if (typeof parsed === "string") {
     process.stdout.write(`${parsed}\n`);
@@ -1092,11 +1147,12 @@ export async function doctor(argv: string[], out: InitOutput = createOutput()): 
   }
 
   const repos = configuredRepos(workspace);
+  const lane = await readLane(repos, laneDeps);
   const lines: Line[] = [
     ...(await checkVersion()),
     ...checkPathVersion(workspace, pathCarrick()),
     ...checkDeclaredPaths(repos),
-    ...checkWorkflow(repos),
+    ...checkWorkflow(repos, lane),
     ...checkHooks(workspace, realMachine()),
     ...checkCodexHooks(workspace),
     ...checkTaskSkills(inspectTaskSkills(workspace)),
