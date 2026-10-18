@@ -41,7 +41,9 @@ use super::row_calls::Reach;
 use super::*;
 use crate::library_claims::{ExportClaims, applies, runtime_package_of};
 use crate::library_store::RUNTIME_TYPES;
-use crate::position_rows::{FLAG_DECLARATION_UNNAMED, Kind, Row};
+use crate::position_rows::{
+    FLAG_DECLARATION_UNNAMED, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, Kind, Row,
+};
 use crate::services::type_sidecar::{LibraryClaim, LibraryOp, LibraryRole};
 
 /// The stop for a walk that reaches a definition the extractor keys and
@@ -211,6 +213,25 @@ fn store_key(row: &Row, exports: &[ExportClaims]) -> Option<String> {
     Some(runtime_package_of(package, exports))
 }
 
+/// The names a row's declaration is published as, as the store keys an
+/// export: `default` and `export =` for its module's whole-module target,
+/// and its own name when its module exports it by that name or it is a
+/// global. None for a member of a class or interface, whatever its name,
+/// and none for a row that does not say (carrick#2508).
+fn published_names(row: &Row) -> Vec<&str> {
+    let mut names = Vec::new();
+    if row.flags() & FLAG_MODULE_DEFAULT != 0 {
+        names.extend(["default", "export ="]);
+    }
+    if row.flags() & FLAG_PUBLISHED != 0
+        && let Some(symbol) = row.symbol()
+        && !names.contains(&symbol)
+    {
+        names.push(symbol);
+    }
+    names
+}
+
 /// Whether a row's declaration is a file of the repository.
 fn in_repo(row: &Row) -> bool {
     row.flags() & FLAG_DECLARATION_UNNAMED == 0
@@ -352,7 +373,9 @@ impl Walker<'_> {
 
     /// The labelled export `call` is made on, when it is one:
     ///
-    /// - the callee's own symbol in the callee's package;
+    /// - the name the callee's package publishes the callee's declaration
+    ///   as, when the row says: its own name, or `default` / `export =` for
+    ///   the module's whole-module target; never a member's name;
     /// - the name the module publishes the binding the callee is read
     ///   through as (`default`, `io`, `export =`), as the store keys the
     ///   export: the compiler names the declaration (`axios`, `lookup`);
@@ -391,10 +414,12 @@ impl Walker<'_> {
             }
         };
         let package = store_key(row, self.labels.exports);
-        if let Some(package) = &package
-            && let Some(claims) = self.labels.get(package, symbol)
-        {
-            return Some(end(package, symbol, None, claims));
+        if let Some(package) = &package {
+            for export in published_names(row) {
+                if let Some(claims) = self.labels.get(package, export) {
+                    return Some(end(package, export, None, claims));
+                }
+            }
         }
         let ir = self.inputs.files.get(file)?;
         // The binding the callee is read through: the callee itself, or the
@@ -1003,6 +1028,99 @@ mod tests {
                 "5 openPipe -> fixture-pipe export = -",
             ])
         );
+    }
+
+    /// The store's answer for the export-shape cases: a package with a
+    /// top-level `json` export, and an `export =` factory's default.
+    const EXPORT_SHAPE_CLAIMS: &str = r#"{
+  "library_claims": [
+    {
+      "package": "fixture-rest", "version": "1.0.0", "status": "answered",
+      "exports": [
+        { "specifier": "fixture-rest", "export": "json", "role": "server_framework", "side": "server",
+          "makes": [], "scopes": [], "ops": [], "reserved": [], "calls": [], "patterns": [] }
+      ]
+    },
+    {
+      "package": "fixture-make", "version": "1.0.0", "status": "answered",
+      "exports": [
+        { "specifier": "fixture-make", "export": "default", "role": "server_framework", "side": "server",
+          "makes": [ { "form": "call", "member": null, "picker": "fixture-picker" } ], "scopes": [],
+          "ops": [], "reserved": [], "calls": [], "patterns": [] }
+      ]
+    }
+  ]
+}"#;
+
+    /// carrick#2508: a declaration is matched by name only when its package
+    /// publishes it under that name. An interface's `json` method is not the
+    /// package's top-level `json` export, however the call is written; the
+    /// top-level export is, imported directly or through a local barrel. An
+    /// `export =` factory re-exported by a local barrel as a named binding,
+    /// so that no import names the package, is the package's `default`.
+    #[test]
+    fn a_member_never_matches_an_export_by_name_and_a_barrel_default_is_the_default() {
+        let edit = [
+            (
+                "node_modules/fixture-rest/package.json",
+                r#"{ "name": "fixture-rest", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/fixture-rest/index.d.ts",
+                "export interface Res {\n  json(body: unknown): void;\n}\nexport declare function json(): (req: unknown, res: Res) => void;\n",
+            ),
+            (
+                "node_modules/fixture-make/package.json",
+                r#"{ "name": "fixture-make", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/fixture-make/index.d.ts",
+                "interface App {\n  post(path: string, handler: () => void): void;\n}\ndeclare function make(): App;\nexport = make;\n",
+            ),
+            (
+                "src/rest-barrel.ts",
+                "export { json as parse } from \"fixture-rest\";\nexport { default as makeApp } from \"fixture-make\";\n",
+            ),
+            (
+                "src/rest.ts",
+                "import { json, type Res } from \"fixture-rest\";\nimport { makeApp, parse } from \"./rest-barrel\";\n\nexport function reply(res: Res): void {\n  res.json({});\n}\n\nexport function parsers(): void {\n  json();\n  parse();\n}\n\nexport function boot(): void {\n  makeApp();\n}\n",
+            ),
+        ];
+        let Some(on) = walked("discovery", "services/web", "web", &edit, true) else {
+            return;
+        };
+        let mut exports = claims();
+        let added = crate::library_store::parse_answer(EXPORT_SHAPE_CLAIMS);
+        assert_eq!(added.dropped, 0, "every added claim parses");
+        exports.extend(added.exports);
+        let discovery = discover(&on.inputs, &Labels::of(&exports), &on.repo);
+        assert_eq!(
+            records_in(&discovery, "services/web/src/rest.ts"),
+            texts(&[
+                "9 json -> fixture-rest json -",
+                "10 parse -> fixture-rest json -",
+                "14 makeApp -> fixture-make default -",
+            ])
+        );
+    }
+
+    /// carrick#2508: the publication bits are flag bits within version 2. A
+    /// row written before them still reads, and reads as a declaration
+    /// nothing says is published: no name to match it by.
+    #[test]
+    fn a_row_without_the_publication_bits_reads_and_names_nothing() {
+        let text = concat!(
+            r#"{"v":2,"typescript":"5.9.3","service":"api","files":1}"#,
+            "\n",
+            r#"{"f":"src/a.ts","h":"00","r":[["call",0,7,"greet","node_modules/p/index.d.ts",1,"p","string",0],["call",9,16,"make","node_modules/p/index.d.ts",3,"p","App",96]]}"#,
+            "\n"
+        );
+        let rows = crate::position_rows::read_rows(text.as_bytes()).expect("an old row reads");
+        let [old, new] = rows.files[0].r.as_slice() else {
+            panic!("two rows");
+        };
+        assert!(published_names(old).is_empty());
+        assert_eq!(published_names(new), vec!["default", "export =", "make"]);
     }
 
     /// carrick#2431: a global of the language's own library is keyed as the

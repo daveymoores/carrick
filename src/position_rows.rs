@@ -41,6 +41,11 @@
 //! Version 2 (carrick#2430) added [`Kind::Impl`] and [`Kind::Jsx`]. A file
 //! of any other version is not read: no rows file outlives the run that
 //! wrote it, so its service reads as [`HoleReason::RowsMissing`].
+//!
+//! [`FLAG_PUBLISHED`] and [`FLAG_MODULE_DEFAULT`] (carrick#2508) are flag
+//! bits within version 2, not a new version: a row written without them
+//! still reads, and reads as a declaration nothing says is published, which
+//! discovery's name match abstains on.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader};
@@ -77,6 +82,13 @@ pub const FLAG_DECLARATION_UNNAMED: u8 = 8;
 /// A [`Kind::Impl`] row standing for more implementations than the walk
 /// lists (16); it names none.
 pub const FLAG_TOO_MANY: u8 = 16;
+/// The declaration is published under the row's symbol name: its module
+/// exports it by that name, or it is a global (a script's top-level
+/// declaration, or one in `declare global`). A member of a class,
+/// interface, type literal or object literal never is.
+pub const FLAG_PUBLISHED: u8 = 32;
+/// The declaration is what its module exports as `export =` or `default`.
+pub const FLAG_MODULE_DEFAULT: u8 = 64;
 
 /// Line 1 of a rows file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

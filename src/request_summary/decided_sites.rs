@@ -58,7 +58,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 use super::{CallIr, FnIr, Piece, RequestSummaryInputs, Value, concat, render_target};
 
 /// The labelled call a discovery site reaches: the store key of the package
-/// (`lib.dom` for the language's own library), the export and member, the
+/// (`lib:lib.dom.d.ts` for the language's own library), the export and member, the
 /// store role and op, and where the call is.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LabelledEnd {
@@ -1864,7 +1864,7 @@ pub(crate) mod tests {
     /// The language's own `fetch`, with label v2's method fields.
     pub(crate) fn fetch_label() -> SiteLabel {
         SiteLabel {
-            package: "lib.dom".into(),
+            package: "lib:lib.dom.d.ts".into(),
             export: "fetch".into(),
             member: None,
             role: "http_client".into(),
