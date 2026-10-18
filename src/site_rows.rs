@@ -143,6 +143,11 @@ pub struct SiteRows {
     /// The sites that are possible calls whatever the fold does: leads,
     /// unanswered sites, and sites whose answer states no row.
     pub leads: Vec<PossibleCall>,
+    /// HTTP route sites no row can be written for ([`unwritable_route`],
+    /// carrick#2517), each as the possible call it is. The fold keeps one
+    /// only where no row stands at its line: elsewhere the index already
+    /// holds the route, and the site is counted, not listed.
+    pub routes: Vec<PossibleCall>,
 }
 
 /// The id a site is asked under: its file and call span, unique in a run.
@@ -153,11 +158,22 @@ pub fn site_id(anchors: &TypeAnchors) -> String {
     )
 }
 
-/// The questions a service's records ask: one per record that asks a slot.
+/// Whether the label states that `record`'s site registers an HTTP route:
+/// kind `http` and role `handles` both forced. No route can be written from
+/// such a site ([`unwritable_route`]: it names no router), so it is never
+/// asked and never a row (carrick#2517).
+fn label_states_a_route(record: &SiteRecord) -> bool {
+    let forced = |slot| record.state.forced.get(&slot).map(String::as_str);
+    forced(Slot::Kind) == Some("http") && forced(Slot::Role) == Some("handles")
+}
+
+/// The questions a service's records ask: one per record that asks a slot,
+/// except a route site ([`label_states_a_route`]), whose answer could not
+/// be written.
 pub fn questions(records: &[SiteRecord]) -> Vec<SiteQuestion> {
     records
         .iter()
-        .filter(|record| record.bucket == Bucket::Asked)
+        .filter(|record| record.bucket == Bucket::Asked && !label_states_a_route(record))
         .map(|record| SiteQuestion {
             site_id: site_id(&record.anchors),
             state: record.state.clone(),
@@ -247,6 +263,34 @@ fn key_of(
     })
 }
 
+/// Why an HTTP route a site answer states cannot be written as an endpoint
+/// (carrick#2517), or `None` for any other row.
+///
+/// - **No method.** A route is keyed on its method; with none, or a word no
+///   route is registered under, [`OperationKey::http`] would write `UNKNOWN`.
+///   A member that mounts an application under a prefix answers this way.
+/// - **No owner.** A route's served path is its registration's path under
+///   every prefix its router is mounted at. The reader composes it from the
+///   router each row hangs from (`owner_node`, which
+///   [`crate::registration_scope::apply_registration_scopes`] re-points to a
+///   [`crate::registration_scope::scope_id`] inside an inline plugin) when it
+///   resolves the mount graph. A site carries no router: its record names the
+///   call and the library member it reaches, not the instance it is made on,
+///   and the mount graph is resolved before site rows are read. Written
+///   as it stands, a route under a prefix would lose it, and in band it
+///   would replace the reader's prefixed row at the same line. Until a site
+///   can name its router it goes to [`SiteRows::routes`]: a possible call
+///   only where no row stands at its line ([`fold_rows`]).
+fn unwritable_route(kind: &str, side: RowSide, method: Option<&str>) -> Option<UnreadReason> {
+    if kind != "http" || side != RowSide::Endpoint {
+        return None;
+    }
+    if !method.is_some_and(crate::type_manifest::is_producer_method) {
+        return Some(UnreadReason::NoMethod);
+    }
+    Some(UnreadReason::OwnerUnknown)
+}
+
 /// The decided site a record was built for.
 fn site_of<'d>(decided: &'d Decided, anchors: &TypeAnchors) -> Option<&'d DecidedSite> {
     decided.sites.iter().find(|site| {
@@ -269,6 +313,7 @@ pub fn of(
         enabled: true,
         rows: Vec::new(),
         leads: crate::possible_calls::from_sites(decided, records),
+        routes: Vec::new(),
     };
     for record in records {
         if record.bucket == Bucket::Lead {
@@ -278,6 +323,10 @@ pub fn of(
             continue;
         };
         let lead = |reason| crate::possible_calls::from_site(site, reason);
+        if label_states_a_route(record) {
+            out.routes.push(lead(UnreadReason::OwnerUnknown));
+            continue;
+        }
         let answered = answers.answered.get(&site_id(&record.anchors));
         if record.bucket == Bucket::Asked && answered.is_none() {
             out.leads.push(lead(UnreadReason::Unanswered));
@@ -311,6 +360,10 @@ pub fn of(
         let namespace = namespace_slot
             .as_ref()
             .and_then(|namespace| namespace.text.clone());
+        if let Some(reason) = unwritable_route(&kind_text, side, method.as_deref()) {
+            out.routes.push(lead(reason));
+            continue;
+        }
         let Some((key, name_scope)) = key_of(
             &kind_text,
             name_text,
@@ -370,9 +423,12 @@ pub struct SiteFold {
     /// The reader rows the fold replaced, as `(file, line, key, side)`:
     /// their manifest entries would anchor an operation no row holds.
     pub withdrawn: Vec<(String, u32, OperationKey, RowSide)>,
-    /// Every possible call: the leads, and the answers below the band at a
-    /// site with no row.
+    /// Every possible call: the leads, the answers below the band at a site
+    /// with no row, and the route sites with no row at their line.
     pub leads: Vec<PossibleCall>,
+    /// Route sites ([`SiteRows::routes`]) where a row already stands at the
+    /// line: the index holds the route, so the site is no possible call.
+    pub route_kept_reader: usize,
 }
 
 /// `file` relative to `root`, `/`-separated, whichever form it is held in
@@ -412,6 +468,18 @@ pub fn fold_rows(
         return out;
     }
     out.leads = site.leads.clone();
+    // The same file:line match as the rows below, on the endpoint side.
+    for route in &site.routes {
+        let held = endpoints.iter().any(|existing| {
+            place(root, existing)
+                .is_some_and(|(file, line)| file == route.file_path && line == route.line_number)
+        });
+        if held {
+            out.route_kept_reader += 1;
+        } else {
+            out.leads.push(route.clone());
+        }
+    }
     for row in &site.rows {
         let rows = match row.side {
             RowSide::Call => &mut *calls,

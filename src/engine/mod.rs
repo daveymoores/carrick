@@ -5380,6 +5380,16 @@ fn append_deterministic_protocol_operations(
         },
     );
     crate::possible_calls::attach_when(extractions.site.enabled, cloud_data, site.leads.clone());
+    if extractions.site.enabled {
+        debug!(
+            routes = extractions.site.routes.len(),
+            route_kept_reader = site.route_kept_reader,
+            possible_calls = site.leads.len(),
+            stated = site.stated.len(),
+            withdrawn = site.withdrawn.len(),
+            "site questions: fold"
+        );
+    }
     site
 }
 
@@ -21572,6 +21582,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 true,
             )],
             leads: Vec::new(),
+            routes: Vec::new(),
         };
         assert_eq!(blob(off), before);
         assert_eq!(blob(stray), before);
@@ -22011,6 +22022,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     below,
                 ],
                 leads: Vec::new(),
+                routes: Vec::new(),
             },
             ..ProtocolExtractions::default()
         };
@@ -22084,6 +22096,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 ),
             ],
             leads: Vec::new(),
+            routes: Vec::new(),
         };
         key_site_requests_canonically(&mut rows, &UrlNormalizer::new(&config));
         let keys: Vec<String> = rows.rows.iter().map(|row| row.key.canonical()).collect();
@@ -22131,6 +22144,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 RowSide::Call,
             )],
             leads: Vec::new(),
+            route_kept_reader: 0,
         };
         let mut entries = Vec::new();
         add_protocol_manifest_entry(
