@@ -109,3 +109,13 @@ function closeWith(path: string, init?: { method?: string; retries?: number }) {
 export function closeNote(id: string): Promise<Response> {
   return closeWith(`/notes/${id}/close`, { method: "PATCH" });
 }
+
+// A parameter every caller passes literal text, in the query only: the
+// route is decided at the call, not at its callers.
+function pageOf(page: number): Promise<Response> {
+  return fetch(`/dashboard?page=${page}`);
+}
+
+export function firstPage(): Promise<Response> {
+  return pageOf("1" as unknown as number);
+}

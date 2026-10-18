@@ -979,8 +979,9 @@ impl<'a> Walk<'a, '_> {
             && !(holds_parameter(pieces) && self.literal_everywhere(placed, pieces))
     }
 
-    /// Whether some parameter `pieces` holds is passed literal text by every
-    /// caller of the function `placed` is written in (and it has callers).
+    /// Whether some parameter in the route `pieces` states is passed literal
+    /// text by every caller of the function `placed` is written in (and it
+    /// has callers).
     fn literal_everywhere(&self, placed: &Placed<'a>, pieces: &[Piece]) -> bool {
         let (Some(own), Some(key)) = (to_definition(pieces, placed.depth), placed.key) else {
             return false;
@@ -993,7 +994,10 @@ impl<'a> Walk<'a, '_> {
             matches!(argument(caller.call, index), Some(Value::Str(pieces))
                 if !pieces.is_empty() && pieces.iter().all(|piece| matches!(piece, Piece::Lit(_))))
         };
-        own.iter()
+        // Only a parameter in the route: one in a query cut from it
+        // (`?page=${page}`) names no route, whoever fills it.
+        super::route_of(&own)
+            .iter()
             .filter_map(|piece| match piece {
                 Piece::Param(index, _) => Some(*index),
                 _ => None,
@@ -2248,6 +2252,7 @@ pub(crate) mod tests {
             "fetch(`${process.env.API}${path}`, { ...init, credentials: \"include\" })",
             "fetch(`/groups/${id}?workspace=${workspace}`)",
             "fetch(`/users/${id}`)",
+            "fetch(`/dashboard?page=${page}`)",
             "fetch(`${process.env.API}${path}`, { ...rest, credentials: \"include\" })",
             "fetch(`${process.env.API}${path}`, { ...requestInit, credentials: \"include\" })",
         ]
@@ -2288,6 +2293,7 @@ pub(crate) mod tests {
             (line("get(\"/refunds\")"), "${process.env.API}/refunds"),
             (line("readOne(\"me\")"), "/accounts/me"),
             (line("fetch(`/users/${id}`)"), "/users/${id}"),
+            (line("fetch(`/dashboard?page="), "/dashboard"),
             (line("sendNote({"), "${process.env.API}/notes/${id}"),
             (
                 line("closeWith(`/notes/"),
@@ -2304,7 +2310,7 @@ pub(crate) mod tests {
                 "{at} {name} in {sites:?}"
             );
         }
-        assert_eq!(sites.len(), 10, "{sites:?}");
+        assert_eq!(sites.len(), 11, "{sites:?}");
         // A segment every caller states is not a path parameter at the call;
         // one a caller fills from data is, and its callers are not sites.
         for not_a_site in [
