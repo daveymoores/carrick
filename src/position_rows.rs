@@ -35,15 +35,16 @@
 //! `(start, end, kind)`: TypeScript `getStart()`/`getEnd()` of the node, in
 //! UTF-16 code units from the start of the file, which is what
 //! [`crate::utils::sidecar_position`] gives for an SWC span. [`Kind::Impl`]
-//! rows are the one kind several rows share a key of
-//! ([`PositionIndex::implementations`]).
+//! and [`Kind::Decl`] rows are the kinds several rows share a key of
+//! ([`PositionIndex::implementations`], [`PositionIndex::union_declarations`]).
 //!
-//! Version 2 (carrick#2430) added [`Kind::Impl`] and [`Kind::Jsx`]. A file
-//! of any other version is not read: no rows file outlives the run that
-//! wrote it, so its service reads as [`HoleReason::RowsMissing`].
+//! Version 2 (carrick#2430) added [`Kind::Impl`] and [`Kind::Jsx`]; version
+//! 3 (carrick#2448) added [`Kind::Decl`]. A file of any other version is not
+//! read: its service reads as [`HoleReason::RowsMissing`]. A walk removes any
+//! earlier rows file before it writes, so none outlives the run that wrote it.
 //!
 //! [`FLAG_PUBLISHED`] and [`FLAG_MODULE_DEFAULT`] (carrick#2508) are flag
-//! bits within version 2, not a new version: a row written without them
+//! bits, not a new version: a row written without them
 //! still reads, and reads as a declaration nothing says is published, which
 //! discovery's name match abstains on.
 
@@ -68,7 +69,7 @@ pub const POSITION_ROWS_ENV: &str = "CARRICK_POSITION_ROWS";
 pub const POSITIONS_DIR: &str = "positions";
 
 /// The format version the header carries.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The type is `any`, declared or inferred. Never set with [`FLAG_ERROR_TYPE`].
 pub const FLAG_ANY: u8 = 1;
@@ -79,8 +80,8 @@ pub const FLAG_CHECKER_THREW: u8 = 4;
 /// The declaration is outside the checkout, not the default library and in
 /// no installed package, so `decl_file` is `null`.
 pub const FLAG_DECLARATION_UNNAMED: u8 = 8;
-/// A [`Kind::Impl`] row standing for more implementations than the walk
-/// lists (16); it names none.
+/// A [`Kind::Impl`] or [`Kind::Decl`] row standing for more rows of its kind
+/// than the walk lists (16); it names none.
 pub const FLAG_TOO_MANY: u8 = 16;
 /// The declaration is published under the row's symbol name: its module
 /// exports it by that name, or it is a global (a script's top-level
@@ -145,6 +146,13 @@ pub enum Kind {
     /// line and package, and no type. Past the cap, one row with
     /// [`FLAG_TOO_MANY`] and nothing else.
     Impl,
+    /// One declaration of a `call` or `member` row's member read on a union
+    /// whose constituents declare it at more than one place (two classes
+    /// behind `a ? x : y`), at that row's span, which names only the first:
+    /// the constituent member's declaration, or for a member with none (a
+    /// mapped type's) the constituent type's own; no type. Ordered and
+    /// capped as [`Kind::Impl`] rows are.
+    Decl,
     /// A JSX opening or self-closing element, at its tag: the declaration
     /// the tag names (for an intrinsic, the `JSX.IntrinsicElements` member)
     /// and the tag's type (an intrinsic's attributes).
@@ -359,6 +367,8 @@ struct IndexedFile {
     rows: HashMap<(u32, u32, Kind), Row>,
     /// The [`Kind::Impl`] rows by span, in the order written.
     impls: HashMap<(u32, u32), Vec<Row>>,
+    /// The [`Kind::Decl`] rows by span, in the order written.
+    decls: HashMap<(u32, u32), Vec<Row>>,
     bound: Bound,
 }
 
@@ -394,6 +404,7 @@ impl PositionIndex {
             .map(|file| {
                 let mut rows = HashMap::new();
                 let mut impls: HashMap<(u32, u32), Vec<Row>> = HashMap::new();
+                let mut decls: HashMap<(u32, u32), Vec<Row>> = HashMap::new();
                 for row in file.r {
                     if row.kind() == Kind::Ident
                         && let (Some(symbol), Some(library)) = (
@@ -406,10 +417,12 @@ impl PositionIndex {
                             .or_default()
                             .insert(symbol.to_string());
                     }
-                    if row.kind() == Kind::Impl {
-                        impls.entry((row.start(), row.end())).or_default().push(row);
-                    } else {
-                        rows.insert((row.start(), row.end(), row.kind()), row);
+                    match row.kind() {
+                        Kind::Impl => impls.entry((row.start(), row.end())).or_default().push(row),
+                        Kind::Decl => decls.entry((row.start(), row.end())).or_default().push(row),
+                        kind => {
+                            rows.insert((row.start(), row.end(), kind), row);
+                        }
                     }
                 }
                 (
@@ -419,6 +432,7 @@ impl PositionIndex {
                         skip: file.skip,
                         rows,
                         impls,
+                        decls,
                         bound: Bound::Unread,
                     },
                 )
@@ -541,6 +555,21 @@ impl PositionIndex {
         let (start, end) = rows_span(text, lo, hi);
         Ok(indexed
             .impls
+            .get(&(start, end))
+            .map(Vec::as_slice)
+            .unwrap_or_default())
+    }
+
+    /// The [`Kind::Decl`] rows at [`Self::lookup`]'s position, in the order
+    /// written (by declaring file, then position). None unless the member is
+    /// read on a union whose constituents declare it at more than one place;
+    /// one with [`FLAG_TOO_MANY`] or [`FLAG_CHECKER_THREW`] where it names
+    /// none.
+    pub fn union_declarations(&self, file: &Path, lo: u32, hi: u32) -> Result<&[Row], HoleReason> {
+        let (indexed, text) = self.file(file)?;
+        let (start, end) = rows_span(text, lo, hi);
+        Ok(indexed
+            .decls
             .get(&(start, end))
             .map(Vec::as_slice)
             .unwrap_or_default())
@@ -991,12 +1020,13 @@ mod tests {
         }
     }
 
-    /// carrick#2430: the reader reads version 2 only; a file of any other
-    /// version is an error, so `load_index` gives every lookup
-    /// [`HoleReason::RowsMissing`].
+    /// carrick#2448: the reader reads version 3 only; a file of any other
+    /// version is an error, so `load_index` over a version-2 file left by an
+    /// earlier build gives every lookup [`HoleReason::RowsMissing`] and the
+    /// scan goes on.
     #[test]
     fn a_rows_file_of_another_version_is_not_read() {
-        for v in [1, 3] {
+        for v in [2, 4] {
             let text = format!(
                 "{{\"v\":{v},\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}}\n\
                  {{\"f\":\"a.ts\",\"h\":\"00\",\"r\":[]}}\n"
@@ -1008,7 +1038,7 @@ mod tests {
         let destination = destination_from(Some("1"), Some(dir.path()), dir.path(), "repo", None)
             .expect("the flag walks");
         std::fs::create_dir_all(destination.path().parent().unwrap()).unwrap();
-        let text = "{\"v\":1,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":2,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[[\"ident\",0,1,\"a\",\"a.ts\",1,null,\"1\",0]]}\n";
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut gz, text.as_bytes()).unwrap();
@@ -1105,23 +1135,85 @@ mod tests {
         );
     }
 
+    /// carrick#2448: the `decl` rows of a member read on a union share its
+    /// span and are all kept, in the order written, apart from the
+    /// `impl` rows; the `member` row keeps its own key.
+    #[test]
+    fn every_decl_row_at_a_span_is_kept_beside_its_member_row() {
+        let root = Path::new("/repo");
+        let text = "(a ? x : y).get();\n";
+        let declaration = |file: &str, line: u32| {
+            Row(
+                Kind::Decl,
+                0,
+                15,
+                Some("get".to_string()),
+                Some(file.to_string()),
+                Some(line),
+                Some("svc".to_string()),
+                None,
+                0,
+            )
+        };
+        let rows = RowsFile {
+            header: Header {
+                v: FORMAT_VERSION,
+                typescript: "6.0.2".to_string(),
+                service: "api".to_string(),
+                files: 1,
+            },
+            files: vec![file_rows(
+                "src/a.ts",
+                Some(text),
+                None,
+                vec![
+                    row(Kind::Member, 0, 15, Some("get"), 0),
+                    declaration("src/x.ts", 2),
+                    declaration("src/y.ts", 4),
+                ],
+            )],
+        };
+        let mut index = PositionIndex::of(root, rows);
+        let file = root.join("src/a.ts");
+        index.bind(&file, text);
+        let base = crate::swc_scanner::SWC_SPAN_BASE;
+        let lines: Vec<_> = index
+            .union_declarations(&file, base, base + 15)
+            .expect("fresh rows")
+            .iter()
+            .map(|r| (r.decl_file(), r.decl_line()))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![(Some("src/x.ts"), Some(2)), (Some("src/y.ts"), Some(4))]
+        );
+        assert_eq!(
+            index
+                .lookup(&file, base, base + 15, Kind::Member)
+                .map(Row::symbol),
+            Ok(Some("get"))
+        );
+        assert_eq!(index.implementations(&file, base, base + 15), Ok(&[][..]));
+        assert_eq!(index.union_declarations(&file, base, base + 3), Ok(&[][..]));
+    }
+
     #[test]
     fn a_line_with_a_key_the_format_does_not_name_is_refused() {
-        let text = "{\"v\":2,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":3,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[],\"extra\":1}\n";
         assert!(read_rows(text.as_bytes()).is_err());
     }
 
     #[test]
     fn a_row_is_a_nine_element_array() {
-        let text = "{\"v\":2,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":3,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[[\"call\",0,3,\"f\",\"a.ts\",1,null,\"void\",0]]}\n";
         let file = read_rows(text.as_bytes()).expect("a valid file");
         let row = &file.files[0].r[0];
         assert_eq!(row.kind(), Kind::Call);
         assert_eq!((row.start(), row.end()), (0, 3));
         assert_eq!(row.symbol(), Some("f"));
-        let short = "{\"v\":2,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let short = "{\"v\":3,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                      {\"f\":\"a.ts\",\"r\":[[\"call\",0,3]]}\n";
         assert!(read_rows(short.as_bytes()).is_err());
     }
@@ -1131,7 +1223,7 @@ mod tests {
     /// compiler version; a member row, and a declaration in a package, give none.
     #[test]
     fn the_index_names_the_default_library_globals_the_code_uses() {
-        let text = "{\"v\":2,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":3,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[\
                     [\"ident\",0,5,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
                     [\"ident\",6,9,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
