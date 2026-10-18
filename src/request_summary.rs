@@ -8464,6 +8464,8 @@ fn is_absolute_url(text: &str) -> bool {
 /// service's own functions builds may end it (carrick#1950), and is not
 /// written: it may be nothing, and it is no part of the route.
 fn render_target(url: &[Piece]) -> Option<String> {
+    let url = route_of(url);
+    let url = url.as_ref();
     if url.iter().enumerate().any(|(position, piece)| match piece {
         Piece::Unknown => true,
         Piece::Param(..) | Piece::ParamKey(..) | Piece::Outer(..) => {
@@ -8522,6 +8524,38 @@ fn render_target(url: &[Piece]) -> Option<String> {
     })
 }
 
+/// The route part of a URL whose query holds a value the source does not
+/// write (carrick#2519): `/groups/${id}?workspace=${workspace}` or
+/// `/items?${params}`. Text from the first literal `?` on is the query, not
+/// the route, so a value there is no path parameter: the URL is cut before
+/// the `?`. A query written all in literal text is kept as it was, so no
+/// target the source states whole changes.
+fn route_of(url: &[Piece]) -> Cow<'_, [Piece]> {
+    let Some((index, at)) = url
+        .iter()
+        .enumerate()
+        .find_map(|(index, piece)| match piece {
+            Piece::Lit(text) => text.find('?').map(|at| (index, at)),
+            _ => None,
+        })
+    else {
+        return Cow::Borrowed(url);
+    };
+    if url[index + 1..]
+        .iter()
+        .all(|piece| matches!(piece, Piece::Lit(_)))
+    {
+        return Cow::Borrowed(url);
+    }
+    let mut route = url[..index].to_vec();
+    if let Piece::Lit(text) = &url[index]
+        && at > 0
+    {
+        route.push(Piece::Lit(text[..at].to_string()));
+    }
+    Cow::Owned(route)
+}
+
 /// Whether the piece at `position` stands for a whole path segment: it
 /// follows a literal ending in `/`, and ends at the next `/`, `?`, `#`, a
 /// built query ([`Piece::Query`]) or the end of the URL.
@@ -8566,6 +8600,37 @@ mod tests {
             render_target(&[lit("/users/"), opaque("id"), lit("/orders")]).as_deref(),
             Some("/users/${id}/orders")
         );
+    }
+
+    /// carrick#2519: a value written in the query is no path parameter; the
+    /// route is the path before the `?`. A query all in literal text is kept.
+    #[test]
+    fn a_value_in_the_query_is_cut_from_the_route() {
+        assert_eq!(
+            render_target(&[
+                lit("/groups/"),
+                Piece::Param(0, "id".to_string()),
+                lit("?workspace="),
+                Piece::Param(1, "workspace".to_string()),
+            ])
+            .as_deref(),
+            Some("/groups/${id}")
+        );
+        assert_eq!(
+            render_target(&[opaque("base"), lit("/items?"), opaque("params.toString()")])
+                .as_deref(),
+            Some("${base}/items")
+        );
+        assert_eq!(
+            render_target(&[lit("/items?limit=10")]).as_deref(),
+            Some("/items?limit=10")
+        );
+        // A value before the `?` still has to be a whole segment.
+        assert_eq!(
+            render_target(&[lit("/v"), opaque("version"), lit("?x="), opaque("y")]),
+            None
+        );
+        assert_eq!(render_target(&[lit("?q="), opaque("q")]), None);
     }
 
     #[test]
