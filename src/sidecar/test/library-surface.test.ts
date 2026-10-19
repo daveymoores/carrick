@@ -226,6 +226,39 @@ export declare class Mixed {
 }
 `;
 
+// An event map a base class takes as a type parameter, which a subclass
+// binds with the library's own reserved names in its heritage clause
+// (carrick#2527): in one package, inline, as the plan writes it.
+const CHANNEL = `declare class Emitter<L, R> { on<E extends (keyof R & string) | (keyof L & string)>(ev: E, fn: (...a: any[]) => void): this }
+interface Reserved { open(): void; close(): void }
+export declare class Channel<L = { [k: string]: any }> extends Emitter<L, Reserved> {}
+`;
+// The same shape across packages, the names read through an alias: the base
+// in one package, a class that binds it in another (`Link`), and one that
+// binds it two heritage clauses down (`Relayed`).
+const KEYED_EMITTER = `export interface EventsMap {
+  [event: string]: any;
+}
+export type EventNames<Map extends EventsMap> = keyof Map & (string | symbol);
+export declare class Emitter<Listen extends EventsMap, Emit extends EventsMap, Reserved extends EventsMap = {}> {
+  on<Ev extends EventNames<Listen> | EventNames<Reserved>>(ev: Ev, listener: (...args: any[]) => void): this;
+}
+`;
+const KEYED_CLIENT = `import { Emitter, EventsMap } from '@fixture/keyed-emitter';
+interface LinkReserved {
+  ready: () => void;
+  lost: (reason: string) => void;
+}
+export interface AnyEvents {
+  [event: string]: (...args: any[]) => void;
+}
+export declare class Link<Listen extends EventsMap = AnyEvents> extends Emitter<Listen, Listen, LinkReserved> {}
+export declare function link(url: string): Link;
+declare class Relay<Listen extends EventsMap, Reserved extends EventsMap> extends Emitter<Listen, Listen, Reserved> {}
+export declare class Relayed<Listen extends EventsMap = AnyEvents> extends Relay<Listen, LinkReserved> {}
+export declare function relay(url: string): Relayed;
+`;
+
 // Slots the verifier reads through a rest's element, a conditional's
 // branches, or one member of a union at a time.
 const SLOTS = `export interface Definition<Id extends string> {
@@ -290,6 +323,12 @@ function installed(socket = SOCKET): Record<string, string> {
     'node_modules/fixture-recursive/index.d.ts': RECURSIVE,
     'node_modules/fixture-slots/package.json': packageJson('fixture-slots', '1.0.0'),
     'node_modules/fixture-slots/index.d.ts': SLOTS,
+    'node_modules/fixture-channel/package.json': packageJson('fixture-channel', '1.0.0'),
+    'node_modules/fixture-channel/index.d.ts': CHANNEL,
+    'node_modules/@fixture/keyed-emitter/package.json': packageJson('@fixture/keyed-emitter', '1.0.0'),
+    'node_modules/@fixture/keyed-emitter/index.d.ts': KEYED_EMITTER,
+    'node_modules/fixture-keyed-client/package.json': packageJson('fixture-keyed-client', '1.0.0'),
+    'node_modules/fixture-keyed-client/index.d.ts': KEYED_CLIENT,
     'node_modules/@fixture/mapped-core/package.json': packageJson('@fixture/mapped-core', '2.0.0'),
     'node_modules/@fixture/mapped-core/index.d.ts': MAPPED_CORE,
     'node_modules/fixture-mapped/package.json': packageJson('fixture-mapped', '2.0.0'),
@@ -519,6 +558,51 @@ describe('list_library_surface (carrick#1660)', () => {
     assert.deepStrictEqual(
       verdicts.verdicts.map(v => v.verdict),
       ['verified', 'verified']
+    );
+  });
+
+  it('spells a keyof map a base class takes as a type parameter from the argument its subclass binds (carrick#2527)', async () => {
+    const listed = await surface(['fixture-channel', 'fixture-keyed-client']);
+    const [channel, keyed] = listed.surfaces;
+    const eventLiterals = (s: Surface, exportName: string, receiver: string) =>
+      s.exports
+        .find(e => e.export === exportName)!
+        .receivers.find(r => r.receiver === receiver)!
+        .members.find(m => m.name === 'on')!
+        .signatures.map(sig => sig.params[0].literals);
+    // The reserved map's names; the open map's default is an index signature and spells none.
+    assert.deepStrictEqual(eventLiterals(channel, 'Channel', 'instance:new'), [['close', 'open']]);
+    // In another package, through an alias, and two heritage clauses down.
+    assert.deepStrictEqual(eventLiterals(keyed, 'link', 'instance:()'), [['lost', 'ready']]);
+    assert.deepStrictEqual(eventLiterals(keyed, 'relay', 'instance:()'), [['lost', 'ready']]);
+
+    const reserved = (claim_id: string, pkg: string, exportName: string, receiver: string, name: string) => ({
+      claim_id,
+      package: pkg,
+      export: exportName,
+      role: 'socket',
+      receiver,
+      claim: { kind: 'reserved', on: 'instance', member: 'on', name },
+    });
+    const verdicts = await client.send<VerdictResponse>(
+      {
+        request_id: `claims-${requestId++}`,
+        action: 'verify_library_claims',
+        from_dir: root,
+        checks: [
+          { ...reserved('channel', 'fixture-channel', 'Channel', 'export', ''), claim: { kind: 'make', form: 'new', member: null } },
+          { ...reserved('link', 'fixture-keyed-client', 'link', 'export', ''), claim: { kind: 'make', form: 'call', member: null } },
+          reserved('open', 'fixture-channel', 'Channel', 'instance:new', 'open'),
+          reserved('chat', 'fixture-channel', 'Channel', 'instance:new', 'chat'),
+          reserved('ready', 'fixture-keyed-client', 'link', 'instance:()', 'ready'),
+          reserved('message', 'fixture-keyed-client', 'link', 'instance:()', 'message'),
+        ],
+      },
+      60_000
+    );
+    assert.deepStrictEqual(
+      verdicts.verdicts.map(v => `${v.verdict}${v.reason ? ` ${v.reason}` : ''}`),
+      ['verified', 'verified', 'verified', 'failed reserved_not_declared', 'verified', 'failed reserved_not_declared']
     );
   });
 
