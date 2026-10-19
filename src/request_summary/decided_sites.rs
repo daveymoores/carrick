@@ -382,10 +382,46 @@ impl DecidedSite {
             .collect();
         match literal {
             Some(text) if !text.is_empty() => Some(text),
-            _ if self.end.role == "http_client" => render_target(&self.name),
+            _ if self.end.role == "http_client" && base_is_named(&self.name) => {
+                render_target(&self.name)
+            }
             _ => None,
         }
     }
+}
+
+/// Whether a URL's leading value, when it has one, is written by a name: an
+/// environment read, an import, a global, a parameter, or a binding the
+/// code reads by a name or member path (`config.apiUrl`, `this.baseUrl`).
+/// A value this pass stopped reading at an expression (a constant whose
+/// initializer is a call, `(process.env.API || "…").replace(…)`) carries
+/// that expression's source text, which is no key (carrick#2524): the name
+/// is then unstated.
+fn base_is_named(pieces: &[Piece]) -> bool {
+    match pieces.first() {
+        Some(Piece::Opaque {
+            text,
+            end: super::Root::Hole(_),
+            ..
+        }) => is_reference(text),
+        _ => true,
+    }
+}
+
+/// `name`, `a.b.c`, `this.#field`, `a?.b`: a name and the members read off
+/// it, and nothing else.
+fn is_reference(text: &str) -> bool {
+    let text = text.strip_prefix("this.").unwrap_or(text);
+    !text.is_empty()
+        && text.split('.').all(|part| {
+            let part = part.strip_suffix('?').unwrap_or(part);
+            let part = part.strip_prefix('#').unwrap_or(part);
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_alphabetic() || first == '_' || first == '$')
+                && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        })
 }
 
 /// Why a discovered call names nothing a caller decides.
@@ -1224,6 +1260,152 @@ pub fn decided_sites(
     out.leads
         .sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
     out
+}
+
+/// Where the request summaries state each request's rows
+/// ([`super::RequestSummaryIndex::placements`]): the request's file and span
+/// start to the file and line of every row stated for it.
+pub type SummaryPlacements = HashMap<(PathBuf, u32), HashSet<(PathBuf, u32)>>;
+
+/// The base an instance's maker was handed, read through the maker's claim
+/// ([`Decided::carry_instance_bases`]).
+#[derive(Debug, PartialEq, Eq)]
+enum MadeBase {
+    /// No maker's claim names a base slot, or no maker was handed one.
+    None,
+    /// Every maker was handed this literal base.
+    Text(String),
+    /// A maker was handed a base the code does not state as text, the
+    /// makers disagree, or the instance is used in a way that may change it.
+    Unstated,
+}
+
+/// The base the instance `site` is called through was made with, as the
+/// claims of its export say a maker's base is read (`create({ baseURL })`).
+fn made_base(
+    site: &super::LibrarySite,
+    exports: &[crate::library_claims::ExportClaims],
+) -> MadeBase {
+    use crate::services::type_sidecar::{LibraryClaim, MakeForm};
+    let super::SiteReceiver::Instance(makers) = &site.receiver else {
+        return MadeBase::None;
+    };
+    let Some(export) = exports
+        .iter()
+        .find(|export| export.package == site.package() && export.export == site.export)
+    else {
+        return MadeBase::None;
+    };
+    let mut bases: BTreeSet<Option<&str>> = BTreeSet::new();
+    for maker in makers {
+        let slot = export.claims.iter().find_map(|claim| match claim {
+            LibraryClaim::Make {
+                form, member, base, ..
+            } if *member == maker.member
+                && matches!(
+                    (form, maker.form),
+                    (MakeForm::Call, super::MakerForm::Call)
+                        | (MakeForm::New, super::MakerForm::New)
+                ) =>
+            {
+                base.as_ref()
+            }
+            _ => None,
+        });
+        let base = match slot {
+            Some(slot) if maker.supplies(slot.arg as usize, slot.key.as_deref()) => {
+                match maker.literal(slot.arg as usize, slot.key.as_deref()) {
+                    Some(text) => Some(text),
+                    None => return MadeBase::Unstated,
+                }
+            }
+            _ => None,
+        };
+        bases.insert(base);
+    }
+    match bases.into_iter().collect::<Vec<_>>().as_slice() {
+        [None] | [] => MadeBase::None,
+        [Some(_)] if site.contested => MadeBase::Unstated,
+        [Some(text)] => MadeBase::Text((*text).to_string()),
+        _ => MadeBase::Unstated,
+    }
+}
+
+impl Decided {
+    /// One request, one row (carrick#2524): an HTTP site whose request the
+    /// summaries already state a row for stands only where one of those
+    /// rows stands. Placement follows the summaries, which put a request's
+    /// row where its last hole is filled; a site anywhere else would be a
+    /// second key for the same request. Returns how many sites yielded.
+    pub fn yield_to_summaries(&mut self, root: &Path, placed: &SummaryPlacements) -> usize {
+        let placed: HashMap<(String, u32), HashSet<(String, u32)>> = placed
+            .iter()
+            .map(|((file, span), rows)| {
+                (
+                    (relative(root, file), *span),
+                    rows.iter()
+                        .map(|(file, line)| (relative(root, file), *line))
+                        .collect(),
+                )
+            })
+            .collect();
+        let before = self.sites.len();
+        self.sites.retain(|site| {
+            site.end.role != "http_client"
+                || placed
+                    .get(&(site.end.file.clone(), site.end.span_start))
+                    .is_none_or(|rows| rows.contains(&(site.file.clone(), site.line)))
+        });
+        before - self.sites.len()
+    }
+
+    /// The base an HTTP request's instance carries rides onto its site's
+    /// path (carrick#2524): a call through an instance whose maker the
+    /// claims say reads a base (`create({ baseURL: "https://…/v1" })`) goes
+    /// to that base, so the base is joined to the path as the summaries join
+    /// one. A base the code does not state as text, or one the path cannot
+    /// be written on, leaves the site out: a host-free path would read as a
+    /// call into this system. Returns how many sites were left out.
+    pub fn carry_instance_bases(
+        &mut self,
+        root: &Path,
+        library: &super::LibrarySites,
+        exports: &[crate::library_claims::ExportClaims],
+    ) -> usize {
+        let at: HashMap<(String, u32, u32), &super::LibrarySite> = library
+            .sites
+            .iter()
+            .filter(|site| site.origin.is_none())
+            .map(|site| {
+                (
+                    (relative(root, &site.file), site.span_start, site.span_end),
+                    site,
+                )
+            })
+            .collect();
+        let before = self.sites.len();
+        self.sites.retain_mut(|site| {
+            if site.end.role != "http_client" || site.key.is_some() || site.name.is_empty() {
+                return true;
+            }
+            let Some(called) = at.get(&(
+                site.end.file.clone(),
+                site.end.span_start,
+                site.end.span_end,
+            )) else {
+                return true;
+            };
+            match made_base(called, exports) {
+                MadeBase::None => true,
+                MadeBase::Unstated => false,
+                MadeBase::Text(base) => {
+                    site.name = super::join_base(&[Piece::Lit(base)], &site.name);
+                    site.name_text().is_some()
+                }
+            }
+        });
+        before - self.sites.len()
+    }
 }
 
 /// The calls a discovery site's chain names: the site's own first, then in
@@ -2394,5 +2576,222 @@ pub(crate) mod tests {
         for call in ["sendNote({", "closeWith(`/notes/"] {
             assert!(!lines.contains(&line_of(&text, call)), "{call}: {lines:?}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // carrick#2524: a site row writes no source text, yields to the
+    // summaries' placement, and carries its instance's base.
+
+    const BASES: &str = "src/slots/bases.ts";
+    const PLACEMENT: &str = "src/slots/placement.ts";
+    const INSTANCES: &str = "src/slots/instances.ts";
+
+    /// The decided sites of `file`'s `calls`, each its own labelled call
+    /// under `label`, with the fixture's summary inputs.
+    fn decided_at(
+        file: &str,
+        calls: &[&str],
+        label: &SiteLabel,
+    ) -> (Decided, String, RequestSummaryInputs) {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        let sites: Vec<_> = calls
+            .iter()
+            .map(|call| bottom(&end_for(label, file, &text, call), "fetch"))
+            .collect();
+        let decided = decided_sites(&inputs, &root, &sites, std::slice::from_ref(label));
+        (decided, text, inputs)
+    }
+
+    fn names_at(decided: &Decided, file: &str) -> Vec<(u32, Option<String>)> {
+        decided
+            .sites
+            .iter()
+            .filter(|site| site.file == file)
+            .map(|site| (site.line, site.name_text()))
+            .collect()
+    }
+
+    /// A base read through a constant whose initializer is an expression
+    /// (a call on an environment read) is that expression's source text:
+    /// no key. The name is unstated. A constant that is the read itself is
+    /// written as the read, as before.
+    #[test]
+    fn a_base_written_as_an_expression_s_text_is_no_name() {
+        let (decided, text, _) = decided_at(
+            BASES,
+            &[
+                "fetch(`${SEED_BASE}/sessions`, { method: \"POST\" })",
+                "fetch(`${PLAIN_BASE}/sessions/end`, { method: \"POST\" })",
+            ],
+            &fetch_label(),
+        );
+        let line = |needle: &str| line_of(&text, needle);
+        assert_eq!(
+            names_at(&decided, BASES),
+            vec![
+                (line("fetch(`${SEED_BASE}"), None),
+                (
+                    line("fetch(`${PLAIN_BASE}"),
+                    Some("${process.env.PLAIN_API}/sessions/end".to_string())
+                ),
+            ]
+        );
+        assert!(is_reference("this.baseUrl") && is_reference("config.api?.url"));
+        assert!(is_reference("this.#base") && is_reference("$base"));
+        assert!(!is_reference(
+            "(process.env.API || \"x\").replace(/\\/$/, \"\")"
+        ));
+        assert!(!is_reference("base()") && !is_reference("a[0]") && !is_reference(""));
+    }
+
+    /// Where the summaries state a request's row at a caller (a query-only
+    /// argument, a literal in the query), the site at the request itself
+    /// yields: one request, one row. A request the summaries state no row
+    /// for keeps its site.
+    #[test]
+    fn a_site_yields_to_the_summaries_placement() {
+        let calls = ["fetch(`/api/notices?${query}`)", "fetch(`/accounts/${id}`)"];
+        let (mut decided, text, inputs) = decided_at(PLACEMENT, &calls, &fetch_label());
+        let line = |needle: &str| line_of(&text, needle);
+        assert_eq!(
+            decided.sites.len(),
+            2,
+            "{:?}",
+            names_at(&decided, PLACEMENT)
+        );
+        let placed = crate::request_summary::summarize(
+            &inputs,
+            &crate::client_semantics::LibrarySemantics::default(),
+        )
+        .placements();
+        let root = decided_fixture();
+        assert_eq!(decided.yield_to_summaries(&root, &placed), 1);
+        assert_eq!(
+            names_at(&decided, PLACEMENT),
+            vec![(
+                line("fetch(`/accounts/"),
+                Some("/accounts/${id}".to_string())
+            )]
+        );
+        // The summaries' row for the notices request stands at its caller.
+        let notices = placed
+            .iter()
+            .find(|((file, _), _)| relative(&root, file) == PLACEMENT)
+            .map(|(_, rows)| rows.clone())
+            .unwrap();
+        assert_eq!(
+            notices
+                .iter()
+                .map(|(file, at)| (relative(&root, file), *at))
+                .collect::<Vec<_>>(),
+            vec![(PLACEMENT.to_string(), line("notices(\"unread=1\")"))]
+        );
+
+        // The same on the paths fixture: a literal in the query only.
+        let (mut paths, paths_text) = paths_decided();
+        let before = paths.sites.len();
+        let paths_placed = crate::request_summary::summarize(
+            &crate::engine::discover_request_inputs(&root),
+            &crate::client_semantics::LibrarySemantics::default(),
+        )
+        .placements();
+        assert_eq!(paths.yield_to_summaries(&root, &paths_placed), 1);
+        assert_eq!(paths.sites.len(), before - 1);
+        assert!(
+            !paths
+                .sites
+                .iter()
+                .any(|site| site.line == line_of(&paths_text, "fetch(`/dashboard?page="))
+        );
+    }
+
+    /// The label of the fixture's `@fixture/http` instance member `get`.
+    fn http_get_label() -> SiteLabel {
+        SiteLabel {
+            package: "@fixture/http".into(),
+            export: "default".into(),
+            member: Some("get".into()),
+            role: "http_client".into(),
+            op: Some("request".into()),
+            side: Some("client".into()),
+            name: Some(ArgSlot { arg: 0, key: None }),
+            payload: None,
+            handler: None,
+            method: Some(MethodLabel {
+                from: None,
+                default: None,
+                literal: Some("GET".into()),
+            }),
+        }
+    }
+
+    /// The store's claims for `@fixture/http`: `create` reads a base from
+    /// its options' `baseURL`.
+    fn http_claims() -> Vec<crate::library_claims::ExportClaims> {
+        vec![
+            serde_json::from_value(serde_json::json!({
+                "package": "@fixture/http", "version": "1.0.0", "specifier": "@fixture/http",
+                "export": "default", "role": "http_client",
+                "claims": [
+                    { "kind": "make", "form": "call", "member": "create",
+                      "base": { "arg": 0, "key": "baseURL" } },
+                    { "kind": "op", "op": "request", "member": "get", "on": "both",
+                      "name": { "arg": 0 }, "method": "GET" }
+                ]
+            }))
+            .unwrap(),
+        ]
+    }
+
+    /// A request through an instance whose maker was handed a literal base
+    /// goes to that base: on a field a constructor sets and on a module
+    /// instance alike. A base the code does not state leaves the site out;
+    /// a maker handed no base leaves the path as it was.
+    #[test]
+    fn an_instance_base_rides_onto_the_site() {
+        let calls = [
+            "this.client.get(\"/invoices\")",
+            "ledger.get(\"/entries\")",
+            "audit.get(\"/events\")",
+            "plain.get(\"/status\")",
+        ];
+        let (mut decided, text, inputs) = decided_at(INSTANCES, &calls, &http_get_label());
+        let line = |needle: &str| line_of(&text, needle);
+        assert_eq!(
+            decided.sites.len(),
+            4,
+            "{:?}",
+            names_at(&decided, INSTANCES)
+        );
+        let library = crate::request_summary::library_sites(&inputs);
+        let root = decided_fixture();
+        assert_eq!(
+            decided.carry_instance_bases(&root, &library, &http_claims()),
+            1
+        );
+        assert_eq!(
+            names_at(&decided, INSTANCES),
+            vec![
+                (
+                    line("this.client.get("),
+                    Some("https://billing.example.com/v1/invoices".to_string())
+                ),
+                (
+                    line("ledger.get("),
+                    Some("https://ledger.example.com/api/entries".to_string())
+                ),
+                (line("plain.get("), Some("/status".to_string())),
+            ]
+        );
+        // No claim names a maker's base: every path is as it was.
+        let (mut unclaimed, _, _) = decided_at(INSTANCES, &calls, &http_get_label());
+        assert_eq!(unclaimed.carry_instance_bases(&root, &library, &[]), 0);
+        assert_eq!(names_at(&unclaimed, INSTANCES).len(), 4);
+        assert_eq!(
+            names_at(&unclaimed, INSTANCES)[0].1.as_deref(),
+            Some("/invoices")
+        );
     }
 }

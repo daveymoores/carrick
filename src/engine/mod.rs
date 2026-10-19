@@ -3853,7 +3853,7 @@ async fn analyze_current_repo_incremental(
                 Path::new(repo_path),
                 ask_turns.clone(),
             );
-            let (analysis, settled, library_answer) = tokio::join!(
+            let (analysis, (settled, placements), library_answer) = tokio::join!(
                 file_orchestrator.analyze_files(
                     &files,
                     &cached_model_results,
@@ -3946,6 +3946,10 @@ async fn analyze_current_repo_incremental(
                 repo_path,
                 service,
                 &claims,
+                SiteContext {
+                    placements: Some(&placements),
+                    library: library_ask.as_ref().map(|ask| &ask.sites),
+                },
             )
             .await;
             let withdrawn = withdraw_model_routes_at_definitions(
@@ -4826,6 +4830,7 @@ async fn site_rows_of(
     repo_path: &str,
     service: &Config,
     claims: &[crate::library_claims::ExportClaims],
+    context: SiteContext<'_>,
 ) -> crate::site_rows::SiteRows {
     if !enabled {
         return crate::site_rows::SiteRows::default();
@@ -4837,7 +4842,7 @@ async fn site_rows_of(
         decided,
         records,
         labels: site_labels,
-    } = site_records_of(inputs, root, claims);
+    } = site_records_of(inputs, root, claims, context);
     let answers = crate::site_questions::ask_service(
         &crate::site_questions::agent(),
         &get_repository_name(repo_path),
@@ -4877,6 +4882,16 @@ async fn site_rows_of(
     rows
 }
 
+/// What the site pass reads from the rest of the scan (carrick#2524): where
+/// the request summaries place each request's rows, and the library sites,
+/// whose instances carry the base their maker was handed. `None` reads
+/// nothing of it.
+#[derive(Debug, Default, Clone, Copy)]
+struct SiteContext<'a> {
+    placements: Option<&'a crate::request_summary::decided_sites::SummaryPlacements>,
+    library: Option<&'a crate::request_summary::LibrarySites>,
+}
+
 /// What a service's site questions read before anything is asked
 /// ([`site_records_of`]).
 struct SiteRecordsOf {
@@ -4898,6 +4913,7 @@ fn site_records_of(
     inputs: &crate::request_summary::RequestSummaryInputs,
     root: &Path,
     claims: &[crate::library_claims::ExportClaims],
+    context: SiteContext<'_>,
 ) -> SiteRecordsOf {
     let labels = crate::request_summary::discovery::Labels::of(claims);
     let discovery = crate::request_summary::discovery::discover(inputs, &labels, root);
@@ -4916,8 +4932,19 @@ fn site_records_of(
         })
         .collect();
     let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
-    let decided =
+    let mut decided =
         crate::request_summary::decided_sites::decided_sites(inputs, root, &discovered, &labels);
+    let yielded = context
+        .placements
+        .map_or(0, |placed| decided.yield_to_summaries(root, placed));
+    let unbased = context.library.map_or(0, |library| {
+        decided.carry_instance_bases(root, library, claims)
+    });
+    debug!(
+        yielded,
+        unbased,
+        "site questions: sites left to the summaries, sites with an unstated instance base"
+    );
     let records =
         crate::request_summary::site_record::site_records(inputs, root, &decided, &labels);
     SiteRecordsOf {
@@ -8411,22 +8438,27 @@ where
 }
 
 /// Once the library semantics have settled, send the request summaries
-/// composed with them, and return the settled entries for the blob to keep.
-/// Runs alongside the file analysis, which reads the summaries only once the
-/// model has been asked. Always sends.
+/// composed with them, and return the settled entries for the blob to keep,
+/// with where the summaries place each request's rows (the site rows follow
+/// that placement, carrick#2524). Runs alongside the file analysis, which
+/// reads the summaries only once the model has been asked. Always sends.
 async fn compose_summaries(
     inputs: &crate::request_summary::RequestSummaryInputs,
     settling: SettlingSemantics,
     sidecar: Option<&TypeSidecar>,
     service_root: &Path,
     summaries: tokio::sync::oneshot::Sender<crate::request_summary::RequestSummaryIndex>,
-) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
+) -> (
+    Option<Vec<crate::client_semantics::ClientSemanticsEntry>>,
+    crate::request_summary::decided_sites::SummaryPlacements,
+) {
     let settled = settling.settled().await;
     let index = summarize_requests(inputs, settled.as_deref(), sidecar, service_root);
+    let placements = index.placements();
     if summaries.send(index).is_err() {
         debug!("The analysis ended before its request summaries were composed");
     }
-    settled
+    (settled, placements)
 }
 
 /// The library semantics one in-scan re-ask gives: what `ask` answered, when
@@ -9907,7 +9939,7 @@ async fn analyze_current_repo(
         Path::new(repo_path),
         ask_turns.clone(),
     );
-    let (analysis_result, settled, library_answer) = tokio::join!(
+    let (analysis_result, (settled, placements), library_answer) = tokio::join!(
         orchestrator.run_complete_analysis(
             files.clone(),
             packages,
@@ -9983,6 +10015,10 @@ async fn analyze_current_repo(
         repo_path,
         service,
         &claims,
+        SiteContext {
+            placements: Some(&placements),
+            library: library_ask.as_ref().map(|ask| &ask.sites),
+        },
     )
     .await;
     let withdrawn = withdraw_model_routes_at_definitions(
@@ -21526,7 +21562,15 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                   "export": "Client", "role": "graphql_client", "claims": [] }
             ]))
             .unwrap();
-        let off = site_rows_of(false, &inputs, ".", &Config::default(), &claims).await;
+        let off = site_rows_of(
+            false,
+            &inputs,
+            ".",
+            &Config::default(),
+            &claims,
+            SiteContext::default(),
+        )
+        .await;
         assert!(!off.enabled && off.rows.is_empty() && off.leads.is_empty());
     }
 
@@ -21538,7 +21582,15 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let inputs = crate::engine::discover_request_inputs(
             &crate::request_summary::decided_sites::tests::decided_fixture(),
         );
-        let off = site_rows_of(false, &inputs, ".", &Config::default(), &[]).await;
+        let off = site_rows_of(
+            false,
+            &inputs,
+            ".",
+            &Config::default(),
+            &[],
+            SiteContext::default(),
+        )
+        .await;
         assert!(!off.enabled && off.rows.is_empty() && off.leads.is_empty());
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -21695,7 +21747,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 |request| async move { Ok(http_store(&request)) },
             )
             .await;
-            let of = super::site_records_of(&on.inputs, &on.repo, &settled.exports);
+            let of = super::site_records_of(
+                &on.inputs,
+                &on.repo,
+                &settled.exports,
+                super::SiteContext::default(),
+            );
             let sites: Vec<(String, u32, String)> = of
                 .decided
                 .sites
@@ -21842,7 +21899,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             |request| async move { Ok(lib_store(&request)) },
         )
         .await;
-        let of = super::site_records_of(&on.inputs, &on.repo, &settled.exports);
+        let of = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &settled.exports,
+            super::SiteContext::default(),
+        );
         let sites: Vec<(u32, String, String)> = of
             .decided
             .sites
@@ -21951,7 +22013,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             ],
             "the factory call and the member call on its instance are sites"
         );
-        let of = super::site_records_of(&on.inputs, &on.repo, &exports);
+        let of = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &exports,
+            super::SiteContext::default(),
+        );
         let decided: Vec<(String, u32, String)> = of
             .decided
             .sites

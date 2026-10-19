@@ -7564,6 +7564,22 @@ impl RequestSummaryIndex {
         self.rows.get(file)
     }
 
+    /// Where the rows of each request stand (carrick#2524): the request's
+    /// file and span start ([`SummaryRow::request_at`]) to the file and line
+    /// of every row stated for it.
+    pub fn placements(&self) -> decided_sites::SummaryPlacements {
+        let mut placed = decided_sites::SummaryPlacements::new();
+        for (file, sites) in &self.rows {
+            for row in sites.values().flatten() {
+                placed
+                    .entry(row.request_at.clone())
+                    .or_default()
+                    .insert((file.clone(), row.line));
+            }
+        }
+        placed
+    }
+
     /// Withdraw every row whose request is made by a call the source states
     /// as an endpoint (carrick#2383). `registered` holds, per file, the span
     /// starts of the calls an endpoint row sits at, from whatever source
