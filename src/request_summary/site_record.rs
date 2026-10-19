@@ -256,12 +256,29 @@ pub enum Bucket {
     Lead,
 }
 
+/// What a forced slot rests on (carrick#2520): a value the code states, or
+/// the store's label alone. A slot the model answers is asked, not forced,
+/// and has no basis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Basis {
+    /// A literal, a summary-composed path, an object key, or a method the
+    /// code writes at the label's method slot.
+    Code,
+    /// The label's role or op (kind, role), the method the member always
+    /// sends or its default, and the argument positions the label names.
+    Label,
+}
+
 /// One decided site's record.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SiteRecord {
     /// What crosses the wire (carrick#2437).
     pub state: SiteState,
     pub anchors: TypeAnchors,
+    /// What each forced slot rests on (carrick#2520). Scanner-side only,
+    /// like the anchors: off the wire, so no cache key moves.
+    pub basis: BTreeMap<Slot, Basis>,
     pub bucket: Bucket,
     /// Why a lead is one.
     pub lead: Option<&'static str>,
@@ -1308,7 +1325,14 @@ fn record(
             } else if let Some(text) = env_based_text(&site.name) {
                 stated.value(&text, place(PlaceFrom::TemplateLiteral, &at));
             }
-            stated_whole(sources.get(file), &site.name, &name_exprs, &literals)
+            // Else, for HTTP, the target the request summaries compose from
+            // the same pieces (carrick#2519): a base, literal segments, and
+            // each parameter or unread value a whole segment.
+            stated_whole(sources.get(file), &site.name, &name_exprs, &literals).or_else(|| {
+                let text = site.name_text()?;
+                stated.value(&text, place(PlaceFrom::TemplateLiteral, &at));
+                Some(BTreeSet::from([text]))
+            })
         }
         (None, None) => None,
     };
@@ -1367,26 +1391,31 @@ fn record(
     // The slot rule.
     let mut asked: Vec<Slot> = Vec::new();
     let mut forced: BTreeMap<Slot, String> = BTreeMap::new();
+    let mut basis: BTreeMap<Slot, Basis> = BTreeMap::new();
     // One stated value forces a slot; several ask it; none leaves it
     // unstated, neither forced nor asked. A slot chosen among a closed set
     // of options (kind, role, method) is asked when nothing forces it.
-    let mut decide = |slot: Slot, values: Vec<String>, closed: bool| match values.as_slice() {
-        [] if !closed => {}
-        [one] => {
-            forced.insert(slot, one.clone());
-        }
-        _ => asked.push(slot),
-    };
+    let mut decide =
+        |slot: Slot, values: Vec<String>, closed: bool, from: Basis| match values.as_slice() {
+            [] if !closed => {}
+            [one] => {
+                forced.insert(slot, one.clone());
+                basis.insert(slot, from);
+            }
+            _ => asked.push(slot),
+        };
     let (kind, role) = kind_and_role(&label.role, label.op.as_deref());
     decide(
         Slot::Kind,
         kind.map(str::to_string).into_iter().collect(),
         true,
+        Basis::Label,
     );
     decide(
         Slot::Role,
         role.map(str::to_string).into_iter().collect(),
         true,
+        Basis::Label,
     );
     // The name: forced only when the code states one whole value; asked
     // when it states several; a lead when it states none whole. A label
@@ -1394,14 +1423,19 @@ fn record(
     // is read from: both are asked.
     let name_unstated = match (&label.name, &whole_names) {
         (None, _) => {
-            decide(Slot::Name, Vec::new(), true);
+            decide(Slot::Name, Vec::new(), true, Basis::Code);
             if site.key.is_none() {
-                decide(Slot::NameArgument, Vec::new(), true);
+                decide(Slot::NameArgument, Vec::new(), true, Basis::Label);
             }
             false
         }
         (Some(_), Some(values)) if !values.is_empty() => {
-            decide(Slot::Name, values.iter().cloned().collect(), false);
+            decide(
+                Slot::Name,
+                values.iter().cloned().collect(),
+                false,
+                Basis::Code,
+            );
             false
         }
         (Some(_), _) => true,
@@ -1412,12 +1446,18 @@ fn record(
                 Slot::NameArgument,
                 site.name_args.iter().map(usize::to_string).collect(),
                 false,
+                Basis::Label,
             );
         }
         // Built below the call, no payload at it, or no payload slot in the
         // label: no argument of this call is stated as one.
         if let (Some(_), Some(PayloadBinding::Arg { arg, .. })) = (&label.payload, &site.payload) {
-            decide(Slot::PayloadArgument, vec![arg.to_string()], false);
+            decide(
+                Slot::PayloadArgument,
+                vec![arg.to_string()],
+                false,
+                Basis::Label,
+            );
         }
     }
     if http {
@@ -1448,9 +1488,17 @@ fn record(
             .into_iter()
             .map(|method| method.to_ascii_uppercase())
             .collect();
+        // A method the code writes at the slot is the code's; the one the
+        // member always sends, or its default, is the label's.
+        let method_basis = match (&method_label.literal, &site.method) {
+            (None, Some(MethodValue::Pieces(_))) => Basis::Code,
+            _ => Basis::Label,
+        };
         match methods.as_slice() {
-            [one] if is_http_method(one) => decide(Slot::Method, methods.clone(), true),
-            _ => decide(Slot::Method, Vec::new(), true),
+            [one] if is_http_method(one) => {
+                decide(Slot::Method, methods.clone(), true, method_basis)
+            }
+            _ => decide(Slot::Method, Vec::new(), true, method_basis),
         }
     }
     asked.sort();
@@ -1610,6 +1658,7 @@ fn record(
     Some(SiteRecord {
         state,
         anchors,
+        basis,
         bucket,
         lead: (bucket == Bucket::Lead).then_some("name_unstated"),
     })
@@ -2324,7 +2373,8 @@ mod tests {
     /// An environment read leading a name is a stated value, as the request
     /// rows write an env base as a named piece: `${process.env.API}/items`
     /// is whole and forces the name, directly or through a module constant.
-    /// A suffix the code does not state leaves a lead, and a wrapper prefix
+    /// A whole segment the code does not read is a path parameter, as the
+    /// request summaries compose it (carrick#2519), and a wrapper prefix
     /// over an unread argument stays out of the records.
     #[test]
     fn an_environment_base_is_a_stated_value() {
@@ -2354,8 +2404,11 @@ mod tests {
             &text,
             "fetch(`${process.env.API}/items/${suffix}`)",
         );
-        assert_eq!(site.bucket, Bucket::Lead, "{:?}", site.state);
-        assert_eq!(site.state.forced.get(&Slot::Name), None);
+        assert_eq!(site.bucket, Bucket::Forced, "{:?}", site.state);
+        assert_eq!(
+            site.state.forced.get(&Slot::Name).map(String::as_str),
+            Some("${process.env.API}/items/${suffix}")
+        );
         // A prefix over an argument nothing reads is no site's record.
         let at = format!("{ENV}:{}", line_of(&text, "fetch(\"/api\" + path)"));
         assert!(records.iter().all(|record| record.state.point.at != at));
@@ -2652,5 +2705,44 @@ mod tests {
                 }
             ])
         );
+    }
+
+    /// A path the summaries compose with a path parameter forces the name,
+    /// and the record says what each forced slot rests on: the name and a
+    /// method the code writes are the code's, kind and role the label's
+    /// (carrick#2519, carrick#2520).
+    #[test]
+    fn a_composed_path_forces_the_name_and_the_basis_is_recorded() {
+        use crate::request_summary::decided_sites::tests::{PATHS, paths_decided};
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let (decided, text) = paths_decided();
+        let records = site_records(&inputs, &root, &decided, &[fetch_label()]);
+        let at = format!("{PATHS}:{}", line_of(&text, "send(`/tasks/"));
+        let record = records
+            .iter()
+            .find(|record| record.state.point.at == at)
+            .unwrap_or_else(|| panic!("{at}"));
+        assert_eq!(record.bucket, Bucket::Forced, "{:?}", record.state);
+        assert_eq!(
+            record.state.forced.get(&Slot::Name).map(String::as_str),
+            Some("${process.env.API}/tasks/${taskId}/status")
+        );
+        assert_eq!(
+            record.state.forced.get(&Slot::Method).map(String::as_str),
+            Some("PUT")
+        );
+        assert_eq!(record.basis.get(&Slot::Name), Some(&Basis::Code));
+        assert_eq!(record.basis.get(&Slot::Method), Some(&Basis::Code));
+        assert_eq!(record.basis.get(&Slot::Kind), Some(&Basis::Label));
+        assert_eq!(record.basis.get(&Slot::Role), Some(&Basis::Label));
+        // A method nothing writes is the label's default.
+        let at = format!("{PATHS}:{}", line_of(&text, "fetch(url)"));
+        let download = records
+            .iter()
+            .find(|record| record.state.point.at == at)
+            .unwrap_or_else(|| panic!("{at}"));
+        assert_eq!(download.basis.get(&Slot::Method), Some(&Basis::Label));
+        assert_eq!(download.basis.get(&Slot::Name), Some(&Basis::Code));
     }
 }

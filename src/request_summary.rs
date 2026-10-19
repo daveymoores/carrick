@@ -390,6 +390,14 @@ pub struct ObjValue {
     /// `fields` and `open` read as if the spread could hold anything: only
     /// the body a request sends reads this.
     pub under_param: Option<(usize, BTreeMap<String, Value>)>,
+    /// A spread of the rest of a destructured parameter (`const { path,
+    /// ...rest } = config`, carrick#2519), as the first thing the object
+    /// holds: the parameter's position and the keys the destructuring takes
+    /// out, with how many functions out the parameter is (0: this one's;
+    /// a closure reads its enclosing function's, carrick#1949). Only a
+    /// decided site's option key (its method) reads this; the body a request
+    /// sends does not, so no body row moves.
+    pub under_rest: Option<(u8, usize, BTreeSet<String>)>,
 }
 
 impl ObjValue {
@@ -458,6 +466,7 @@ impl Value {
                 open: obj.open,
                 // A closure's object reads as it always did.
                 under_param: None,
+                under_rest: None,
             }),
             Value::Callback(index) => Value::Callback(*index),
         }
@@ -3163,6 +3172,8 @@ struct Captured {
     /// as the caller wrote them ([`Scope::key_objects`]), with how many
     /// functions out each is and its position there (carrick#1949).
     objects: HashMap<BindingKey, (u8, usize)>,
+    /// [`Scope::rest_of`], each one function further out.
+    rests: HashMap<BindingKey, (u8, usize, BTreeSet<String>)>,
     /// Literal text only: a hole is a parameter of the enclosing function,
     /// which the function written inside it is not called with.
     texts: HashMap<BindingKey, Vec<library_sites::TextPiece>>,
@@ -3606,6 +3617,12 @@ struct Scope<'a> {
     /// nested pattern: each may hold something other than what the caller
     /// wrote under that key.
     keyed: HashMap<BindingKey, (usize, String)>,
+    /// The rest element of a parameter the body unpacks (`const { path,
+    /// ...rest } = config`, or `= init ?? {}`), with the parameter's
+    /// position and every key the pattern takes out (carrick#2519): it holds
+    /// the caller's other keys. Never a binding declared twice or assigned
+    /// again.
+    rest_of: HashMap<BindingKey, (u8, usize, BTreeSet<String>)>,
     /// The plain parameters whose keys the body may read as the caller wrote
     /// them (`options.url`, `const { url } = options`): never one the body
     /// assigns again, nor one whose name the file writes through.
@@ -3664,6 +3681,7 @@ impl<'a> Scope<'a> {
         Self {
             params: Vec::new(),
             keyed: HashMap::new(),
+            rest_of: HashMap::new(),
             key_objects: HashSet::new(),
             outer_objects: HashMap::new(),
             locals: HashMap::new(),
@@ -4243,6 +4261,7 @@ impl Reader<'_> {
         let mut scope = Scope {
             params: Vec::new(),
             keyed: HashMap::new(),
+            rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
             outer_objects: captured.objects.clone(),
             locals: captured.values.clone(),
@@ -4297,6 +4316,7 @@ impl Reader<'_> {
         let mut scope = Scope {
             params: Vec::new(),
             keyed: HashMap::new(),
+            rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
             outer_objects: captured.objects.clone(),
             locals: captured.values.clone(),
@@ -4404,6 +4424,18 @@ impl Reader<'_> {
                     // the parameter it is unpacked from (carrick#1950), where
                     // the body declares the name once and never assigns it
                     // again.
+                    // `const { path, ...rest } = config` (or `= init ?? {}`):
+                    // the rest holds the caller's other keys (carrick#2519).
+                    if let (Pat::Object(object), Some(init)) = (&declarator.name, &declarator.init)
+                        && let Some(source) = param_or_empty(init)
+                        && scope.key_objects.contains(&ident_key(source))
+                        && let Some(index) = scope.param_index(source)
+                        && let Some((rest, taken)) = rest_and_taken(object)
+                        && !reassigned.names.contains(&rest.0)
+                        && declared.binding_count(&rest) == 1
+                    {
+                        scope.rest_of.insert(rest, (0, index, taken));
+                    }
                     if let (Pat::Object(object), Some(init)) = (&declarator.name, &declarator.init)
                         && let Expr::Ident(source) =
                             crate::graphql_document_sites::unwrap_expression(init)
@@ -4607,6 +4639,7 @@ impl Reader<'_> {
                             fields: BTreeMap::new(),
                             open: true,
                             under_param: None,
+                            under_rest: None,
                         });
                     }
                     return value.clone();
@@ -4882,9 +4915,14 @@ impl Reader<'_> {
                 PropOrSpread::Spread(spread) => {
                     // A held object is open, so a second spread takes no hold.
                     value.under_param = None;
+                    let first = !value.open && value.fields.is_empty();
+                    value.under_rest = None;
                     match self.spread_branches(&spread.expr, scope) {
                         Some(branches) => value.spread(&branches),
                         None => {
+                            if first {
+                                value.under_rest = self.rest_of_param(&spread.expr, scope);
+                            }
                             if !value.open {
                                 value.under_param = self
                                     .own_param(&spread.expr, scope)
@@ -4907,6 +4945,7 @@ impl Reader<'_> {
                         value.fields.clear();
                         value.open = true;
                         value.under_param = None;
+                        value.under_rest = None;
                     }
                 },
                 Prop::Shorthand(ident) => {
@@ -4931,10 +4970,24 @@ impl Reader<'_> {
                     }
                     value.open = true;
                     value.under_param = None;
+                    value.under_rest = None;
                 }
             }
         }
         value
+    }
+
+    /// The parameter position and the keys taken out, when `expr` names the
+    /// rest of a destructured parameter ([`Scope::rest_of`], carrick#2519).
+    fn rest_of_param(
+        &self,
+        expr: &Expr,
+        scope: &Scope<'_>,
+    ) -> Option<(u8, usize, BTreeSet<String>)> {
+        match crate::graphql_document_sites::unwrap_expression(expr) {
+            Expr::Ident(ident) => scope.rest_of.get(&ident_key(ident)).cloned(),
+            _ => None,
+        }
     }
 
     /// The position of the function's own parameter `expr` names, when its
@@ -5609,6 +5662,51 @@ fn method_of(pieces: &[Piece]) -> MethodValue {
     }
 }
 
+/// The parameter `init` names: the identifier itself, or `param ?? {}` /
+/// `param || {}` with an empty object literal on the right.
+fn param_or_empty(init: &Expr) -> Option<&Ident> {
+    match crate::graphql_document_sites::unwrap_expression(init) {
+        Expr::Ident(ident) => Some(ident),
+        Expr::Bin(bin)
+            if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr)
+                && matches!(
+                    crate::graphql_document_sites::unwrap_expression(&bin.right),
+                    Expr::Object(empty) if empty.props.is_empty()
+                ) =>
+        {
+            match crate::graphql_document_sites::unwrap_expression(&bin.left) {
+                Expr::Ident(ident) => Some(ident),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The rest binding of an object pattern whose other properties are all
+/// plain keys, and those keys: `{ path, headers: h, ...rest }` gives `rest`
+/// and `{path, headers}`. `None` with no rest, a computed key, or a rest that
+/// is not a plain name.
+fn rest_and_taken(object: &ObjectPat) -> Option<(BindingKey, BTreeSet<String>)> {
+    let mut taken = BTreeSet::new();
+    let mut rest = None;
+    for prop in &object.props {
+        match prop {
+            ObjectPatProp::Assign(assign) => {
+                taken.insert(assign.key.id.sym.to_string());
+            }
+            ObjectPatProp::KeyValue(kv) => {
+                taken.insert(prop_name(&kv.key)?);
+            }
+            ObjectPatProp::Rest(rest_pat) => match &*rest_pat.arg {
+                Pat::Ident(binding) => rest = Some(ident_key(&binding.id)),
+                _ => return None,
+            },
+        }
+    }
+    Some((rest?, taken))
+}
+
 /// The bindings an object pattern introduces that hold exactly one key of the
 /// object it unpacks, each with its key (carrick#1950): `{ url }` and
 /// `{ url: target }`. Not one with a default (`{ url = "/x" }`), which holds
@@ -6216,9 +6314,21 @@ impl CallWalker<'_, '_, '_> {
                 objects.insert(key.clone(), (1, index));
             }
         }
+        let rests = self
+            .scope
+            .rest_of
+            .iter()
+            .map(|(key, (depth, index, taken))| {
+                (
+                    key.clone(),
+                    (depth.saturating_add(1), *index, taken.clone()),
+                )
+            })
+            .collect();
         Captured {
             values,
             objects,
+            rests,
             texts: self
                 .scope
                 .texts
@@ -8464,6 +8574,8 @@ fn is_absolute_url(text: &str) -> bool {
 /// service's own functions builds may end it (carrick#1950), and is not
 /// written: it may be nothing, and it is no part of the route.
 fn render_target(url: &[Piece]) -> Option<String> {
+    let url = route_of(url);
+    let url = url.as_ref();
     if url.iter().enumerate().any(|(position, piece)| match piece {
         Piece::Unknown => true,
         Piece::Param(..) | Piece::ParamKey(..) | Piece::Outer(..) => {
@@ -8522,6 +8634,38 @@ fn render_target(url: &[Piece]) -> Option<String> {
     })
 }
 
+/// The route part of a URL whose query holds a value the source does not
+/// write (carrick#2519): `/groups/${id}?workspace=${workspace}` or
+/// `/items?${params}`. Text from the first literal `?` on is the query, not
+/// the route, so a value there is no path parameter: the URL is cut before
+/// the `?`. A query written all in literal text is kept as it was, so no
+/// target the source states whole changes.
+fn route_of(url: &[Piece]) -> Cow<'_, [Piece]> {
+    let Some((index, at)) = url
+        .iter()
+        .enumerate()
+        .find_map(|(index, piece)| match piece {
+            Piece::Lit(text) => text.find('?').map(|at| (index, at)),
+            _ => None,
+        })
+    else {
+        return Cow::Borrowed(url);
+    };
+    if url[index + 1..]
+        .iter()
+        .all(|piece| matches!(piece, Piece::Lit(_)))
+    {
+        return Cow::Borrowed(url);
+    }
+    let mut route = url[..index].to_vec();
+    if let Piece::Lit(text) = &url[index]
+        && at > 0
+    {
+        route.push(Piece::Lit(text[..at].to_string()));
+    }
+    Cow::Owned(route)
+}
+
 /// Whether the piece at `position` stands for a whole path segment: it
 /// follows a literal ending in `/`, and ends at the next `/`, `?`, `#`, a
 /// built query ([`Piece::Query`]) or the end of the URL.
@@ -8566,6 +8710,37 @@ mod tests {
             render_target(&[lit("/users/"), opaque("id"), lit("/orders")]).as_deref(),
             Some("/users/${id}/orders")
         );
+    }
+
+    /// carrick#2519: a value written in the query is no path parameter; the
+    /// route is the path before the `?`. A query all in literal text is kept.
+    #[test]
+    fn a_value_in_the_query_is_cut_from_the_route() {
+        assert_eq!(
+            render_target(&[
+                lit("/groups/"),
+                Piece::Param(0, "id".to_string()),
+                lit("?workspace="),
+                Piece::Param(1, "workspace".to_string()),
+            ])
+            .as_deref(),
+            Some("/groups/${id}")
+        );
+        assert_eq!(
+            render_target(&[opaque("base"), lit("/items?"), opaque("params.toString()")])
+                .as_deref(),
+            Some("${base}/items")
+        );
+        assert_eq!(
+            render_target(&[lit("/items?limit=10")]).as_deref(),
+            Some("/items?limit=10")
+        );
+        // A value before the `?` still has to be a whole segment.
+        assert_eq!(
+            render_target(&[lit("/v"), opaque("version"), lit("?x="), opaque("y")]),
+            None
+        );
+        assert_eq!(render_target(&[lit("?q="), opaque("q")]), None);
     }
 
     #[test]
@@ -8634,6 +8809,7 @@ mod tests {
                 .collect(),
             open,
             under_param: None,
+            under_rest: None,
         })
     }
 
@@ -8787,6 +8963,7 @@ mod tests {
             fields: BTreeMap::from([("url".to_string(), object(&[], false))]),
             open: false,
             under_param: None,
+            under_rest: None,
         });
         assert_eq!(
             wrapper.instantiate(&[nested], &[]).url,

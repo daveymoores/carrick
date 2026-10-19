@@ -21509,6 +21509,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 },
                 trace_depth: 0,
             },
+            needs_reader: false,
         }
     }
 

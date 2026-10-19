@@ -3487,6 +3487,9 @@ impl FileOrchestrator {
                     &cm,
                     &handler,
                 );
+                // A base read by a declared name stays under that name
+                // (carrick#2519).
+                normalizer.keep_declared_alias_names(&mut pf.env_alias_map);
                 Self::merge_cross_file_literal_bases(
                     &mut pf.literal_bases,
                     &importer,

@@ -35,6 +35,15 @@
 //!   lowest of those slots and `orders_agree` is true only if all agree.
 //! - **Unanswered.** An asked site the cloud did not answer states no row
 //!   and withdraws none; it is a possible call (`unanswered`).
+//! - **Corroboration** (RULED by David, 2026-10-18, carrick#2520). A slot
+//!   the label forces with no value the code states is not a fact on its
+//!   own. A row whose kind, role, method or name rests on such a slot is
+//!   written only when the code states the name ([`Basis::Code`]: a literal
+//!   or a path the request summaries compose) or a reader row at the same
+//!   file and line agrees on its key ([`agrees`]). Otherwise the site is a
+//!   possible call, `uncorroborated`. Kind and role are always the label's,
+//!   so in practice: a row whose name the model answered needs an agreeing
+//!   reader row.
 //! - **Switch.** Nothing here runs unless `CARRICK_SITE_QUESTIONS=1`
 //!   ([`SiteRows::enabled`]); with it off the blob is byte for byte as
 //!   before.
@@ -49,7 +58,7 @@ use crate::cloud_storage::CloudRepoData;
 use crate::operation::{OperationKey, SocketDirection};
 use crate::possible_calls::{PossibleCall, UnreadReason};
 use crate::request_summary::decided_sites::{Decided, DecidedSite, SiteLabel};
-use crate::request_summary::site_record::{Bucket, SiteRecord, TypeAnchors};
+use crate::request_summary::site_record::{Basis, Bucket, SiteRecord, TypeAnchors};
 use crate::site_questions::{Answered, SiteAnswers, SiteQuestion, Slot, SlotAnswer, SlotValue};
 
 /// The fold band (RULED by David, 2026-10-16): an answer replaces the
@@ -126,6 +135,10 @@ pub struct SiteRow {
     pub anchors: TypeAnchors,
     /// The possible call the site is when it stands nowhere.
     pub lead: PossibleCall,
+    /// Whether the row rests on a slot only the label forced and the code
+    /// does not state its name (carrick#2520): it stands only where a reader
+    /// row at its line agrees on the key.
+    pub needs_reader: bool,
 }
 
 impl SiteRow {
@@ -291,6 +304,59 @@ fn unwritable_route(kind: &str, side: RowSide, method: Option<&str>) -> Option<U
     Some(UnreadReason::OwnerUnknown)
 }
 
+/// Whether `record`'s row rests on a slot only the label forced, with a
+/// name the code does not state (carrick#2520, module docs).
+fn needs_reader(record: &SiteRecord) -> bool {
+    let rests_on_label = [Slot::Kind, Slot::Role, Slot::Method, Slot::Name]
+        .iter()
+        .any(|slot| record.basis.get(slot) == Some(&Basis::Label));
+    rests_on_label && record.basis.get(&Slot::Name) != Some(&Basis::Code)
+}
+
+/// An HTTP path as the agreement check reads it: a leading base written as a
+/// value (`${process.env.API}`) dropped, and every segment written as a
+/// value (`${id}`) a `:` parameter, so `${base}/tasks/${id}` and
+/// `/tasks/:taskId` read alike.
+fn route_shape(path: &str) -> String {
+    let written = |segment: &str| segment.starts_with("${") && segment.ends_with('}');
+    let mut segments: Vec<&str> = path.split('/').collect();
+    if segments.first().is_some_and(|first| written(first)) {
+        segments[0] = "";
+    }
+    segments
+        .into_iter()
+        .map(|segment| if written(segment) { ":p" } else { segment })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Whether a reader row's key agrees with a site row's: the same key, or
+/// for HTTP the same method and paths ([`route_shape`]) that match with at
+/// least one literal segment in common ([`carrick_match::match_agreement`]),
+/// either way round.
+fn agrees(reader: &OperationKey, site: &OperationKey) -> bool {
+    match (reader, site) {
+        (
+            OperationKey::Http {
+                method: reader_method,
+                path: reader_path,
+            },
+            OperationKey::Http {
+                method: site_method,
+                path: site_path,
+            },
+        ) => {
+            let (reader_path, site_path) = (route_shape(reader_path), route_shape(site_path));
+            let agreement = |a: &str, b: &str| {
+                carrick_match::match_agreement(a, b).is_some_and(|literal| literal > 0)
+            };
+            reader_method.eq_ignore_ascii_case(site_method)
+                && (agreement(&reader_path, &site_path) || agreement(&site_path, &reader_path))
+        }
+        _ => reader == site,
+    }
+}
+
 /// The decided site a record was built for.
 fn site_of<'d>(decided: &'d Decided, anchors: &TypeAnchors) -> Option<&'d DecidedSite> {
     decided.sites.iter().find(|site| {
@@ -409,6 +475,7 @@ pub fn of(
             name_scope,
             anchors: record.anchors.clone(),
             lead: lead(UnreadReason::BelowBand),
+            needs_reader: needs_reader(record),
         });
     }
     out
@@ -503,6 +570,18 @@ pub fn fold_rows(
             continue;
         }
         let readers: Vec<usize> = here;
+        // A row on a label-only slot stands only with a reader row that
+        // agrees (carrick#2520).
+        if row.needs_reader
+            && !readers
+                .iter()
+                .any(|&index| agrees(&rows[index].key, &row.key))
+        {
+            let mut lead = row.lead.clone();
+            lead.unread.reason = UnreadReason::Uncorroborated;
+            out.leads.push(lead);
+            continue;
+        }
         let replaces = row.fact() || row.in_band;
         if !readers.is_empty() && !replaces {
             // The reader's rows stand, carrying the answer.

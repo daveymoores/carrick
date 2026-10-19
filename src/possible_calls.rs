@@ -71,6 +71,10 @@ pub enum UnreadReason {
     /// tell which router it hangs from, so the prefix it is mounted under is
     /// unknown (carrick#2517). No route is written for it.
     OwnerUnknown,
+    /// A site answer's row rests on a slot only the store's label forced,
+    /// the code does not state its name, and no row the file reader stated
+    /// at the line agrees (carrick#2520). No row is written for it.
+    Uncorroborated,
 }
 
 /// The slot the code does not state, and why.
@@ -237,8 +241,22 @@ pub fn from_sites(decided: &Decided, records: &[SiteRecord]) -> Vec<PossibleCall
             trace_depth: site.map_or(0, |s| s.via.len() as u32),
         });
     }
-    out.extend(decided.leads.iter().map(from_undecided));
+    out.extend(
+        decided
+            .leads
+            .iter()
+            .filter(|lead| !class_only_graphql(lead))
+            .map(from_undecided),
+    );
     out
+}
+
+/// A call on a GraphQL client export the store labels with no op: GraphQL
+/// operations are labelled by class only (the document names the operation,
+/// read by [`crate::graphql_document_sites`]), so such a call is not listed
+/// as a possible call. Every other export with no op is (carrick#2515).
+fn class_only_graphql(lead: &DecidedLead) -> bool {
+    lead.reason == Undecided::NoOpClaim && lead.end.role == "graphql_client"
 }
 
 /// A decided site that states no row, for `reason` (carrick#2439): its
@@ -436,5 +454,47 @@ mod tests {
             let parsed: UnreadReason = serde_json::from_value(serde_json::json!(reason)).unwrap();
             assert_eq!(serde_json::to_value(parsed).unwrap(), reason);
         }
+    }
+
+    /// A call on a GraphQL client export with no op is not listed: GraphQL
+    /// operations are labelled by class only. Another export with no op is.
+    #[test]
+    fn a_class_only_graphql_export_is_not_listed() {
+        let end = |package: &str, role: &str| LabelledEnd {
+            package: package.to_string(),
+            export: "Client".to_string(),
+            member: None,
+            role: role.to_string(),
+            op: None,
+            file: "src/a.ts".to_string(),
+            line: 3,
+            span_start: 10,
+            span_end: 20,
+        };
+        let lead = |end: LabelledEnd| DecidedLead {
+            file: "src/a.ts".to_string(),
+            line: 3,
+            span_start: 10,
+            span_end: 20,
+            depth: 0,
+            end,
+            reason: Undecided::NoOpClaim,
+        };
+        let decided = Decided {
+            leads: vec![
+                lead(end("a-graphql-lib", "graphql_client")),
+                lead(end("a-storage-lib", "http_client")),
+            ],
+            ..Decided::default()
+        };
+        let found = from_sites(&decided, &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0]
+                .labelled_end
+                .as_ref()
+                .map(|end| end.package.as_str()),
+            Some("a-storage-lib")
+        );
     }
 }
