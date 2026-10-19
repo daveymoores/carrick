@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.121](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.120...carrick-v0.3.121) (2026-10-19)
+
+
+### Features
+
+* **site:** a call that hands a maker its function states no row; a reserved name states no site (S1, S2) ([#2532](https://github.com/carrick-tools/carrick/issues/2532)) ([10c5443](https://github.com/carrick-tools/carrick/commit/10c54433fc1db5bc0c1d5df4d4c3ba25fa9c61f6))
+* **site:** a site's path is the summaries' composition; a label-only row needs a code name or an agreeing reader row ([#2519](https://github.com/carrick-tools/carrick/issues/2519), [#2520](https://github.com/carrick-tools/carrick/issues/2520)) ([#2521](https://github.com/carrick-tools/carrick/issues/2521)) ([f168503](https://github.com/carrick-tools/carrick/commit/f1685039ecdcbdfc96dd714f237f2ce0e1699481))
+
+
+### Bug Fixes
+
+* **sidecar:** spell keyof event maps through the heritage type argument ([#2530](https://github.com/carrick-tools/carrick/issues/2530)) ([eff5e9c](https://github.com/carrick-tools/carrick/commit/eff5e9c4e3a820a2f844fdebaa65dd1f8e5f324d)), closes [#2527](https://github.com/carrick-tools/carrick/issues/2527)
+* **site:** a site row writes no source text, yields to the summaries' placement, and carries its instance's base ([#2524](https://github.com/carrick-tools/carrick/issues/2524)) ([#2528](https://github.com/carrick-tools/carrick/issues/2528)) ([8ab2c45](https://github.com/carrick-tools/carrick/commit/8ab2c453a485e2a050898d6199157379bf196ebd))
+
 ## [0.3.120](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.119...carrick-v0.3.120) (2026-10-18)
 
 
