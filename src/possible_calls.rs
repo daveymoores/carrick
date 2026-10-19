@@ -469,6 +469,7 @@ mod tests {
             file: "src/a.ts".to_string(),
             line: 3,
             span_start: 10,
+            new: false,
             span_end: 20,
         };
         let lead = |end: LabelledEnd| DecidedLead {

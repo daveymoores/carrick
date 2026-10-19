@@ -73,6 +73,9 @@ pub struct LabelledEnd {
     pub line: u32,
     pub span_start: u32,
     pub span_end: u32,
+    /// The call constructs its callee (`new m(…)`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new: bool,
 }
 
 impl LabelledEnd {
@@ -162,6 +165,24 @@ pub struct SiteLabel {
     /// Label v2's method fields; a cassette until the store's rebuild.
     #[serde(default)]
     pub method: Option<MethodLabel>,
+    /// The names the library emits itself on this op's member, which the
+    /// store settled (carrick#2426): a call that spells one states no row.
+    #[serde(default)]
+    pub reserved: Vec<String>,
+    /// Set on a label of a maker that runs a function the call supplies (a
+    /// label with no `op`): the slot and the form it is claimed for.
+    #[serde(default)]
+    pub runs: Option<RunsMake>,
+}
+
+/// A maker that runs the function its call supplies at `slot`
+/// (carrick#2426): the function holds the request, found at its own site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunsMake {
+    pub slot: ArgSlot,
+    /// The maker is constructed (`new`), not called.
+    #[serde(default)]
+    pub new: bool,
 }
 
 impl SiteLabel {
@@ -217,6 +238,8 @@ impl SiteLabel {
                         payload: op.payload,
                         handler: op.handler,
                         method: op.method,
+                        reserved: Vec::new(),
+                        runs: None,
                     });
                 }
             }
@@ -227,9 +250,11 @@ impl SiteLabel {
     /// Every op the claims the scan settled label (carrick#2439), one label
     /// each, as [`Self::from_store_answer`] reads them off the store's raw
     /// answer: the scan holds the claims, already read and grouped by export.
-    /// A maker, a scope and a reserved name label no op.
+    /// A maker that runs a function its call supplies labels no op, and
+    /// carries `runs`; a scope labels nothing. A reserved name rides on the
+    /// labels of the op it applies to.
     pub fn from_exports(exports: &[crate::library_claims::ExportClaims]) -> Vec<SiteLabel> {
-        use crate::services::type_sidecar::{LibraryClaim, OpName};
+        use crate::services::type_sidecar::{LibraryClaim, MakeForm, OpName};
         let word = |value: serde_json::Result<serde_json::Value>| -> Option<String> {
             value.ok()?.as_str().map(str::to_string)
         };
@@ -244,9 +269,38 @@ impl SiteLabel {
                 .side
                 .and_then(|side| word(serde_json::to_value(side)));
             for claim in &export.claims {
+                if let LibraryClaim::Make {
+                    form,
+                    member,
+                    runs: Some(runs),
+                    ..
+                } = claim
+                {
+                    labels.push(SiteLabel {
+                        package: export.package.clone(),
+                        export: export.export.clone(),
+                        member: member.clone(),
+                        role: role.clone(),
+                        op: None,
+                        side: side.clone(),
+                        name: None,
+                        payload: None,
+                        handler: None,
+                        method: None,
+                        reserved: Vec::new(),
+                        runs: Some(RunsMake {
+                            slot: slot(runs),
+                            new: *form == MakeForm::New,
+                        }),
+                    });
+                    continue;
+                }
                 let LibraryClaim::Op {
                     op,
                     member,
+                    path,
+                    on,
+                    of,
                     name,
                     payload,
                     handler,
@@ -278,19 +332,97 @@ impl SiteLabel {
                     payload: payload.as_ref().map(slot),
                     handler: handler.as_ref().map(slot),
                     method,
+                    reserved: reserved_on(&export.claims, member.as_deref(), path, (*on, of)),
+                    runs: None,
                 });
             }
         }
         labels
     }
 
-    /// The label for `end` among `labels`: the same package, export and
-    /// member.
+    /// The op label for `end` among `labels`: the same package, export and
+    /// member. A maker's label (no op) is [`Self::runner`]'s.
     pub fn find<'l>(labels: &'l [SiteLabel], end: &LabelledEnd) -> Option<&'l SiteLabel> {
         labels.iter().find(|label| {
-            label.package == end.package && label.export == end.export && label.member == end.member
+            label.op.is_some()
+                && label.package == end.package
+                && label.export == end.export
+                && label.member == end.member
         })
     }
+
+    /// The slot the call `end` names is handed a function in, when the store
+    /// settled that the maker it calls runs that function (carrick#2426).
+    pub fn runner<'l>(labels: &'l [SiteLabel], end: &LabelledEnd) -> Option<&'l ArgSlot> {
+        labels.iter().find_map(|label| {
+            let runs = label.runs.as_ref()?;
+            (label.package == end.package
+                && label.export == end.export
+                && label.member == end.member
+                && runs.new == end.new)
+                .then_some(&runs.slot)
+        })
+    }
+}
+
+/// The receivers a claim applies to: the export, instances, or both; `of`
+/// names one receiver.
+fn receivers(on: Option<crate::services::type_sidecar::ClaimOn>, of: Option<&str>) -> (bool, bool) {
+    use crate::services::type_sidecar::ClaimOn;
+    match (of, on) {
+        (Some("export"), _) => (true, false),
+        (Some(_), _) => (false, true),
+        (None, Some(ClaimOn::Export)) => (true, false),
+        (None, Some(ClaimOn::Instance)) => (false, true),
+        (None, _) => (true, true),
+    }
+}
+
+/// The names the store settled the library emits itself on the member `member`
+/// reached through `path`, where an op claimed on `selector` acts
+/// (carrick#2426): the reserved claims of the same member and path whose
+/// receivers overlap the op's, so one claimed on another receiver never hides
+/// a name.
+fn reserved_on(
+    claims: &[crate::services::type_sidecar::LibraryClaim],
+    member: Option<&str>,
+    path: &[String],
+    selector: (
+        Option<crate::services::type_sidecar::ClaimOn>,
+        &Option<String>,
+    ),
+) -> Vec<String> {
+    use crate::services::type_sidecar::LibraryClaim;
+    let (op_on, op_of) = selector;
+    let mut names: Vec<String> = Vec::new();
+    for claim in claims {
+        let LibraryClaim::Reserved {
+            member: reserved_member,
+            name,
+            path: reserved_path,
+            on,
+            of,
+            ..
+        } = claim
+        else {
+            continue;
+        };
+        if Some(reserved_member.as_str()) != member || reserved_path != path {
+            continue;
+        }
+        let (a, b) = (
+            receivers(op_on, op_of.as_deref()),
+            receivers(*on, of.as_deref()),
+        );
+        let same_instance = match (op_of, of) {
+            (Some(one), Some(other)) => one == other,
+            _ => true,
+        };
+        if ((a.0 && b.0) || (a.1 && b.1)) && same_instance && !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    names
 }
 
 /// Where the payload a decided site sends is bound (carrick#2472 C3): an
@@ -512,6 +644,12 @@ pub struct Decided {
     /// discovery's chain (a hop into a callback, an ambiguous hop, or a
     /// chain that stops short), by `file:line`.
     pub walked: Vec<String>,
+    /// Calls that state no row because they hand a maker the function it
+    /// runs (carrick#2426), by `file:line`.
+    pub ran: Vec<String>,
+    /// Sites that state no row because their name is one the library emits
+    /// itself (carrick#2426), by `file:line`.
+    pub reserved: Vec<String>,
 }
 
 /// One call, where it is written: its file, the definition key of the
@@ -991,6 +1129,12 @@ impl<'a> Walk<'a, '_> {
             return;
         }
         let label = self.label;
+        if let Some(text) = literal_name(&name)
+            && label.is_some_and(|label| label.reserved.contains(&text))
+        {
+            self.out.reserved.push(end.at());
+            return;
+        }
         let handler_slot = label.and_then(|label| label.handler.as_ref());
         let payload = match label.and_then(|label| label.payload.as_ref()) {
             Some(slot) => payload_binding(self.root, down, slot),
@@ -1138,6 +1282,13 @@ impl<'a> Walk<'a, '_> {
     fn table(&mut self, placed: &Placed<'a>, end: &LabelledEnd, keys: Vec<TableKey>) {
         let file = relative(self.root, placed.file);
         for entry in keys {
+            if self
+                .label
+                .is_some_and(|label| label.reserved.contains(&entry.key))
+            {
+                self.out.reserved.push(end.at());
+                continue;
+            }
             let id = (
                 file.clone(),
                 entry.handler.line,
@@ -1162,6 +1313,31 @@ impl<'a> Walk<'a, '_> {
                 method: None,
             });
         }
+    }
+}
+
+/// The name `pieces` spell when the code writes all of it as text.
+fn literal_name(pieces: &[Piece]) -> Option<String> {
+    let mut text = String::new();
+    for piece in pieces {
+        match piece {
+            Piece::Lit(part) => text.push_str(part),
+            _ => return None,
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+/// Whether the labelled call `placed` supplies the slot `slot`: the argument
+/// is written, and, for an option key, an object written at the call holds
+/// the key. A spread before it, or a value the scan cannot read, supplies
+/// nothing it can state.
+fn supplies(call: &CallIr, slot: &ArgSlot) -> bool {
+    match (argument(call, slot.arg), &slot.key) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(Value::Obj(object)), Some(key)) => object.fields.contains_key(key),
+        (Some(_), Some(_)) => false,
     }
 }
 
@@ -1213,13 +1389,22 @@ pub fn decided_sites(
             continue;
         };
         let Some(label) = SiteLabel::find(labels, end) else {
+            // A call that hands a maker the function it runs
+            // (carrick#2426): the function holds the request, found at its
+            // own site. A call that does not supply it stays a lead.
+            if let Some(slot) = SiteLabel::runner(labels, end) {
+                match calls.at_span(&root.join(&end.file), end.span_start, end.span_end) {
+                    Some(placed) if supplies(placed.call, slot) => walk.out.ran.push(end.at()),
+                    _ => walk.no_op_claim(end),
+                }
+                continue;
+            }
             // An export the store labels with a role and no op at all
             // (carrick#2515): the call is a lead. An export with ops, and a
             // member of it none labels, is not.
-            if !labels
-                .iter()
-                .any(|label| label.package == end.package && label.export == end.export)
-            {
+            if !labels.iter().any(|label| {
+                label.op.is_some() && label.package == end.package && label.export == end.export
+            }) {
                 walk.no_op_claim(end);
             }
             continue;
@@ -1296,6 +1481,8 @@ pub fn decided_sites(
     walked.dedup();
     out.walked = walked;
     out.unplaced = unplaced;
+    out.ran.sort();
+    out.reserved.sort();
     out.sites.sort_by(|a, b| {
         (&a.file, a.line, &a.key, &a.end.file, a.end.line).cmp(&(
             &b.file,
@@ -1722,6 +1909,8 @@ pub(crate) mod tests {
                     name: Some(ArgSlot { arg: 0, key: None }),
                     payload: Some(ArgSlot { arg: 1, key: None }),
                     handler: None,
+                    reserved: Vec::new(),
+                    runs: None,
                     method: Some(MethodLabel {
                         from: None,
                         default: None,
@@ -1738,6 +1927,8 @@ pub(crate) mod tests {
                     name: None,
                     payload: None,
                     handler: None,
+                    reserved: Vec::new(),
+                    runs: None,
                     method: Some(MethodLabel {
                         from: Some(ArgSlot {
                             arg: 1,
@@ -1778,6 +1969,7 @@ pub(crate) mod tests {
             file: "src/gql.ts".into(),
             line,
             span_start: line * 100,
+            new: false,
             span_end: line * 100 + 20,
         };
         let sites = [
@@ -1809,6 +2001,193 @@ pub(crate) mod tests {
         assert_eq!(
             serde_json::to_value(crate::possible_calls::UnreadReason::NoOpClaim).unwrap(),
             "no_op_claim"
+        );
+    }
+
+    const STATED: &str = "src/slots/stated.ts";
+
+    /// The end of the call `call` of `slots/stated.ts` on `export` of `package`.
+    fn stated_end(
+        text: &str,
+        package: &str,
+        export: &str,
+        member: Option<&str>,
+        role: &str,
+        call: &str,
+    ) -> LabelledEnd {
+        let (span_start, span_end) = span_of(text, call);
+        LabelledEnd {
+            package: package.into(),
+            export: export.into(),
+            member: member.map(str::to_string),
+            role: role.into(),
+            op: None,
+            file: STATED.into(),
+            line: line_of(text, call),
+            span_start,
+            span_end,
+            new: false,
+        }
+    }
+
+    /// carrick#2426: a call that hands a maker the function it runs states
+    /// no row and is no lead (the function holds the request, found at its
+    /// own site); a call that hands none it can read stays a lead; a maker
+    /// claimed for `new` does not speak for a plain call; an export the store
+    /// holds no such claim for stays a lead.
+    #[test]
+    fn a_call_that_supplies_the_function_a_maker_runs_is_not_a_lead() {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let text = std::fs::read_to_string(root.join(STATED)).unwrap();
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([
+                { "package": "cache-kit", "version": "1.0.0", "specifier": "cache-kit",
+                  "export": "useCached", "role": "http_client", "label": "request_runner",
+                  "claims": [{ "kind": "make", "form": "call", "member": null,
+                               "runs": { "arg": 0, "key": "load" } }] },
+                { "package": "cache-kit", "version": "1.0.0", "specifier": "cache-kit",
+                  "export": "Loader", "role": "http_client", "label": "request_runner",
+                  "claims": [{ "kind": "make", "form": "new", "member": null,
+                               "runs": { "arg": 0, "key": "load" } }] }
+            ]))
+            .unwrap();
+        let labels = SiteLabel::from_exports(&exports);
+        let cached =
+            |call: &str| stated_end(&text, "cache-kit", "useCached", None, "http_client", call);
+        let fetch = {
+            let label = fetch_label();
+            bottom(
+                &end_for(&label, STATED, &text, "fetch(\"/api/x\")"),
+                "fetch",
+            )
+        };
+        let sites = [
+            bottom(
+                &cached("useCached({ key: [\"x\"], load: () => fetch(\"/api/x\") })"),
+                "useCached",
+            ),
+            bottom(&cached("useCached(options)"), "useCached"),
+            bottom(&cached("useCached({ ...options })"), "useCached"),
+            fetch,
+        ];
+        let mut all = labels.clone();
+        all.push(fetch_label());
+        let decided = decided_sites(&inputs, &root, &sites, &all);
+        assert_eq!(
+            decided
+                .leads
+                .iter()
+                .map(|lead| (lead.line, lead.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (line_of(&text, "useCached(options)"), Undecided::NoOpClaim),
+                (
+                    line_of(&text, "useCached({ ...options })"),
+                    Undecided::NoOpClaim
+                ),
+            ]
+        );
+        assert_eq!(
+            decided.ran,
+            vec![format!("{STATED}:{}", line_of(&text, "useCached({ key"))]
+        );
+        assert_eq!(
+            decided
+                .sites
+                .iter()
+                .map(|site| (site.line, site.name_text()))
+                .collect::<Vec<_>>(),
+            vec![(
+                line_of(&text, "fetch(\"/api/x\")"),
+                Some("/api/x".to_string())
+            )]
+        );
+        // The form: the same member called without `new` is not the maker
+        // claimed for `new`.
+        let plain = stated_end(
+            &text,
+            "cache-kit",
+            "Loader",
+            None,
+            "http_client",
+            "useCached(options)",
+        );
+        assert_eq!(SiteLabel::runner(&labels, &plain), None);
+        let constructed = LabelledEnd { new: true, ..plain };
+        assert_eq!(
+            SiteLabel::runner(&labels, &constructed),
+            Some(&ArgSlot {
+                arg: 0,
+                key: Some("load".into())
+            })
+        );
+        // Nothing claimed for the export: the call is a lead, as before.
+        let unclaimed = bottom(&cached("useCached(options)"), "useCached");
+        let decided = decided_sites(&inputs, &root, &[unclaimed], &[]);
+        assert_eq!(decided.leads.len(), 1);
+        assert!(decided.ran.is_empty());
+    }
+
+    /// carrick#2426: a decided site whose name is one the store settled the
+    /// library emits itself, on the same member and path, states no row and
+    /// is counted; any other name, and the same name on another member, stay.
+    #[test]
+    fn a_site_named_a_reserved_name_states_no_row() {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let text = std::fs::read_to_string(root.join(STATED)).unwrap();
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([
+                { "package": "event-kit", "version": "1.0.0", "specifier": "event-kit",
+                  "export": "link", "role": "socket", "side": "client",
+                  "claims": [
+                    { "kind": "op", "op": "receive", "member": "on", "name": { "arg": 0 },
+                      "handler": { "arg": 1 }, "on": "instance" },
+                    { "kind": "op", "op": "receive", "member": "once", "name": { "arg": 0 },
+                      "handler": { "arg": 1 }, "on": "instance" },
+                    { "kind": "reserved", "member": "on", "name": "open", "on": "instance" },
+                    { "kind": "reserved", "member": "on", "name": "close", "on": "export" },
+                    { "kind": "reserved", "member": "off", "name": "chat", "on": "instance" },
+                    { "kind": "reserved", "member": "once", "name": "close", "on": "instance" }
+                  ] }
+            ]))
+            .unwrap();
+        let labels = SiteLabel::from_exports(&exports);
+        let on = labels
+            .iter()
+            .find(|label| label.member.as_deref() == Some("on"))
+            .unwrap();
+        // `close` is claimed on the export, `open` on instances: only the
+        // names that share the op's receivers count.
+        assert_eq!(on.reserved, vec!["open".to_string()]);
+        let end = |member: &str, call: &str| {
+            stated_end(&text, "event-kit", "link", Some(member), "socket", call)
+        };
+        let sites = [
+            bottom(&end("on", "conn.on(\"open\", () => {})"), "conn.on"),
+            bottom(&end("on", "conn.on(\"chat\", () => {})"), "conn.on"),
+            bottom(&end("once", "conn.once(\"close\", () => {})"), "conn.once"),
+        ];
+        let decided = decided_sites(&inputs, &root, &sites, &labels);
+        assert_eq!(
+            decided
+                .sites
+                .iter()
+                .map(|site| site.name_text())
+                .collect::<Vec<_>>(),
+            vec![Some("chat".to_string())]
+        );
+        assert_eq!(
+            decided.reserved,
+            vec![
+                format!("{STATED}:{}", line_of(&text, "conn.once(")),
+                format!("{STATED}:{}", line_of(&text, "conn.on(\"open")),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
         );
     }
 
@@ -2113,6 +2492,7 @@ pub(crate) mod tests {
             file: "src/realtime/session.ts".into(),
             line: 7,
             span_start: start,
+            new: false,
             span_end: start + call.len() as u32,
         };
         let bottom = DiscoverySite {
@@ -2248,6 +2628,8 @@ pub(crate) mod tests {
             name: Some(ArgSlot { arg: 0, key: None }),
             payload: payload.map(|arg| ArgSlot { arg, key: None }),
             handler: handler.map(|arg| ArgSlot { arg, key: None }),
+            reserved: Vec::new(),
+            runs: None,
             method: None,
         }
     }
@@ -2264,6 +2646,8 @@ pub(crate) mod tests {
             name: Some(ArgSlot { arg: 0, key: None }),
             payload: None,
             handler: None,
+            reserved: Vec::new(),
+            runs: None,
             method: Some(MethodLabel {
                 from: Some(ArgSlot {
                     arg: 1,
@@ -2288,6 +2672,8 @@ pub(crate) mod tests {
             name: None,
             payload: Some(ArgSlot { arg: 0, key: None }),
             handler: None,
+            reserved: Vec::new(),
+            runs: None,
             method: None,
         }
     }
@@ -2304,6 +2690,7 @@ pub(crate) mod tests {
             file: file.into(),
             line: line_of(text, call),
             span_start,
+            new: false,
             span_end,
         }
     }
@@ -2783,6 +3170,8 @@ pub(crate) mod tests {
             name: Some(ArgSlot { arg: 0, key: None }),
             payload: None,
             handler: None,
+            reserved: Vec::new(),
+            runs: None,
             method: Some(MethodLabel {
                 from: None,
                 default: None,

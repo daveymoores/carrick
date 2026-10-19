@@ -86,6 +86,9 @@ pub struct SiteEnd {
     pub line: u32,
     pub span_start: u32,
     pub span_end: u32,
+    /// The call constructs its callee (`new m(…)`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new: bool,
 }
 
 /// One function a walk entered.
@@ -411,6 +414,7 @@ impl Walker<'_> {
                 line: call.site.line,
                 span_start: call.site.span_start,
                 span_end: call.site.span_end,
+                new: construction,
             }
         };
         let package = store_key(row, self.labels.exports);
