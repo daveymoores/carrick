@@ -382,30 +382,78 @@ impl DecidedSite {
             .collect();
         match literal {
             Some(text) if !text.is_empty() => Some(text),
-            _ if self.end.role == "http_client" && base_is_named(&self.name) => {
-                render_target(&self.name)
+            _ if self.end.role == "http_client" => {
+                named_base(&self.name).and_then(|name| render_target(&name))
             }
             _ => None,
         }
     }
 }
 
-/// Whether a URL's leading value, when it has one, is written by a name: an
-/// environment read, an import, a global, a parameter, or a binding the
-/// code reads by a name or member path (`config.apiUrl`, `this.baseUrl`).
-/// A value this pass stopped reading at an expression (a constant whose
-/// initializer is a call, `(process.env.API || "…").replace(…)`) carries
-/// that expression's source text, which is no key (carrick#2524): the name
-/// is then unstated.
-fn base_is_named(pieces: &[Piece]) -> bool {
-    match pieces.first() {
-        Some(Piece::Opaque {
-            text,
-            end: super::Root::Hole(_),
-            ..
-        }) => is_reference(text),
-        _ => true,
+/// The URL with its leading value written the way a key can carry it
+/// (carrick#2524). A value this pass stopped reading at an expression (a
+/// constant whose initializer is a call) carries that expression's source
+/// text. Where the text reads an environment variable
+/// (`(process.env.API || "…").replace(…)`), the key would keep that text
+/// verbatim, as an environment base it cannot classify: the base is written
+/// as the one read it holds (`process.env.API`), as every other environment
+/// base is, or, holding more than one, the name is unstated (`None`). Any
+/// other leading value is kept as it is.
+fn named_base(pieces: &[Piece]) -> Option<std::borrow::Cow<'_, [Piece]>> {
+    use std::borrow::Cow;
+    let Some(Piece::Opaque {
+        text,
+        end: super::Root::Hole(_),
+        ..
+    }) = pieces.first()
+    else {
+        return Some(Cow::Borrowed(pieces));
+    };
+    if is_reference(text) {
+        return Some(Cow::Borrowed(pieces));
     }
+    let reads = env_reads(text);
+    match reads.as_slice() {
+        [] => Some(Cow::Borrowed(pieces)),
+        [read] => {
+            let mut named = pieces.to_vec();
+            named[0] = Piece::Opaque {
+                text: read.clone(),
+                end: super::Root::Env {
+                    written: read.clone(),
+                    name: read.rsplit('.').next().unwrap_or(read).to_string(),
+                    fallback: None,
+                },
+                link: None,
+            };
+            Some(Cow::Owned(named))
+        }
+        _ => None,
+    }
+}
+
+/// Every distinct environment read `text` writes, `process.env.NAME` or
+/// `import.meta.env.NAME`, as written.
+fn env_reads(text: &str) -> Vec<String> {
+    let mut reads: Vec<String> = Vec::new();
+    for prefix in ["process.env.", "import.meta.env."] {
+        let mut rest = text;
+        while let Some(at) = rest.find(prefix) {
+            let after = &rest[at + prefix.len()..];
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            if !name.is_empty() {
+                let read = format!("{prefix}{name}");
+                if !reads.contains(&read) {
+                    reads.push(read);
+                }
+            }
+            rest = after;
+        }
+    }
+    reads
 }
 
 /// `name`, `a.b.c`, `this.#field`, `a?.b`: a name and the members read off
@@ -2614,9 +2662,11 @@ pub(crate) mod tests {
     }
 
     /// A base read through a constant whose initializer is an expression
-    /// (a call on an environment read) is that expression's source text:
-    /// no key. The name is unstated. A constant that is the read itself is
-    /// written as the read, as before.
+    /// over one environment read is written as that read, never as the
+    /// expression's source text; over two reads, the name is unstated. A
+    /// constant that is the read itself is written as the read, and an
+    /// expression with no read is kept as before (the normalizer reads it
+    /// as an injected base).
     #[test]
     fn a_base_written_as_an_expression_s_text_is_no_name() {
         let (decided, text, _) = decided_at(
@@ -2624,6 +2674,8 @@ pub(crate) mod tests {
             &[
                 "fetch(`${SEED_BASE}/sessions`, { method: \"POST\" })",
                 "fetch(`${PLAIN_BASE}/sessions/end`, { method: \"POST\" })",
+                "fetch(`${EITHER_BASE}/status`)",
+                "fetch(`${TRIMMED}/ping`)",
             ],
             &fetch_label(),
         );
@@ -2631,12 +2683,24 @@ pub(crate) mod tests {
         assert_eq!(
             names_at(&decided, BASES),
             vec![
-                (line("fetch(`${SEED_BASE}"), None),
+                (
+                    line("fetch(`${SEED_BASE}"),
+                    Some("${process.env.SEED_API}/sessions".to_string())
+                ),
                 (
                     line("fetch(`${PLAIN_BASE}"),
                     Some("${process.env.PLAIN_API}/sessions/end".to_string())
                 ),
+                (line("fetch(`${EITHER_BASE}"), None),
+                (
+                    line("fetch(`${TRIMMED}"),
+                    Some("${settings.base.replace(/\\/$/, \"\")}/ping".to_string())
+                ),
             ]
+        );
+        assert_eq!(
+            env_reads("(process.env.A || import.meta.env.B || process.env.A).trim()"),
+            vec!["process.env.A".to_string(), "import.meta.env.B".to_string()]
         );
         assert!(is_reference("this.baseUrl") && is_reference("config.api?.url"));
         assert!(is_reference("this.#base") && is_reference("$base"));

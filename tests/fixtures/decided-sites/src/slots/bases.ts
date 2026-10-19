@@ -15,3 +15,19 @@ const PLAIN_BASE = process.env.PLAIN_API;
 export function signOut(): Promise<Response> {
   return fetch(`${PLAIN_BASE}/sessions/end`, { method: "POST" });
 }
+
+// A constant over two environment reads: which one is the base is not
+// stated.
+const EITHER_BASE = (process.env.PRIMARY_API || process.env.BACKUP_API || "").trim();
+
+export function status(): Promise<Response> {
+  return fetch(`${EITHER_BASE}/status`);
+}
+
+// A constant over a value with no environment read.
+declare const settings: { base: string };
+const TRIMMED = settings.base.replace(/\/$/, "");
+
+export function ping(): Promise<Response> {
+  return fetch(`${TRIMMED}/ping`);
+}
