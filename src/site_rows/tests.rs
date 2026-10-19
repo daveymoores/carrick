@@ -59,6 +59,7 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
             file: file.to_string(),
             line: LINE,
             span_start: 100,
+            new: false,
             span_end: 130,
         },
         name: Vec::new(),
@@ -149,6 +150,8 @@ fn labels() -> Vec<SiteLabel> {
         name: None,
         payload: None,
         handler: None,
+        reserved: Vec::new(),
+        runs: None,
         method: None,
     };
     vec![

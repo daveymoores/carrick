@@ -4943,7 +4943,9 @@ fn site_records_of(
     debug!(
         yielded,
         unbased,
-        "site questions: sites left to the summaries, sites with an unstated instance base"
+        ran = decided.ran.len(),
+        reserved = decided.reserved.len(),
+        "site questions: sites left to the summaries, sites with an unstated instance base, calls that hand a maker its function, sites named a reserved name"
     );
     let records =
         crate::request_summary::site_record::site_records(inputs, root, &decided, &labels);
