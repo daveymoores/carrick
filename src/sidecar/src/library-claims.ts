@@ -258,7 +258,8 @@ function furthest(current: RankedFailure | undefined, rank: number, outcome: Out
 type Read<T> = { value: T } | { reason: string };
 
 /** The callee's signatures, or the verdict when there is nothing to call. */
-type Callable = { signatures: readonly ts.Signature[] } | { failure: Outcome };
+/** A callee's signatures, and the type its member was read from. */
+type Callable = { signatures: readonly ts.Signature[]; holder: ts.Type } | { failure: Outcome };
 
 interface ModuleRead {
   entry: SemanticsModule;
@@ -1920,7 +1921,7 @@ class DeclarationReader {
     for (const signature of callee.signatures) {
       const count = signature.getParameters().length;
       for (let arg = 0; arg < count; arg++) {
-        if (this.literalsAt(signature, { arg }).has(claim.name)) return VERIFIED;
+        if (this.literalsAt(signature, { arg }, callee.holder).has(claim.name)) return VERIFIED;
       }
     }
     return failed('reserved_not_declared');
@@ -2334,32 +2335,34 @@ class DeclarationReader {
   /**
    * The string literals a slot spells: the literal parts of its type, through
    * a type parameter's constraint, and the property names of a map a `keyof`
-   * reads, both as instantiated and as written at the declaration.
+   * reads, both as instantiated and as written at the declaration. `holder`
+   * is the type the member was read from: a map that is a type parameter of
+   * a base class is read as the holder's class chain binds it.
    */
-  private literalsAt(signature: ts.Signature, at: ClaimSlot): ReadonlySet<string> {
+  private literalsAt(signature: ts.Signature, at: ClaimSlot, holder: ts.Type): ReadonlySet<string> {
     const literals = new Set<string>();
     let slot: Slot | undefined = this.parameterAt(signature, at.arg);
     if (slot !== undefined && slot !== VARIADIC && at.key !== undefined) {
       const property = this.declaredProperty(slot, at.key);
       slot = property ? this.checker.getTypeOfSymbol(property) : undefined;
     }
-    if (slot !== undefined && slot !== VARIADIC) this.spell(slot, literals, 0);
+    if (slot !== undefined && slot !== VARIADIC) this.spell(slot, literals, 0, holder);
     if (at.key === undefined) {
       const parameters = signature.getDeclaration()?.parameters;
       const node = parameters?.[Math.min(at.arg, parameters.length - 1)]?.type;
-      if (node) this.spell(this.checker.getTypeFromTypeNode(node), literals, 0);
+      if (node) this.spell(this.checker.getTypeFromTypeNode(node), literals, 0, holder);
     }
     return literals;
   }
 
-  private spell(type: ts.Type, into: Set<string>, depth: number): void {
+  private spell(type: ts.Type, into: Set<string>, depth: number, holder: ts.Type): void {
     if (depth > 6) return;
     if (type.isStringLiteral()) {
       into.add(type.value);
       return;
     }
     if (type.isUnionOrIntersection()) {
-      for (const part of type.types) this.spell(part, into, depth + 1);
+      for (const part of type.types) this.spell(part, into, depth + 1, holder);
       return;
     }
     if (type.flags & ts.TypeFlags.TypeParameter) {
@@ -2367,12 +2370,14 @@ class DeclarationReader {
       this.spell(
         constraintNode ? this.checker.getTypeFromTypeNode(constraintNode) : this.checker.getBaseConstraintOfType(type) ?? type,
         into,
-        depth + 1
+        depth + 1,
+        holder
       );
       return;
     }
     if (type.flags & ts.TypeFlags.Index) {
       let map = (type as ts.IndexType).type;
+      if (map.flags & ts.TypeFlags.TypeParameter) map = this.heritageArgument(map, holder);
       if (map.flags & ts.TypeFlags.TypeParameter) {
         map = this.checker.getDefaultFromTypeParameter(map) ?? this.checker.getBaseConstraintOfType(map) ?? map;
       }
@@ -2380,6 +2385,44 @@ class DeclarationReader {
         if (!isSymbolKeyed(property)) into.add(property.getName());
       }
     }
+  }
+
+  /**
+   * The type argument a class's type parameter takes in `holder`'s class
+   * chain: the argument a heritage clause passes for it
+   * (`class Channel<L> extends Emitter<L, Reserved>` binds Emitter's second
+   * parameter to `Reserved`), followed down the chain while that argument is
+   * a type parameter of a class below. A parameter no heritage clause binds
+   * comes back as it is (or as the last parameter it was bound to), for the
+   * caller to read at its default.
+   */
+  private heritageArgument(parameter: ts.Type, holder: ts.Type): ts.Type {
+    const bases: ts.TypeReference[] = [];
+    const seen = new Set<ts.Type>();
+    const visit = (type: ts.Type, depth: number): void => {
+      if (depth > 8) return;
+      if (type.isIntersection()) {
+        for (const part of type.types) visit(part, depth + 1);
+        return;
+      }
+      const target = ((type as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.Reference ? (type as ts.TypeReference).target : type;
+      if (!(((target as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.ClassOrInterface) || seen.has(target)) return;
+      seen.add(target);
+      for (const base of this.checker.getBaseTypes(target as ts.InterfaceType)) {
+        if (((base as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.Reference) bases.push(base as ts.TypeReference);
+        visit(base, depth + 1);
+      }
+    };
+    visit(this.checker.getNonNullableType(holder), 0);
+    let bound = parameter;
+    for (let step = 0; step <= bases.length && bound.flags & ts.TypeFlags.TypeParameter; step++) {
+      const base = bases.find(each => (each.target.typeParameters ?? []).includes(bound as ts.TypeParameter));
+      if (!base) break;
+      const argument = this.checker.getTypeArguments(base)[base.target.typeParameters!.indexOf(bound as ts.TypeParameter)];
+      if (!argument) break;
+      bound = argument;
+    }
+    return bound;
   }
 
   /**
@@ -2429,7 +2472,7 @@ class DeclarationReader {
     const own = boundBase
       ? library
       : library.filter(signature => this.isOwnFile(this.signatureFile(signature, type, form)!, home));
-    if (own.length > 0) return { signatures: own };
+    if (own.length > 0) return { signatures: own, holder: holder.type };
     if (library.length > 0) return { failure: failed('member_inherited') };
     return { failure: this.slotFailure(type, form === 'new' ? 'member_not_constructible' : 'member_not_callable') };
   }
@@ -2754,10 +2797,10 @@ class DeclarationReader {
     // The receiver's own call and construct signatures, as a claim with a
     // null member reads them.
     const call = this.ownCallee(holder, [], null, 'call');
-    if ('signatures' in call) fills.push(() => (receiver.call = this.listSignatures(call.signatures, take)));
+    if ('signatures' in call) fills.push(() => (receiver.call = this.listSignatures(call.signatures, holder.type, take)));
     const construct = this.ownCallee(holder, [], null, 'new');
     if ('signatures' in construct) {
-      fills.push(() => (receiver.construct = this.listSignatures(construct.signatures, take)));
+      fills.push(() => (receiver.construct = this.listSignatures(construct.signatures, holder.type, take)));
     }
     if (this.isOpenTop(type)) return receiver;
     names.push(() => {
@@ -2772,13 +2815,13 @@ class DeclarationReader {
         const own = 'signatures' in callee;
         const member: SurfaceMember = { name: property.getName(), own, signatures: [] };
         receiver.members.push(member);
-        fills.push(() => (member.signatures = this.listSignatures(own ? callee.signatures : library, take)));
+        fills.push(() => (member.signatures = this.listSignatures(own ? callee.signatures : library, holder.type, take)));
       }
     });
     return receiver;
   }
 
-  private listSignatures(signatures: readonly ts.Signature[], take: () => boolean): SurfaceSignature[] {
+  private listSignatures(signatures: readonly ts.Signature[], holder: ts.Type, take: () => boolean): SurfaceSignature[] {
     const listed: SurfaceSignature[] = [];
     for (const signature of signatures) {
       if (!take()) continue;
@@ -2805,7 +2848,7 @@ class DeclarationReader {
           const keys = this.listKeys(slot, take);
           if (keys.length > 0) param.keys = keys;
         }
-        const literals = this.literalsAt(signature, { arg: index });
+        const literals = this.literalsAt(signature, { arg: index }, holder);
         if (literals.size > 0) param.literals = [...literals].sort();
         params.push(param);
       }
@@ -2921,7 +2964,7 @@ class DeclarationReader {
         const declaration = signature.getDeclaration();
         return declaration !== undefined && this.isLibraryFile(declaration.getSourceFile());
       });
-    if (signatures.length > 0) return { signatures };
+    if (signatures.length > 0) return { signatures, holder: type };
     return { failure: this.slotFailure(type, 'member_not_callable') };
   }
 
