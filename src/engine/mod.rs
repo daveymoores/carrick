@@ -25646,4 +25646,68 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             possible_calls_omitted: None,
         }
     }
+
+    /// `src/orders.ts`: a module constant set by `serviceRoot()`, whose body
+    /// is `returns`, leads the URL of a wrapper that a caller in the same
+    /// module fills (carrick#2536).
+    fn orders_source(returns: &str) -> String {
+        format!(
+            "function serviceRoot() {{\n{returns}}}\n\
+             const ROOT = serviceRoot();\n\
+             \n\
+             async function fetchLines(order: string, page: string) {{\n\
+             \x20 const res = await fetch(`${{ROOT}}/orders/${{encodeURIComponent(order)}}/lines?page=${{page}}`);\n\
+             \x20 return res.json();\n\
+             }}\n\
+             \n\
+             export function firstPage() {{\n\
+             \x20 return fetchLines(currentOrder(), \"1\");\n\
+             }}\n"
+        )
+    }
+
+    /// The summary rows `source` states in `src/orders.ts`: each target and
+    /// the path it normalises to.
+    fn orders_rows(source: &str) -> Vec<(String, String)> {
+        let (dir, discovery) = discover_sources(&[("src/orders.ts", source)]);
+        let normalizer = crate::url_normalizer::UrlNormalizer::new(&Config::default());
+        summary_rows_of(&dir, &discovery, "src/orders.ts")
+            .into_iter()
+            .map(|row| {
+                let path = normalizer.normalize(&row.target).path;
+                (row.target, path)
+            })
+            .collect()
+    }
+
+    /// carrick#2536: a wrapper whose URL leads with a module constant built
+    /// by a function declaration keeps the path every return of that
+    /// function writes, after a hole for the value it does not write.
+    #[test]
+    fn a_wrapper_keeps_the_path_its_base_function_always_returns() {
+        let rows = orders_rows(&orders_source(
+            "  const mount = readMount();\n  if (mount) {\n    return mount + \"/svc/v2\";\n  }\n  return \"/svc/v2\";\n",
+        ));
+        assert_eq!(
+            rows,
+            vec![(
+                "${serviceRoot()}/svc/v2/orders/${encodeURIComponent(order)}/lines?page=1"
+                    .to_string(),
+                "/svc/v2/orders/:order/lines".to_string()
+            )]
+        );
+    }
+
+    /// carrick#2536, must not verify: returns that end in different paths
+    /// share no written path, so no row claims one.
+    #[test]
+    fn a_wrapper_claims_no_path_its_base_function_does_not_always_return() {
+        let rows = orders_rows(&orders_source(
+            "  if (legacy()) {\n    return \"/svc/v1\";\n  }\n  return \"/svc/v2\";\n",
+        ));
+        assert!(
+            rows.iter().all(|(target, _)| !target.contains("/svc/")),
+            "{rows:#?}"
+        );
+    }
 }

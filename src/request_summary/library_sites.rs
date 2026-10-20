@@ -3368,9 +3368,12 @@ pub(super) fn name_value(expr: &Expr, module: &ModuleScope) -> Option<NameValue>
 /// What a builder ([`super::Builder`]) returns as a name reads it
 /// ([`NameValue::Builder`]): text built from its parameters.
 pub(super) fn builder(builder: &super::Builder, module: &ModuleScope) -> Option<NameValue> {
+    let [returned] = builder.returned.as_slice() else {
+        return None;
+    };
     let mut scope = Scope::module(module);
     scope.params = builder.params.clone();
-    Some(NameValue::Builder(text_pieces(&builder.returned, &scope)?))
+    Some(NameValue::Builder(text_pieces(returned, &scope)?))
 }
 
 fn arg_literal<'a>(args: &'a [SiteArg], arg: usize, key: Option<&str>) -> Option<&'a str> {
