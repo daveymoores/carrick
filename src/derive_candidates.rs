@@ -40,6 +40,12 @@ pub struct Candidates {
     pub env: Vec<EnvCandidate>,
     pub origins: Vec<OriginCandidate>,
     pub truncated: Truncated,
+    /// What the service's declared roots reach (carrick#2397).
+    pub reach: crate::derive_reach::Reach,
+    /// The units reach cannot place that nothing outside them loads, each
+    /// with the pattern that would leave it out; at most
+    /// [`crate::derive_reach::MAX_UNITS`].
+    pub directories: Vec<crate::derive_reach::Unit>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -78,6 +84,8 @@ pub struct Site {
 pub struct Truncated {
     pub env: usize,
     pub origins: usize,
+    /// Offered units past a cap: not listed, so read.
+    pub directories: usize,
 }
 
 /// Every site of one candidate, keyed so the order is file, then line.
@@ -176,6 +184,10 @@ pub fn service_candidates(repo: &Path, service: &Config) -> Candidates {
         .collect();
     let (env, env_cut) = capped(env, |entry| (entry.site_count, entry.name.as_str()));
     let (origins, origins_cut) = capped(origins, |entry| (entry.site_count, entry.origin.as_str()));
+    let crate::derive_reach::ServiceReach { reach, mut units } =
+        crate::derive_reach::service_reach(&repo, service, &files);
+    let directories_cut = units.len().saturating_sub(crate::derive_reach::MAX_UNITS);
+    units.truncate(crate::derive_reach::MAX_UNITS);
     Candidates {
         files_read: files.len(),
         env,
@@ -183,7 +195,10 @@ pub fn service_candidates(repo: &Path, service: &Config) -> Candidates {
         truncated: Truncated {
             env: env_cut,
             origins: origins_cut,
+            directories: directories_cut,
         },
+        reach,
+        directories: units,
     }
 }
 

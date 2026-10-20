@@ -321,12 +321,12 @@ pub fn export_assignments(module: &Module) -> CommonJsExports {
 }
 
 /// Which published name an assignment target names.
-enum ExportTarget {
+pub(crate) enum ExportTarget {
     Whole,
     Member(String),
 }
 
-fn assignment_target(target: &MemberExpr) -> Option<ExportTarget> {
+pub(crate) fn assignment_target(target: &MemberExpr) -> Option<ExportTarget> {
     let MemberProp::Ident(property) = &target.prop else {
         return None;
     };

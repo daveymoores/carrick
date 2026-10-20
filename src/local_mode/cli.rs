@@ -429,8 +429,13 @@ fn derive(root: Option<&Path>, candidates: bool) -> Result<serde_json::Value, St
         // Additive and only on request, so a derive without the flag prints
         // the same bytes it did before it (carrick#2232).
         if candidates {
-            for (document, service) in services.iter_mut().zip(&derived.services) {
-                let found = crate::derive_candidates::service_candidates(repo, service);
+            let mut found: Vec<crate::derive_candidates::Candidates> = derived
+                .services
+                .iter()
+                .map(|service| crate::derive_candidates::service_candidates(repo, service))
+                .collect();
+            crate::derive_reach::cap_repo_units(&mut found);
+            for (document, found) in services.iter_mut().zip(found) {
                 document["candidates"] =
                     serde_json::to_value(found).expect("candidates serialize as a JSON object");
             }

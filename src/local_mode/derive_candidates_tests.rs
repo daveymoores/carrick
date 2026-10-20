@@ -202,10 +202,17 @@ fn each_service_lists_the_env_vars_and_origins_its_source_reads() {
         // `services/docs` holds a manifest and no source file, so it is no
         // service and has no candidates (carrick#2298).
     });
-    assert_eq!(
-        serde_json::Value::Object(candidates_by_service(dir.path())),
-        expected
-    );
+    // Reach and units have their own cases (tests/derive_reach_units_test.rs,
+    // carrick#2397); what this case pins is unchanged beside them.
+    let mut found = candidates_by_service(dir.path());
+    for candidates in found.values_mut() {
+        let candidates = candidates.as_object_mut().unwrap();
+        assert!(candidates.remove("reach").is_some());
+        assert!(candidates.remove("directories").is_some());
+        let truncated = candidates["truncated"].as_object_mut().unwrap();
+        assert!(truncated.remove("directories").is_some());
+    }
+    assert_eq!(serde_json::Value::Object(found), expected);
 }
 
 /// The same tree prints the same bytes, whatever order its files were
@@ -230,13 +237,22 @@ fn no_service_string_is_an_absolute_path() {
         match value {
             serde_json::Value::String(text) => found.push(text),
             serde_json::Value::Array(items) => items.iter().for_each(|item| strings(item, found)),
-            serde_json::Value::Object(map) => map.values().for_each(|item| strings(item, found)),
+            // A unit's `pattern` is anchored at its service's directory
+            // (`/src/`), so it starts with `/` and is checked below for the
+            // machine's paths only.
+            serde_json::Value::Object(map) => map
+                .iter()
+                .filter(|(key, _)| key.as_str() != "pattern")
+                .for_each(|(_, item)| strings(item, found)),
             _ => {}
         }
     }
     let dir = tempfile::tempdir().unwrap();
     write_repo(dir.path(), FIXTURE);
     let document = derive(Some(dir.path()), true).unwrap();
+    let rendered = document["repos"][0]["services"].to_string();
+    let temp = dir.path().canonicalize().unwrap().display().to_string();
+    assert!(!rendered.contains(&temp));
     let mut found = Vec::new();
     strings(&document["repos"][0]["services"], &mut found);
     assert!(found.iter().any(|text| text.ends_with(".ts")), "{found:?}");
