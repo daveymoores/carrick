@@ -3929,6 +3929,16 @@ impl FileOrchestrator {
                 &env_schema,
                 true,
             );
+            // A site whose URL reads as several written paths states no row,
+            // from any deterministic pass: a row a lower-precedence pass states
+            // there would carry the path the summary refused (carrick#2541).
+            if let Some(several) = summaries.several_paths(file) {
+                pf.resolved.retain(|resolved| {
+                    !resolved
+                        .span
+                        .is_some_and(|(start, _)| several.contains(&start))
+                });
+            }
         }
 
         // PHASE 3 (serial): emit the deterministic rows for each file, join

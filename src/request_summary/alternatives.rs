@@ -45,7 +45,9 @@
 //!   writes a path and the other is a value nothing here read, the slot may
 //!   span segments, so the request states no row rather than a placeholder
 //!   one. A conditional that leads the URL is a base, which the row was
-//!   always allowed to read as opaque text, and is read as before.
+//!   always allowed to read as opaque text, and is read as before when no
+//!   branch writes a path; one whose branches write different paths states
+//!   no row (carrick#2541).
 //! - **A reading that differs from another only in a query is the same
 //!   route.**
 //!

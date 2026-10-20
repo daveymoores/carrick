@@ -48,6 +48,19 @@ fn calls() -> &'static [serde_json::Value] {
     })
 }
 
+/// No call at `file:line`, from any source: the URL there reads as more than
+/// one written path, so no one path is its (carrick#2541).
+fn assert_no_row(file: &str, line: i64) {
+    let rows: Vec<_> = calls()
+        .iter()
+        .filter(|call| call["file"].as_str() == Some(file) && call["line"].as_i64() == Some(line))
+        .collect();
+    assert!(
+        rows.is_empty(),
+        "expected no row at {file}:{line}, got {rows:#?}"
+    );
+}
+
 /// The one row at `file:line`, stated by the summaries, sending `GET` to
 /// `target`.
 fn assert_row(file: &str, line: i64, target: &str) {
@@ -110,11 +123,15 @@ fn builders_declared_beside_the_client_compose_too() {
 }
 
 #[test]
+fn a_call_that_reads_as_several_paths_states_no_row() {
+    // Two different returns, each a path: `/a` or `/b`, so no one path.
+    assert_no_row("src/client.ts", 29);
+    assert_no_row("src/local.ts", 27);
+}
+
+#[test]
 fn a_part_with_no_stated_value_stays_an_unread_value() {
     let file = "src/client.ts";
-    // Two different returns: the call states no one value.
-    assert_row(file, 29, "${pick(flag)}/two");
-    assert_row("src/local.ts", 27, "${pick(flag)}/two");
     // A runtime value.
     assert_row(file, 35, "${process.env.X}/env");
     // An object another function writes to.

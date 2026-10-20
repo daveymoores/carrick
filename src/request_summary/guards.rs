@@ -141,6 +141,11 @@ pub enum HoleReason {
     /// A member or a call whose receiver the compiler types as `any`, with
     /// no declaration.
     UntypedReceiver,
+    /// A value that reads as more than one written path: a builder whose
+    /// returns, or a conditional whose branches, write different path text
+    /// (carrick#2541). No one path is its, so a URL holding it states no
+    /// row. It serialises only into guard chain ends and never into a row.
+    SeveralPaths,
 }
 
 /// Where a compared value comes from, before any access is applied to it.

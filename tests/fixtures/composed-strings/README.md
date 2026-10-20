@@ -30,7 +30,7 @@ unread value, and the row kept the unread base in its target.
 | 20 | `` `${PREFIX}/x/${id}` `` | `/api/v1/x/${id}` |
 | 23 | `sessionBase() + "/local"`, the builder has a local `const` before its `return` | `/api/v1/local` |
 | 26 | `PATHS.users + "/m"`, an entry of an `as const` object | `/users/m` |
-| 29 | `pick(flag) + "/two"`, the builder returns `"/a"` on one path and `"/b"` on the other | `${pick(flag)}/two`: the base stays unread |
+| 29 | `pick(flag) + "/two"`, the builder returns `"/a"` on one path and `"/b"` on the other | no row: the call reads as `/a` or `/b`, so no one path is its (carrick#2541) |
 | 32 | `same(flag) + "/same"`, every path returns `"/a"` | `/a/same` |
 | 35 | `process.env.X + "/env"` | `${process.env.X}/env`: a runtime value |
 | 41 | `MUTABLE.users + "/mutable"`, another function writes `MUTABLE.users` | `${MUTABLE.users}/mutable` |
@@ -46,7 +46,7 @@ same file as the client, which is read without any import:
 |---|---|---|
 | 21 | `base() + "/session"` | `/api/v1/session` |
 | 24 | `sessionBase() + "/local"` | `/api/v1/local` |
-| 27 | `pick(flag) + "/two"` | `${pick(flag)}/two` |
+| 27 | `pick(flag) + "/two"` | no row: the call reads as `/a` or `/b`, so no one path is its (carrick#2541) |
 | 30 | `same(flag) + "/same"` | `/a/same` |
 
 ## The cassettes

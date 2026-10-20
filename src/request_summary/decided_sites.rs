@@ -535,13 +535,15 @@ fn named_base(pieces: &[Piece]) -> Option<std::borrow::Cow<'_, [Piece]>> {
     use std::borrow::Cow;
     let Some(Piece::Opaque {
         text,
-        end: super::Root::Hole(_),
+        end: super::Root::Hole(reason),
         ..
     }) = pieces.first()
     else {
         return Some(Cow::Borrowed(pieces));
     };
-    if is_reference(text) {
+    // A value that reads as several paths is never renamed to the one
+    // environment read its text holds: no row is keyed on it (carrick#2541).
+    if *reason == super::HoleReason::SeveralPaths || is_reference(text) {
         return Some(Cow::Borrowed(pieces));
     }
     let reads = env_reads(text);
@@ -3245,6 +3247,24 @@ pub(crate) mod tests {
         assert_eq!(
             names_at(&unclaimed, INSTANCES)[0].1.as_deref(),
             Some("/invoices")
+        );
+    }
+
+    /// carrick#2541: a leading value that reads as several paths is never
+    /// renamed to the one environment read its text holds.
+    #[test]
+    fn a_base_that_reads_as_several_paths_names_no_site() {
+        let pieces = [
+            Piece::Opaque {
+                text: "local ? \"/v1\" : process.env.API_URL".to_string(),
+                end: super::super::Root::Hole(super::super::HoleReason::SeveralPaths),
+                link: None,
+            },
+            Piece::Lit("/x".to_string()),
+        ];
+        assert_eq!(
+            named_base(&pieces).and_then(|name| render_target(&name)),
+            None
         );
     }
 }
