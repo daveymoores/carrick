@@ -680,6 +680,64 @@ fn the_fold_keeps_to_its_side() {
     assert_eq!(calls.len(), 1);
 }
 
+fn lead_at(file: &str, line: u32, role: Option<&str>) -> PossibleCall {
+    PossibleCall {
+        file_path: file.to_string(),
+        line_number: line,
+        span_start: 0,
+        span_end: 0,
+        kind: None,
+        role: role.map(str::to_string),
+        labelled_end: None,
+        unread: crate::possible_calls::Unread {
+            slot: "path".to_string(),
+            reason: UnreadReason::NoOpClaim,
+        },
+        trace_depth: 0,
+    }
+}
+
+/// A lead on a line the blob already holds a row at is dropped, by side:
+/// a consumer lead matches a call row, a producer lead an endpoint row, a
+/// lead with no role either (carrick#2539).
+#[test]
+fn a_lead_on_a_line_with_a_row_is_dropped() {
+    let mut calls = vec![blob_row(
+        OperationKey::http("GET", "/a"),
+        "src/a.ts",
+        10,
+        None,
+    )];
+    let mut endpoints = vec![blob_row(
+        OperationKey::http("GET", "/b"),
+        "src/b.ts",
+        5,
+        None,
+    )];
+    let site = SiteRows {
+        enabled: true,
+        rows: Vec::new(),
+        leads: vec![
+            lead_at("src/a.ts", 10, None),
+            lead_at("src/a.ts", 20, None),
+            lead_at("src/b.ts", 5, Some("consumer")),
+            lead_at("src/b.ts", 5, Some("producer")),
+        ],
+        routes: Vec::new(),
+    };
+    let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), make);
+    let kept: Vec<(&str, u32, Option<&str>)> = fold
+        .leads
+        .iter()
+        .map(|l| (l.file_path.as_str(), l.line_number, l.role.as_deref()))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![("src/a.ts", 20, None), ("src/b.ts", 5, Some("consumer"))]
+    );
+    assert_eq!(fold.lead_on_row_line, 2);
+}
+
 /// Off, nothing folds and nothing is written: the rows are byte for byte
 /// what they were.
 #[test]

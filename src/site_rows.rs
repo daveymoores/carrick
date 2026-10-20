@@ -519,6 +519,9 @@ pub struct SiteFold {
     /// Route sites ([`SiteRows::routes`]) where a row already stands at the
     /// line: the index holds the route, so the site is no possible call.
     pub route_kept_reader: usize,
+    /// Leads dropped because the blob already holds a row at their line
+    /// (carrick#2539): the index states that site, so it is no possible call.
+    pub lead_on_row_line: usize,
 }
 
 /// `file` relative to `root`, `/`-separated, whichever form it is held in
@@ -557,7 +560,27 @@ pub fn fold_rows(
     if !site.enabled {
         return out;
     }
-    out.leads = site.leads.clone();
+    // A lead on a line the blob already holds a row at is that row's site.
+    // A consumer lead matches a call row, a producer lead an endpoint row,
+    // and a lead with no role either.
+    let held_at = |rows: &[ApiEndpointDetails], file: &str, line: u32| {
+        rows.iter()
+            .any(|existing| place(root, existing).is_some_and(|(f, l)| f == file && l == line))
+    };
+    for lead in &site.leads {
+        let on_call = held_at(calls, &lead.file_path, lead.line_number);
+        let on_endpoint = held_at(endpoints, &lead.file_path, lead.line_number);
+        let held = match lead.role.as_deref() {
+            Some("consumer") => on_call,
+            Some("producer") => on_endpoint,
+            _ => on_call || on_endpoint,
+        };
+        if held {
+            out.lead_on_row_line += 1;
+        } else {
+            out.leads.push(lead.clone());
+        }
+    }
     // The same file:line match as the rows below, on the endpoint side.
     for route in &site.routes {
         let held = endpoints.iter().any(|existing| {

@@ -5413,6 +5413,7 @@ fn append_deterministic_protocol_operations(
         debug!(
             routes = extractions.site.routes.len(),
             route_kept_reader = site.route_kept_reader,
+            lead_on_row_line = site.lead_on_row_line,
             possible_calls = site.leads.len(),
             stated = site.stated.len(),
             withdrawn = site.withdrawn.len(),
@@ -22309,6 +22310,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             )],
             leads: Vec::new(),
             route_kept_reader: 0,
+            lead_on_row_line: 0,
         };
         let mut entries = Vec::new();
         add_protocol_manifest_entry(
