@@ -22044,6 +22044,100 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(of.decided.sites.len(), 1, "decided sites");
     }
 
+    /// carrick#2538: a message listener on a forked child process is an
+    /// in-process end. The row it writes stays in its service, so it never
+    /// pairs with a publisher of the same name in another service, whatever
+    /// kind the model named for it.
+    #[tokio::test]
+    async fn a_forked_child_s_message_listener_stays_in_its_service() {
+        use crate::site_questions::{Answered, SiteAnswers, Slot, SlotAnswer, SlotValue};
+        let edit = [
+            (
+                "node_modules/@types/node/child_process.d.ts",
+                "declare module \"node:child_process\" {\n  export interface ChildProcess {\n    send(message: unknown): boolean;\n    on(event: string, listener: (...args: unknown[]) => void): this;\n  }\n  export function fork(modulePath: string): ChildProcess;\n}\n",
+            ),
+            (
+                "src/worker-link.ts",
+                "import { fork } from \"node:child_process\";\n\nconst child = fork(\"./worker.js\");\n\nchild.on(\"message\", (message: unknown) => {\n  void message;\n});\n",
+            ),
+        ];
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        ) else {
+            return;
+        };
+        let answer = r#"{"library_claims":[{"package":"node:child_process","version":"22.0.0","status":"answered",
+            "exports":[{"specifier":"node:child_process","export":"ChildProcess","role":"in_process_bus","side":"client",
+            "makes":[],"scopes":[],
+            "ops":[{"op":"receive","member":"on","on":"instance","name":{"arg":0},"handler":{"arg":1}}],
+            "reserved":[],"calls":[],"patterns":[]},
+            {"specifier":"node:child_process","export":"fork","role":"none","makes":[],"scopes":[],"ops":[],
+            "reserved":[],"calls":[],"patterns":[]}]}]}"#;
+        let exports = crate::library_store::parse_answer(answer).exports;
+        let of = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &exports,
+            super::SiteContext::default(),
+        );
+        let file = "services/web/src/worker-link.ts";
+        let record = of
+            .records
+            .iter()
+            .find(|record| record.anchors.call.file == file && record.anchors.call.line == 5)
+            .expect("the listener is a decided site");
+        let said = |text: &str| {
+            Some(SlotAnswer {
+                value: Some(SlotValue::Text(text.to_string())),
+                confidence: 0.95,
+                orders_agree: true,
+            })
+        };
+        let mut answered = Answered::default();
+        for slot in &record.state.asked {
+            match slot {
+                Slot::Kind => answered.kind = said("message"),
+                Slot::Role => answered.role = said("handles"),
+                Slot::Name => answered.name = said("message"),
+                other => panic!("an unexpected asked slot {other:?}"),
+            }
+        }
+        let mut answers = SiteAnswers::default();
+        answers
+            .answered
+            .insert(crate::site_rows::site_id(&record.anchors), answered);
+        let rows = crate::site_rows::of(&of.decided, &of.records, &of.labels, &answers);
+        let at: Vec<_> = rows
+            .rows
+            .iter()
+            .filter(|row| row.file == file && row.line == 5)
+            .collect();
+        assert_eq!(at.len(), 1, "one row at the listener");
+        let row = at[0];
+        assert_eq!(row.key, crate::operation::OperationKey::pubsub("message"));
+        assert_eq!(row.side, crate::site_rows::RowSide::Endpoint);
+        let scope = row.name_scope.as_ref().expect("the row is scoped");
+        assert_eq!(scope.scope, carrick_match::SERVICE_SCOPE);
+        let global = carrick_match::NameScope {
+            scope: carrick_match::GLOBAL_SCOPE.to_string(),
+            namespace: None,
+        };
+        assert!(!carrick_match::names_pair(
+            carrick_match::ScopedRow {
+                service: "billing",
+                name_scope: Some(&global),
+            },
+            carrick_match::ScopedRow {
+                service: "web",
+                name_scope: Some(scope),
+            },
+        ));
+    }
+
     /// carrick#2439: on, an answer in the band replaces the model's pub/sub
     /// row at its site and carries its answer, and the sites that state no
     /// row are written as possible calls.
