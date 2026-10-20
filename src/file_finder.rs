@@ -656,7 +656,7 @@ impl std::fmt::Debug for Exclusion {
 impl Exclusion {
     /// The matcher for `patterns` rooted at `root`, or the reason one of
     /// them is not a pattern.
-    fn build(root: &Path, patterns: &[String]) -> Result<Exclusion, String> {
+    pub(crate) fn build(root: &Path, patterns: &[String]) -> Result<Exclusion, String> {
         if patterns.is_empty() {
             return Ok(Exclusion::default());
         }
@@ -752,21 +752,42 @@ fn keep_what_is_imported(
         );
     }
     let modules = modules();
+    let paths: Vec<&Path> = found.iter().map(|file| file.path.as_path()).collect();
+    let read = import_closure(&paths, |index| !found[index].ignored, &modules);
+    let (kept, left_out): (Vec<_>, Vec<_>) =
+        found.into_iter().zip(read).partition(|(_, read)| *read);
+    (
+        kept.into_iter().map(|(file, _)| file.path).collect(),
+        left_out.into_iter().map(|(file, _)| file.path).collect(),
+    )
+}
+
+/// Which of `files` the roots reach through what they load: every file
+/// `is_root` names, and every file of `files` a reached file loads, directly
+/// or through another. `modules` resolves a specifier the way the call graph
+/// does ([`WorkspaceIndex::resolve_module_path`]); a specifier the source
+/// computes names no file.
+///
+/// The one closure [`keep_what_is_imported`] and the derive's reached set
+/// (carrick#2397) share.
+pub(crate) fn import_closure(
+    files: &[&Path],
+    is_root: impl Fn(usize) -> bool,
+    modules: &crate::workspace_resolver::WorkspaceIndex,
+) -> Vec<bool> {
     let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut read: Vec<bool> = found.iter().map(|file| !file.ignored).collect();
-    let mut waiting: HashMap<PathBuf, usize> = found
-        .iter()
-        .enumerate()
-        .filter(|(_, file)| file.ignored)
-        .map(|(index, file)| (canonical(&file.path), index))
+    let mut read: Vec<bool> = (0..files.len()).map(&is_root).collect();
+    let mut waiting: HashMap<PathBuf, usize> = (0..files.len())
+        .filter(|&index| !read[index])
+        .map(|index| (canonical(files[index]), index))
         .collect();
-    let mut queue: Vec<usize> = (0..found.len()).filter(|&index| read[index]).collect();
+    let mut queue: Vec<usize> = (0..files.len()).filter(|&index| read[index]).collect();
     let mut reader = crate::parser::ModuleReader::quiet();
     while let Some(index) = queue.pop() {
         if waiting.is_empty() {
             break;
         }
-        let importer = &found[index].path;
+        let importer = files[index];
         for specifier in reader.loaded_specifiers(importer) {
             let Some(target) = modules.resolve_module_path(importer, &specifier) else {
                 continue;
@@ -777,12 +798,7 @@ fn keep_what_is_imported(
             }
         }
     }
-    let (kept, left_out): (Vec<_>, Vec<_>) =
-        found.into_iter().zip(read).partition(|(_, read)| *read);
-    (
-        kept.into_iter().map(|(file, _)| file.path).collect(),
-        left_out.into_iter().map(|(file, _)| file.path).collect(),
-    )
+    read
 }
 
 /// Find all JavaScript and TypeScript files in a directory

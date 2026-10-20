@@ -660,7 +660,7 @@ fn service_tsconfig_path(root: &Path, service_root: &Path, service: &Config) -> 
 }
 
 /// The part of a tsconfig `include` entry before its first wildcard.
-fn static_prefix(entry: &str) -> PathBuf {
+pub(crate) fn static_prefix(entry: &str) -> PathBuf {
     entry
         .trim_start_matches("./")
         .split('/')

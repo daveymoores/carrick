@@ -102,46 +102,10 @@ impl ModuleReader {
     /// specifier anywhere in the file. A specifier the source computes names
     /// no module and is not here.
     pub fn loaded_specifiers(&mut self, file: &Path) -> Vec<String> {
-        use swc_ecma_ast::{CallExpr, Callee, Expr, ModuleDecl, ModuleItem, TsModuleRef};
-        use swc_ecma_visit::{Visit, VisitWith};
-        struct Loads(Vec<String>);
-        impl Visit for Loads {
-            fn visit_call_expr(&mut self, call: &CallExpr) {
-                let loads = match &call.callee {
-                    Callee::Import(_) => true,
-                    Callee::Expr(callee) => {
-                        matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require")
-                    }
-                    Callee::Super(_) => false,
-                };
-                if loads
-                    && let [argument] = call.args.as_slice()
-                    && argument.spread.is_none()
-                    && let Some(specifier) =
-                        crate::request_summary::literal_specifier(&argument.expr)
-                {
-                    self.0.push(specifier);
-                }
-                call.visit_children_with(self);
-            }
-        }
         let Some(module) = parse_file(file, &self.source_map, &self.handler) else {
             return Vec::new();
         };
-        let mut found = static_specifiers(&module);
-        found.extend(module.body.iter().filter_map(|item| match item {
-            ModuleItem::ModuleDecl(ModuleDecl::TsImportEquals(decl)) => match &decl.module_ref {
-                TsModuleRef::TsExternalModuleRef(external) => {
-                    Some(external.expr.value.to_string_lossy().into_owned())
-                }
-                TsModuleRef::TsEntityName(_) => None,
-            },
-            _ => None,
-        }));
-        let mut loads = Loads(Vec::new());
-        module.visit_with(&mut loads);
-        found.extend(loads.0);
-        found
+        module_loads(&module)
     }
 
     /// Every module specifier `file` imports from, in source order.
@@ -155,6 +119,47 @@ impl ModuleReader {
         };
         static_specifiers(&module)
     }
+}
+
+/// Every module specifier `module` loads a module by, as
+/// [`ModuleReader::loaded_specifiers`] reads them from a file.
+pub fn module_loads(module: &Module) -> Vec<String> {
+    use swc_ecma_ast::{CallExpr, Callee, Expr, ModuleDecl, ModuleItem, TsModuleRef};
+    use swc_ecma_visit::{Visit, VisitWith};
+    struct Loads(Vec<String>);
+    impl Visit for Loads {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            let loads = match &call.callee {
+                Callee::Import(_) => true,
+                Callee::Expr(callee) => {
+                    matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require")
+                }
+                Callee::Super(_) => false,
+            };
+            if loads
+                && let [argument] = call.args.as_slice()
+                && argument.spread.is_none()
+                && let Some(specifier) = crate::request_summary::literal_specifier(&argument.expr)
+            {
+                self.0.push(specifier);
+            }
+            call.visit_children_with(self);
+        }
+    }
+    let mut found = static_specifiers(module);
+    found.extend(module.body.iter().filter_map(|item| match item {
+        ModuleItem::ModuleDecl(ModuleDecl::TsImportEquals(decl)) => match &decl.module_ref {
+            TsModuleRef::TsExternalModuleRef(external) => {
+                Some(external.expr.value.to_string_lossy().into_owned())
+            }
+            TsModuleRef::TsEntityName(_) => None,
+        },
+        _ => None,
+    }));
+    let mut loads = Loads(Vec::new());
+    module.visit_with(&mut loads);
+    found.extend(loads.0);
+    found
 }
 
 /// The specifiers `module` names in `import`, `export ... from` and
