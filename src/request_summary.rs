@@ -7785,10 +7785,6 @@ fn declared_client(
 pub struct RequestSummaryIndex {
     rows: HashMap<PathBuf, BTreeMap<u32, Vec<SummaryRow>>>,
     silent: HashMap<PathBuf, BTreeSet<u32>>,
-    /// Call sites whose URL reads as several written paths and that state no
-    /// row for that reason, by span start (carrick#2541): no other
-    /// deterministic pass states one there either.
-    several: HashMap<PathBuf, BTreeSet<u32>>,
     /// Every function that hands back its one request's parsed body
     /// ([`Summary::passes_body`]), by its file's canonical path and the name
     /// the file declares it under.
@@ -7910,12 +7906,6 @@ impl RequestSummaryIndex {
             .flat_map(|sites| sites.values())
             .map(Vec::len)
             .sum()
-    }
-
-    /// Call sites of `file` that state no row because their URL reads as
-    /// several written paths, by span start (carrick#2541).
-    pub fn several_paths(&self, file: &Path) -> Option<&BTreeSet<u32>> {
-        self.several.get(file)
     }
 
     pub fn silent_count(&self) -> usize {
@@ -8357,7 +8347,6 @@ fn emit(
             continue;
         }
         let mut rows: Vec<SummaryRow> = Vec::new();
-        let mut several = false;
         match composer.callee(file, call) {
             Some((callee_file, callee)) => {
                 let callee_ir = composer
@@ -8441,7 +8430,6 @@ fn emit(
                         Some(row) => rows.push(row),
                         None => {
                             index.undetermined += 1;
-                            several |= reads_several_paths(&instantiated);
                         }
                     }
                 }
@@ -8488,7 +8476,6 @@ fn emit(
                                         Some(row) => rows.push(row),
                                         None => {
                                             index.undetermined += 1;
-                                            several |= reads_several_paths(&effect);
                                         }
                                     }
                                 }
@@ -8516,31 +8503,11 @@ fn emit(
                 .entry(call.site.span_start)
                 .or_default()
                 .extend(rows);
-        } else if several {
-            index
-                .several
-                .entry(file.to_path_buf())
-                .or_default()
-                .insert(call.site.span_start);
         }
     }
     for nested in ir.nested.iter().chain(&ir.detached) {
         emit(composer, file, nested, index, false);
     }
-}
-
-/// Whether the URL `effect` sends reads as several written paths
-/// (carrick#2541): the site states no row for that reason.
-fn reads_several_paths(effect: &Effect) -> bool {
-    join_base(&effect.base, &effect.url).iter().any(|piece| {
-        matches!(
-            piece,
-            Piece::Opaque {
-                end: Root::Hole(HoleReason::SeveralPaths),
-                ..
-            }
-        )
-    })
 }
 
 /// Where a row's call expression sits relative to the request it states.
