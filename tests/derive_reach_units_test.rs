@@ -484,3 +484,77 @@ fn units_past_the_repo_cap_are_counted() {
     assert_eq!(listed, 2000);
     assert_eq!(cut, 100);
 }
+
+/// A Deno config is the service's manifest too: its `exports` are entries and
+/// its `tasks` are its scripts.
+#[test]
+fn a_deno_config_states_entries_and_tasks() {
+    let dir = tree(&[
+        (
+            "deno.json",
+            r#"{"exports":{".":"./mod.ts","./config":"./config.ts"},"tasks":{"dev":"deno run -A src/main.ts","check":{"command":"deno run tools/check.ts"}}}"#,
+        ),
+        ("mod.ts", "export * from \"./lib.ts\";\n"),
+        ("lib.ts", "export const lib = 1;\n"),
+        ("config.ts", "export const config = 1;\n"),
+        ("src/main.ts", "console.log(1);\n"),
+        ("tools/check.ts", "console.log(2);\n"),
+        ("scratch/x.ts", "console.log(3);\n"),
+    ]);
+    let found = only(&dir);
+    assert_eq!(found["reach"]["manifest_roots"], 2);
+    assert_eq!(found["reach"]["script_roots"], 2);
+    assert_eq!(found["reach"]["reached"], 5);
+    assert_eq!(units(&found), ["scratch"]);
+}
+
+/// An entry that names build output is read back to the source the compiler
+/// built it from: the path under a config's `outDir`, placed under its
+/// `rootDir`, else under its `include` roots, with the output extension
+/// swapped for a source one.
+#[test]
+fn an_entry_in_build_output_roots_the_source_it_was_built_from() {
+    let dir = tree(&[
+        (
+            "package.json",
+            r#"{"name":"worker","main":"./dist/index.cjs","types":"./dist/index.d.ts","exports":{".":{"types":"./dist/index.d.ts","import":"./dist/index.js"}}}"#,
+        ),
+        ("tsconfig.json", "{}"),
+        (
+            "tsconfig.build.json",
+            r#"{"include":["src/**/*.ts"],"compilerOptions":{"outDir":"dist"}}"#,
+        ),
+        ("src/index.ts", "export * from \"./queue\";\n"),
+        ("src/queue.ts", "export const queue = 1;\n"),
+        ("scratch/x.ts", "console.log(1);\n"),
+    ]);
+    let found = only(&dir);
+    assert_eq!(found["reach"]["manifest_roots"], 1);
+    assert_eq!(found["reach"]["reached"], 2);
+    assert_eq!(units(&found), ["scratch"]);
+}
+
+#[test]
+fn a_script_running_build_output_roots_the_source_under_root_dir() {
+    let dir = tree(&[
+        (
+            "package.json",
+            r#"{"name":"server","main":"dist/server.js","scripts":{"start":"tsc && node dist/server.js"}}"#,
+        ),
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"rootDir":"lib","outDir":"dist"}}"#,
+        ),
+        (
+            "lib/server.ts",
+            "import { routes } from \"./routes/index.js\";\nexport default routes;\n",
+        ),
+        ("lib/routes/index.ts", "export const routes = [];\n"),
+        ("one-off/fix.ts", "console.log(1);\n"),
+    ]);
+    let found = only(&dir);
+    assert_eq!(found["reach"]["manifest_roots"], 1);
+    assert_eq!(found["reach"]["script_roots"], 1);
+    assert_eq!(found["reach"]["reached"], 2);
+    assert_eq!(units(&found), ["one-off"]);
+}

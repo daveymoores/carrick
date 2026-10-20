@@ -176,23 +176,25 @@ pub fn service_reach(repo: &Path, service: &Config, files: &[PathBuf]) -> Servic
             .map(|(directory, tsconfig)| (directory.as_path(), tsconfig.as_path())),
     );
     let walk = Walk::new(files);
+    let internal = modules.internal_package_dirs();
     let mut roots = vec![false; files.len()];
     let mut reach = Reach::default();
 
-    let manifest = crate::file_finder::find_service_manifest(repo, service)
-        .filter(|path| path.file_name().is_some_and(|name| name == "package.json"))
-        .and_then(|path| {
-            let json = crate::packages::read_json_config(&path).ok()?;
-            Some((path.parent()?.to_path_buf(), json))
-        });
+    // A `package.json`, or a Deno config: its `exports` are entries and its
+    // `tasks` are its scripts.
+    let manifest = crate::file_finder::find_service_manifest(repo, service).and_then(|path| {
+        let json = crate::packages::read_json_config(&path).ok()?;
+        Some((path.parent()?.to_path_buf(), json))
+    });
     if let Some((dir, json)) = &manifest {
+        let outputs = build_outputs(repo, dir, &internal);
         let entries: BTreeSet<usize> = manifest_entries(json)
             .iter()
-            .flat_map(|target| walk.resolve(dir, target))
+            .flat_map(|target| walk.resolve(dir, target, &outputs))
             .collect();
         let scripts: BTreeSet<usize> = script_tokens(json)
             .iter()
-            .flat_map(|token| walk.resolve(dir, token))
+            .flat_map(|token| walk.resolve(dir, token, &outputs))
             .collect();
         reach.manifest_roots = entries.len();
         reach.script_roots = scripts.len();
@@ -210,7 +212,6 @@ pub fn service_reach(repo: &Path, service: &Config, files: &[PathBuf]) -> Servic
         }
     }
 
-    let internal = modules.internal_package_dirs();
     if let Some(config) = governing_config(repo, &service_root, service) {
         let rules = program_rules(repo, &config, &internal);
         let config_dir = config.parent().unwrap_or(repo).to_path_buf();
@@ -295,8 +296,9 @@ impl Walk {
     /// The walk files a manifest target names, relative to `dir`: as
     /// written, with each source extension appended, or as a directory's
     /// `index`. A target with a `*` is a subpath pattern and names every walk
-    /// file under its static prefix.
-    fn resolve(&self, dir: &Path, target: &str) -> Vec<usize> {
+    /// file under its static prefix. A target in build output names the
+    /// source it was built from ([`BuildOutput`]).
+    fn resolve(&self, dir: &Path, target: &str, outputs: &[BuildOutput]) -> Vec<usize> {
         if let Some(star) = target.find('*') {
             let prefix = normalize(&dir.join(&target[..star]));
             let mut prefix = prefix.to_string_lossy().into_owned();
@@ -316,7 +318,21 @@ impl Walk {
                 .collect();
         }
         let base = normalize(&dir.join(target));
-        let mut candidates = vec![base.clone()];
+        if let Some(found) = self.source_at(&base) {
+            return vec![found];
+        }
+        outputs
+            .iter()
+            .flat_map(|output| output.sources_of(&base))
+            .find_map(|stem| self.source_at(&stem))
+            .into_iter()
+            .collect()
+    }
+
+    /// The walk file at `base` as written, with a source extension
+    /// appended, or as a directory's `index`.
+    fn source_at(&self, base: &Path) -> Option<usize> {
+        let mut candidates = vec![base.to_path_buf()];
         for extension in SOURCE_EXTENSIONS {
             candidates.push(PathBuf::from(format!("{}.{extension}", base.display())));
         }
@@ -327,9 +343,95 @@ impl Walk {
             .iter()
             .filter(|candidate| candidate.is_file())
             .find_map(|candidate| self.index(candidate))
-            .into_iter()
-            .collect()
     }
+}
+
+/// Where one config at a manifest's directory emits (`outDir`) and the
+/// source directories it emits from: its `rootDir`, else the static prefix
+/// of each `include` entry, else its own directory. Each key is decided by the
+/// nearest config in the `extends` chain that states it.
+struct BuildOutput {
+    out_dir: PathBuf,
+    source_dirs: Vec<PathBuf>,
+}
+
+impl BuildOutput {
+    /// The source stems (no extension) a path under `out_dir` was built from:
+    /// the same relative path under each source directory, its output
+    /// extension (`.js`, `.mjs`, `.cjs`, `.jsx`, `.d.ts`, `.d.mts`, `.d.cts`)
+    /// removed.
+    fn sources_of(&self, built: &Path) -> Vec<PathBuf> {
+        let Ok(relative) = built.strip_prefix(&self.out_dir) else {
+            return Vec::new();
+        };
+        let text = relative.to_string_lossy();
+        let stem = [".d.ts", ".d.mts", ".d.cts", ".js", ".mjs", ".cjs", ".jsx"]
+            .iter()
+            .find_map(|extension| text.strip_suffix(extension))
+            .unwrap_or(&text);
+        self.source_dirs.iter().map(|dir| dir.join(stem)).collect()
+    }
+}
+
+/// The [`BuildOutput`] of every `tsconfig*.json` at `dir`, in name order.
+fn build_outputs(
+    repo: &Path,
+    dir: &Path,
+    internal: &BTreeMap<String, PathBuf>,
+) -> Vec<BuildOutput> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut configs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("tsconfig") && name.ends_with(".json"))
+        })
+        .collect();
+    configs.sort();
+    configs
+        .iter()
+        .filter_map(|config| {
+            let relative = config.strip_prefix(repo).ok()?;
+            let (chain, _) = crate::module_aliases::tsconfig_chain(repo, relative, internal);
+            let option = |key: &str| -> Option<PathBuf> {
+                chain.iter().find_map(|(declared_in, json)| {
+                    let value = json.get("compilerOptions")?.get(key)?.as_str()?;
+                    let base = repo.join(declared_in.parent().unwrap_or(Path::new("")));
+                    Some(normalize(&base.join(value)))
+                })
+            };
+            let out_dir = option("outDir")?;
+            let source_dirs = match option("rootDir") {
+                Some(root_dir) => vec![root_dir],
+                None => chain
+                    .iter()
+                    .find_map(|(declared_in, json)| {
+                        let entries = json.get("include")?.as_array()?;
+                        let base = repo.join(declared_in.parent().unwrap_or(Path::new("")));
+                        Some(
+                            entries
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(|entry| {
+                                    normalize(&base.join(crate::change_scope::static_prefix(entry)))
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .unwrap_or_else(|| vec![config.parent().unwrap_or(dir).to_path_buf()]),
+            };
+            Some(BuildOutput {
+                out_dir,
+                source_dirs,
+            })
+        })
+        .collect()
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -369,15 +471,19 @@ fn string_leaves(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-/// The tokens of every `scripts` command, split on whitespace and shell
+/// The tokens of every `scripts` command (a Deno config's `tasks`, written
+/// as a string or as `{ "command": … }`), split on whitespace and shell
 /// operators, quotes stripped.
 fn script_tokens(json: &serde_json::Value) -> Vec<String> {
-    let Some(scripts) = json.get("scripts").and_then(serde_json::Value::as_object) else {
-        return Vec::new();
-    };
-    scripts
-        .values()
-        .filter_map(serde_json::Value::as_str)
+    ["scripts", "tasks"]
+        .into_iter()
+        .filter_map(|key| json.get(key).and_then(serde_json::Value::as_object))
+        .flat_map(|commands| commands.values())
+        .filter_map(|command| {
+            command
+                .as_str()
+                .or_else(|| command.get("command").and_then(serde_json::Value::as_str))
+        })
         .flat_map(|command| {
             command
                 .split(|c: char| {
