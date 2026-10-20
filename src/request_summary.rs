@@ -87,7 +87,10 @@
 //! - **A builder's return is a value** (carrick#1562). A call to a
 //!   module-scope builder (an arrow or a function whose body only returns an
 //!   expression, or one held in a constant object nothing writes through) is
-//!   what it returns, with the call's arguments in its parameters.
+//!   what it returns, with the call's arguments in its parameters. Several
+//!   returns that end in one written path, after values the source does not
+//!   write, read as a hole for those values with the path after it
+//!   (carrick#2536).
 //! - **A key of an object parameter is a parameter** (carrick#1950). A
 //!   wrapper that takes its request as one object (`send({ url, body })`)
 //!   reads each key as the caller writes it: through a destructured
@@ -1435,6 +1438,20 @@ pub fn extract_file_ir(
     };
     module_scope.guards = guards::ModuleGuards::of(module, &imports, definition_keys, &reader);
 
+    // A function declared at module scope whose body only returns text is a
+    // builder (carrick#1562), unless the module assigns its binding again.
+    // A declaration is hoisted, so every constant below reads it
+    // (carrick#2536).
+    for item in &module.body {
+        if let Some(Decl::Fn(fn_decl)) = module_decl(item)
+            && !reassigned.names.contains(fn_decl.ident.sym.as_ref())
+            && let Some(builder) = Builder::of_function(&fn_decl.function)
+        {
+            module_scope
+                .builders
+                .insert((ident_key(&fn_decl.ident), Vec::new()), builder);
+        }
+    }
     // Module constants first, in source order, so a later one can read an
     // earlier one (`const BASE = ...; const USERS = `${BASE}/users``).
     for item in &module.body {
@@ -1525,22 +1542,16 @@ pub fn extract_file_ir(
                 .insert(DEFAULT_EXPORT.to_string(), client);
         }
     }
-    // A function declared at module scope whose body only returns text is a
-    // builder a name may read through (carrick#1562), unless the module
-    // assigns its binding again. Read once every constant is known, since a
-    // declaration is hoisted.
+    // A name may read through such a builder too. Read once every constant is
+    // known, since the text it builds may name one.
     for item in &module.body {
         if let Some(Decl::Fn(fn_decl)) = module_decl(item)
             && !reassigned.names.contains(fn_decl.ident.sym.as_ref())
             && let Some(builder) = Builder::of_function(&fn_decl.function)
+            && let Some(value) = library_sites::builder(&builder, &module_scope)
         {
-            if let Some(value) = library_sites::builder(&builder, &module_scope) {
-                module_scope.named.insert(ident_key(&fn_decl.ident));
-                file.names.insert(fn_decl.ident.sym.to_string(), value);
-            }
-            module_scope
-                .builders
-                .insert((ident_key(&fn_decl.ident), Vec::new()), builder);
+            module_scope.named.insert(ident_key(&fn_decl.ident));
+            file.names.insert(fn_decl.ident.sym.to_string(), value);
         }
     }
     // A client a getter builds into a module `let` on first use
@@ -1868,7 +1879,9 @@ impl ModuleScope {
 /// reads a call to it (carrick#1562): its parameters and what it returns.
 struct Builder {
     params: Vec<Option<BindingKey>>,
-    returned: Box<Expr>,
+    /// Each different expression a `return` writes, in source order; never
+    /// empty. [`Reader::builder_call`] reads them together (carrick#2536).
+    returned: Vec<Expr>,
 }
 
 impl Builder {
@@ -1878,10 +1891,10 @@ impl Builder {
         match crate::graphql_document_sites::unwrap_expression(expr) {
             Expr::Arrow(arrow) => Some(Builder {
                 params: arrow.params.iter().map(pat_key).collect(),
-                returned: Box::new(match &*arrow.body {
-                    ArrowFunctionBody::Expr(expr) => (**expr).clone(),
-                    ArrowFunctionBody::FunctionBody(block) => returned_value(&block.stmts)?,
-                }),
+                returned: match &*arrow.body {
+                    ArrowFunctionBody::Expr(expr) => vec![(**expr).clone()],
+                    ArrowFunctionBody::FunctionBody(block) => returned_values(&block.stmts)?,
+                },
             }),
             Expr::Fn(function) => Self::of_function(&function.function),
             _ => None,
@@ -1898,7 +1911,7 @@ impl Builder {
                 .iter()
                 .map(|param| pat_key(&param.pat))
                 .collect(),
-            returned: Box::new(returned_value(&function.body.as_ref()?.stmts)?),
+            returned: returned_values(&function.body.as_ref()?.stmts)?,
         })
     }
 
@@ -1932,21 +1945,21 @@ impl Builder {
     }
 }
 
-/// The one expression every `return` of a function body writes
-/// (carrick#2447), with each local `const` it names replaced by its
+/// Each different expression a `return` of a function body writes, in source
+/// order (carrick#2447, carrick#2536), with each local `const` it names replaced by its
 /// initialiser, so the builder reads it as `return root + "/v1"` for
 /// `const root = "/api"; return root + "/v1"`.
 ///
 /// The body may hold only `const name = <expr>` declarations, `return <expr>`,
 /// `throw`, blocks and `if` / `else`, and every path through it must end in a
-/// `return` or a `throw`. Several returns count only when they write the same
-/// expression: a body returning two different values states none (the
-/// call stays a hole), as does any other statement (a loop, a `let`, a call
-/// that may change what a later line reads). A local is replaced by its
+/// `return` or a `throw`. Any other statement (a loop, a `let`, a call that
+/// may change what a later line reads) states no value, and nor does a body
+/// with no `return`. The caller reads several different returns together
+/// ([`shared_written_tail`]). A local is replaced by its
 /// binding ([`ident_key`]), never by name, and a `const` a block or a branch
 /// declares is read only inside it, so a block that declares the name again
 /// keeps its own and the lines after the block read the outer one.
-fn returned_value(stmts: &[Stmt]) -> Option<Expr> {
+fn returned_values(stmts: &[Stmt]) -> Option<Vec<Expr>> {
     fn ends(stmts: &[Stmt]) -> bool {
         stmts.iter().any(|stmt| match stmt {
             Stmt::Return(_) | Stmt::Throw(_) => true,
@@ -2023,11 +2036,50 @@ fn returned_value(stmts: &[Stmt]) -> Option<Expr> {
     }
     let mut returns = Vec::new();
     walk(stmts, &mut HashMap::new(), &mut returns)?;
-    let first = returns.first()?.clone();
-    returns
-        .iter()
-        .all(|other| swc_common::EqIgnoreSpan::eq_ignore_span(other, &first))
-        .then_some(first)
+    let mut distinct: Vec<Expr> = Vec::new();
+    for value in returns {
+        if !distinct
+            .iter()
+            .any(|seen| swc_common::EqIgnoreSpan::eq_ignore_span(seen, &value))
+        {
+            distinct.push(value);
+        }
+    }
+    (!distinct.is_empty()).then_some(distinct)
+}
+
+/// The written path every value ends in, when what comes before it is only
+/// values the source does not write (carrick#2536): `readMount() + "/svc"`
+/// and `"/svc"` share `/svc`. The tails must be byte-equal, not merely
+/// share a suffix (`/v1/api` and `/v2/api` share none, and `/admin/api` with
+/// `/api` would fold written text into the hole). The tail starts with `/`,
+/// holds a non-empty segment and no `?` or `#`, and every earlier piece of
+/// every value is an unread value.
+fn shared_written_tail(values: &[Value]) -> Option<String> {
+    let mut tail: Option<&str> = None;
+    for value in values {
+        let Value::Str(pieces) = value else {
+            return None;
+        };
+        let (Piece::Lit(last), before) = pieces.split_last()? else {
+            return None;
+        };
+        if !before
+            .iter()
+            .all(|piece| matches!(piece, Piece::Opaque { .. }))
+        {
+            return None;
+        }
+        if tail.is_some_and(|tail| tail != last) {
+            return None;
+        }
+        tail = Some(last);
+    }
+    let tail = tail?;
+    (tail.starts_with('/')
+        && !tail.contains(['?', '#'])
+        && tail.split('/').any(|segment| !segment.is_empty()))
+    .then(|| tail.to_string())
 }
 
 /// How one binding is used beyond its own declaration: an identifier, or a
@@ -4865,9 +4917,27 @@ impl Reader<'_> {
             inner.locals.insert(param.clone(), value);
         }
         self.builder_depth.set(depth + 1);
-        let value = self.eval(&builder.returned, &inner);
+        let values: Vec<Value> = builder
+            .returned
+            .iter()
+            .map(|returned| self.eval(returned, &inner))
+            .collect();
         self.builder_depth.set(depth);
-        Some(value)
+        if values.iter().all(|value| *value == values[0]) {
+            return values.into_iter().next();
+        }
+        // Returns that differ: the call stays the hole it was, followed by
+        // the path every return writes (carrick#2536).
+        shared_written_tail(&values).map(|tail| {
+            Value::Str(vec![
+                Piece::Opaque {
+                    text: self.text(call.span),
+                    end: Root::Hole(HoleReason::UnreadExpression),
+                    link: None,
+                },
+                Piece::Lit(tail),
+            ])
+        })
     }
 
     /// `new URL(path, base)`: the base is opaque and leads, the path follows.
@@ -9737,9 +9807,9 @@ function build() { return {}; }
         let Some(ModuleItem::Stmt(Stmt::Decl(Decl::Fn(base)))) = module.body.first() else {
             panic!("the module declares base first");
         };
-        let returned = returned_value(&base.function.body.as_ref().expect("body").stmts);
+        let returned = returned_values(&base.function.body.as_ref().expect("body").stmts);
         assert!(
-            matches!(&returned, Some(Expr::Lit(Lit::Str(text))) if text.value.to_string_lossy() == "/x"),
+            matches!(returned.as_deref(), Some([Expr::Lit(Lit::Str(text))]) if text.value.to_string_lossy() == "/x"),
             "{returned:?}"
         );
     }
@@ -9765,6 +9835,123 @@ function build() { return {}; }
             assert!(
                 matches!(url.first(), Some(Piece::Opaque { text, .. }) if text == "base()"),
                 "{body}: {url:?}"
+            );
+        }
+    }
+
+    /// carrick#2536: a module constant set to a call of a function the
+    /// module declares is what the function returns. A declaration is
+    /// hoisted, so a constant written above it reads it too.
+    #[test]
+    fn a_constant_set_by_a_declared_function_reads_what_it_returns() {
+        for (source, target) in [
+            (
+                "function base() { return \"/api/v1\"; }\n\
+                 const API = base();\n\
+                 export function f() { return fetch(API + \"/x\"); }\n",
+                "/api/v1/x",
+            ),
+            (
+                "const API = base();\n\
+                 function base() { return process.env.ORIGIN + \"/api/v1\"; }\n\
+                 export function f() { return fetch(API + \"/x\"); }\n",
+                "${process.env.ORIGIN}/api/v1/x",
+            ),
+        ] {
+            let url = request_url(source, "f");
+            assert_eq!(render_target(&url).as_deref(), Some(target), "{source}");
+        }
+    }
+
+    /// carrick#2536: returns that differ only in a value the source does not
+    /// write, before one literal path every return ends in, read as a hole
+    /// for that value with the path after it. The hole is the call, as it
+    /// was before; only the path is added.
+    #[test]
+    fn returns_that_end_in_one_written_path_keep_it_after_a_hole() {
+        for source in [
+            "function base() { const m = readMount(); if (m) { return m + \"/svc/v2\"; } return \"/svc/v2\"; }\n\
+             export function f() { return fetch(base() + \"/x\"); }\n",
+            "function base() { if (flag()) { return process.env.ROOT + \"/svc/v2\"; } return `${origin()}/svc/v2`; }\n\
+             export function f() { return fetch(base() + \"/x\"); }\n",
+            "const base = () => { if (flag()) { return readMount() + \"/svc/v2\"; } return \"/svc/v2\"; };\n\
+             export function f() { return fetch(base() + \"/x\"); }\n",
+            "function base() { if (flag()) { return readMount() + \"/svc/v2\"; } return \"/svc/v2\"; }\n\
+             const ROOT = base();\n\
+             export function f() { return fetch(ROOT + \"/x\"); }\n",
+        ] {
+            let url = request_url(source, "f");
+            assert_eq!(
+                first_end(&url),
+                (
+                    &Root::Hole(HoleReason::UnreadExpression),
+                    Some("${base()}/svc/v2/x".to_string())
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    /// carrick#2536, must not verify: no path is claimed that every return
+    /// does not write whole after only values the source does not write.
+    /// Returns ending in different text (even with a common tail, `/api`),
+    /// a varying part the source writes (`/admin`, `/t/`), a path with no
+    /// leading slash or no segment, text the call hands the function, and a
+    /// parameter a caller may fill with text all leave the call the one hole
+    /// it was before.
+    #[test]
+    fn returns_that_do_not_end_in_one_written_path_stay_a_hole() {
+        for (declaration, params, call) in [
+            (
+                "function base() { if (flag()) { return \"/api/v1\"; } return \"/api/v2\"; }",
+                "",
+                "base()",
+            ),
+            (
+                "function base() { if (flag()) { return \"/v1/api\"; } return \"/v2/api\"; }",
+                "",
+                "base()",
+            ),
+            (
+                "function base() { if (flag()) { return readMount() + \"/admin/api\"; } return \"/api\"; }",
+                "",
+                "base()",
+            ),
+            (
+                "function base() { if (flag()) { return `/t/${tenant()}/api`; } return \"/api\"; }",
+                "",
+                "base()",
+            ),
+            (
+                "function base() { if (flag()) { return readMount() + \"api/v1\"; } return \"api/v1\"; }",
+                "",
+                "base()",
+            ),
+            (
+                "function base() { if (flag()) { return readMount() + \"/\"; } return \"/\"; }",
+                "",
+                "base()",
+            ),
+            (
+                "function base(p: string) { if (p) { return p + \"/api\"; } return \"/api\"; }",
+                "",
+                "base(\"/admin\")",
+            ),
+            (
+                "function base(p: string) { if (p) { return p + \"/api\"; } return \"/api\"; }",
+                "prefix: string",
+                "base(prefix)",
+            ),
+        ] {
+            let url = request_url(
+                &format!(
+                    "{declaration}\nexport function f({params}) {{ return fetch({call} + \"/x\"); }}\n"
+                ),
+                "f",
+            );
+            assert!(
+                matches!(url.as_slice(), [Piece::Opaque { text, .. }, Piece::Lit(rest)] if text == call && rest == "/x"),
+                "{declaration}: {url:?}"
             );
         }
     }
