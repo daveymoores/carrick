@@ -25796,7 +25796,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     /// different paths.
     #[test]
     fn an_imported_value_claims_no_path_it_does_not_hold() {
-        let cases: [(&[(&str, &str)], &str, &str); 4] = [
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, &'a str);
+        let cases: [Case; 4] = [
             (
                 &[
                     ("src/mount.ts", "export const MOUNT = \"/mnt\";\n"),

@@ -1239,6 +1239,13 @@ pub struct FileIr {
     held_returns: HashMap<String, Held>,
 }
 
+/// Text a link resolves to, and what a binding hands an importer where it
+/// does not, each by the importing file and the binding it names.
+type LinkedReads = (
+    HashMap<(PathBuf, library_sites::NamedRef), String>,
+    HashMap<(PathBuf, library_sites::NamedRef), Held>,
+);
+
 /// What a module-scope binding hands an importer where its text cannot be
 /// read by name (carrick#2540): the declaring module's own reading of it.
 /// The importer reads the binding as the declaring module does.
@@ -7243,10 +7250,7 @@ impl RequestSummaryInputs {
         if wanted.is_empty() {
             return self;
         }
-        let (resolved, held): (
-            HashMap<(PathBuf, library_sites::NamedRef), String>,
-            HashMap<(PathBuf, library_sites::NamedRef), Held>,
-        ) = {
+        let (resolved, held): LinkedReads = {
             let names =
                 library_sites::LinkedNames::link(&self.files, &self.bindings, self.links.as_ref());
             let mut resolved = HashMap::new();
