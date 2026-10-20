@@ -419,10 +419,7 @@ fn a_vendored_bundle_and_a_docs_template_beside_an_app_are_offered() {
             "docs/template/src/api.js",
             "export function user(login) {\n  return fetch(\"/users/\" + login);\n}\n",
         ),
-        (
-            "docs/template/download-pack/editor.min.js",
-            minified.as_str(),
-        ),
+        ("docs/template/assets/editor.min.js", minified.as_str()),
     ]);
     let found = only(&dir);
     assert_eq!(found["reach"]["reached"], 2);
