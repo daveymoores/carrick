@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.122](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.121...carrick-v0.3.122) (2026-10-20)
+
+
+### Bug Fixes
+
+* **request_summary:** a value that reads as several written paths states no row ([#2547](https://github.com/carrick-tools/carrick/issues/2547)) ([512bd32](https://github.com/carrick-tools/carrick/commit/512bd32ac1497b9c2f16dc7356b620aa6d73da00))
+* **request_summary:** keep the path every return of a module builder writes ([#2542](https://github.com/carrick-tools/carrick/issues/2542)) ([3826714](https://github.com/carrick-tools/carrick/commit/38267140858ad4a70a8be48d2ebacdfcf06cf7a6)), closes [#2536](https://github.com/carrick-tools/carrick/issues/2536)
+* **request_summary:** read an imported constant or builder as its own module reads it ([#2546](https://github.com/carrick-tools/carrick/issues/2546)) ([1bd6a8c](https://github.com/carrick-tools/carrick/commit/1bd6a8c0410036bbecd5908975c6fa918a0eef35))
+* **scanner:** scope an in-process site row to its service whatever its kind ([#2544](https://github.com/carrick-tools/carrick/issues/2544)) ([96d6f72](https://github.com/carrick-tools/carrick/commit/96d6f72440cfc72cc9a15e769a6e54ce800893ee)), closes [#2538](https://github.com/carrick-tools/carrick/issues/2538)
+* **site-rows:** drop a lead on a line the blob already holds a row at ([#2545](https://github.com/carrick-tools/carrick/issues/2545)) ([2cc3878](https://github.com/carrick-tools/carrick/commit/2cc3878933b559051d80ea508b3e7c0a83ddfdb1))
+
 ## [0.3.121](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.120...carrick-v0.3.121) (2026-10-19)
 
 
