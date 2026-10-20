@@ -25806,4 +25806,136 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             "{rows:#?}"
         );
     }
+
+    /// `src/orders.ts` imports `import` from `src/config.ts` and leads a
+    /// wrapper's URL with `head`; a caller in the module fills the wrapper's
+    /// query (carrick#2540). `files` holds config.ts and any module it
+    /// imports. The rows orders.ts states: each target and its path.
+    fn importer_rows(files: &[(&str, &str)], import: &str, head: &str) -> Vec<(String, String)> {
+        let orders = format!(
+            "import {{ {import} }} from \"./config\";\n\
+             \n\
+             async function fetchLines(order: string, page: string) {{\n\
+             \x20 const res = await fetch(`${{{head}}}/orders/${{encodeURIComponent(order)}}/lines?page=${{page}}`);\n\
+             \x20 return res.json();\n\
+             }}\n\
+             \n\
+             export function firstPage() {{\n\
+             \x20 return fetchLines(currentOrder(), \"1\");\n\
+             }}\n"
+        );
+        let mut all: Vec<(&str, &str)> = files.to_vec();
+        all.push(("src/orders.ts", orders.as_str()));
+        let (dir, discovery) = discover_sources(&all);
+        let normalizer = crate::url_normalizer::UrlNormalizer::new(&Config::default());
+        summary_rows_of(&dir, &discovery, "src/orders.ts")
+            .into_iter()
+            .map(|row| {
+                let path = normalizer.normalize(&row.target).path;
+                (row.target, path)
+            })
+            .collect()
+    }
+
+    /// carrick#2540: an imported constant set by a call to a function the
+    /// declaring module declares reads what the function returns: above or
+    /// below the constant, and when its return reads another constant.
+    #[test]
+    fn an_imported_constant_a_declared_function_sets_reads_what_it_returns() {
+        for config in [
+            "function base() { return \"/svc/v2\"; }\nexport const ROOT = base();\n",
+            "export const ROOT = base();\nfunction base() { return \"/svc/v2\"; }\n",
+            "const PREFIX = \"/svc\";\nfunction base() { return PREFIX + \"/v2\"; }\nexport const ROOT = base();\n",
+        ] {
+            assert_eq!(
+                importer_rows(&[("src/config.ts", config)], "ROOT", "ROOT"),
+                vec![(
+                    "/svc/v2/orders/${encodeURIComponent(order)}/lines?page=1".to_string(),
+                    "/svc/v2/orders/:order/lines".to_string()
+                )],
+                "{config}"
+            );
+        }
+    }
+
+    /// carrick#2540: an imported constant or builder whose value is a value
+    /// no module writes, then one written path, hands the importer that
+    /// path after its own piece.
+    #[test]
+    fn an_imported_value_keeps_the_path_after_a_value_no_module_writes() {
+        let tail = |head: &str| {
+            vec![(
+                format!("${{{head}}}/svc/v2/orders/${{encodeURIComponent(order)}}/lines?page=1"),
+                "/svc/v2/orders/:order/lines".to_string(),
+            )]
+        };
+        let two_returns = "function serviceRoot() {\n  const m = readMount();\n  if (m) {\n    return m + \"/svc/v2\";\n  }\n  return \"/svc/v2\";\n}\n";
+        for (config, import, head) in [
+            (format!("{two_returns}export const ROOT = serviceRoot();\n"), "ROOT", "ROOT"),
+            ("export const ROOT = process.env.ORDERS_ORIGIN + \"/svc/v2\";\n".to_string(), "ROOT", "ROOT"),
+            ("export const ROOT = `${process.env.ORDERS_ORIGIN}/svc/v2`;\n".to_string(), "ROOT", "ROOT"),
+            (format!("export {two_returns}"), "serviceRoot", "serviceRoot()"),
+            ("export function serviceRoot() { return process.env.ORDERS_ORIGIN + \"/svc/v2\"; }\n".to_string(), "serviceRoot", "serviceRoot()"),
+        ] {
+            assert_eq!(
+                importer_rows(&[("src/config.ts", &config)], import, head),
+                tail(head),
+                "{config}"
+            );
+        }
+    }
+
+    /// carrick#2540, must not verify: no path crosses where the exporter
+    /// does not hold it after only values no module writes: a lead that is
+    /// another module's binding, a `let`, a builder whose prefix the caller
+    /// hands it (`/admin/svc` is the real path), and returns that end in
+    /// different paths.
+    #[test]
+    fn an_imported_value_claims_no_path_it_does_not_hold() {
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, &'a str);
+        let cases: [Case; 4] = [
+            (
+                &[
+                    ("src/mount.ts", "export const MOUNT = \"/mnt\";\n"),
+                    (
+                        "src/config.ts",
+                        "import { MOUNT } from \"./mount\";\nexport const ROOT = MOUNT + readSuffix() + \"/svc\";\n",
+                    ),
+                ],
+                "ROOT",
+                "ROOT",
+            ),
+            (
+                &[(
+                    "src/config.ts",
+                    "export let ROOT = process.env.ORDERS_ORIGIN + \"/svc\";\n",
+                )],
+                "ROOT",
+                "ROOT",
+            ),
+            (
+                &[(
+                    "src/config.ts",
+                    "export function serviceRoot(prefix: string) {\n  if (prefix) {\n    return prefix + \"/svc\";\n  }\n  return \"/svc\";\n}\n",
+                )],
+                "serviceRoot",
+                "serviceRoot(\"/admin\")",
+            ),
+            (
+                &[(
+                    "src/config.ts",
+                    "function serviceRoot() {\n  if (legacy()) {\n    return \"/svc/v1\";\n  }\n  return \"/svc/v2\";\n}\nexport const ROOT = serviceRoot();\n",
+                )],
+                "ROOT",
+                "ROOT",
+            ),
+        ];
+        for (files, import, head) in cases {
+            let rows = importer_rows(files, import, head);
+            assert!(
+                rows.iter().all(|(target, _)| !target.contains("/svc")),
+                "{files:?}: {rows:#?}"
+            );
+        }
+    }
 }
