@@ -90,7 +90,9 @@
 //!   what it returns, with the call's arguments in its parameters. Several
 //!   returns that end in one written path, after values the source does not
 //!   write, read as a hole for those values with the path after it
-//!   (carrick#2536).
+//!   (carrick#2536). Returns that write different
+//!   paths, and a conditional whose branches do, read as no one path and
+//!   state no row (carrick#2541).
 //! - **A key of an object parameter is a parameter** (carrick#1950). A
 //!   wrapper that takes its request as one object (`send({ url, body })`)
 //!   reads each key as the caller writes it: through a destructured
@@ -357,6 +359,19 @@ impl Piece {
 /// the parameter it is read from, and anything else at the expression
 /// reading stopped at.
 fn end_of(pieces: &[Piece]) -> Root {
+    // A value that reads as several written paths keeps that end through a
+    // rename (carrick#2541).
+    if pieces.iter().any(|piece| {
+        matches!(
+            piece,
+            Piece::Opaque {
+                end: Root::Hole(HoleReason::SeveralPaths),
+                ..
+            }
+        )
+    }) {
+        return Root::Hole(HoleReason::SeveralPaths);
+    }
     match pieces {
         [Piece::Lit(text)] => Root::Literal(text.clone()),
         [Piece::Opaque { end, .. }] => end.clone(),
@@ -1256,6 +1271,9 @@ enum Held {
     /// Values the source does not write, then the one written path every
     /// value ends in ([`shared_written_tail`]).
     Tail(String),
+    /// The value reads as more than one written path (carrick#2541): no
+    /// importer keys a row on it.
+    SeveralPaths,
 }
 
 /// Every expression-position identifier among `names`, by name, with its
@@ -2166,9 +2184,13 @@ fn shared_written_tail(values: &[Value]) -> Option<String> {
 /// written text every value is, or the one written path every value ends in
 /// after values the source does not write. A value that reads through another
 /// module's binding is never a tail: that binding may write path text the
-/// tail would hide.
+/// tail would hide. A value that reads as several written paths is that
+/// (carrick#2541).
 fn held_by(values: &[Value]) -> Option<Held> {
     let first = values.first()?;
+    if values.iter().any(holds_several_paths) {
+        return Some(Held::SeveralPaths);
+    }
     if let Value::Str(pieces) = first
         && let [Piece::Lit(text)] = pieces.as_slice()
         && values.iter().all(|value| value == first)
@@ -2180,10 +2202,79 @@ fn held_by(values: &[Value]) -> Option<Held> {
             .iter()
             .any(|piece| matches!(piece, Piece::Opaque { link: Some(_), .. })))
     };
-    if values.iter().any(linked) {
-        return None;
+    if !values.iter().any(linked)
+        && let Some(tail) = shared_written_tail(values)
+    {
+        return Some(Held::Tail(tail));
     }
-    shared_written_tail(values).map(Held::Tail)
+    several_values(values.to_vec(), String::new())
+        .filter(holds_several_paths)
+        .map(|_| Held::SeveralPaths)
+}
+
+/// Whether `value` writes a path: a literal that holds a `/` with a
+/// non-empty segment before any `?` or `#`, outside the origin
+/// (`scheme://host[:port]` or `//host`) a value may lead with (carrick#2541).
+/// An origin is a base, not a path.
+fn writes_a_path_segment(value: &Value) -> bool {
+    let Value::Str(pieces) = value else {
+        return false;
+    };
+    for (position, piece) in pieces.iter().enumerate() {
+        let Piece::Lit(text) = piece else {
+            continue;
+        };
+        let text = if position == 0 && is_absolute_url(text) {
+            let rest = text.split_once("//").map_or("", |(_, rest)| rest);
+            rest.find('/').map_or("", |at| &rest[at..])
+        } else {
+            text.as_str()
+        };
+        let route = text.split(['?', '#']).next().unwrap_or("");
+        if route.contains('/') && route.split('/').any(|segment| !segment.is_empty()) {
+            return true;
+        }
+        if route.len() != text.len() {
+            return false;
+        }
+    }
+    false
+}
+
+/// A value that is one of `values`: a builder's returns, a conditional's
+/// branches (carrick#2536, carrick#2541).
+///
+/// 1. Every value equal: that value.
+/// 2. [`shared_written_tail`]: the unread value, then the one path they share.
+/// 3. Some value writes a path, or already reads as several: the hole
+///    [`HoleReason::SeveralPaths`], which no row is keyed on.
+/// 4. Otherwise `None`: the caller's hole, as before.
+fn several_values(values: Vec<Value>, text: String) -> Option<Value> {
+    if values.iter().all(|value| *value == values[0]) {
+        return values.into_iter().next();
+    }
+    if let Some(tail) = shared_written_tail(&values) {
+        return Some(Value::Str(vec![
+            Piece::Opaque {
+                text,
+                end: Root::Hole(HoleReason::UnreadExpression),
+                link: None,
+            },
+            Piece::Lit(tail),
+        ]));
+    }
+    values
+        .iter()
+        .any(|value| writes_a_path_segment(value) || holds_several_paths(value))
+        .then(|| Value::hole(text, HoleReason::SeveralPaths))
+}
+
+/// Whether `value` holds a piece that reads as several written paths.
+fn holds_several_paths(value: &Value) -> bool {
+    matches!(value, Value::Str(pieces) if pieces.iter().any(|piece| matches!(
+        piece,
+        Piece::Opaque { end: Root::Hole(HoleReason::SeveralPaths), .. }
+    )))
 }
 
 /// How one binding is used beyond its own declaration: an identifier, or a
@@ -4865,6 +4956,18 @@ impl Reader<'_> {
             Expr::TsSatisfies(e) => self.eval(&e.expr, scope),
             Expr::TsTypeAssertion(e) => self.eval(&e.expr, scope),
             Expr::Await(e) => self.eval(&e.arg, scope),
+            // The branches read as a builder's returns do (carrick#2541).
+            Expr::Cond(cond) => {
+                let (cons, alt) = (self.eval(&cond.cons, scope), self.eval(&cond.alt, scope));
+                let text = self.text(cond.span);
+                match (&cons, &alt) {
+                    (Value::Str(_), Value::Str(_)) => several_values(vec![cons, alt], text),
+                    _ => None,
+                }
+                .unwrap_or_else(|| {
+                    Value::hole(self.text(expr.span()), HoleReason::UnreadExpression)
+                })
+            }
             _ => Value::hole(self.text(expr.span()), HoleReason::UnreadExpression),
         }
     }
@@ -5027,21 +5130,7 @@ impl Reader<'_> {
             .map(|returned| self.eval(returned, &inner))
             .collect();
         self.builder_depth.set(depth);
-        if values.iter().all(|value| *value == values[0]) {
-            return values.into_iter().next();
-        }
-        // Returns that differ: the call stays the hole it was, followed by
-        // the path every return writes (carrick#2536).
-        shared_written_tail(&values).map(|tail| {
-            Value::Str(vec![
-                Piece::Opaque {
-                    text: self.text(call.span),
-                    end: Root::Hole(HoleReason::UnreadExpression),
-                    link: None,
-                },
-                Piece::Lit(tail),
-            ])
-        })
+        several_values(values, self.text(call.span))
     }
 
     /// `new URL(path, base)`: the base is opaque and leads, the path follows.
@@ -7281,6 +7370,16 @@ impl RequestSummaryInputs {
                             (None, Some(Held::Tail(tail))) => {
                                 Some(vec![piece.clone(), Piece::Lit(tail.clone())])
                             }
+                            (None, Some(Held::SeveralPaths)) => {
+                                let Piece::Opaque { text, .. } = piece else {
+                                    return None;
+                                };
+                                Some(vec![Piece::Opaque {
+                                    text: text.clone(),
+                                    end: Root::Hole(HoleReason::SeveralPaths),
+                                    link: None,
+                                }])
+                            }
                             (None, None) => None,
                         }
                     }
@@ -8329,7 +8428,9 @@ fn emit(
                     };
                     match row(&instantiated, file, files, call, reaches, at, call_body) {
                         Some(row) => rows.push(row),
-                        None => index.undetermined += 1,
+                        None => {
+                            index.undetermined += 1;
+                        }
                     }
                 }
                 if is_silent(composer, file, ir, call, &callee) {
@@ -8373,7 +8474,9 @@ fn emit(
                                     match row(&effect, file, composer.files, call, None, at, None) {
                                         Some(row) if declared => verbs.push(row),
                                         Some(row) => rows.push(row),
-                                        None => index.undetermined += 1,
+                                        None => {
+                                            index.undetermined += 1;
+                                        }
                                     }
                                 }
                             }
@@ -8781,6 +8884,11 @@ fn render_target(url: &[Piece]) -> Option<String> {
     let url = url.as_ref();
     if url.iter().enumerate().any(|(position, piece)| match piece {
         Piece::Unknown => true,
+        // A value that reads as several paths is no one path (carrick#2541).
+        Piece::Opaque {
+            end: Root::Hole(HoleReason::SeveralPaths),
+            ..
+        } => true,
         Piece::Param(..) | Piece::ParamKey(..) | Piece::Outer(..) => {
             !is_whole_segment(url, position)
         }
@@ -10070,6 +10178,100 @@ function build() { return {}; }
                 matches!(url.as_slice(), [Piece::Opaque { text, .. }, Piece::Lit(rest)] if text == call && rest == "/x"),
                 "{declaration}: {url:?}"
             );
+        }
+    }
+
+    fn several_paths(url: &[Piece]) -> bool {
+        url.iter().any(|piece| {
+            matches!(
+                piece,
+                Piece::Opaque {
+                    end: Root::Hole(HoleReason::SeveralPaths),
+                    ..
+                }
+            )
+        })
+    }
+
+    /// carrick#2541: a value that reads as more than one written path (a
+    /// builder's returns, a conditional's branches) is no one path, wherever
+    /// it is held: inline, in a module constant, in a local, or in a local
+    /// built from it with no text of its own. The URL states no target.
+    #[test]
+    fn a_value_that_reads_as_several_paths_states_no_target() {
+        let two = "function base() { if (flag()) { return \"/svc/v1\"; } return \"/svc/v2\"; }\n";
+        for source in [
+            format!("{two}export function f() {{ return fetch(base() + \"/x\"); }}\n"),
+            format!("{two}const ROOT = base();\nexport function f() {{ return fetch(ROOT + \"/x\"); }}\n"),
+            format!("{two}export function f() {{ const root = base(); return fetch(root + \"/x\"); }}\n"),
+            format!("{two}export function f() {{ const u = `${{base()}}${{tail()}}`; return fetch(u + \"/x\"); }}\n"),
+            "function base() { if (flag()) { return readMount(); } return \"/api\"; }\nexport function f() { return fetch(base() + \"/x\"); }\n".to_string(),
+            "function base() { if (flag()) { return \"https://a.example/v1\"; } return \"/v1\"; }\nexport function f() { return fetch(base() + \"/x\"); }\n".to_string(),
+            "const ROOT = flag() ? \"/svc/v1\" : \"/svc/v2\";\nexport function f() { return fetch(ROOT + \"/x\"); }\n".to_string(),
+            "const ROOT = flag() ? readMount() : \"/api\";\nexport function f() { return fetch(ROOT + \"/x\"); }\n".to_string(),
+            "export function f(local: boolean) { const base = local ? readMount() : \"/api\"; return fetch(`${base}/x`); }\n".to_string(),
+            format!("{two}const ROOT = flag() ? base() : readMount();\nexport function f() {{ return fetch(ROOT + \"/x\"); }}\n"),
+        ] {
+            let url = request_url(&source, "f");
+            assert!(several_paths(&url), "{source}: {url:?}");
+            assert_eq!(render_target(&url), None, "{source}: {url:?}");
+        }
+    }
+
+    /// carrick#2541: a conditional reads as a builder's returns do
+    /// (carrick#2536): branches that are one value are that value; branches
+    /// that end in one written path after values the source does not write
+    /// keep it after a hole.
+    #[test]
+    fn a_conditional_reads_as_a_builder_does() {
+        for (source, target) in [
+            (
+                "const ROOT = flag() ? \"/svc/v2\" : \"/svc/v2\";\nexport function f() { return fetch(ROOT + \"/x\"); }\n",
+                "/svc/v2/x",
+            ),
+            (
+                "const ROOT = flag() ? readMount() + \"/svc/v2\" : \"/svc/v2\";\nexport function f() { return fetch(ROOT + \"/x\"); }\n",
+                "${flag() ? readMount() + \"/svc/v2\" : \"/svc/v2\"}/svc/v2/x",
+            ),
+        ] {
+            assert_eq!(
+                render_target(&request_url(source, "f")).as_deref(),
+                Some(target),
+                "{source}"
+            );
+        }
+    }
+
+    /// carrick#2541, must not verify: readings that write no path (origins,
+    /// one segment, values nothing here reads, a bare `/`) are the hole they
+    /// were, and the URL renders as before.
+    #[test]
+    fn a_value_that_writes_no_path_reads_as_before() {
+        for (source, target) in [
+            (
+                "function base() { if (flag()) { return \"https://a.example\"; } return \"http://localhost:3000\"; }\nexport function f() { return fetch(base() + \"/x\"); }\n",
+                "${base()}/x",
+            ),
+            (
+                "const BASE = flag() ? \"http://localhost:3000\" : process.env.API_URL;\nexport function f() { return fetch(BASE + \"/x\"); }\n",
+                "${flag() ? \"http://localhost:3000\" : process.env.API_URL}/x",
+            ),
+            (
+                "function base() { if (flag()) { return readA(); } return readB(); }\nexport function f() { return fetch(base() + \"/x\"); }\n",
+                "${base()}/x",
+            ),
+            (
+                "function kind() { if (flag()) { return \"a\"; } return \"b\"; }\nexport function f() { return fetch(\"/items/\" + kind() + \"/x\"); }\n",
+                "/items/${kind()}/x",
+            ),
+            (
+                "function base() { if (flag()) { return readMount() + \"/\"; } return \"/\"; }\nexport function f() { return fetch(base() + \"/x\"); }\n",
+                "${base()}/x",
+            ),
+        ] {
+            let url = request_url(source, "f");
+            assert!(!several_paths(&url), "{source}: {url:?}");
+            assert_eq!(render_target(&url).as_deref(), Some(target), "{source}");
         }
     }
 

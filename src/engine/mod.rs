@@ -25938,4 +25938,56 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             );
         }
     }
+
+    /// carrick#2541: a wrapper whose URL leads with a base that reads as
+    /// several written paths states no row.
+    #[test]
+    fn a_wrapper_states_no_row_for_a_base_that_reads_as_several_paths() {
+        for returns in [
+            "  if (legacy()) {\n    return \"/svc/v1\";\n  }\n  return \"/svc/v2\";\n",
+            "  if (legacy()) {\n    return readMount();\n  }\n  return \"/svc/v2\";\n",
+        ] {
+            let rows = orders_rows(&orders_source(returns));
+            assert!(rows.is_empty(), "{returns}: {rows:#?}");
+        }
+    }
+
+    /// carrick#2541: a caller that hands a wrapper a URL reading as several
+    /// paths, through a builder or a conditional, states no row.
+    #[test]
+    fn a_caller_states_no_row_for_an_argument_that_reads_as_several_paths() {
+        let source = "const apiFetch = (url: string) => fetch(url);\n\
+                      function pick(flag: boolean) {\n  if (flag) {\n    return \"/a\";\n  }\n  return \"/b\";\n}\n\
+                      export function two(flag: boolean) {\n  return apiFetch(pick(flag) + \"/two\");\n}\n\
+                      export function chosen(flag: boolean) {\n  return apiFetch((flag ? \"/a\" : \"/b\") + \"/two\");\n}\n";
+        let (dir, discovery) = discover_sources(&[("src/local.ts", source)]);
+        let rows = summary_rows_of(&dir, &discovery, "src/local.ts");
+        assert!(rows.is_empty(), "{rows:#?}");
+    }
+
+    /// carrick#2541 across modules: an imported constant or builder that
+    /// reads as several paths states no row in the importer; an imported
+    /// builder whose returns are origins keeps its row.
+    #[test]
+    fn an_imported_value_that_reads_as_several_paths_states_no_row() {
+        let config = "export function serviceRoot() {\n  if (legacy()) {\n    return \"/svc/v1\";\n  }\n  return \"/svc/v2\";\n}\n\
+                      export const ROOT = serviceRoot();\n\
+                      export const PICKED = legacy() ? \"/svc/v1\" : \"/svc/v2\";\n\
+                      export function host() {\n  if (legacy()) {\n    return \"https://a.example\";\n  }\n  return \"http://localhost:3000\";\n}\n";
+        for (import, head) in [
+            ("ROOT", "ROOT"),
+            ("PICKED", "PICKED"),
+            ("serviceRoot", "serviceRoot()"),
+        ] {
+            let rows = importer_rows(&[("src/config.ts", config)], import, head);
+            assert!(rows.is_empty(), "{head}: {rows:#?}");
+        }
+        assert_eq!(
+            importer_rows(&[("src/config.ts", config)], "host", "host()"),
+            vec![(
+                "${host()}/orders/${encodeURIComponent(order)}/lines?page=1".to_string(),
+                "/orders/:order/lines".to_string()
+            )]
+        );
+    }
 }
