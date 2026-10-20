@@ -287,7 +287,9 @@ pub enum Piece {
     /// imported constant object, a call of an imported builder with text
     /// arguments: carrick#2447). Once every module is read, text the link
     /// resolves to takes the piece's place ([`RequestSummaryInputs::linked`]);
-    /// a link that resolves to nothing changes nothing.
+    /// a link that resolves to nothing changes nothing. A binding whose text
+    /// the names cannot read hands the importer what its own module reads it
+    /// as: its text, or one written path after the piece (carrick#2540).
     Opaque {
         text: String,
         end: Root,
@@ -1228,6 +1230,25 @@ pub struct FileIr {
     /// names the library store keys an export by (carrick#2431). A binding
     /// assigned again or declared again below is left out.
     bindings: HashMap<String, ImportBinding>,
+    /// What this module's own reading makes of each module `const` that
+    /// [`Self::names`] states nothing for, read uncalled: what an importer
+    /// reads where the text link fails (carrick#2540).
+    held: HashMap<String, Held>,
+    /// The same for each module builder with no [`Self::names`] entry, read
+    /// called (carrick#2540).
+    held_returns: HashMap<String, Held>,
+}
+
+/// What a module-scope binding hands an importer where its text cannot be
+/// read by name (carrick#2540): the declaring module's own reading of it.
+/// The importer reads the binding as the declaring module does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Held {
+    /// Every value is the one written text.
+    Text(String),
+    /// Values the source does not write, then the one written path every
+    /// value ends in ([`shared_written_tail`]).
+    Tail(String),
 }
 
 /// Every expression-position identifier among `names`, by name, with its
@@ -1552,6 +1573,57 @@ pub fn extract_file_ir(
         {
             module_scope.named.insert(ident_key(&fn_decl.ident));
             file.names.insert(fn_decl.ident.sym.to_string(), value);
+        }
+    }
+    // What an importer reads where `names` states nothing (carrick#2540): a
+    // module constant, and a module builder called, as this module reads them.
+    for item in &module.body {
+        let Some(decl) = module_var_decl(item) else {
+            continue;
+        };
+        if decl.kind != VarDeclKind::Const {
+            continue;
+        }
+        for declarator in &decl.decls {
+            let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) else {
+                continue;
+            };
+            let name = ident.id.sym.as_ref();
+            if matches!(&**init, Expr::Arrow(_) | Expr::Fn(_)) || file.names.contains_key(name) {
+                continue;
+            }
+            if let Some(value) = module_scope.consts.get(&ident_key(&ident.id))
+                && let Some(held) = held_by(std::slice::from_ref(value))
+            {
+                file.held.insert(name.to_string(), held);
+            }
+        }
+    }
+    for ((key, path), builder) in &module_scope.builders {
+        if !path.is_empty()
+            || file.names.contains_key(&key.0)
+            || builder.params.iter().any(Option::is_none)
+        {
+            continue;
+        }
+        // Each parameter reads as itself: a prefix the caller hands in is no
+        // value the module states.
+        let mut inner = Scope::module(&module_scope);
+        for (index, param) in builder.params.iter().enumerate() {
+            if let Some(param) = param {
+                inner.locals.insert(
+                    param.clone(),
+                    Value::Str(vec![Piece::Param(index, param.0.clone())]),
+                );
+            }
+        }
+        let values: Vec<Value> = builder
+            .returned
+            .iter()
+            .map(|returned| reader.eval(returned, &inner))
+            .collect();
+        if let Some(held) = held_by(&values) {
+            file.held_returns.insert(key.0.clone(), held);
         }
     }
     // A client a getter builds into a module `let` on first use
@@ -2080,6 +2152,31 @@ fn shared_written_tail(values: &[Value]) -> Option<String> {
         && !tail.contains(['?', '#'])
         && tail.split('/').any(|segment| !segment.is_empty()))
     .then(|| tail.to_string())
+}
+
+/// What a binding that holds one of `values` hands an importer (carrick#2540,
+/// the #2536 rule read where an importer cannot see the value): the one
+/// written text every value is, or the one written path every value ends in
+/// after values the source does not write. A value that reads through another
+/// module's binding is never a tail: that binding may write path text the
+/// tail would hide.
+fn held_by(values: &[Value]) -> Option<Held> {
+    let first = values.first()?;
+    if let Value::Str(pieces) = first
+        && let [Piece::Lit(text)] = pieces.as_slice()
+        && values.iter().all(|value| value == first)
+    {
+        return Some(Held::Text(text.clone()));
+    }
+    let linked = |value: &Value| {
+        matches!(value, Value::Str(pieces) if pieces
+            .iter()
+            .any(|piece| matches!(piece, Piece::Opaque { link: Some(_), .. })))
+    };
+    if values.iter().any(linked) {
+        return None;
+    }
+    shared_written_tail(values).map(Held::Tail)
 }
 
 /// How one binding is used beyond its own declaration: an identifier, or a
@@ -7116,6 +7213,9 @@ impl RequestSummaryInputs {
     /// arguments and a client's options are kept. A piece anywhere else
     /// keeps its link unread, which changes nothing.
     ///
+    /// A binding whose text the names cannot read hands the importer what its
+    /// own module reads it as ([`Held`], carrick#2540).
+    ///
     /// With rows, what each import reaches is read from them first
     /// ([`Self::links`]), and the reading follows it.
     pub fn linked(mut self) -> Self {
@@ -7143,19 +7243,25 @@ impl RequestSummaryInputs {
         if wanted.is_empty() {
             return self;
         }
-        let resolved: HashMap<(PathBuf, library_sites::NamedRef), String> = {
+        let (resolved, held): (
+            HashMap<(PathBuf, library_sites::NamedRef), String>,
+            HashMap<(PathBuf, library_sites::NamedRef), Held>,
+        ) = {
             let names =
                 library_sites::LinkedNames::link(&self.files, &self.bindings, self.links.as_ref());
-            wanted
-                .into_iter()
-                .filter_map(|(file, named)| {
-                    let piece = library_sites::TextPiece::Named(Box::new(named.clone()));
-                    let text = names.text(&file, &[piece])?;
-                    Some(((file, named), text))
-                })
-                .collect()
+            let mut resolved = HashMap::new();
+            let mut held = HashMap::new();
+            for (file, named) in wanted {
+                let piece = library_sites::TextPiece::Named(Box::new(named.clone()));
+                if let Some(text) = names.text(&file, &[piece]) {
+                    resolved.insert((file, named), text);
+                } else if let Some(found) = names.held(&file, &named) {
+                    held.insert((file, named), found.clone());
+                }
+            }
+            (resolved, held)
         };
-        if resolved.is_empty() {
+        if resolved.is_empty() && held.is_empty() {
             return self;
         }
         for (path, ir) in &mut self.files {
@@ -7163,16 +7269,23 @@ impl RequestSummaryInputs {
                 let read = |piece: &Piece| match piece {
                     Piece::Opaque {
                         link: Some(named), ..
-                    } => resolved.get(&(scope.to_path_buf(), (**named).clone())),
+                    } => {
+                        let key = (scope.to_path_buf(), (**named).clone());
+                        match (resolved.get(&key), held.get(&key)) {
+                            (Some(text), _) => Some(vec![Piece::Lit(text.clone())]),
+                            (None, Some(Held::Text(text))) => Some(vec![Piece::Lit(text.clone())]),
+                            (None, Some(Held::Tail(tail))) => {
+                                Some(vec![piece.clone(), Piece::Lit(tail.clone())])
+                            }
+                            (None, None) => None,
+                        }
+                    }
                     _ => None,
                 };
                 if pieces.iter().any(|piece| read(piece).is_some()) {
                     let parts: Vec<Vec<Piece>> = pieces
                         .drain(..)
-                        .map(|piece| match read(&piece) {
-                            Some(text) => vec![Piece::Lit(text.clone())],
-                            None => vec![piece],
-                        })
+                        .map(|piece| read(&piece).unwrap_or_else(|| vec![piece]))
                         .collect();
                     *pieces = concat(parts);
                 }

@@ -1772,6 +1772,59 @@ impl<'a> LinkedNames<'a> {
         split_text(self.resolve(file, pieces, 0)).0
     }
 
+    /// What the module that declares the binding `named` names reads it as,
+    /// where its `names` entry states nothing (carrick#2540): `None` for an
+    /// entry of an object, a binding the scan cannot follow, or one the
+    /// declaring module reads as nothing an importer may take.
+    ///
+    /// An uncalled binding reads [`super::FileIr::held`], a called one
+    /// [`super::FileIr::held_returns`]. The declaring module is found as
+    /// [`Self::reached`] finds it: with rows, the declaration the rows name;
+    /// without, by name through the modules that re-export it.
+    pub(super) fn held(&self, file: &Path, named: &NamedRef) -> Option<&'a super::Held> {
+        if !named.path.is_empty() {
+            return None;
+        }
+        let held_in = |ir: &'a FileIr, name: &str| match named.args {
+            None => ir.held.get(name),
+            Some(_) => ir.held_returns.get(name),
+        };
+        let own = self.files.get(file)?;
+        if let Some(found) = held_in(own, &named.binding) {
+            return Some(found);
+        }
+        if let Some(links) = self.links {
+            let RowLink::Declared(at, declared) = links.get(file, &named.binding)? else {
+                return None;
+            };
+            return held_in(self.files.get(at)?, declared);
+        }
+        if self.unfollowable {
+            return None;
+        }
+        let (mut at, mut name) = (file.to_path_buf(), named.binding.clone());
+        for _ in 0..=super::MAX_REEXPORT_HOPS {
+            let ir = self.files.get(&at)?;
+            if ir.names.contains_key(&name) {
+                return None;
+            }
+            if let Some(found) = held_in(ir, &name) {
+                return Some(found);
+            }
+            if !ir.imported.contains_key(&name) {
+                return None;
+            }
+            match self.bindings.get(&at, &name)? {
+                super::ImportedBinding::Binding { file, name: next } => {
+                    at = file.clone();
+                    name = next.clone();
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// `arg`, read in `file`, with every named piece read
     /// ([`Self::resolve`]).
     fn resolved(&self, file: &Path, arg: &SiteArg) -> SiteArg {
