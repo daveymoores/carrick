@@ -28,7 +28,9 @@
 //!
 //! - [`read_sites`], per service, while its files and its resolved call sites
 //!   are in hand: for each model call row, the definitions its call expression
-//!   goes through. Never serialised.
+//!   goes through. Stored with the service's blob ([`StoredCallThrough`]),
+//!   so a service `--changed-only` carries states them as an analysed one
+//!   does (carrick#2378).
 //! - [`settle`], once per scan, when every service's rows and definitions are
 //!   in hand: the walk and the change.
 //!
@@ -37,6 +39,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use swc_common::{
     BytePos, FileName, SourceMap, Span, Spanned,
     errors::{ColorConfig, Handler},
@@ -63,14 +66,14 @@ const MAX_EDGE_DEPTH: usize = 4;
 
 /// A definition as every service names it: its repository-relative file and
 /// the line it opens on. A definition key is one service's own.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DefinitionSite {
     pub file: String,
     pub line: u32,
 }
 
 /// One model call row and the definitions its call expression goes through.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SiteRow {
     /// Repository-relative file and line, as the row's `file_location` packs
     /// them.
@@ -105,12 +108,89 @@ pub struct CallThroughSites {
     pub side_calls: HashMap<SideKey, SideCall>,
 }
 
+impl CallThroughSites {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.hands_back_body.is_empty() && self.side_calls.is_empty()
+    }
+}
+
+/// A service's [`CallThroughSites`] as its blob stores them (carrick#2378):
+/// every fact [`settle`] reads of a service, so a service `--changed-only`
+/// carries is read as the scan that stored it read it. Sorted, so one scan
+/// writes the same bytes every time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredCallThrough {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<SiteRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hands_back_body: Vec<DefinitionSite>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub side_calls: Vec<StoredSideCall>,
+}
+
+/// One entry of [`CallThroughSites::side_calls`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredSideCall {
+    pub file: String,
+    pub line: u32,
+    pub definition: DefinitionSite,
+    pub side: SideCall,
+}
+
+impl StoredCallThrough {
+    /// `None` for a service with no facts, which writes no field.
+    pub fn of(sites: &CallThroughSites) -> Option<Self> {
+        if sites.is_empty() {
+            return None;
+        }
+        let mut hands_back_body: Vec<DefinitionSite> =
+            sites.hands_back_body.iter().cloned().collect();
+        hands_back_body.sort();
+        let mut side_calls: Vec<StoredSideCall> = sites
+            .side_calls
+            .iter()
+            .map(|((file, line, definition), side)| StoredSideCall {
+                file: file.clone(),
+                line: *line,
+                definition: definition.clone(),
+                side: side.clone(),
+            })
+            .collect();
+        side_calls.sort_by(|a, b| {
+            (&a.file, a.line, &a.definition).cmp(&(&b.file, b.line, &b.definition))
+        });
+        Some(Self {
+            rows: sites.rows.clone(),
+            hands_back_body,
+            side_calls,
+        })
+    }
+
+    pub fn sites(&self) -> CallThroughSites {
+        CallThroughSites {
+            rows: self.rows.clone(),
+            hands_back_body: self.hands_back_body.iter().cloned().collect(),
+            side_calls: self
+                .side_calls
+                .iter()
+                .map(|entry| {
+                    (
+                        (entry.file.clone(), entry.line, entry.definition.clone()),
+                        entry.side.clone(),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A resolved call: the repository-relative file and line it is written on,
 /// and the definition it reaches.
 pub type SideKey = (String, u32, DefinitionSite);
 
 /// How a call that is not returned is used.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SideCall {
     /// Its value is dropped.
     Discarded,
@@ -121,7 +201,8 @@ pub enum SideCall {
 }
 
 /// A call whose arguments another call's value goes into.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Outer {
     /// A row of the service is written on its line: a request.
     Request,
@@ -1597,6 +1678,53 @@ mod tests {
             file: file.to_string(),
             line,
         }
+    }
+
+    /// carrick#2378: what a blob stores reads back as the facts the scan
+    /// read, and two scans that read the same facts store the same bytes.
+    #[test]
+    fn stored_facts_read_back_as_the_scan_read_them() {
+        let facts = |order: &[usize]| {
+            let side_calls = [
+                (
+                    ("a.ts".to_string(), 3, definition("b.ts", 1)),
+                    SideCall::Discarded,
+                ),
+                (
+                    ("a.ts".to_string(), 7, definition("b.ts", 9)),
+                    SideCall::InputTo(vec![
+                        Outer::Request,
+                        Outer::Calls(definition("c.ts", 2)),
+                        Outer::Unknown,
+                    ]),
+                ),
+            ];
+            let bodies = [definition("b.ts", 9), definition("b.ts", 1)];
+            CallThroughSites {
+                rows: vec![SiteRow {
+                    file: "a.ts".to_string(),
+                    line: 7,
+                    method: "GET".to_string(),
+                    target: "/getRun".to_string(),
+                    steps: vec![vec![definition("b.ts", 9)], vec![]],
+                }],
+                hands_back_body: order.iter().map(|&i| bodies[i].clone()).collect(),
+                side_calls: order.iter().map(|&i| side_calls[i].clone()).collect(),
+            }
+        };
+        let sites = facts(&[0, 1]);
+        let stored = StoredCallThrough::of(&sites).expect("facts are stored");
+        let written = serde_json::to_string(&stored).unwrap();
+        let read: StoredCallThrough = serde_json::from_str(&written).unwrap();
+        let back = read.sites();
+        assert_eq!(back.rows, sites.rows);
+        assert_eq!(back.hands_back_body, sites.hands_back_body);
+        assert_eq!(back.side_calls, sites.side_calls);
+        assert_eq!(
+            serde_json::to_string(&StoredCallThrough::of(&facts(&[1, 0])).unwrap()).unwrap(),
+            written
+        );
+        assert_eq!(StoredCallThrough::of(&CallThroughSites::default()), None);
     }
 
     /// A model row on `line` that no candidate joined: it has no span.

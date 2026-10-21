@@ -267,6 +267,7 @@ mod tests {
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
         for (i, d) in defs.into_iter().enumerate() {
             data.function_definitions

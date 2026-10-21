@@ -3193,6 +3193,7 @@ mod tests {
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }
     }
 

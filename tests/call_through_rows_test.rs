@@ -877,3 +877,130 @@ fn a_pull_request_scan_reports_nothing_as_introduced_against_a_main_copy_without
         "no route is added or removed: {delta:#}"
     );
 }
+
+/// The scanner on `repo` with the store at `storage` and `flags`, reading
+/// the services the store holds, with a home of its own: what it printed.
+fn rescan(repo: &Path, storage: &Path, home: &Path, flags: &[&str]) -> String {
+    let _ = std::fs::remove_dir_all(home);
+    std::fs::create_dir_all(home).unwrap();
+    let mut cmd = scan_command(repo, storage);
+    cmd.args(flags)
+        .env("HOME", home)
+        .env("CARRICK_NO_UPDATE_CHECK", "1");
+    let output = cmd.output().expect("failed to spawn carrick");
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "the scan failed:\n{printed}");
+    printed
+}
+
+/// The services a `--changed-only` scan printed as `how` (`analysed`,
+/// `carried`).
+fn scoped(output: &str, how: &str) -> Vec<String> {
+    let mut services: Vec<String> = output
+        .lines()
+        .filter_map(|line| {
+            let rest = &line[line.find("scope: ")? + "scope: ".len()..];
+            let (service, verdict) = rest.split_once(' ')?;
+            (verdict == how || verdict.starts_with(&format!("{how} (")))
+                .then(|| service.to_string())
+        })
+        .collect();
+    services.sort();
+    services
+}
+
+/// The fixture scanned at A into `<tmp>/store`, then commit B, which edits
+/// only `packages/cli`: no other service reads it, so `--changed-only`
+/// analyses `cli` and carries the rest, among them `client`, where the
+/// requests `cli`'s rows reach are written.
+fn scanned_then_cli_edited(tmp: &Path) -> (PathBuf, PathBuf) {
+    let repo = committed_copy(tmp);
+    let storage = tmp.join("store");
+    std::fs::create_dir_all(&storage).unwrap();
+    rescan(&repo, &storage, &tmp.join("home"), &[]);
+    let types = repo.join("packages/cli/src/types.ts");
+    let mut source = std::fs::read_to_string(&types).unwrap();
+    source.push_str("\n/** A run's id, as a command takes it. */\nexport type RunId = string;\n");
+    std::fs::write(&types, source).unwrap();
+    run_git(&repo, &["commit", "-qam", "B: name the id type"]);
+    (repo, storage)
+}
+
+/// carrick#2378: a service `--changed-only` carries states what the
+/// call-through pass reads of it (the definitions that hand back a request's
+/// parsed body, the calls whose value is not handed back, its own call-through
+/// rows), so the rows of the service analysed beside it settle exactly as a
+/// full scan settles them.
+#[test]
+fn a_changed_only_scan_settles_the_rows_a_full_scan_settles() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (repo, storage) = scanned_then_cli_edited(tmp.path());
+    let full_storage = tmp.path().join("full-store");
+    copy_dir(&storage, &full_storage);
+
+    let scoped_scan = rescan(
+        &repo,
+        &storage,
+        &tmp.path().join("home"),
+        &["--changed-only"],
+    );
+    assert_eq!(scoped(&scoped_scan, "analysed"), ["cli"], "{scoped_scan}");
+    assert_eq!(
+        scoped(&scoped_scan, "carried"),
+        ["api", "client", "web"],
+        "{scoped_scan}"
+    );
+    // The pass's own counts are not compared: a full scan also settles the
+    // rows of the services the scoped one carries.
+    rescan(&repo, &full_storage, &tmp.path().join("home"), &[]);
+
+    let pinned = |mut blob: serde_json::Value| {
+        blob["last_updated"] = serde_json::Value::Null;
+        serde_json::to_string_pretty(&blob).unwrap()
+    };
+    let scoped_blobs = read_blobs(&storage);
+    let full_blobs = read_blobs(&full_storage);
+    assert_eq!(
+        pinned(scoped_blobs["cli"].1.clone()),
+        pinned(full_blobs["cli"].1.clone()),
+        "the analysed service's blob"
+    );
+}
+
+/// A stored blob that states no call-through facts (one written before
+/// carrick#2378) is carried and read as a service with none, as every
+/// carried service was read before: the scan completes, and the carried blob
+/// is not given facts it was not stored with.
+#[test]
+fn a_carried_blob_without_call_through_facts_reads_as_one_with_none() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (repo, storage) = scanned_then_cli_edited(tmp.path());
+    let (client_path, mut client) = read_blobs(&storage).remove("client").unwrap();
+    assert!(
+        client.get("call_through").is_some(),
+        "the client states its facts: {:?}",
+        client
+            .as_object()
+            .map(|blob| blob.keys().collect::<Vec<_>>())
+    );
+    client.as_object_mut().unwrap().remove("call_through");
+    std::fs::write(&client_path, serde_json::to_string(&client).unwrap()).unwrap();
+
+    let scan = rescan(
+        &repo,
+        &storage,
+        &tmp.path().join("home"),
+        &["--changed-only"],
+    );
+    assert_eq!(scoped(&scan, "carried"), ["api", "client", "web"], "{scan}");
+    let carried: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&client_path).unwrap()).unwrap();
+    assert!(
+        carried.get("call_through").is_none(),
+        "a carried blob states no facts it was not stored with"
+    );
+}
