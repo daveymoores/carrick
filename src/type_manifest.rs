@@ -741,6 +741,8 @@ mod tests {
             file_path: "lib/api.ts".to_string(),
             span_start: None,
             span_end: None,
+            expression_text: None,
+            expression_line: None,
             line_number: 5,
             infer_kind: crate::services::type_sidecar::InferKind::CallResult,
             is_explicit: false,
