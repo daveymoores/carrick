@@ -864,8 +864,6 @@ export interface PositionRowsCounts {
   any: number;
   /** Rows whose type is the compiler's error type (flag 2). */
   error_type: number;
-  /** `impl` rows: implementations of a bodyless declaration, or one past the cap (carrick#2430). */
-  impl: number;
   /** `jsx` rows: one per JSX opening or self-closing element. */
   jsx: number;
   /** The rows file's size on disk, compressed. */
