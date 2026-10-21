@@ -54,8 +54,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
+
+use crate::utils::Utf16Offsets;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -371,10 +372,10 @@ struct IndexedFile {
 enum Bound {
     /// Discovery has not read the file.
     Unread,
-    /// The bytes discovery read hash to `h`. The text is kept only when its
-    /// SWC byte offsets and the rows' UTF-16 offsets differ: anything but
-    /// plain ASCII.
-    Fresh(Option<Arc<str>>),
+    /// The bytes discovery read hash to `h`. The text's offset table is kept
+    /// only when its SWC byte offsets and the rows' UTF-16 offsets differ:
+    /// anything but plain ASCII.
+    Fresh(Option<Utf16Offsets>),
     /// The bytes discovery read hash otherwise.
     Stale,
 }
@@ -496,14 +497,14 @@ impl PositionIndex {
             return;
         };
         indexed.bound = if indexed.hash.as_deref() == Some(content_hash(text.as_bytes()).as_str()) {
-            Bound::Fresh((!text.is_ascii()).then(|| Arc::from(text)))
+            Bound::Fresh((!text.is_ascii()).then(|| Utf16Offsets::new(text)))
         } else {
             Bound::Stale
         };
     }
 
     /// Why `file` holds no usable rows, or its rows.
-    fn file(&self, file: &Path) -> Result<(&IndexedFile, Option<&str>), HoleReason> {
+    fn file(&self, file: &Path) -> Result<(&IndexedFile, Option<&Utf16Offsets>), HoleReason> {
         let indexed = self
             .relative(file)
             .and_then(|relative| self.files.get(&relative))
@@ -512,7 +513,7 @@ impl PositionIndex {
             return Err(HoleReason::NotInProgram);
         }
         match &indexed.bound {
-            Bound::Fresh(text) => Ok((indexed, text.as_deref())),
+            Bound::Fresh(text) => Ok((indexed, text.as_ref())),
             Bound::Stale => Err(HoleReason::RowsStale),
             Bound::Unread => Err(HoleReason::RowsMissing),
         }
@@ -613,14 +614,11 @@ impl PositionIndex {
     }
 }
 
-/// An SWC span of a file as the rows key it: converted over the bound text
-/// when it is not plain ASCII, else less the SWC span base.
-fn rows_span(text: Option<&str>, lo: u32, hi: u32) -> (u32, u32) {
+/// An SWC span of a file as the rows key it: converted by the bound text's
+/// offset table when it is not plain ASCII, else less the SWC span base.
+fn rows_span(text: Option<&Utf16Offsets>, lo: u32, hi: u32) -> (u32, u32) {
     match text {
-        Some(text) => (
-            crate::utils::sidecar_position(text, lo),
-            crate::utils::sidecar_position(text, hi),
-        ),
+        Some(text) => (text.position(lo), text.position(hi)),
         None => (
             lo.saturating_sub(crate::swc_scanner::SWC_SPAN_BASE),
             hi.saturating_sub(crate::swc_scanner::SWC_SPAN_BASE),

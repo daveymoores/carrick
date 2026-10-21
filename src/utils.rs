@@ -158,9 +158,84 @@ pub fn sidecar_position(content: &str, span: u32) -> u32 {
     )
 }
 
+/// [`sidecar_position`] over one file, for many spans (carrick#2564): each
+/// conversion is a binary search over the file's characters wider in UTF-8
+/// than in UTF-16, rather than a count from the start of the file, so a
+/// file read at N positions costs N log L and not N x L.
+#[derive(Debug)]
+pub(crate) struct Utf16Offsets {
+    /// The text's length in bytes, any BOM dropped.
+    len: usize,
+    /// Each character that is not ASCII, in order: its first byte, the byte
+    /// after it, and how many more bytes than UTF-16 units the text holds up
+    /// to and including it.
+    wide: Vec<(usize, usize, usize)>,
+}
+
+impl Utf16Offsets {
+    /// The table for `content`, the file as read from disk.
+    pub(crate) fn new(content: &str) -> Self {
+        let body = content.strip_prefix('\u{feff}').unwrap_or(content);
+        let mut saved = 0;
+        let wide = body
+            .char_indices()
+            .filter(|(_, character)| !character.is_ascii())
+            .map(|(at, character)| {
+                saved += character.len_utf8() - character.len_utf16();
+                (at, at + character.len_utf8(), saved)
+            })
+            .collect();
+        Self {
+            len: body.len(),
+            wide,
+        }
+    }
+
+    /// What [`sidecar_position`] gives for `span` over the same text: every
+    /// character that starts before the byte counts whole, and a byte past
+    /// the end counts the whole text.
+    pub(crate) fn position(&self, span: u32) -> u32 {
+        let byte = (span.saturating_sub(crate::swc_scanner::SWC_SPAN_BASE) as usize).min(self.len);
+        let before = self.wide.partition_point(|(start, _, _)| *start < byte);
+        let (counted, saved) = match before.checked_sub(1).map(|last| self.wide[last]) {
+            Some((_, end, saved)) => (byte.max(end), saved),
+            None => (byte, 0),
+        };
+        u32::try_from(counted - saved).unwrap_or(u32::MAX)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table gives what `sidecar_position` gives at every byte of text
+    /// mixing ASCII with two-, three- and four-byte characters, with and
+    /// without a BOM, inside a character and past the end (carrick#2564).
+    #[test]
+    fn the_offset_table_converts_every_span_as_sidecar_position_does() {
+        let base = crate::swc_scanner::SWC_SPAN_BASE;
+        for content in [
+            "",
+            "plain ascii\r\n",
+            "é",
+            "😀",
+            "a é b € c 😀 d\r\nconst s = \"日本語\";\n",
+            "😀😀€éx",
+            "\u{feff}",
+            "\u{feff}const s = \"é\";\n",
+            "\u{feff}plain",
+        ] {
+            let table = Utf16Offsets::new(content);
+            for span in 0..=(content.len() as u32 + base + 3) {
+                assert_eq!(
+                    table.position(span),
+                    sidecar_position(content, span),
+                    "span {span} of {content:?}"
+                );
+            }
+        }
+    }
 
     /// A declared repository is the repository, whatever the environment and
     /// the folder say (carrick#2207); with nothing declared, the name is the

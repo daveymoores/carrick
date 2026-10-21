@@ -354,10 +354,14 @@ pub(crate) fn is_identifier(text: &str) -> bool {
 
 impl RequestSummaryInputs {
     /// The calls that stay on the call graph, and the run log's counts:
-    /// read once, when the rows are bound ([`Self::linked`]).
-    pub(crate) fn row_calls(&self) -> RowCalls {
+    /// read once, when the rows are bound ([`Self::linked`]). `None` once
+    /// `deadline` passes (carrick#2564).
+    pub(crate) fn row_calls(&self, deadline: std::time::Instant) -> Option<RowCalls> {
         let mut out = RowCalls::default();
         for (file, call, _) in every_call(&self.files) {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
             let graph = self.sites.target_at(file, call.site.lo, call.site.hi);
             let kept = call.jsx
                 || (is_identifier(&call.callee_text)
@@ -384,7 +388,7 @@ impl RequestSummaryInputs {
             out.answers
                 .insert((file.to_path_buf(), call.site.lo, call.site.hi), reach);
         }
-        out
+        Some(out)
     }
 
     /// What the call spanning exactly `lo..hi` (discovery numbering) in

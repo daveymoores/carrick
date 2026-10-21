@@ -3586,7 +3586,13 @@ async fn analyze_current_repo_incremental(
         function_definitions,
         repo_name,
         request_inputs,
-    } = discover_with_positions(repo_path, config, cm.clone(), positions)?;
+    } = discover_with_positions(
+        repo_path,
+        config,
+        cm.clone(),
+        positions,
+        crate::request_summary::ROWS_JOIN_BUDGET,
+    )?;
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
     // 3. Check if we can use incremental mode. The cache version is the whole
@@ -7960,18 +7966,26 @@ fn discover_files_and_symbols(
     service: &Config,
     cm: Lrc<SourceMap>,
 ) -> FileDiscoveryResult {
-    discover_with_positions(repo_path, service, cm, None)
+    discover_with_positions(
+        repo_path,
+        service,
+        cm,
+        None,
+        crate::request_summary::ROWS_JOIN_BUDGET,
+    )
 }
 
 /// Discover the service's files and symbols, binding each file's compiler
 /// rows, when the run walked them, to the text discovery parses it from
 /// (carrick#2413): the one read of the file, so the rows' hash is checked
-/// against the bytes every span is counted in.
+/// against the bytes every span is counted in. Binding the rows may take
+/// `rows_budget` (carrick#2564).
 fn discover_with_positions(
     repo_path: &str,
     service: &Config,
     cm: Lrc<SourceMap>,
     mut positions: Option<crate::position_rows::PositionIndex>,
+    rows_budget: std::time::Duration,
 ) -> FileDiscoveryResult {
     crate::scan_stage::enter(crate::scan_stage::Stage::Discovery);
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
@@ -8189,7 +8203,9 @@ fn discover_with_positions(
 
     // Composed later, once the library semantics this service can use are
     // verified: that needs detection and the service's sidecar, and both come
-    // after discovery (carrick#1564).
+    // after discovery (carrick#1564). Binding the rows is bounded: past the
+    // budget the service reads as with no rows, and the run log says so
+    // (carrick#2564).
     let request_inputs = crate::request_summary::RequestSummaryInputs {
         files: request_irs,
         sites: resolution.sites,
@@ -8198,7 +8214,10 @@ fn discover_with_positions(
         links: None,
         row_calls: None,
     }
-    .linked();
+    .linked(
+        service.service_name.as_deref().unwrap_or("(root)"),
+        rows_budget,
+    );
     if let Some(links) = &request_inputs.links {
         debug!(
             "Position rows for service {}: {}",
@@ -8251,12 +8270,30 @@ pub(crate) fn discover_service_inputs(
     service: &Config,
     positions: Option<crate::position_rows::PositionIndex>,
 ) -> crate::request_summary::RequestSummaryInputs {
+    discover_service_inputs_within(
+        repo,
+        service,
+        positions,
+        crate::request_summary::ROWS_JOIN_BUDGET,
+    )
+}
+
+/// [`discover_service_inputs`], binding the rows within `budget`
+/// (carrick#2564).
+#[cfg(test)]
+pub(crate) fn discover_service_inputs_within(
+    repo: &Path,
+    service: &Config,
+    positions: Option<crate::position_rows::PositionIndex>,
+    budget: std::time::Duration,
+) -> crate::request_summary::RequestSummaryInputs {
     let cm: Lrc<SourceMap> = Default::default();
     discover_with_positions(
         &canonical_repo_path(&repo.to_string_lossy()),
         service,
         cm,
         positions,
+        budget,
     )
     .expect("discovery reads the service")
     .request_inputs

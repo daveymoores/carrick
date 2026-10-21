@@ -45,6 +45,8 @@ pub(crate) struct Walked {
     /// The copied repo's root, canonical.
     pub(crate) repo: PathBuf,
     pub(crate) inputs: RequestSummaryInputs,
+    /// How long discovery took, rows bound included (not the walk).
+    pub(crate) discovered_in: std::time::Duration,
 }
 
 impl Walked {
@@ -69,6 +71,25 @@ pub(crate) fn walked(
     service: &str,
     edit: &[(&str, &str)],
     with_rows: bool,
+) -> Option<Walked> {
+    walked_within(
+        fixture,
+        service_dir,
+        service,
+        edit,
+        with_rows,
+        super::ROWS_JOIN_BUDGET,
+    )
+}
+
+/// [`walked`], binding the rows within `budget` (carrick#2564).
+pub(crate) fn walked_within(
+    fixture: &str,
+    service_dir: &str,
+    service: &str,
+    edit: &[(&str, &str)],
+    with_rows: bool,
+    budget: std::time::Duration,
 ) -> Option<Walked> {
     let script = sidecar()?;
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -120,10 +141,12 @@ pub(crate) fn walked(
             crate::position_rows::read_rows_file(&out).expect("the rows read"),
         )
     });
-    let inputs = crate::engine::discover_service_inputs(&repo, &config, positions);
+    let started = std::time::Instant::now();
+    let inputs = crate::engine::discover_service_inputs_within(&repo, &config, positions, budget);
     Some(Walked {
         _dir: dir,
         repo,
         inputs,
+        discovered_in: started.elapsed(),
     })
 }
