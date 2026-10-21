@@ -85,12 +85,14 @@ pub(crate) struct RowLinks {
 }
 
 impl RowLinks {
-    /// What each import of `files` reaches, as `positions` says.
+    /// What each import of `files` reaches, as `positions` says. `None`
+    /// once `deadline` passes (carrick#2564).
     pub(crate) fn of(
         files: &HashMap<PathBuf, FileIr>,
         bindings: &ImportedBindings,
         positions: &PositionIndex,
-    ) -> Self {
+        deadline: std::time::Instant,
+    ) -> Option<Self> {
         let mut links = RowLinks::default();
         let mut paths: Vec<&PathBuf> = files.keys().collect();
         paths.sort();
@@ -103,6 +105,9 @@ impl RowLinks {
             let mut locals: Vec<&String> = ir.imported.keys().collect();
             locals.sort();
             for local in locals {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
                 let link = match uses.get(local.as_str()) {
                     Some(spans) => links.link_of(files, bindings, positions, file, local, spans),
                     // Used only where no row is written (a JSX tag, a
@@ -115,7 +120,7 @@ impl RowLinks {
                 links.links.insert((file.clone(), local.clone()), link);
             }
         }
-        links
+        Some(links)
     }
 
     /// What `local`, imported in `file` and used at `spans`, reaches.

@@ -1464,6 +1464,8 @@ pub(super) struct LinkedNames<'a> {
     /// Some module names a specifier the scan cannot follow; with rows, a
     /// use no row follows may change an exported object.
     unfollowable: bool,
+    /// Past this, nothing more is read ([`Self::until`]).
+    deadline: Option<std::time::Instant>,
 }
 
 impl<'a> LinkedNames<'a> {
@@ -1481,6 +1483,7 @@ impl<'a> LinkedNames<'a> {
             links: None,
             contested: HashSet::new(),
             unfollowable: !bindings.unresolved_in().is_empty(),
+            deadline: None,
         };
         let mut every: Vec<(PathBuf, String)> = Vec::new();
         for (file, ir) in files {
@@ -1541,6 +1544,7 @@ impl<'a> LinkedNames<'a> {
             links: Some(links),
             contested: HashSet::new(),
             unfollowable: links.open(),
+            deadline: None,
         };
         let mut every: Vec<(PathBuf, String)> = Vec::new();
         for (file, ir) in files {
@@ -1579,6 +1583,13 @@ impl<'a> LinkedNames<'a> {
         }
         linked.contest_every(every);
         linked
+    }
+
+    /// The names, reading nothing once `deadline` passes: a read past it is
+    /// `None`, and the caller that set it discards every read (carrick#2564).
+    pub(super) fn until(mut self, deadline: Option<std::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// A namespace import, or a module loaded some other way, may reach any
@@ -1659,6 +1670,12 @@ impl<'a> LinkedNames<'a> {
     /// binding it names: text, or a parameter of the function `pieces` is
     /// written in. `None` when one names nothing this can read.
     fn resolve(&self, file: &Path, pieces: &[TextPiece], depth: usize) -> Option<Vec<TextPiece>> {
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return None;
+        }
         let mut out = Vec::new();
         for piece in pieces {
             let TextPiece::Named(named) = piece else {

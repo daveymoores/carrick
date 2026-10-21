@@ -211,6 +211,10 @@ mod row_links;
 // rows when the run walks them (carrick#2413 slice D).
 mod row_calls;
 
+// What binding the rows costs, and the budget that bounds it (carrick#2564).
+mod rows_join;
+pub use rows_join::ROWS_JOIN_BUDGET;
+
 // Every call that reaches a labelled library export, at any depth, read
 // from the rows (carrick#2431). Record-only: only tests and the offline
 // census read it so far, so the binary sees it as unused.
@@ -7313,16 +7317,53 @@ impl RequestSummaryInputs {
     /// own module reads it as ([`Held`], carrick#2540).
     ///
     /// With rows, what each import reaches is read from them first
-    /// ([`Self::links`]), and the reading follows it.
-    pub fn linked(mut self) -> Self {
-        if let Some(positions) = &self.positions {
-            self.links = Some(row_links::RowLinks::of(
-                &self.files,
-                &self.bindings,
-                positions,
-            ));
-            self.row_calls = Some(self.row_calls());
+    /// ([`Self::links`]), and the reading follows it. Binding the rows of
+    /// `service` may take `budget` (carrick#2564): past it, the service
+    /// reads as with no rows, and the run log says so.
+    pub fn linked(mut self, service: &str, budget: std::time::Duration) -> Self {
+        if self.positions.is_some() {
+            let mut join = rows_join::RowsJoin::start(service, budget);
+            if let Some(reads) = self.bind_rows(&mut join) {
+                return self.read_through(reads);
+            }
+            self.positions = None;
+            self.links = None;
+            self.row_calls = None;
         }
+        let reads = self.linked_reads(None).unwrap_or_default();
+        self.read_through(reads)
+    }
+
+    /// The rows bound to the import links and the calls, and what the
+    /// linked names read through them, each step before `join`'s deadline.
+    /// `None` past it, with the rest of `self` as it was.
+    fn bind_rows(&mut self, join: &mut rows_join::RowsJoin) -> Option<LinkedReads> {
+        let deadline = join.deadline();
+        let positions = self.positions.as_ref()?;
+        let Some(links) = row_links::RowLinks::of(&self.files, &self.bindings, positions, deadline)
+        else {
+            join.run_out("import links");
+            return None;
+        };
+        self.links = Some(links);
+        join.step("import links");
+        let Some(row_calls) = self.row_calls(deadline) else {
+            join.run_out("calls");
+            return None;
+        };
+        self.row_calls = Some(row_calls);
+        join.step("calls");
+        let Some(reads) = self.linked_reads(Some(deadline)) else {
+            join.run_out("linked names");
+            return None;
+        };
+        join.step("linked names");
+        Some(reads)
+    }
+
+    /// What each linked piece of the files reads as: its text, or what its
+    /// own module holds it as. `None` once `deadline` passes.
+    fn linked_reads(&mut self, deadline: Option<std::time::Instant>) -> Option<LinkedReads> {
         let mut wanted: BTreeSet<(PathBuf, library_sites::NamedRef)> = BTreeSet::new();
         for (path, ir) in &mut self.files {
             ir.visit_pieces(path, &mut |scope, pieces| {
@@ -7337,23 +7378,31 @@ impl RequestSummaryInputs {
             });
         }
         if wanted.is_empty() {
-            return self;
+            return Some(LinkedReads::default());
         }
-        let (resolved, held): LinkedReads = {
-            let names =
-                library_sites::LinkedNames::link(&self.files, &self.bindings, self.links.as_ref());
-            let mut resolved = HashMap::new();
-            let mut held = HashMap::new();
-            for (file, named) in wanted {
-                let piece = library_sites::TextPiece::Named(Box::new(named.clone()));
-                if let Some(text) = names.text(&file, &[piece]) {
-                    resolved.insert((file, named), text);
-                } else if let Some(found) = names.held(&file, &named) {
-                    held.insert((file, named), found.clone());
-                }
+        let names =
+            library_sites::LinkedNames::link(&self.files, &self.bindings, self.links.as_ref())
+                .until(deadline);
+        let past = || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        let mut resolved = HashMap::new();
+        let mut held = HashMap::new();
+        for (file, named) in wanted {
+            if past() {
+                return None;
             }
-            (resolved, held)
-        };
+            let piece = library_sites::TextPiece::Named(Box::new(named.clone()));
+            if let Some(text) = names.text(&file, &[piece]) {
+                resolved.insert((file, named), text);
+            } else if let Some(found) = names.held(&file, &named) {
+                held.insert((file, named), found.clone());
+            }
+        }
+        // A read the deadline cut short is no reading.
+        (!past()).then_some((resolved, held))
+    }
+
+    /// The files with each linked piece read as `reads` says.
+    fn read_through(mut self, (resolved, held): LinkedReads) -> Self {
         if resolved.is_empty() && held.is_empty() {
             return self;
         }
