@@ -21,7 +21,10 @@
 //! declares, whose binding SWC already names exactly.
 //!
 //! A call whose row says nothing is [`Reach::Unknown`], never a fallback to
-//! the name join: the summary it sits in is not complete.
+//! the name join: the summary it sits in is not complete. The one exception
+//! is a call through an import the compiler could not resolve: it knows
+//! nothing of that callee, so the call reaches what the call graph names, as
+//! without rows (carrick#2557).
 
 use super::*;
 use crate::position_rows::{FLAG_ANY, FLAG_ERROR_TYPE, Kind};
@@ -402,10 +405,39 @@ impl RequestSummaryInputs {
         if row_calls.kept.contains(&at) {
             return graph();
         }
-        match row_calls.answers.get(&at) {
+        match self.rows_say(file, lo, hi) {
+            // The import the call goes through did not resolve: the compiler
+            // knows nothing of the callee, so its rows hold nothing against
+            // the call graph, which is read as without rows (carrick#2557).
+            Reach::Unknown(HoleReason::UnresolvedImport) => graph(),
+            reach => reach,
+        }
+    }
+
+    /// What the rows alone say the call at `lo..hi` in `file` reaches.
+    fn rows_say(&self, file: &Path, lo: u32, hi: u32) -> Reach {
+        let at = (file.to_path_buf(), lo, hi);
+        match self
+            .row_calls
+            .as_ref()
+            .and_then(|row_calls| row_calls.answers.get(&at))
+        {
             Some(reach) => reach.clone(),
             None => self.row_reach(file, lo, hi),
         }
+    }
+
+    /// Whether [`Self::reach`] reads the call at `lo..hi` in `file` from the
+    /// call graph because the rows cannot resolve the import it goes
+    /// through, and the call graph follows it into a function of the
+    /// repository (carrick#2557).
+    pub(crate) fn fell_back(&self, file: &Path, lo: u32, hi: u32) -> bool {
+        let Some(row_calls) = &self.row_calls else {
+            return false;
+        };
+        !row_calls.kept.contains(&(file.to_path_buf(), lo, hi))
+            && self.rows_say(file, lo, hi) == Reach::Unknown(HoleReason::UnresolvedImport)
+            && self.sites.target_at(file, lo, hi).is_some()
     }
 
     /// [`Self::reach`]'s definition, as [`CallSiteTargets::target_at`]
@@ -620,6 +652,89 @@ mod tests {
             texts.sort();
         }
         out
+    }
+
+    /// Every summary row `walked` states, in every file, with the copied
+    /// repo's root taken out so two walks compare.
+    fn every_row(walked: &Walked, index: &RequestSummaryIndex) -> Vec<String> {
+        let root = walked.repo.to_string_lossy().to_string();
+        let mut out: Vec<String> = walked
+            .inputs
+            .files
+            .keys()
+            .filter_map(|path| index.rows(path))
+            .flat_map(BTreeMap::values)
+            .flatten()
+            .map(|row| format!("{row:?}").replace(&root, ""))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// carrick#2557: a service rooted above the directory that holds its
+    /// tsconfig, whose components call service functions that call a shared
+    /// fetch wrapper. The call graph follows every import; the compiler's
+    /// rows, walked with no tsconfig at the service root, resolve none of
+    /// them. An import the compiler cannot resolve tells it nothing about
+    /// the callee, so each such call is read from the call graph as without
+    /// rows, and counted as such: the summaries state the same rows.
+    #[test]
+    fn a_call_through_an_unresolved_import_is_read_from_the_call_graph() {
+        let Some(off) = walked("position-rows-wrapper", ".", "web", &[], false) else {
+            return;
+        };
+        let without = summarize(&off.inputs, &LibrarySemantics::default());
+        assert!(
+            without.row_count() > 0,
+            "the call graph follows the wrapper"
+        );
+        assert_eq!(without.fell_back(), 0, "no rows, nothing read around them");
+
+        let on = walked("position-rows-wrapper", ".", "web", &[], true).unwrap();
+        let with = summarize(&on.inputs, &LibrarySemantics::default());
+        assert_eq!(every_row(&on, &with), every_row(&off, &without));
+        assert_eq!(with.silent_count(), without.silent_count());
+        assert_eq!(with.undetermined, without.undetermined);
+        // Each call into a function another module declares: 9 in the
+        // components (7 into the services, 2 straight into the wrapper) and
+        // 8 in the services. The wrapper's own calls of its token helper are
+        // bare calls of a function the same file declares, which stay on the
+        // call graph.
+        assert_eq!(with.fell_back(), 17);
+        assert_eq!(with.unfollowed_count(), 0, "{:?}", with.unfollowed());
+    }
+
+    const PROBE_FILE: &str = "web/src/components/Sync.ts";
+    const PROBE: &str = "import * as users from \"../services/users\";\n\nexport async function sync() {\n  return users.listUsers();\n}\n";
+    const PROBE_REASON: &str = "unresolved_name";
+
+    /// carrick#2557: only an unresolved import is read from the call graph.
+    /// A call the rows cannot follow for any other reason is still no
+    /// callee: the summaries state no row there, and the call is counted
+    /// under that reason.
+    #[test]
+    fn a_call_the_rows_cannot_follow_for_another_reason_states_no_row() {
+        let edit = [(PROBE_FILE, PROBE)];
+        let Some(off) = walked("position-rows-wrapper", ".", "web", &edit, false) else {
+            return;
+        };
+        let without = summarize(&off.inputs, &LibrarySemantics::default());
+        let on = walked("position-rows-wrapper", ".", "web", &edit, true).unwrap();
+        assert_eq!(
+            reached_in(&on, PROBE_FILE),
+            BTreeMap::from([(4, vec![format!("unknown {PROBE_REASON}")])])
+        );
+        let with = summarize(&on.inputs, &LibrarySemantics::default());
+        assert!(
+            !stated_in(&off, PROBE_FILE).is_empty(),
+            "the call graph follows it"
+        );
+        assert_eq!(stated_in(&on, PROBE_FILE), BTreeMap::new());
+        assert_eq!(
+            with.unfollowed().clone(),
+            BTreeMap::from([(PROBE_REASON.to_string(), 1)])
+        );
+        assert_eq!(without.unfollowed_count(), 0);
     }
 
     fn line(n: u32, target: &str) -> (u32, Vec<String>) {

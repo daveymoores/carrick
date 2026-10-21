@@ -7791,6 +7791,15 @@ pub struct RequestSummaryIndex {
     passes_body: HashSet<(PathBuf, String)>,
     /// Requests this pass reached whose URL it could not state.
     pub undetermined: usize,
+    /// The call sites the call graph follows into a function of the
+    /// repository that the compiler's rows cannot say the callee of, by the
+    /// rows' reason (carrick#2557). Each is read as no request: neither a
+    /// row nor a silent site.
+    unfollowed: BTreeMap<String, usize>,
+    /// The call sites the compiler's rows cannot follow because the import
+    /// they call through did not resolve, read from the call graph as
+    /// without rows (carrick#2557).
+    fell_back: usize,
     /// What the requests whose method is a parameter declared as a set of
     /// verbs wait on (carrick#2049).
     methods: Box<DeclaredMethods>,
@@ -7911,6 +7920,23 @@ impl RequestSummaryIndex {
     pub fn silent_count(&self) -> usize {
         self.silent.values().map(BTreeSet::len).sum()
     }
+
+    /// The call sites the summaries read as no request because the
+    /// compiler's rows cannot say what the call graph follows, by the rows'
+    /// reason (carrick#2557).
+    pub fn unfollowed(&self) -> &BTreeMap<String, usize> {
+        &self.unfollowed
+    }
+
+    pub fn unfollowed_count(&self) -> usize {
+        self.unfollowed.values().sum()
+    }
+
+    /// The call sites read from the call graph because the compiler could
+    /// not resolve the import they call through (carrick#2557).
+    pub fn fell_back(&self) -> usize {
+        self.fell_back
+    }
 }
 
 struct Composer<'a> {
@@ -8002,6 +8028,21 @@ impl Composer<'_> {
                 self.inputs.reach(file, call.site.lo, call.site.hi),
                 row_calls::Reach::Unknown(_)
             )
+    }
+
+    /// Why the rows cannot say the callee of a call the call graph follows
+    /// into a function of the repository (carrick#2557): the site the rows
+    /// take from the summaries. `None` without rows, for a call the rows
+    /// answer, and for one the call graph does not follow either.
+    fn unfollowed(&self, file: &Path, call: &CallIr) -> Option<HoleReason> {
+        if self.inputs.row_calls.is_none() || call.jsx {
+            return None;
+        }
+        let row_calls::Reach::Unknown(reason) = self.inputs.reach(file, call.site.lo, call.site.hi)
+        else {
+            return None;
+        };
+        self.inputs.sites.target(file, call.site.lo).map(|_| reason)
     }
 
     /// The callee a call resolves to, when it is a function this pass read.
@@ -8346,6 +8387,9 @@ fn emit(
         if call.invokes_param.is_some() {
             continue;
         }
+        if !call.jsx && composer.inputs.fell_back(file, call.site.lo, call.site.hi) {
+            index.fell_back += 1;
+        }
         let mut rows: Vec<SummaryRow> = Vec::new();
         match composer.callee(file, call) {
             Some((callee_file, callee)) => {
@@ -8446,7 +8490,16 @@ fn emit(
                 // row, and claims the site as a summary does anywhere else:
                 // the passes that read the site's own source cannot read the
                 // client's base, so their reading is not the one to keep.
-                if let Some(mut request) = composer.request_of(file, call) {
+                let request = composer.request_of(file, call);
+                if request.is_none()
+                    && let Some(reason) = composer.unfollowed(file, call)
+                {
+                    *index
+                        .unfollowed
+                        .entry(row_calls::hole_key(reason))
+                        .or_default() += 1;
+                }
+                if let Some(mut request) = request {
                     // A function written inside another has callers this pass
                     // does not resolve, so what its declaration allows is not
                     // what it sends (carrick#2049): its calls are the model's
