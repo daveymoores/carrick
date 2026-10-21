@@ -470,9 +470,6 @@ pub struct PositionRowsCounts {
     pub any: usize,
     /// Rows whose type is the compiler's error type.
     pub error_type: usize,
-    /// `impl` rows (carrick#2430).
-    #[serde(rename = "impl")]
-    pub impl_rows: usize,
     /// `jsx` rows.
     pub jsx: usize,
     /// The rows file's size on disk, compressed.

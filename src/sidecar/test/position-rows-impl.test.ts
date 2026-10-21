@@ -1,7 +1,7 @@
 /**
- * Version 2 of the per-position rows (carrick#2430): `impl` rows name what
- * implements a call's bodyless declaration, and `jsx` rows record each JSX
- * element's tag.
+ * `jsx` rows (carrick#2430) record each JSX element's tag. Version 4
+ * (carrick#2561) writes no `impl` rows: the walk runs no go-to-implementation
+ * search, so the bodyless declarations below get none.
  *
  * The fixture (`test/fixtures/position-rows-impl/`) is an interface `Port`
  * implemented by a class and by an object literal, an abstract class with two
@@ -22,8 +22,6 @@ import { SidecarClient, asVersion1Rows } from './helpers.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = path.join(__dirname, '..', '..', 'test', 'fixtures', 'position-rows-impl');
 
-const FLAG_CHECKER_THREW = 4;
-const FLAG_TOO_MANY = 16;
 
 type Row = [string, number, number, string | null, string | null, number | null, string | null, string | null, number];
 
@@ -71,7 +69,7 @@ async function walk(repo: string, out: string): Promise<Walked> {
   }
 }
 
-describe('position_rows version 2: impl and jsx rows (carrick#2430)', () => {
+describe('position_rows version 4: jsx rows, no impl rows (carrick#2430, #2561)', () => {
   let root: string;
   let one: Walked;
   let two: Walked;
@@ -98,53 +96,11 @@ describe('position_rows version 2: impl and jsx rows (carrick#2430)', () => {
     return (one.rows.get(file) ?? []).filter((r) => r[0] === kind && source.slice(r[1], r[2]) === text);
   };
 
-  /** `[symbol, decl_file, decl_line, decl_package, type_text, flags]` of each `impl` row at a span. */
-  const implsAt = (file: string, text: string): unknown[][] =>
-    rowsAt(file, 'impl', text).map((r) => [r[3], r[4], r[5], r[6], r[7], r[8]]);
-
-  it('names the class and the object literal that implement an interface method, at the call and at the member', () => {
-    const expected = [
-      ['send', 'src/port.ts', 6, 'svc', null, 0],
-      ['send', 'src/port.ts', 14, 'svc', null, 0],
-    ];
-    assert.deepStrictEqual(implsAt('src/main.ts', "port.send('created', { id: 1 })"), expected);
-    assert.deepStrictEqual(implsAt('src/main.ts', 'port.send'), expected);
-    assert.deepStrictEqual(implsAt('src/relay.ts', 'workerPort.send(name, body)'), expected);
-  });
-
-  it('names both subclasses of an abstract method', () => {
-    assert.deepStrictEqual(implsAt('src/main.ts', "store.save('key', 'value')"), [
-      ['save', 'src/store.ts', 8, 'svc', null, 0],
-      ['save', 'src/store.ts', 14, 'svc', null, 0],
-    ]);
-  });
-
-  it('writes one too_many row past the cap, with no list', () => {
-    assert.deepStrictEqual(implsAt('src/main.ts', 'step.run()'), [[null, null, null, null, null, FLAG_TOO_MANY]]);
-    assert.deepStrictEqual(implsAt('src/main.ts', 'step.run'), [[null, null, null, null, null, FLAG_TOO_MANY]]);
-  });
-
-  it('writes no impl row where the declaration has a body', () => {
-    assert.deepStrictEqual(implsAt('src/main.ts', "relay.forward('moved', { id: 2 })"), []);
-    assert.deepStrictEqual(implsAt('src/port.ts', "fetch(`/events/${name}`, { method: 'POST', body: JSON.stringify(body) })"), []);
-  });
-
-  it('writes what go-to-implementation answers for a function-typed constructor parameter: nothing', () => {
-    // The language service names no implementation of a parameter; the
-    // argument passed to the constructor is a value flow, not an implementation.
-    assert.deepStrictEqual(implsAt('src/relay.ts', 'this.deliver(name, body)'), []);
-  });
-
-  it('never names a declaration as its own implementation', () => {
-    // Go-to-implementation on an overloaded default-library method answers
-    // with its own overload signatures.
-    assert.deepStrictEqual(implsAt('src/port.ts', 'JSON.stringify(body)'), []);
-  });
-
-  it('never marks an impl search that answered as a checker throw', () => {
-    for (const rows of one.rows.values()) {
-      for (const r of rows) assert.ok(r[0] !== 'impl' || (r[8] & FLAG_CHECKER_THREW) === 0, JSON.stringify(r));
-    }
+  it('writes only the version-4 kinds, with no impl row at an interface, abstract or capped call', () => {
+    const kinds = new Set([...one.rows.values()].flat().map((r) => r[0]));
+    assert.deepStrictEqual([...kinds].sort(), ['call', 'ident', 'jsx', 'member']);
+    assert.ok(rowsAt('src/main.ts', 'call', "port.send('created', { id: 1 })").length === 1);
+    assert.ok(rowsAt('src/main.ts', 'call', 'step.run()').length === 1);
   });
 
   it('writes a jsx row for each element: the imported component and the intrinsic', () => {
@@ -162,9 +118,9 @@ describe('position_rows version 2: impl and jsx rows (carrick#2430)', () => {
     assert.strictEqual(all.length, 3, 'one jsx row per opening or self-closing element');
   });
 
-  it('counts the impl and jsx rows it wrote', () => {
+  it('counts the jsx rows it wrote, and no impl count', () => {
     const all = [...one.rows.values()].flat();
-    assert.strictEqual(one.counts.impl, all.filter((r) => r[0] === 'impl').length);
+    assert.ok(!('impl' in one.counts), JSON.stringify(one.counts));
     assert.strictEqual(one.counts.jsx, all.filter((r) => r[0] === 'jsx').length);
     assert.strictEqual(one.counts.rows, all.length);
   });

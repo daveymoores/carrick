@@ -13,29 +13,26 @@
  * | `member`  | property or element access                        | the name or the argument  | the access     |
  * | `compare` | `=== !== == != < > <= >= instanceof in`           | the left operand          | the left operand |
  * | `ident`   | an identifier in expression position              | itself                    | itself         |
- * | `impl`    | a `call` or `member` whose declaration has no body | an implementation of it  | nothing        |
  * | `decl`    | a `call` or `member` on a union of declaring types | one of those declarations | nothing       |
  * | `jsx`     | a JSX opening or self-closing element's tag        | the tag's name           | the tag        |
  *
- * An `impl` row (version 2, carrick#2430) follows the `call` or `member` row
- * it belongs to and has its span: one per declaration that go-to-implementation
- * names for that row's declaration, when that declaration is an interface's
- * or type literal's method, a function-typed property signature, an abstract
- * member, or a function-typed class property or parameter with no
- * initializer. Its `decl_*` name the implementing declaration. Past
- * {@link IMPL_CAP} the row is one, with {@link FLAG_TOO_MANY} and nothing else.
- *
  * A `decl` row (version 3, carrick#2448) follows the `call` or `member` row
- * it belongs to, before its `impl` rows, and has its span: one per
+ * it belongs to and has its span: one per
  * declaration of the member when the receiver is a union whose constituents
  * declare it at more than one place (`(pick ? a : b).get()` with two
  * classes). That row names only the first of them. Each constituent's
  * declaration is its own member's, or, for a member with none (a mapped
- * type's), the declaration of the constituent type itself. Sorted and capped
- * as `impl` rows are; `type_text` is `null`.
+ * type's), the declaration of the constituent type itself. Sorted by file and
+ * position; past {@link DECL_CAP} the row is one, with {@link FLAG_TOO_MANY}
+ * and nothing else. `type_text` is `null`.
  *
- * A row's key is `(start, end, kind)`, except that several `impl` rows, and
- * several `decl` rows, share one: TypeScript `getStart()`/`getEnd()` of the
+ * Version 4 (carrick#2561) dropped the `impl` rows of versions 2 and 3: the
+ * go-to-implementation search behind them was most of the walk's time, and
+ * nothing read them. Implementations are asked for where discovery stops
+ * (carrick#2432).
+ *
+ * A row's key is `(start, end, kind)`, except that several `decl` rows share
+ * one: TypeScript `getStart()`/`getEnd()` of the
  * node, in UTF-16 code units from the start of the file, which is what the scanner's `sidecar_position`
  * gives for an SWC span. Every path written is relative to the scanned repo's
  * root, with `/` separators.
@@ -63,7 +60,7 @@ import type { ProjectLoader } from './project-loader.js';
 import type { PositionRowsCounts } from './types.js';
 
 /** The format's version, written in the header. */
-export const POSITION_ROWS_VERSION = 3;
+export const POSITION_ROWS_VERSION = 4;
 
 /** The type is `any`, declared or inferred. Never set with the error type. */
 export const FLAG_ANY = 1;
@@ -73,7 +70,7 @@ export const FLAG_ERROR_TYPE = 2;
 export const FLAG_CHECKER_THREW = 4;
 /** The declaration is outside the checkout, not the default library and in no installed package. */
 export const FLAG_DECLARATION_UNNAMED = 8;
-/** An `impl` or `decl` row standing for more than {@link IMPL_CAP} rows of its kind; it names none. */
+/** A `decl` row standing for more than {@link DECL_CAP} rows; it names none. */
 export const FLAG_TOO_MANY = 16;
 /**
  * The declaration is published under the row's symbol name: its module
@@ -85,12 +82,12 @@ export const FLAG_PUBLISHED = 32;
 /** The declaration is what its module exports as `export =` or `default` (carrick#2508). */
 export const FLAG_MODULE_DEFAULT = 64;
 
-/** The most `impl` rows one declaration lists, and the most `decl` rows one position lists. */
-export const IMPL_CAP = 16;
+/** The most `decl` rows one position lists. */
+export const DECL_CAP = 16;
 
-/** The kinds {@link kindOf} gives a node; `impl`, `decl` and `jsx` rows are written beside them. */
+/** The kinds {@link kindOf} gives a node; `decl` and `jsx` rows are written beside them. */
 export type NodeKind = 'call' | 'member' | 'compare' | 'ident';
-export type PositionKind = NodeKind | 'impl' | 'decl' | 'jsx';
+export type PositionKind = NodeKind | 'decl' | 'jsx';
 
 /** `[kind, start, end, symbol, decl_file, decl_line, decl_package, type_text, flags]` */
 export type PositionRow = [
@@ -157,7 +154,6 @@ export function writePositionRows(options: PositionRowsOptions): PositionRowsCou
     resolved: 0,
     any: 0,
     error_type: 0,
-    impl: 0,
     jsx: 0,
     bytes: 0,
     load_ms: 0,
@@ -213,15 +209,15 @@ export function writePositionRows(options: PositionRowsOptions): PositionRowsCou
       read.set(index, sourceFile?.getFilePath());
     }
     // Built once, after every file the group adds. The language service's
-    // program is the one walked, so go-to-implementation answers over it
-    // and no second program is built.
+    // program is the one walked, as it was when go-to-implementation answered
+    // over it (carrick#2430, dropped in #2561): its rows are pinned.
     const service = project.getLanguageService().compilerObject;
     const program = service.getProgram();
     if (!program) throw new Error('the language service built no program');
     counts.load_ms += performance.now() - loadStarted;
 
     const walkStarted = performance.now();
-    const walker = new PositionWalker(program, service, paths, loader);
+    const walker = new PositionWalker(program, paths, loader);
     const missed: number[] = [];
     for (const index of indexes) {
       if (!read.has(index)) continue;
@@ -237,7 +233,6 @@ export function writePositionRows(options: PositionRowsOptions): PositionRowsCou
         if (row[3] !== null) counts.resolved += 1;
         if (row[8] & FLAG_ANY) counts.any += 1;
         if (row[8] & FLAG_ERROR_TYPE) counts.error_type += 1;
-        if (row[0] === 'impl') counts.impl += 1;
         if (row[0] === 'jsx') counts.jsx += 1;
       }
       lines[index] = fileLine({ f: paths.relative(files[index]), h: hashes.get(index), r: rows });
@@ -449,20 +444,11 @@ interface RequireBinding {
 /** The rows of one program's files. */
 class PositionWalker {
   private readonly checker: ts.TypeChecker;
-  /**
-   * Each bodyless declaration's implementations, as `impl` rows with no span
-   * yet (`start` and `end` are 0): go-to-implementation searches the whole
-   * program, so it is asked once per declaration, never per call.
-   */
-  private readonly implementations = new Map<ts.Declaration, PositionRow[]>();
-  /** The same for a member whose symbol has no declaration, keyed by symbol. */
-  private readonly undeclaredImplementations = new Map<ts.Symbol, PositionRow[]>();
   /** Each module's exports by name, and its `export =` and `default` targets, aliases followed. */
   private readonly moduleExports = new Map<ts.Symbol, { byName: Map<string, ts.Symbol>; wholes: ts.Symbol[] }>();
 
   constructor(
     private readonly program: ts.Program,
-    private readonly service: ts.LanguageService,
     private readonly paths: PathNames,
     private readonly loader: ProjectLoader
   ) {
@@ -478,7 +464,6 @@ class PositionWalker {
         rows.push(row);
         if ((kind === 'call' || kind === 'member') && !(row[8] & FLAG_CHECKER_THREW)) {
           for (const decl of this.declRows(kind, node)) rows.push(['decl', row[1], row[2], ...tail(decl)]);
-          for (const impl of this.implRows(kind, node)) rows.push(['impl', row[1], row[2], ...tail(impl)]);
         }
       }
       if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
@@ -490,7 +475,7 @@ class PositionWalker {
     return rows;
   }
 
-  private row(kind: Exclude<PositionKind, 'impl' | 'decl'>, node: ts.Node, sourceFile: ts.SourceFile): PositionRow {
+  private row(kind: Exclude<PositionKind, 'decl'>, node: ts.Node, sourceFile: ts.SourceFile): PositionRow {
     const start = node.getStart(sourceFile);
     const end = node.getEnd();
     try {
@@ -553,94 +538,6 @@ class PositionWalker {
     const declLine = declaringFile.getLineAndCharacterOfPosition(position).line + 1;
     const declPackage = this.paths.declaringPackage(declaringFile.fileName, (file) => this.loader.packageOf(file));
     return { declFile, declLine, declPackage };
-  }
-
-  /**
-   * The `impl` rows of a `call` or `member` row (spans unset): none unless the
-   * row's declaration has no body of its own ({@link isBodyless}). Its own
-   * search, apart from the row's: a throw here writes one `impl` row flagged
-   * {@link FLAG_CHECKER_THREW} and leaves the row as it was.
-   */
-  private implRows(kind: 'call' | 'member', node: ts.Node): PositionRow[] {
-    let declaration: ts.Declaration | undefined;
-    try {
-      const symbol = this.symbolOf(kind, node);
-      if (symbol && (symbol.declarations ?? []).length === 0) return this.undeclaredImplRows(kind, node, symbol);
-      declaration = symbol ? attributedDeclaration(() => this.program, symbol.declarations ?? []) : undefined;
-      if (!declaration || !isBodyless(declaration, this.checker)) return [];
-    } catch {
-      return [];
-    }
-    let rows = this.implementations.get(declaration);
-    if (!rows) {
-      try {
-        rows = this.implementationsOf(declaration);
-      } catch {
-        rows = [['impl', 0, 0, null, null, null, null, null, FLAG_CHECKER_THREW]];
-      }
-      this.implementations.set(declaration, rows);
-    }
-    return rows;
-  }
-
-  /**
-   * The `impl` rows of a member whose symbol has no declaration (a mapped
-   * type's member): there is no declaration name to ask at, so the answer is
-   * asked at the use site's name, once per symbol. Same shape as
-   * {@link implementationsOf}; nothing of the symbol's own is filtered out.
-   */
-  private undeclaredImplRows(kind: 'call' | 'member', node: ts.Node, symbol: ts.Symbol): PositionRow[] {
-    const cached = this.undeclaredImplementations.get(symbol);
-    if (cached) return cached;
-    let rows: PositionRow[];
-    try {
-      const named = nameNodeOf(kind, node);
-      rows = named ? this.implementationRows(named, []) : [];
-    } catch {
-      rows = [['impl', 0, 0, null, null, null, null, null, FLAG_CHECKER_THREW]];
-    }
-    this.undeclaredImplementations.set(symbol, rows);
-    return rows;
-  }
-
-  /**
-   * What go-to-implementation names for `declaration`, asked at its name:
-   * every declaration the language service answers, except the symbol's own
-   * (an overloaded method answers with its other signatures), in file and
-   * position order.
-   */
-  private implementationsOf(declaration: ts.Declaration): PositionRow[] {
-    const name = ts.getNameOfDeclaration(declaration) ?? declaration;
-    const own = (this.checker.getSymbolAtLocation(name) ?? (declaration as { symbol?: ts.Symbol }).symbol)
-      ?.declarations ?? [declaration];
-    return this.implementationRows(name, own);
-  }
-
-  /** Go-to-implementation at `name`, minus results inside `own`, as sorted `impl` rows. */
-  private implementationRows(name: ts.Node, own: readonly ts.Declaration[]): PositionRow[] {
-    const declaringFile = name.getSourceFile();
-    const found = new Map<string, { file: ts.SourceFile; start: number }>();
-    for (const location of this.service.getImplementationAtPosition(
-      declaringFile.fileName,
-      name.getStart(declaringFile)
-    ) ?? []) {
-      const file = this.program.getSourceFile(location.fileName);
-      if (!file) continue;
-      const start = location.textSpan.start;
-      if (own.some((d) => d.getSourceFile() === file && d.pos <= start && start < d.end)) continue;
-      found.set(`${location.fileName}\u0000${start}`, { file, start });
-    }
-    if (found.size === 0) return [];
-    if (found.size > IMPL_CAP) return [['impl', 0, 0, null, null, null, null, null, FLAG_TOO_MANY]];
-    const rows = [...found.values()].map(({ file, start }) => {
-      const { declFile, declLine, declPackage } = this.located(file, start);
-      const named = nodeStartingAt(file, start);
-      const symbol = named ? this.checker.getSymbolAtLocation(named) : undefined;
-      const flags = declFile === null ? FLAG_DECLARATION_UNNAMED : 0;
-      return { start, row: ['impl', 0, 0, symbol ? ts.symbolName(symbol) : null, declFile, declLine, declPackage, null, flags] as PositionRow };
-    });
-    rows.sort((a, b) => compareNames(a.row[4], b.row[4]) || a.start - b.start);
-    return rows.map(({ row }) => row);
   }
 
   /**
@@ -769,7 +666,7 @@ class PositionWalker {
       return [['decl', 0, 0, null, null, null, null, null, FLAG_CHECKER_THREW]];
     }
     if (found.size < 2) return [];
-    if (found.size > IMPL_CAP) return [['decl', 0, 0, null, null, null, null, null, FLAG_TOO_MANY]];
+    if (found.size > DECL_CAP) return [['decl', 0, 0, null, null, null, null, null, FLAG_TOO_MANY]];
     const rows = [...found].map((declaration) => {
       const file = declaration.getSourceFile();
       const start = declaration.getStart(file);
@@ -923,37 +820,6 @@ function compareNames(a: string | null, b: string | null): number {
   return a < b ? -1 : 1;
 }
 
-/**
- * Whether a declaration has no body for a call to run: an interface's or type
- * literal's method, a function-typed property signature, an abstract method or
- * property, or a function-typed class property or parameter with no
- * initializer. Its implementations are what go-to-implementation names.
- */
-function isBodyless(declaration: ts.Declaration, checker: ts.TypeChecker): boolean {
-  const functionTyped = (): boolean =>
-    checker.getTypeAtLocation(declaration).getNonNullableType().getCallSignatures().length > 0;
-  if (ts.isMethodSignature(declaration)) return true;
-  if (ts.isPropertySignature(declaration)) return functionTyped();
-  if (ts.isMethodDeclaration(declaration) || ts.isPropertyDeclaration(declaration)) {
-    if (ts.getCombinedModifierFlags(declaration) & ts.ModifierFlags.Abstract) return true;
-    return ts.isPropertyDeclaration(declaration) && !declaration.initializer && functionTyped();
-  }
-  if (ts.isParameter(declaration)) return !declaration.initializer && functionTyped();
-  return false;
-}
-
-/** The innermost node of `file` that starts at `position` (an implementation's name). */
-function nodeStartingAt(file: ts.SourceFile, position: number): ts.Node | undefined {
-  let found: ts.Node | undefined;
-  const visit = (node: ts.Node): void => {
-    if (position < node.getStart(file) || position >= node.getEnd()) return;
-    if (node.getStart(file) === position) found = node;
-    ts.forEachChild(node, visit);
-  };
-  ts.forEachChild(file, visit);
-  return found;
-}
-
 /** The kind of row a node gives, if any (exported for the editor-parity test, carrick#2418). */
 export function kindOf(node: ts.Node): NodeKind | undefined {
   if (ts.isCallExpression(node) || ts.isNewExpression(node) || ts.isTaggedTemplateExpression(node)) {
@@ -980,7 +846,6 @@ function nameNodeOf(kind: PositionKind, node: ts.Node): ts.Node | undefined {
       return referenceName((node as ts.BinaryExpression).left);
     case 'ident':
       return node;
-    case 'impl':
     case 'decl':
       return undefined;
     case 'jsx':
