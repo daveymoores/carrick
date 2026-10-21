@@ -53,11 +53,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{info, warn};
 
 use crate::config::Config;
+use serde::{Deserialize, Serialize};
 
 /// The flag that scans an unprepared tree deliberately.
 pub const ALLOW_FLAG: &str = "--allow-unprepared";
@@ -187,10 +189,88 @@ impl Unprepared {
 /// message, so a caller reports it the way it reports any other reason it did
 /// not scan.
 pub fn require_prepared(repo_root: &Path, services: &[Config]) -> Result<(), String> {
+    // Every call records, allowed or not: a refused run exits before any blob
+    // is written, so what is kept here is only ever read by a run that went on.
+    record(repo_root, services);
     match refusal(unprepared(repo_root, services)) {
         Some(message) => Err(message),
         None => Ok(()),
     }
+}
+
+/// One thing a service was scanned without, as the index blob states it
+/// (carrick#2556). The wire form of [`Unprepared`] without the service, which
+/// the blob already is, and without the command, which is text for a person.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UnpreparedRow {
+    Dependencies {
+        install_root: String,
+        lockfile: String,
+    },
+    Mapping {
+        declared_by: String,
+        target: String,
+    },
+}
+
+impl From<&Unprepared> for UnpreparedRow {
+    fn from(row: &Unprepared) -> Self {
+        match row {
+            Unprepared::Dependencies {
+                install_root,
+                lockfile,
+                ..
+            } => UnpreparedRow::Dependencies {
+                // The wire names the repo root `.`, as the cloud reader expects;
+                // in memory it is the empty relative path.
+                install_root: if install_root.is_empty() {
+                    ".".to_string()
+                } else {
+                    install_root.clone()
+                },
+                lockfile: (*lockfile).to_string(),
+            },
+            Unprepared::Mapping {
+                declared_by,
+                target,
+                ..
+            } => UnpreparedRow::Mapping {
+                declared_by: declared_by.clone(),
+                target: target.clone(),
+            },
+        }
+    }
+}
+
+/// What this process's pre-flight found, per `Config.service_name`. `None`
+/// until the pre-flight runs, so a pass that never ran it reads as "not
+/// stated" and not as "found nothing".
+static RECORDED: Mutex<Option<BTreeMap<Option<String>, Vec<UnpreparedRow>>>> = Mutex::new(None);
+
+fn record(repo_root: &Path, services: &[Config]) {
+    let mut by_service: BTreeMap<Option<String>, Vec<UnpreparedRow>> = BTreeMap::new();
+    for service in services {
+        let rows = unprepared(repo_root, std::slice::from_ref(service));
+        by_service
+            .entry(service.service_name.clone())
+            .or_default()
+            .extend(rows.iter().map(UnpreparedRow::from));
+    }
+    *RECORDED.lock().expect("preflight record lock") = Some(by_service);
+}
+
+/// The rows the pre-flight found for `service`: `None` when it did not run in
+/// this process, `Some` empty when it ran and found none.
+pub fn recorded_for(service: Option<&str>) -> Option<Vec<UnpreparedRow>> {
+    let guard = RECORDED.lock().expect("preflight record lock");
+    let by_service = guard.as_ref()?;
+    Some(
+        by_service
+            .get(&service.map(str::to_string))
+            .cloned()
+            .unwrap_or_default(),
+    )
 }
 
 /// The message for a set of unprepared services, or `None` when there are
@@ -790,6 +870,22 @@ mod tests {
                 command: "deno install",
             }],
             "a config that asks for a local node_modules is asked about it"
+        );
+    }
+
+    /// carrick#2556: the blob names a root install `.`, never the empty
+    /// string, because that is what the cloud reader turns into "the repo root".
+    #[test]
+    fn a_root_install_is_written_as_dot() {
+        let row = UnpreparedRow::from(&Unprepared::Dependencies {
+            service: "api".to_string(),
+            install_root: String::new(),
+            lockfile: "package-lock.json",
+            command: "npm ci",
+        });
+        assert_eq!(
+            serde_json::to_string(&row).unwrap(),
+            r#"{"kind":"dependencies","install_root":".","lockfile":"package-lock.json"}"#
         );
     }
 }

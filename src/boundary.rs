@@ -214,6 +214,20 @@ pub struct ServiceBoundary {
     /// `library_packages_pending`, with the same `None` and `Some(0)` reading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library_packages_failed: Option<usize>,
+    /// What the pre-flight found this service scanned without, when the scan
+    /// ran over an unprepared tree under the override (carrick#2556): a
+    /// lockfile with no install, or a mapped directory that is not on the
+    /// checkout. In memory `Some(empty)` is "the pre-flight ran and found
+    /// nothing" and `None` is "it did not run in this process"; on the wire
+    /// both are the absent key, so a blob from a prepared tree is the blob it
+    /// was before this field existed. For the agent reading the index: never
+    /// printed by [`Self::lines`].
+    #[serde(default, skip_serializing_if = "unprepared_not_stated")]
+    pub unprepared: Option<Vec<crate::preflight::UnpreparedRow>>,
+}
+
+fn unprepared_not_stated(rows: &Option<Vec<crate::preflight::UnpreparedRow>>) -> bool {
+    rows.as_ref().is_none_or(Vec::is_empty)
 }
 
 impl ServiceBoundary {
@@ -292,6 +306,7 @@ impl ServiceBoundary {
             time_limits_run_out: None,
             library_packages_pending: library_counts.map(|(pending, _)| pending),
             library_packages_failed: library_counts.map(|(_, failed)| failed),
+            unprepared: crate::preflight::recorded_for(data.service_name.as_deref()),
         }
     }
 
@@ -1459,5 +1474,158 @@ mod tests {
             let read: ServiceBoundary = serde_json::from_value(value).unwrap();
             assert_eq!(read, boundary);
         }
+    }
+
+    fn unprepared_service(name: &str, directory: &str) -> crate::config::Config {
+        crate::config::Config {
+            service_name: Some(name.to_string()),
+            directory: Some(directory.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn blob_for(service: &str) -> CloudRepoData {
+        serde_json::from_value(serde_json::json!({
+            "repo_name": "acme/app", "service_name": service, "endpoints": [], "calls": [],
+            "mounts": [], "apps": {}, "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-01-01T00:00:00Z", "commit_hash": "abc1234"
+        }))
+        .expect("the blob reads")
+    }
+
+    fn collected(service: &str) -> ServiceBoundary {
+        ServiceBoundary::collect(
+            &blob_for(service),
+            &ProcessingStats::default(),
+            &HashMap::new(),
+            "/repo",
+        )
+    }
+
+    fn put(root: &std::path::Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// carrick#2556: a scan over an unprepared tree under the override puts
+    /// the pre-flight's own rows on each service's boundary, and a service
+    /// the pre-flight cleared states an empty list.
+    #[test]
+    #[serial_test::serial(allow_unprepared)]
+    fn an_allowed_unprepared_scan_names_each_service_it_scanned_bare() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let root = repo.path();
+        put(
+            root,
+            "a/package.json",
+            r#"{"dependencies":{"express":"4"}}"#,
+        );
+        put(root, "a/package-lock.json", "{}");
+        put(
+            root,
+            "b/package.json",
+            r#"{"dependencies":{"express":"4"}}"#,
+        );
+        let services = [unprepared_service("a", "a"), unprepared_service("b", "b")];
+
+        // SAFETY: serialised on the key every test that reads this variable uses.
+        unsafe { std::env::set_var(crate::preflight::ALLOW_ENV, "1") };
+        let verdict = crate::preflight::require_prepared(root, &services);
+        unsafe { std::env::remove_var(crate::preflight::ALLOW_ENV) };
+        assert!(verdict.is_ok(), "the override lets the scan go on");
+
+        assert_eq!(
+            collected("a").unprepared,
+            Some(vec![crate::preflight::UnpreparedRow::Dependencies {
+                install_root: "a".to_string(),
+                lockfile: "package-lock.json".to_string(),
+            }])
+        );
+        assert_eq!(collected("b").unprepared, Some(vec![]));
+        assert_eq!(
+            collected("unknown").unprepared,
+            Some(vec![]),
+            "a service the pre-flight did not list found nothing"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(allow_unprepared)]
+    fn a_mapping_to_an_absent_directory_is_one_mapping_row() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let root = repo.path();
+        put(
+            root,
+            "deno.jsonc",
+            r#"{"imports":{"@generated-client/": "./src/generated/client/"}}"#,
+        );
+        put(
+            root,
+            "src/app.ts",
+            "import { db } from '@generated-client/db';\nexport const a = db;",
+        );
+        unsafe { std::env::set_var(crate::preflight::ALLOW_ENV, "1") };
+        let verdict = crate::preflight::require_prepared(root, &[unprepared_service("api", ".")]);
+        unsafe { std::env::remove_var(crate::preflight::ALLOW_ENV) };
+        assert!(verdict.is_ok());
+        assert_eq!(
+            collected("api").unprepared,
+            Some(vec![crate::preflight::UnpreparedRow::Mapping {
+                declared_by: "@generated-client/".to_string(),
+                target: "src/generated/client".to_string(),
+            }])
+        );
+    }
+
+    /// A blob without the key reads as "not stated" and writes back without
+    /// it; the rows never reach the printed block.
+    #[test]
+    fn the_unprepared_key_is_optional_and_never_printed() {
+        let old = serde_json::to_value(ServiceBoundary::default()).unwrap();
+        assert!(old.get("unprepared").is_none(), "None is not serialised");
+        let read: ServiceBoundary = serde_json::from_value(old).unwrap();
+        assert_eq!(read.unprepared, None);
+
+        let ran_and_found_none = ServiceBoundary {
+            unprepared: Some(vec![]),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&ran_and_found_none).unwrap(),
+            serde_json::to_value(ServiceBoundary::default()).unwrap(),
+            "a prepared tree writes the blob it always wrote"
+        );
+
+        let mut stated = read.clone();
+        stated.unprepared = Some(vec![crate::preflight::UnpreparedRow::Dependencies {
+            install_root: ".".to_string(),
+            lockfile: "package-lock.json".to_string(),
+        }]);
+        let value = serde_json::to_value(&stated).unwrap();
+        assert_eq!(
+            value["unprepared"],
+            serde_json::json!([{"kind":"dependencies","install_root":".","lockfile":"package-lock.json"}])
+        );
+        assert_eq!(stated.lines("svc"), read.lines("svc"));
+    }
+
+    /// The wire shape the cloud reader expects, byte for byte.
+    #[test]
+    fn each_unprepared_row_kind_serialises_to_its_exact_wire_json() {
+        let rows = vec![
+            crate::preflight::UnpreparedRow::Dependencies {
+                install_root: ".".to_string(),
+                lockfile: "package-lock.json".to_string(),
+            },
+            crate::preflight::UnpreparedRow::Mapping {
+                declared_by: "@app/client".to_string(),
+                target: "src/generated/client".to_string(),
+            },
+        ];
+        assert_eq!(
+            serde_json::to_string(&rows).unwrap(),
+            r#"[{"kind":"dependencies","install_root":".","lockfile":"package-lock.json"},{"kind":"mapping","declared_by":"@app/client","target":"src/generated/client"}]"#
+        );
     }
 }
