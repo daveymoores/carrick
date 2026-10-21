@@ -7796,6 +7796,10 @@ pub struct RequestSummaryIndex {
     /// rows' reason (carrick#2557). Each is read as no request: neither a
     /// row nor a silent site.
     unfollowed: BTreeMap<String, usize>,
+    /// The call sites the compiler's rows cannot follow because the import
+    /// they call through did not resolve, read from the call graph as
+    /// without rows (carrick#2557).
+    fell_back: usize,
     /// What the requests whose method is a parameter declared as a set of
     /// verbs wait on (carrick#2049).
     methods: Box<DeclaredMethods>,
@@ -7926,6 +7930,12 @@ impl RequestSummaryIndex {
 
     pub fn unfollowed_count(&self) -> usize {
         self.unfollowed.values().sum()
+    }
+
+    /// The call sites read from the call graph because the compiler could
+    /// not resolve the import they call through (carrick#2557).
+    pub fn fell_back(&self) -> usize {
+        self.fell_back
     }
 }
 
@@ -8376,6 +8386,9 @@ fn emit(
     for call in &ir.calls {
         if call.invokes_param.is_some() {
             continue;
+        }
+        if !call.jsx && composer.inputs.fell_back(file, call.site.lo, call.site.hi) {
+            index.fell_back += 1;
         }
         let mut rows: Vec<SummaryRow> = Vec::new();
         match composer.callee(file, call) {
