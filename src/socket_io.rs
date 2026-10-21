@@ -203,6 +203,11 @@ impl SocketExtraction {
     }
 }
 
+// FROZEN (old path, 2026-10-21): this list only. Deletions and safety fixes
+// only. Fixes for wrong or missing rows go in the `reserved` claims of the
+// library store. Delete when the socket parity gate passes (carrick#1667) with
+// no true row lost, and the in-process event pass reads the claims too
+// (carrick#1670).
 /// Socket.IO lifecycle/reserved events that are not application contract
 /// events. Shared with `crate::event_emitter`, which declines the same names:
 /// a site this pass leaves alone because the event is reserved must not be
@@ -224,6 +229,11 @@ pub(crate) const RESERVED_EVENTS: &[&str] = &[
     "removeListener",
 ];
 
+// FROZEN (old path, 2026-10-21): `UNKNOWN_SUBSCRIBE_METHODS` and
+// `UNKNOWN_PUBLISH_METHODS`, the widened detected-client rule (S2). Deletions
+// and safety fixes only. Fixes for wrong or missing rows go in the library
+// store's socket claims. Delete when the socket parity gate passes
+// (carrick#1667) with no true row lost (carrick#1670).
 /// Handler-registration vocabulary for unknown-direction roots. This is the
 /// protocol's own words, not a library list — the same footing
 /// `crate::event_emitter::SUBSCRIBE_METHODS` stands on. A call only counts as a
@@ -591,6 +601,11 @@ struct SocketRoots {
 }
 
 impl SocketRoots {
+    // FROZEN (old path, 2026-10-21): `for_clients` and `is_socket_client`, the
+    // widened detected-client rule (S2). Deletions and safety fixes only.
+    // Fixes for wrong or missing rows go in the library store's socket claims.
+    // Delete when the socket parity gate passes (carrick#1667) with no true
+    // row lost (carrick#1670).
     /// Empty roots that will admit unknown-direction sockets for
     /// `socket_clients`.
     fn for_clients(socket_clients: &[String]) -> Self {
@@ -600,6 +615,10 @@ impl SocketRoots {
         }
     }
 
+    // FROZEN (old path, 2026-10-21): this function only (S2). Deletions and
+    // safety fixes only. Fixes for wrong or missing rows go in the library
+    // store's socket claims. Delete when the socket parity gate passes
+    // (carrick#1667) with no true row lost (carrick#1670).
     /// Is this import specifier one of the detected socket-client packages?
     /// Exact or `<entry>/` prefix — the same convention
     /// `file_imports_messaging_client` uses, so a package gates the same way
@@ -820,6 +839,13 @@ impl Visit for RootCollector<'_> {
                     .insert(named.local.sym.to_string(), (source.to_string(), exported));
             }
         }
+        // FROZEN (old path, 2026-10-21): from here to the end of this function
+        // only: the widened detected-client branch (S2) and the rules that read
+        // one socket library by its package name (S1); the type-import table
+        // above stays. Deletions and safety fixes only. Fixes for wrong or
+        // missing rows go in the library store's socket claims (side from the
+        // classification, ops from the store). Delete when the socket parity
+        // gate passes (carrick#1667) with no true row lost (carrick#1670).
         if source != "socket.io" && source != "socket.io-client" {
             // Any import from a package the detector labelled a socket client
             // admits its local names as unknown-direction roots. The specifier
@@ -1003,6 +1029,11 @@ impl Visit for RootCollector<'_> {
         node.visit_children_with(self);
     }
 
+    // FROZEN (old path, 2026-10-21): this function only, the connection-handler
+    // root rule (S1). Deletions and safety fixes only. Fixes for wrong or
+    // missing rows go in the library store's socket claims (side from the
+    // classification, ops from the store). Delete when the socket parity gate
+    // passes (carrick#1667) with no true row lost (carrick#1670).
     fn visit_call_expr(&mut self, node: &swc_ecma_ast::CallExpr) {
         // io.on("connection", (socket) => ...) — the handler's first param
         // is a per-connection server socket.

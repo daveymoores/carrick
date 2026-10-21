@@ -3773,6 +3773,12 @@ pub(crate) fn literal_specifier(expr: &Expr) -> Option<String> {
     }
 }
 
+// FROZEN (old path, 2026-10-21): this function only (the package is the
+// import specifier as written). Deletions and safety fixes only. Fixes for
+// wrong or missing rows go in the compiler's position rows (the `call` or
+// `member` row's `decl_package`, carrick#2413 slice E). Delete at carrick#2413
+// slice F, once the unresolved-import (#2573) and rows-join budget (#2574)
+// fallbacks count zero (carrick#2413).
 /// The imports that name a package's export (carrick#1564). A namespace import
 /// names the module rather than an export, and a relative specifier names no
 /// package, so neither is a client of one.
@@ -5139,6 +5145,12 @@ impl Reader<'_> {
 
     /// `new URL(path, base)`: the base is opaque and leads, the path follows.
     fn new_url(&self, new: &NewExpr, scope: &Scope<'_>) -> Value {
+        // FROZEN (old path, 2026-10-21): the by-name `URL` test on the next
+        // line only. Deletions and safety fixes only. Fixes for wrong or
+        // missing rows go in the compiler's position rows (the `URL`
+        // identifier's row, carrick#2413 slice C). Delete at carrick#2413
+        // slice F, once the unresolved-import (#2573) and rows-join budget
+        // (#2574) fallbacks count zero (carrick#2413).
         let is_url = matches!(&*new.callee, Expr::Ident(ident) if ident.sym == *"URL");
         let args = new.args.as_deref().unwrap_or_default();
         if !is_url || args.iter().any(|arg| arg.spread.is_some()) {
@@ -5870,6 +5882,12 @@ fn fetch_bindings(pat: &Pat, module: &ModuleScope, out: &mut HashSet<BindingKey>
     }
 }
 
+// FROZEN (old path, 2026-10-21): this function only (the global `fetch` read
+// by name). Deletions and safety fixes only. Fixes for wrong or missing rows
+// go in the compiler's position rows (the `ident` row's declaration in the
+// default library, carrick#2413 slice C). Delete at carrick#2413 slice F, once
+// the unresolved-import (#2573) and rows-join budget (#2574) fallbacks count
+// zero (carrick#2413).
 /// Whether `expr` is the platform's `fetch`, as a default or a fallback
 /// names it (carrick#1562): the global (no binding of the module or below
 /// it is named `fetch`), `globalThis.fetch` or `window.fetch`, either bound
@@ -7795,6 +7813,12 @@ impl LinkedClients {
     }
 }
 
+// FROZEN (old path, 2026-10-21): this function only, a by-name re-export walk
+// (and the `unfollowable` switch it serves). Deletions and safety fixes only.
+// Fixes for wrong or missing rows go in the compiler's position rows (the
+// `ident` row's declaration, carrick#2413 slice B). Delete at carrick#2413
+// slice F, once the unresolved-import (#2573) and rows-join budget (#2574)
+// fallbacks count zero (carrick#2413).
 /// What `name` in `file` reaches, following a module that re-exports a
 /// binding it imports (`import { api } from "./api"; export { api }`) to the
 /// module that declares it.

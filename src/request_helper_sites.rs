@@ -1,3 +1,9 @@
+// FROZEN (old path, 2026-10-21): deletions and safety fixes only. Fixes for
+// wrong or missing rows go in discovery (a call that reaches a labelled library
+// export, reported where its name is decided). Delete when discovery is on by
+// default and the four-repo replay shows no site only this signal raised
+// (carrick#2440, target 1).
+
 //! Calls into a same-module request helper that pass a route literal where the
 //! helper builds its URL (carrick-cloud#2373, "Signal 4b" of the candidate
 //! scanner).

@@ -149,6 +149,10 @@ const SUBSCRIBE_METHODS: &[&str] = &[
 /// The method that sends.
 const PUBLISH_METHOD: &str = "emit";
 
+// FROZEN (old path, 2026-10-21): this list only. Deletions and safety fixes
+// only. Fixes for wrong or missing rows go in the `reserved` claims of the
+// library store. Delete when the socket parity gate passes (carrick#1667) with
+// no true row lost, and this pass reads the claims too (carrick#1670).
 /// The runtime's own reserved vocabulary: events a Node process, stream,
 /// socket, or child process emits at code that subscribes to them. User code is
 /// on one side of these only, so they are lifecycle, not a contract between two

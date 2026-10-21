@@ -1,3 +1,8 @@
+// FROZEN (old path, 2026-10-21): deletions and safety fixes only. Fixes for
+// wrong or missing rows go in request summaries (`crate::request_summary`).
+// Delete when summaries give the same or better rows on this pass's fixtures
+// and the four-repo replay, with no true row lost (carrick#1561).
+
 //! Call sites that reach an endpoint through a request member declared in
 //! ANOTHER same-repo module, where the member states its whole request itself
 //! (carrick#588, wrong-method/wrong-version class).

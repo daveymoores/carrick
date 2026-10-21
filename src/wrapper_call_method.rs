@@ -1,3 +1,9 @@
+// FROZEN (old path, 2026-10-21): deletions and safety fixes only. Fixes for
+// wrong or missing rows go in request summaries (`crate::request_summary`).
+// Delete when summaries give the same or better rows on this pass's fixtures
+// and the four-repo replay, with no true row lost, including the verb this
+// pass corrects on a golden repo (carrick#1561).
+
 //! The verb at a call through a declaration is the declaration's, not the
 //! model's (carrick#1384).
 //!

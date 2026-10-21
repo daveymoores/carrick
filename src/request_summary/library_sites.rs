@@ -948,6 +948,12 @@ impl<'a> GetterHolders<'a> {
         linked
     }
 
+    // FROZEN (old path, 2026-10-21): this function only, a by-name re-export
+    // walk (and the `unfollowable` switch it serves). Deletions and safety
+    // fixes only. Fixes for wrong or missing rows go in the compiler's position
+    // rows (the `ident` row's declaration, carrick#2413 slice B). Delete at
+    // carrick#2413 slice F, once the unresolved-import (#2573) and rows-join
+    // budget (#2574) fallbacks count zero (carrick#2413).
     /// What `name` in `file` reaches, following a module that re-exports an
     /// import (as [`super::declared_client`] does for a module-scope
     /// instance).
@@ -1624,6 +1630,12 @@ impl<'a> LinkedNames<'a> {
         }
     }
 
+    // FROZEN (old path, 2026-10-21): this function only, a by-name re-export
+    // walk (and the `unfollowable` switch it serves). Deletions and safety
+    // fixes only. Fixes for wrong or missing rows go in the compiler's position
+    // rows (the `ident` row's declaration, carrick#2413 slice B). Delete at
+    // carrick#2413 slice F, once the unresolved-import (#2573) and rows-join
+    // budget (#2574) fallbacks count zero (carrick#2413).
     /// What `name` in `file` holds, following a module that re-exports an
     /// import, with the module and name that declare it.
     fn declared(

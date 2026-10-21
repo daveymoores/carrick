@@ -884,6 +884,10 @@ impl DispatchWitnesses {
     }
 }
 
+// FROZEN (old path, 2026-10-21): `RouteLiteralWitness` and its impl only.
+// Deletions and safety fixes only. Fixes for wrong or missing rows go in guard
+// sites with chains (carrick#2474 R4). Delete after R4, with discovery on by
+// default and a clean four-repo replay (carrick#2474).
 /// The route paths a file's source states in a dispatch position
 /// (carrick#2382), read by [`compared_route_literals`]: a literal compared by
 /// equality, a `case` test, or a `startsWith` argument, directly or through a
@@ -5365,6 +5369,12 @@ impl FileOrchestrator {
                 // envelope-copy guard) — because arbitration in
                 // `demote_witnessed_borrowed_anchors` needs the second
                 // anchor's inference to exist for the same alias.
+                // FROZEN (old path, 2026-10-21): the topic-literal test in this
+                // expression, a use of the envelope guard below. Deletions and
+                // safety fixes only. Fixes for wrong or missing rows go in the
+                // type-level topic fact on the listed candidates (carrick#2472
+                // C2). Delete when C2 is released, in the deletion release
+                // (carrick#2472, C6).
                 let payload_borrow_witness = op
                     .payload_expression_text
                     .as_deref()
@@ -5523,6 +5533,11 @@ impl FileOrchestrator {
                 let Some(text) = op.payload_expression_text.as_ref() else {
                     continue;
                 };
+                // FROZEN (old path, 2026-10-21): this envelope guard only.
+                // Deletions and safety fixes only. Fixes for wrong or missing
+                // rows go in the type-level topic fact on the listed candidates
+                // (carrick#2472 C2). Delete when C2 is released, in the
+                // deletion release (carrick#2472, C6).
                 // Envelope guard (measured 10/20 on the wrapper-dispatch harness
                 // fixture): the model sometimes copies the whole options/envelope
                 // object or call instead of the payload value. When the locator
@@ -6891,6 +6906,11 @@ impl FileOrchestrator {
                 }
             }
 
+            // FROZEN (old path, 2026-10-21): the topic-literal test here, a use
+            // of the pub/sub envelope guard. Deletions and safety fixes only.
+            // Fixes for wrong or missing rows go in the type-level topic fact on
+            // the listed candidates (carrick#2472 C2). Delete when C2 is
+            // released, in the deletion release (carrick#2472, C6).
             let demote_survives_envelope_guard = op
                 .payload_expression_text
                 .as_deref()
@@ -7769,6 +7789,13 @@ impl FileOrchestrator {
                     ))),
                 });
             }
+            // FROZEN (old path, 2026-10-21): this `ReceiverType` arm only.
+            // Deletions and safety fixes only. Fixes for wrong or missing rows
+            // go in library claims (the store's role) and compiler rows
+            // (`decl_package`). Delete when the server-framework pick
+            // (carrick-cloud#2378) and the store rebuild (carrick-cloud#2379)
+            // are in, with discovery on by default and a clean four-repo replay
+            // (carrick#2474, R7).
             // The ROLE of a bare `x.verb("/lit", arg)` site, read off what its
             // receiver IS (carrick#695). The path and the verb are the site's
             // own literals, exactly as `InlineLiteral` already reads them; the
@@ -8259,6 +8286,12 @@ impl FileOrchestrator {
         }
     }
 
+    // FROZEN (old path, 2026-10-21): this function only. Deletions and safety
+    // fixes only. Fixes for wrong or missing rows go in library claims (the
+    // store's role) and compiler rows (`decl_package`). Delete when the
+    // server-framework pick (carrick-cloud#2378) and the store rebuild
+    // (carrick-cloud#2379) are in, with discovery on by default and a clean
+    // four-repo replay (carrick#2474, R7).
     /// The route row a server-typed receiver states (carrick#695).
     ///
     /// Every field is the site's own: the receiver identifier owns the route
@@ -8304,6 +8337,12 @@ impl FileOrchestrator {
         }
     }
 
+    // FROZEN (old path, 2026-10-21): this function only. Deletions and safety
+    // fixes only. Fixes for wrong or missing rows go in library claims (the
+    // store's role) and compiler rows (`decl_package`). Delete when the
+    // server-framework pick (carrick-cloud#2378) and the store rebuild
+    // (carrick-cloud#2379) are in, with discovery on by default and a clean
+    // four-repo replay (carrick#2474, R7).
     /// Ask the type sidecar what the receiver of every bare
     /// `x.verb("/lit", arg)` site is, and map the answers onto roles
     /// (carrick#695).
@@ -10323,6 +10362,11 @@ impl FileOrchestrator {
         normalizer.consumer_call_path(url)
     }
 
+    // FROZEN (old path, 2026-10-21): this function only. Deletions and safety
+    // fixes only. Fixes for wrong or missing rows go in per-function
+    // composition in request summaries (`crate::request_summary`). Delete when
+    // summaries give the same or better rows on the wrapper fixtures and the
+    // four-repo replay, with no true row lost (carrick#1561).
     /// Carry the wrapper's method onto the rows that delegate to it.
     ///
     /// A delegating site is a row with no span on a line where no call states
@@ -11575,6 +11619,11 @@ impl FileOrchestrator {
         }
     }
 
+    // FROZEN (old path, 2026-10-21): this function only (file-first route
+    // owners). Deletions and safety fixes only. Fixes for wrong or missing rows
+    // go in the compiler rows (declaration identity). Delete after carrick#2474
+    // R3 and R5, with discovery on by default and a clean four-repo replay
+    // (carrick#2474).
     /// Resolve every mount's imported child back to the file that DEFINES it,
     /// keyed by the `file_results` key of that file.
     ///
@@ -11667,6 +11716,11 @@ impl FileOrchestrator {
         bindings
     }
 
+    // FROZEN (old path, 2026-10-21): this function only (file-first route
+    // owners and the substring fallback over import specifiers). Deletions and
+    // safety fixes only. Fixes for wrong or missing rows go in the compiler
+    // rows (declaration identity). Delete after carrick#2474 R3 and R5, with
+    // discovery on by default and a clean four-repo replay (carrick#2474).
     /// Resolve the node an endpoint belongs to, so its path can be joined to
     /// the prefix its module was mounted under.
     ///

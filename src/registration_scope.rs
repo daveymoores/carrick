@@ -1,3 +1,9 @@
+// FROZEN (old path, 2026-10-21): deletions and safety fixes only. Fixes for
+// wrong or missing rows go in the compiler rows (receiver identity, call
+// targets), library claims (scope, runs, prefix) and request summaries (value
+// flow). Delete when routes come from the trace (carrick#2474 R3), with
+// discovery on by default and a clean four-repo replay (carrick#2474).
+
 //! Registration scopes: routes registered inside an inline plugin
 //! (carrick#2092).
 //!

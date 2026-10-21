@@ -1093,6 +1093,11 @@ impl<'a> CallResolver<'a> {
         self.resolve_named_class_member(&module, &class, member)
     }
 
+    // FROZEN (old path, 2026-10-21): this function only. Deletions and safety
+    // fixes only. Fixes for wrong or missing rows go in the compiler rows (the
+    // `call` row's declaration, carrick#2413 slices D and E). Delete after
+    // carrick#2413 slice D, with discovery on by default and a clean four-repo
+    // replay (carrick#2440, target 5).
     /// `client.foo(...)` where `const client = make()` and `make` is a value
     /// declared as a function type: inline (`make: () => Client`) or by an
     /// alias (`make: MakeClient`, `type MakeClient = () => Client`)

@@ -1,3 +1,10 @@
+// FROZEN (old path, 2026-10-21): deletions and safety fixes only. Fixes for
+// wrong or missing rows go in request summaries (`crate::request_summary`).
+// Delete when summaries give the same or better rows on this pass's fixtures
+// and the four-repo replay, with no true row lost; this module goes last,
+// after `wrapper_call_method` and `wrapper_call_route`, which import its
+// helpers (carrick#1561).
+
 //! A model row at a call through a client method is not a second request
 //! (carrick#1403).
 //!

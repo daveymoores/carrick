@@ -115,6 +115,12 @@ pub(crate) enum ReceiverRole {
     Client,
 }
 
+// FROZEN (old path, 2026-10-21): this function only. Deletions and safety
+// fixes only. Fixes for wrong or missing rows go in library claims (the
+// store's role) and compiler rows (`decl_package`). Delete when the
+// server-framework pick (carrick-cloud#2378) and the store rebuild
+// (carrick-cloud#2379) are in, with discovery on by default and a clean
+// four-repo replay (carrick#2474, R7).
 /// Map a receiver type, as the sidecar resolved it, onto a role.
 ///
 /// Three facts, in order, and no shape rule anywhere:

@@ -395,6 +395,13 @@ impl RequestSummaryInputs {
     /// `file` reaches: from the rows when the run walks them, from the call
     /// graph otherwise.
     pub(crate) fn reach(&self, file: &Path, lo: u32, hi: u32) -> Reach {
+        // FROZEN (old path, 2026-10-21): this call-graph answer only (call
+        // targets joined by name; every summaries read of `CallSiteTargets`
+        // goes through it). Deletions and safety fixes only. Fixes for wrong or
+        // missing rows go in the compiler's position rows (the `call` row's
+        // declaration, carrick#2413 slice D). Delete at carrick#2413 slice F,
+        // once the unresolved-import fallback below (#2573) and the rows-join
+        // budget fallback (#2574) count zero (carrick#2413).
         let graph = || match self.sites.target_at(file, lo, hi) {
             Some((target, key)) if self.files.contains_key(target) => {
                 Reach::Function(target.clone(), key.clone())
