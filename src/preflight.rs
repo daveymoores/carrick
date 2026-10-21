@@ -222,7 +222,13 @@ impl From<&Unprepared> for UnpreparedRow {
                 lockfile,
                 ..
             } => UnpreparedRow::Dependencies {
-                install_root: install_root.clone(),
+                // The wire names the repo root `.`, as the cloud reader expects;
+                // in memory it is the empty relative path.
+                install_root: if install_root.is_empty() {
+                    ".".to_string()
+                } else {
+                    install_root.clone()
+                },
                 lockfile: (*lockfile).to_string(),
             },
             Unprepared::Mapping {
@@ -864,6 +870,22 @@ mod tests {
                 command: "deno install",
             }],
             "a config that asks for a local node_modules is asked about it"
+        );
+    }
+
+    /// carrick#2556: the blob names a root install `.`, never the empty
+    /// string, because that is what the cloud reader turns into "the repo root".
+    #[test]
+    fn a_root_install_is_written_as_dot() {
+        let row = UnpreparedRow::from(&Unprepared::Dependencies {
+            service: "api".to_string(),
+            install_root: String::new(),
+            lockfile: "package-lock.json",
+            command: "npm ci",
+        });
+        assert_eq!(
+            serde_json::to_string(&row).unwrap(),
+            r#"{"kind":"dependencies","install_root":".","lockfile":"package-lock.json"}"#
         );
     }
 }
