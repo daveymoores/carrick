@@ -7297,6 +7297,11 @@ pub struct RequestSummaryInputs {
     /// names ([`Self::reach`]). `None` without rows, and then every call
     /// reaches what [`Self::sites`] names.
     pub(crate) row_calls: Option<row_calls::RowCalls>,
+    /// Binding the rows ran past its budget in [`Self::linked`], which then
+    /// dropped them: the one way a service that walked rows ends with
+    /// [`Self::positions`] `None`. Counted per scan
+    /// ([`crate::fallback_tally`]).
+    pub(crate) rows_ran_out: bool,
 }
 
 impl RequestSummaryInputs {
@@ -7329,6 +7334,7 @@ impl RequestSummaryInputs {
             self.positions = None;
             self.links = None;
             self.row_calls = None;
+            self.rows_ran_out = true;
         }
         let reads = self.linked_reads(None).unwrap_or_default();
         self.read_through(reads)

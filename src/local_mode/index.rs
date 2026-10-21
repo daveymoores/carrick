@@ -966,6 +966,12 @@ fn run_scan(
             failure = Some(stated);
             continue;
         }
+        // A service's fallback counts are for the cloud runner, which reads
+        // them off a scan it starts itself; here they are dropped, parsed or
+        // not, so a failure's excerpt never shows one.
+        if crate::fallback_tally::is_marker(&line) {
+            continue;
+        }
         // Kept clean from here on: what this loop keeps is read back by a
         // JSON reader and by a log file, neither of which renders escapes
         // (carrick#1023 item 6).
@@ -2575,6 +2581,34 @@ mod tests {
         )
         .expect_err("the child exited non-zero");
         assert!(!error.contains("@carrick-notice"), "{error}");
+        assert!(error.contains("plain log line"), "{error}");
+    }
+
+    /// A service's fallback counts are for the cloud runner, and the indexer
+    /// drops them: they are never part of a failure's excerpt, whether or not
+    /// the line parses.
+    #[test]
+    fn a_fallbacks_line_from_the_child_is_not_part_of_the_excerpt() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "echo '@carrick-fallbacks {\"service\":\"api\",\"rows\":\"read\",\"unresolved_import\":2}' >&2; \
+             echo '@carrick-fallbacks not json' >&2; \
+             echo 'plain log line' >&2; exit 1",
+        );
+        let error = run_scan(
+            command,
+            "scan of api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .expect_err("the child exited non-zero");
+        assert!(!error.contains("@carrick-fallbacks"), "{error}");
         assert!(error.contains("plain log line"), "{error}");
     }
 

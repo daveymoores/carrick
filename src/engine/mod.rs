@@ -8213,6 +8213,7 @@ fn discover_with_positions(
         positions,
         links: None,
         row_calls: None,
+        rows_ran_out: false,
     }
     .linked(
         service.service_name.as_deref().unwrap_or("(root)"),
@@ -8329,6 +8330,11 @@ fn summarize_requests(
         summaries.unfollowed_count(),
         serde_json::to_string(summaries.unfollowed()).unwrap_or_default()
     );
+    crate::fallback_tally::report(&crate::fallback_tally::ServiceFallbacks::of(
+        crate::current_service::name(),
+        inputs,
+        &summaries,
+    ));
     summaries
 }
 

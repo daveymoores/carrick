@@ -500,6 +500,9 @@ struct Scan {
     /// `start <pid> <earlier pids alive>` and `action <pid> <action> <out>`
     /// lines, in order.
     events: Vec<String>,
+    /// What each service read its rows as, from the fallbacks lines the scan
+    /// states for a parent that reads them.
+    rows: BTreeSet<(Option<String>, String)>,
 }
 
 /// One scan of `repo`. With no `store` the blobs go to the mock store and
@@ -529,6 +532,7 @@ fn scan(
         .env("CARRICK_NO_MODEL", "1")
         .env("CARRICK_SKIP_INTENTS", "1")
         .env("CARRICK_FAIL_ON_TYPE_MEMORY", "1")
+        .env("CARRICK_PROGRESS", "1")
         .env("CARRICK_SIDECAR_DIR", &shim);
     if rows_on {
         cmd.env("CARRICK_POSITION_ROWS", "1");
@@ -584,6 +588,14 @@ fn scan(
         starts: read("starts").lines().count(),
         actions: read("actions").lines().map(str::to_string).collect(),
         events: read("events").lines().map(str::to_string).collect(),
+        rows: String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(carrick::fallback_tally::parse)
+            .map(|fallbacks| {
+                let rows = serde_json::to_value(fallbacks.rows).unwrap();
+                (fallbacks.service, rows.as_str().unwrap().to_string())
+            })
+            .collect(),
     }
 }
 
@@ -766,7 +778,8 @@ fn without_a_store_the_walk_writes_to_the_temp_dir_and_cleans_up() {
 
 /// Off means off; on writes the rows and the same blob; a walk that dies of
 /// memory under `CARRICK_FAIL_ON_TYPE_MEMORY=1` leaves the scan to finish,
-/// with the same blob and no rows.
+/// with the same blob and no rows. Each scan states, for a parent reading
+/// its stderr, what its service read the rows as (`off`, `read`, `missing`).
 #[test]
 fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
     if !sidecar_available() {
@@ -786,6 +799,10 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
         "a scan without the flag asked for a walk"
     );
     assert!(!off.blobs.is_empty(), "the scan stored no blob");
+    let read_as = |scan: &Scan| -> BTreeSet<String> {
+        scan.rows.iter().map(|(_, rows)| rows.clone()).collect()
+    };
+    assert_eq!(read_as(&off), BTreeSet::from(["off".to_string()]));
 
     let on_store = tempfile::tempdir().unwrap();
     let on = scan(&repo, true, false, Some(on_store.path()), None);
@@ -806,6 +823,18 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
     );
     assert_walk_first(&on.events);
     assert_eq!(on.blobs, off.blobs, "writing rows moved the blob");
+    assert_eq!(read_as(&on), BTreeSet::from(["read".to_string()]));
+    assert_eq!(
+        on.rows
+            .iter()
+            .map(|(service, _)| service)
+            .collect::<Vec<_>>(),
+        off.rows
+            .iter()
+            .map(|(service, _)| service)
+            .collect::<Vec<_>>(),
+        "one line a service"
+    );
 
     let died_store = tempfile::tempdir().unwrap();
     let died = scan(&repo, true, true, Some(died_store.path()), None);
@@ -820,6 +849,7 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
         .collect();
     assert!(left.is_empty(), "a walk that died left files: {left:?}");
     assert_eq!(died.blobs, off.blobs, "a walk that died moved the blob");
+    assert_eq!(read_as(&died), BTreeSet::from(["missing".to_string()]));
 }
 
 /// The census (`#[ignore]`): for each `<repo>:<rows file>` in
