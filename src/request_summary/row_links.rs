@@ -105,15 +105,18 @@ impl RowLinks {
             let mut locals: Vec<&String> = ir.imported.keys().collect();
             locals.sort();
             for local in locals {
-                if std::time::Instant::now() >= deadline {
-                    return None;
-                }
                 let link = match uses.get(local.as_str()) {
-                    Some(spans) => links.link_of(files, bindings, positions, file, local, spans),
+                    Some(spans) => {
+                        links.link_of(files, bindings, positions, file, local, spans, deadline)
+                    }
                     // Used only where no row is written (a JSX tag, a
                     // re-export by name).
                     None => RowLink::Hole(HoleReason::RowsMissing),
                 };
+                // A link the deadline cut short is no link.
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
                 if matches!(link, RowLink::Hole(_)) && ir.imported[local].may_change() {
                     links.open = Some(Open::UnreadImport);
                 }
@@ -123,7 +126,10 @@ impl RowLinks {
         Some(links)
     }
 
-    /// What `local`, imported in `file` and used at `spans`, reaches.
+    /// What `local`, imported in `file` and used at `spans`, reaches. Past
+    /// `deadline` a hole, which [`Self::of`] discards: one binding may be
+    /// used at every line of a large file.
+    #[allow(clippy::too_many_arguments)]
     fn link_of(
         &mut self,
         files: &HashMap<PathBuf, FileIr>,
@@ -132,6 +138,7 @@ impl RowLinks {
         file: &Path,
         local: &str,
         spans: &[(u32, u32)],
+        deadline: std::time::Instant,
     ) -> RowLink {
         type Named<'r> = (
             Option<&'r str>,
@@ -141,6 +148,9 @@ impl RowLinks {
         );
         let mut agreed: Option<Named<'_>> = None;
         for (lo, hi) in spans {
+            if std::time::Instant::now() >= deadline {
+                return RowLink::Hole(HoleReason::RowsMissing);
+            }
             let row = match positions.declaration(file, *lo, *hi, Kind::Ident, true) {
                 Ok(row) => row,
                 Err(reason) => return RowLink::Hole(reason),

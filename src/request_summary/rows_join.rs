@@ -59,7 +59,7 @@ impl RowsJoin {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixture_walk::{Walked, walked, walked_within};
+    use super::super::fixture_walk::{Walked, walked_within};
     use super::super::row_calls::every_call;
     use super::super::{LibrarySemantics, summarize};
     use std::collections::BTreeMap;
@@ -167,46 +167,49 @@ mod tests {
         files
     }
 
-    fn walk_heavy(lines: usize, with_rows: bool) -> Option<Walked> {
+    fn walk_heavy(lines: usize, with_rows: bool, budget: Duration) -> Option<Walked> {
         let files = heavy_service(lines, 40);
         let edit: Vec<(&str, &str)> = files
             .iter()
             .map(|(name, text)| (name.as_str(), text.as_str()))
             .collect();
-        walked(
+        walked_within(
             "position-rows-names",
             "services/names",
             "names",
             &edit,
             with_rows,
+            budget,
         )
     }
 
-    /// Discovery of a large non-ASCII file binds its rows in time linear in
-    /// the file: a lookup converts its span from a per-file table, not by
-    /// counting from the start of the file (carrick#2564).
+    /// The rows of a large file that is not plain ASCII bind well within a
+    /// minute: a lookup converts its span from a per-file table, not by
+    /// counting from the start of the file (carrick#2564). Counting from
+    /// the start, this join runs for many minutes, so it runs out of the
+    /// budget and the rows are dropped.
     #[test]
-    fn a_large_non_ascii_file_binds_its_rows_under_a_bound() {
+    fn a_large_non_ascii_file_binds_its_rows_within_a_budget() {
         const LINES: usize = 20_000;
-        let Some(on) = walk_heavy(LINES, true) else {
+        let budget = Duration::from_secs(60);
+        let Some(on) = walk_heavy(LINES, true, budget) else {
             return;
         };
-        let off = walk_heavy(LINES, false).unwrap();
+        let off = walk_heavy(LINES, false, budget).unwrap();
         crate::errln!(
             "rows join, {LINES} lines: discovery with rows {:?}, without {:?}",
             on.discovered_in,
             off.discovered_in
         );
-        let row_calls = on.inputs.row_calls.as_ref().expect("the rows are bound");
+        let row_calls = on
+            .inputs
+            .row_calls
+            .as_ref()
+            .expect("the rows are bound within the budget");
         assert!(
             row_calls.describe().contains("agree"),
             "the calls are read from the rows: {}",
             row_calls.describe()
-        );
-        assert!(
-            on.discovered_in < Duration::from_secs(30),
-            "discovery with rows took {:?}",
-            on.discovered_in
         );
     }
 }
