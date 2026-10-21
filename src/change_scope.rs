@@ -147,11 +147,6 @@ pub struct ServiceInputs {
 }
 
 impl ServiceInputs {
-    /// The first path in `changed` this service reads.
-    pub fn first_change<'a>(&self, changed: &'a [ChangedPath]) -> Option<&'a ChangedPath> {
-        changed.iter().find(|change| self.reads(change))
-    }
-
     /// Whether `change` touches an input of this service that is not under
     /// one of its roots.
     fn reads_outside_roots(&self, change: &ChangedPath) -> bool {
@@ -276,11 +271,22 @@ pub fn is_repo_input(path: &str) -> bool {
 /// entry for it serialized as a blob stores it, `changed` the paths changed
 /// since the stored commit (`Err` when git could not compare), and `inputs`
 /// computes what it reads, asked only when nothing cheaper decides.
+/// `version_only` says whether a changed manifest moved nothing but its
+/// top-level `version` ([`only_version_differs`]); it is asked only of a
+/// repo input, and such a manifest is read only by the services that import
+/// its package, not by the one whose manifest it is (carrick#2566).
+///
+/// A run that carries under that rule and uploads would write a stored
+/// manifest projection (`packages`, `package_json`, `package_json_hash`)
+/// older than HEAD's; `refreshed_carried` does not refresh it today because
+/// no uploading run carries (pinned by
+/// `a_carried_write_keeps_the_stored_manifest_projection`).
 pub fn decide(
     stored: Option<&CloudRepoData>,
     this_run: ThisRun<'_>,
     config_json: Option<&str>,
     changed: Result<&[ChangedPath], &str>,
+    mut version_only: impl FnMut(&ChangedPath) -> bool,
     inputs: impl FnOnce() -> ServiceInputs,
 ) -> Scope {
     let Some(stored) = stored else {
@@ -346,10 +352,24 @@ pub fn decide(
             ),
         );
     }
-    if let Some(change) = changed.iter().find(|change| is_repo_input(&change.path)) {
+    let version_only: Vec<bool> = changed
+        .iter()
+        .map(|change| is_repo_input(&change.path) && version_only(change))
+        .collect();
+    if let Some((change, _)) = changed
+        .iter()
+        .zip(&version_only)
+        .find(|(change, only)| is_repo_input(&change.path) && !**only)
+    {
         return Scope::analysed(Reason::RepoInputChanged, change.path.clone());
     }
-    if let Some(change) = inputs.first_change(changed) {
+    if let Some((change, _)) = changed.iter().zip(&version_only).find(|(change, only)| {
+        if **only {
+            inputs.reads_outside_roots(change)
+        } else {
+            inputs.reads(change)
+        }
+    }) {
         return Scope::analysed(Reason::InputsChanged, change.path.clone());
     }
     Scope::Carried {
@@ -402,13 +422,22 @@ fn short(commit: &str) -> &str {
 
 /// Each service's scope, index for index with `services`, logged one line
 /// per service with a summary and the closure walk's wall time.
+///
+/// `stored_services` names every service this repository has a stored index
+/// for. An untracked `carrick.json` the runner wrote is no changed input only
+/// when it names exactly those services ([`scaffold_config_is_the_stored_one`]).
 pub fn plan<'a>(
     repo_path: &str,
     services: &[Config],
+    stored_services: &[Option<String>],
     stored: impl Fn(&Config) -> Option<&'a CloudRepoData>,
     this_run: ThisRun<'_>,
 ) -> Vec<Scope> {
     let top = crate::git_state::toplevel(repo_path).ok();
+    let scaffold_config = scaffold_config_is_the_stored_one(services, stored_services)
+        .then(|| crate::git_state::untracked_root_config(repo_path))
+        .flatten();
+    let mut version_only: HashMap<(String, String), bool> = HashMap::new();
     let mut changed_by_commit: HashMap<String, Result<Vec<ChangedPath>, String>> = HashMap::new();
     let mut closure_took = std::time::Duration::ZERO;
     let mut walked = 0usize;
@@ -421,7 +450,13 @@ pub fn plan<'a>(
                 changed_by_commit
                     .entry(blob.commit_hash.clone())
                     .or_insert_with(|| {
-                        crate::git_state::changed_paths(repo_path, &blob.commit_hash, None)
+                        let mut paths =
+                            crate::git_state::changed_paths(repo_path, &blob.commit_hash, None);
+                        if let (Ok(paths), Some(config)) = (&mut paths, &scaffold_config) {
+                            paths
+                                .retain(|change| !(change.status == 'A' && &change.path == config));
+                        }
+                        paths
                     })
                     .clone()
             });
@@ -430,20 +465,39 @@ pub fn plan<'a>(
                 Some(Err(reason)) => Err(reason.as_str()),
                 None => Ok(&[][..]),
             };
-            let scope = decide(stored, this_run, config_json.as_deref(), changed, || {
-                let started = Instant::now();
-                walked += 1;
-                let inputs = match &top {
-                    Some(top) => service_inputs(repo_path, top, service),
-                    // No top level, no paths to compare: nothing vouches.
-                    None => ServiceInputs {
-                        unresolved: Some("git named no top level for this checkout".to_string()),
-                        ..ServiceInputs::default()
-                    },
+            let version_only = |change: &ChangedPath| {
+                let (Some(blob), Some(top)) = (stored, &top) else {
+                    return false;
                 };
-                closure_took += started.elapsed();
-                inputs
-            });
+                *version_only
+                    .entry((blob.commit_hash.clone(), change.path.clone()))
+                    .or_insert_with(|| {
+                        manifest_moves_only_version(repo_path, top, &blob.commit_hash, change)
+                    })
+            };
+            let scope = decide(
+                stored,
+                this_run,
+                config_json.as_deref(),
+                changed,
+                version_only,
+                || {
+                    let started = Instant::now();
+                    walked += 1;
+                    let inputs = match &top {
+                        Some(top) => service_inputs(repo_path, top, service),
+                        // No top level, no paths to compare: nothing vouches.
+                        None => ServiceInputs {
+                            unresolved: Some(
+                                "git named no top level for this checkout".to_string(),
+                            ),
+                            ..ServiceInputs::default()
+                        },
+                    };
+                    closure_took += started.elapsed();
+                    inputs
+                },
+            );
             let label = service.service_name.as_deref().unwrap_or("(root)");
             match &scope {
                 Scope::Carried { commit } => info!(
@@ -480,6 +534,59 @@ pub fn plan<'a>(
         closure_took.as_secs_f64()
     );
     scopes
+}
+
+/// Whether the `carrick.json` an untracked-config run found names the
+/// services the repository has stored: the same set, so each entry is judged
+/// by `ConfigChanged` alone. A different list changes which directories nest
+/// in which, and the stored `config_json` does not show that
+/// (`Config::nested_directories`).
+fn scaffold_config_is_the_stored_one(
+    services: &[Config],
+    stored_services: &[Option<String>],
+) -> bool {
+    let named: BTreeSet<&Option<String>> = services.iter().map(|s| &s.service_name).collect();
+    let stored: BTreeSet<&Option<String>> = stored_services.iter().collect();
+    !services.is_empty() && named == stored
+}
+
+/// Whether a modified `package.json` differs from the stored commit's copy in
+/// its top-level `version` alone. Anything else (another file, an added or
+/// deleted manifest, a copy that cannot be read or parsed) is `false`.
+fn manifest_moves_only_version(
+    repo_path: &str,
+    top: &Path,
+    commit: &str,
+    change: &ChangedPath,
+) -> bool {
+    if change.status != 'M' || change.path.rsplit('/').next() != Some("package.json") {
+        return false;
+    }
+    let Some(stored) = crate::git_state::file_at_commit(repo_path, commit, &change.path) else {
+        return false;
+    };
+    let Ok(head) = std::fs::read_to_string(top.join(&change.path)) else {
+        return false;
+    };
+    only_version_differs(&stored, &head)
+}
+
+/// Whether two manifests parse as objects that both state a top-level
+/// `version`, differ in it, and are equal in every other key.
+pub(crate) fn only_version_differs(stored: &str, head: &str) -> bool {
+    let (Ok(mut stored), Ok(mut head)) = (
+        serde_json::from_str::<serde_json::Value>(stored),
+        serde_json::from_str::<serde_json::Value>(head),
+    ) else {
+        return false;
+    };
+    let (Some(stored), Some(head)) = (stored.as_object_mut(), head.as_object_mut()) else {
+        return false;
+    };
+    match (stored.remove("version"), head.remove("version")) {
+        (Some(before), Some(after)) => before != after && stored == head,
+        _ => false,
+    }
 }
 
 /// What `service` reads on the tree at `repo_path`, relative to the
@@ -902,6 +1009,7 @@ mod tests {
             THIS,
             Some("{\"serviceName\":\"api\"}"),
             changes,
+            |_| false,
             || inputs,
         )
     }
@@ -1131,6 +1239,7 @@ mod tests {
             no_model,
             Some("{\"serviceName\":\"api\"}"),
             Ok(&changes),
+            |_| false,
             api_inputs,
         );
         assert_eq!(reason(&carried), None);
@@ -1449,5 +1558,282 @@ mod tests {
                 "blobless: {filter}"
             );
         }
+    }
+
+    // --- carrick#2565 / carrick#2566: what a carried service ignores ---
+
+    /// The scan's own `ThisRun` for blobs `copy_at` writes at the crate's
+    /// version.
+    fn this_scanner() -> ThisRun<'static> {
+        ThisRun {
+            scanner_version: env!("CARGO_PKG_VERSION"),
+            cache_version: 7,
+            asks_model: true,
+        }
+    }
+
+    /// Each service stored at `commit` with the config this run reads for it.
+    fn stored_at(services: &[Config], commit: &str) -> Vec<CloudRepoData> {
+        services
+            .iter()
+            .map(|service| {
+                let mut copy = copy_at(service.service_name.as_deref().unwrap(), commit);
+                copy.config_json = serde_json::to_string(service).ok();
+                copy
+            })
+            .collect()
+    }
+
+    fn scopes_of(
+        repo: &Path,
+        services: &[Config],
+        blobs: &[CloudRepoData],
+        stored_names: &[Option<String>],
+    ) -> Vec<Scope> {
+        plan(
+            &repo.to_string_lossy(),
+            services,
+            stored_names,
+            |service| {
+                blobs
+                    .iter()
+                    .find(|blob| blob.service_name == service.service_name)
+            },
+            this_scanner(),
+        )
+    }
+
+    fn names_of(services: &[Config]) -> Vec<Option<String>> {
+        services.iter().map(|s| s.service_name.clone()).collect()
+    }
+
+    fn carried(scopes: &[Scope]) -> Vec<bool> {
+        scopes.iter().map(Scope::is_carried).collect()
+    }
+
+    fn reasons(scopes: &[Scope]) -> Vec<Option<Reason>> {
+        scopes.iter().map(reason).collect()
+    }
+
+    fn write_config(repo: &Path) {
+        std::fs::write(repo.join("carrick.json"), "{ \"services\": [] }").unwrap();
+    }
+
+    #[test]
+    fn an_untracked_config_naming_the_stored_services_is_no_changed_input() {
+        let (repo, a, services) = workspace();
+        let blobs = stored_at(&services, &a);
+        write_config(repo.path());
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(carried(&scopes), [true, true, true], "{scopes:?}");
+    }
+
+    #[test]
+    fn an_untracked_config_with_another_service_list_stays_an_input() {
+        let (repo, a, services) = workspace();
+        let blobs = stored_at(&services, &a);
+        write_config(repo.path());
+        // A service the stored index lacks.
+        let mut longer = services.clone();
+        longer.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "extra", "directory": "apps/extra",
+            }))
+            .unwrap(),
+        );
+        let scopes = scopes_of(repo.path(), &longer, &blobs, &names_of(&services));
+        assert_eq!(
+            reasons(&scopes),
+            [
+                Some(Reason::RepoInputChanged),
+                Some(Reason::RepoInputChanged),
+                Some(Reason::RepoInputChanged),
+                Some(Reason::NoStored)
+            ]
+        );
+        // A stored service the config no longer names.
+        let mut stored_names = names_of(&services);
+        stored_names.push(Some("gone".to_string()));
+        let scopes = scopes_of(repo.path(), &services, &blobs, &stored_names);
+        assert_eq!(carried(&scopes), [false, false, false]);
+    }
+
+    #[test]
+    fn an_untracked_config_changing_one_entry_analyses_that_service_alone() {
+        let (repo, a, services) = workspace();
+        let mut blobs = stored_at(&services, &a);
+        write_config(repo.path());
+        blobs[0].config_json = Some("{\"serviceName\":\"api\",\"include\":[\"x\"]}".into());
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::ConfigChanged), None, None],
+            "{scopes:?}"
+        );
+    }
+
+    #[test]
+    fn a_tracked_config_edit_still_analyses_every_service() {
+        let (repo, _, services) = workspace();
+        let a = commit_edit(repo.path(), "carrick.json", "{ \"services\": [] }");
+        let blobs = stored_at(&services, &a);
+        // Committed at the stored commit, then edited in the tree.
+        std::fs::write(repo.path().join("carrick.json"), "{ \"services\": [1] }").unwrap();
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(
+            reasons(&scopes),
+            [Some(Reason::RepoInputChanged); 3],
+            "{scopes:?}"
+        );
+        // And one a commit added since the stored commit.
+        let (repo, a, services) = workspace();
+        let blobs = stored_at(&services, &a);
+        commit_edit(repo.path(), "carrick.json", "{ \"services\": [] }");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(reasons(&scopes), [Some(Reason::RepoInputChanged); 3]);
+    }
+
+    fn set_version(repo: &Path, manifest: &str, version: &str) {
+        let path = repo.join(manifest);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        json["version"] = serde_json::json!(version);
+        std::fs::write(path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    }
+
+    fn commit_all(repo: &Path, message: &str) -> String {
+        git_in(repo, &["add", "-A"]);
+        git_in(repo, &["commit", "-qm", message]);
+        git_in(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// The stored index sits at A, where every manifest states a version.
+    fn versioned_workspace() -> (tempfile::TempDir, String, Vec<Config>) {
+        let (repo, _, services) = workspace();
+        for manifest in [
+            "package.json",
+            "apps/api/package.json",
+            "apps/web/package.json",
+            "apps/worker/package.json",
+            "packages/shared/package.json",
+        ] {
+            set_version(repo.path(), manifest, "1.0.0");
+        }
+        let a = commit_all(repo.path(), "versions");
+        (repo, a, services)
+    }
+
+    #[test]
+    fn a_version_only_manifest_change_carries_every_service() {
+        let (repo, a, services) = versioned_workspace();
+        let blobs = stored_at(&services, &a);
+        set_version(repo.path(), "package.json", "1.0.1");
+        set_version(repo.path(), "apps/api/package.json", "1.0.1");
+        commit_all(repo.path(), "bump");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(carried(&scopes), [true, true, true], "{scopes:?}");
+    }
+
+    #[test]
+    fn a_manifest_change_beyond_the_version_analyses_every_service() {
+        let (repo, a, services) = versioned_workspace();
+        let blobs = stored_at(&services, &a);
+        set_version(repo.path(), "package.json", "1.0.1");
+        let path = repo.path().join("package.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        json["dependencies"] = serde_json::json!({ "left-pad": "1.0.0" });
+        std::fs::write(&path, json.to_string()).unwrap();
+        commit_all(repo.path(), "dependency");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(reasons(&scopes), [Some(Reason::RepoInputChanged); 3]);
+    }
+
+    #[test]
+    fn a_version_bump_of_an_imported_package_analyses_its_importers_only() {
+        let (repo, a, services) = versioned_workspace();
+        let blobs = stored_at(&services, &a);
+        set_version(repo.path(), "packages/shared/package.json", "1.0.1");
+        commit_all(repo.path(), "bump shared");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        // api, web, worker: only worker imports `@fixture/shared`.
+        assert_eq!(
+            reasons(&scopes),
+            [None, None, Some(Reason::InputsChanged)],
+            "{scopes:?}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_added_or_unreadable_stays_a_repo_input() {
+        let (repo, a, services) = versioned_workspace();
+        let blobs = stored_at(&services, &a);
+        // A stored commit the clone does not hold.
+        let missing = stored_at(&services, &"f".repeat(40));
+        let scopes = scopes_of(repo.path(), &services, &missing, &names_of(&services));
+        assert_eq!(reasons(&scopes), [Some(Reason::CommitMissing); 3]);
+        // A manifest added since the stored commit.
+        std::fs::create_dir_all(repo.path().join("libs/x")).unwrap();
+        std::fs::write(
+            repo.path().join("libs/x/package.json"),
+            "{\"version\":\"1\"}",
+        )
+        .unwrap();
+        commit_all(repo.path(), "added");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(reasons(&scopes), [Some(Reason::RepoInputChanged); 3]);
+    }
+
+    #[test]
+    fn a_manifest_the_head_copy_cannot_parse_stays_a_repo_input() {
+        let (repo, a, services) = versioned_workspace();
+        let blobs = stored_at(&services, &a);
+        std::fs::write(repo.path().join("package.json"), "{ not json").unwrap();
+        commit_all(repo.path(), "broken");
+        let scopes = scopes_of(repo.path(), &services, &blobs, &names_of(&services));
+        assert_eq!(reasons(&scopes), [Some(Reason::RepoInputChanged); 3]);
+    }
+
+    #[test]
+    fn only_a_top_level_version_value_is_ignored() {
+        let base = r#"{"name":"a","version":"1.0.0","dependencies":{"x":"1"}}"#;
+        assert!(only_version_differs(
+            base,
+            r#"{"version":"1.0.1","dependencies":{"x":"1"},"name":"a"}"#
+        ));
+        for head in [
+            base,
+            r#"{"name":"a","version":"1.0.1","dependencies":{"x":"2"}}"#,
+            r#"{"name":"a","dependencies":{"x":"1"}}"#,
+            r#"{"name":"b","version":"1.0.1","dependencies":{"x":"1"}}"#,
+            "{ broken",
+            "[]",
+        ] {
+            assert!(!only_version_differs(base, head), "{head}");
+        }
+        assert!(!only_version_differs("{ broken", base));
+    }
+
+    /// No run that uploads carries under the version-only rule today. If one
+    /// does, the carried write must refresh the stored manifest projection
+    /// from HEAD first (carrick#2566); until then this pins that
+    /// `refreshed_carried` leaves the projection as stored, so the refresh is
+    /// built before that run exists.
+    #[test]
+    fn a_carried_write_keeps_the_stored_manifest_projection() {
+        let mut stored = stored("abcdef1234");
+        stored.package_json = Some("{\"version\":\"1.0.0\"}".to_string());
+        stored.package_json_hash = Some("hash-at-stored-commit".to_string());
+        let mut payload = stored.clone();
+        payload.compat_verdicts = Some(vec![
+            serde_json::from_value(serde_json::json!({
+                "producer_repo": "p", "producer_key": "http|GET|/x",
+                "consumer_repo": "c", "consumer_key": "http|GET|/x", "scanner_version": "1.0.0",
+            }))
+            .unwrap(),
+        ]);
+        let written = refreshed_carried(payload, &stored, &[], "1234567fff", false).unwrap();
+        assert_eq!(written.package_json, stored.package_json);
+        assert_eq!(written.package_json_hash, stored.package_json_hash);
     }
 }
