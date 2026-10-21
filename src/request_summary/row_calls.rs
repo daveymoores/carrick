@@ -622,6 +622,47 @@ mod tests {
         out
     }
 
+    /// carrick#2557: a service rooted above the directory that holds its
+    /// tsconfig, whose components call service functions that call a shared
+    /// fetch wrapper. The call graph follows every import and the summaries
+    /// state a row at each call; the compiler's rows, walked with no tsconfig
+    /// at the service root, follow none of them. Every call the rows take
+    /// from the summaries is counted under the rows' reason, so the drop
+    /// shows as a number and not as rows that are simply gone.
+    #[test]
+    fn a_call_the_rows_cannot_follow_is_counted_under_its_reason() {
+        let Some(off) = walked("position-rows-wrapper", ".", "web", &[], false) else {
+            return;
+        };
+        let without = summarize(&off.inputs, &LibrarySemantics::default());
+        assert!(
+            without.row_count() > 0,
+            "the call graph follows the wrapper"
+        );
+        assert_eq!(without.unfollowed_count(), 0, "no rows, nothing unfollowed");
+
+        let on = walked("position-rows-wrapper", ".", "web", &[], true).unwrap();
+        let with = summarize(&on.inputs, &LibrarySemantics::default());
+        // Each call into a function another module declares: 9 in the
+        // components (7 into the services, 2 straight into the wrapper) and
+        // 8 in the services. The wrapper's own calls of its token helper are
+        // bare calls of a function the same file declares, which stay on the
+        // call graph.
+        let unfollowed: Vec<(String, usize)> = with
+            .unfollowed()
+            .iter()
+            .map(|(reason, n)| (reason.clone(), *n))
+            .collect();
+        assert_eq!(
+            unfollowed,
+            vec![("unresolved_import".to_string(), 17)],
+            "rows {} silent {}",
+            with.row_count(),
+            with.silent_count()
+        );
+        assert_eq!(with.row_count(), 0, "the rows follow no import here");
+    }
+
     fn line(n: u32, target: &str) -> (u32, Vec<String>) {
         (n, vec![target.to_string()])
     }

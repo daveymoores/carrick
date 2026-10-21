@@ -8283,11 +8283,13 @@ fn summarize_requests(
     };
     let summaries = crate::request_summary::summarize(inputs, &semantics);
     debug!(
-        "request summaries: {} row(s) at call sites ({} through library semantics), {} site(s) whose callee sends nothing, {} request(s) with no statable URL",
+        "request summaries: {} row(s) at call sites ({} through library semantics), {} site(s) whose callee sends nothing, {} request(s) with no statable URL, {} site(s) the call graph follows that the compiler's rows cannot {}",
         summaries.row_count(),
         summaries.library_row_count(),
         summaries.silent_count(),
-        summaries.undetermined
+        summaries.undetermined,
+        summaries.unfollowed_count(),
+        serde_json::to_string(summaries.unfollowed()).unwrap_or_default()
     );
     summaries
 }
