@@ -508,6 +508,86 @@ pub fn resolve_call_edges(
     }
 }
 
+/// The edges the compiler's `call` rows state where resolution by name
+/// stated none: a member call on a `const` receiver a call initialised
+/// (`const client = make(id); client.list()`), whatever declares what that
+/// call returns (carrick#2615). The type of `make` may be an inline function
+/// type, an alias, an inferred return or a parameter's declared type; the
+/// row's declaration names the member the compiler resolved, joined to the
+/// definition that opens at its file and line ([`crate::request_summary`]'s
+/// `RowCalls`).
+///
+/// `row_target` is what the rows say the call spanning `lo..hi` in a file
+/// reaches; it is only consulted where [`CallSiteTargets`] holds nothing for
+/// the site, so every edge resolution stated is unchanged. A target the
+/// merged definitions do not hold (a file outside the service) adds nothing,
+/// and neither does a call at module scope whose row the resolver dropped for
+/// want of an edge. Returns how many edges were added.
+pub fn add_row_edges(
+    function_definitions: &mut HashMap<String, FunctionDefinition>,
+    per_file: &HashMap<PathBuf, FileCallIndex>,
+    keys: &RekeyIndex,
+    sites: &CallSiteTargets,
+    row_target: impl Fn(&Path, u32, u32) -> Option<(PathBuf, String)>,
+) -> usize {
+    let mut added = 0;
+    let mut files: Vec<&PathBuf> = per_file.keys().collect();
+    files.sort();
+    for canonical in files {
+        let index = &per_file[canonical];
+        let mut callers: Vec<&String> = index.callees.keys().collect();
+        callers.sort();
+        for caller_key in callers {
+            let mut edges: Vec<FunctionCallRef> = Vec::new();
+            for callee in &index.callees[caller_key] {
+                if !matches!(callee.shape, CalleeShape::Member(_))
+                    || !callee.receiver.call_bound
+                    || callee.span.is_dummy()
+                    || sites
+                        .target_at(&index.path, callee.span.lo.0, callee.span.hi.0)
+                        .is_some()
+                {
+                    continue;
+                }
+                let Some((file, key)) = row_target(&index.path, callee.span.lo.0, callee.span.hi.0)
+                else {
+                    continue;
+                };
+                if file == index.path && key == *caller_key {
+                    continue;
+                }
+                let Some(definition) = function_definitions
+                    .get(keys.merged_key(&key, &file))
+                    .filter(|definition| definition.file_path == file)
+                else {
+                    continue;
+                };
+                edges.push(FunctionCallRef {
+                    name: key,
+                    file_path: file.to_string_lossy().to_string(),
+                    line_number: definition.line_number,
+                    call_site_line: callee.line,
+                    call_count: 1,
+                });
+            }
+            if edges.is_empty() {
+                continue;
+            }
+            let caller_row = keys.merged_key(caller_key, &index.path);
+            let Some(def) = function_definitions
+                .get_mut(caller_row)
+                .filter(|def| def.file_path == index.path)
+            else {
+                continue;
+            };
+            added += edges.len();
+            def.calls.append(&mut edges);
+            dedupe_edges(&mut def.calls);
+        }
+    }
+    added
+}
+
 /// What [`resolve_call_edges`] produces besides the edges it writes into the
 /// definitions: the imports it could not follow, where each call site it DID
 /// follow lands, and what each wanted import binding names.

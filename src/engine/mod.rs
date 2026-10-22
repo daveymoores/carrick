@@ -8535,6 +8535,20 @@ fn discover_with_positions(
             service.service_name.as_deref().unwrap_or("(root)"),
             row_calls.describe()
         );
+        // Member calls on a receiver a call initialised take their target
+        // from the `call` row where resolution by name stated none
+        // (carrick#2615).
+        let added = crate::call_graph::add_row_edges(
+            &mut all_function_definitions,
+            &per_file_calls,
+            &keys,
+            &request_inputs.sites,
+            |file, lo, hi| request_inputs.call_target(file, lo, hi),
+        );
+        debug!(
+            "Call edges the position rows added for service {}: {added}",
+            service.service_name.as_deref().unwrap_or("(root)")
+        );
     }
 
     debug!(

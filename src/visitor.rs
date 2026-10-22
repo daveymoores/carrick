@@ -338,6 +338,11 @@ pub struct ReceiverBinding {
     /// an annotated local (carrick#1561). The type, not the name, says what
     /// the call returns.
     pub typed_factory: Option<TypedCall>,
+    /// A `const` receiver initialised by a call (`const client =
+    /// make(id)`), with no class declared for it: what the call returns is
+    /// the compiler's to say, through the member call's `call` row
+    /// (carrick#2615).
+    pub call_bound: bool,
 }
 
 /// SWC gives each lexical binding a distinct Id, including unknown and
@@ -416,6 +421,7 @@ impl LexicalReceivers {
         };
         let mut receiver = binding.receiver.clone();
         receiver.declared = binding.declared_id.is_some();
+        receiver.call_bound = binding.factory.is_some() && !receiver.declared;
         // A callee bound by a pattern is a value handed in, not the function
         // a same-named declaration or import would resolve to.
         receiver.factory = binding
@@ -479,6 +485,7 @@ impl Visit for LexicalReceivers {
                         local_member: None,
                         factory: None,
                         typed_factory: None,
+                        call_bound: false,
                         origin: (!import.type_only && !type_only)
                             .then(|| import.src.value.to_string_lossy().into_owned()),
                     },
@@ -503,6 +510,7 @@ impl Visit for LexicalReceivers {
                     local_member: None,
                     factory: None,
                     typed_factory: None,
+                    call_bound: false,
                     origin: Some(external.expr.value.to_string_lossy().into_owned()),
                 },
                 ..Default::default()
@@ -567,6 +575,7 @@ impl Visit for LexicalReceivers {
                                 local_member: None,
                                 factory: None,
                                 typed_factory: None,
+                                call_bound: false,
                                 origin: Some(specifier.clone()),
                             },
                             ..Default::default()
