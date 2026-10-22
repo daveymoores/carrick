@@ -324,18 +324,6 @@ interface RecoveredPayload {
 }
 
 /**
- * The type an assertion states, or undefined when it states none. A const
- * assertion (`x as const`, `<const>x`) narrows its operand's own type and
- * names no type: its type node prints as `const`, a name nothing declares
- * (carrick#2590). The walk stops there rather than reaching for an assertion
- * further out, which describes a larger value than the read.
- */
-function statedAssertionType(typeNode: Node | undefined): Node | undefined {
-  if (!typeNode || ts.isConstTypeReference(typeNode.compilerNode)) return undefined;
-  return typeNode;
-}
-
-/**
  * The items whose whitespace-collapsed texts differ, first of each kept, in
  * order: how a joined union drops a member it already has.
  */
@@ -5610,15 +5598,24 @@ export class TypeInferrer {
     const asExpr = Node.isAsExpression(node)
       ? node
       : node.getFirstAncestorByKind(SyntaxKind.AsExpression);
-    const asType = statedAssertionType(asExpr?.getTypeNode());
-    if (asType) {
-      return asType;
+    if (asExpr) {
+      const typeNode = asExpr.getTypeNode();
+      if (typeNode) {
+        return typeNode;
+      }
     }
 
     const typeAssertion = Node.isTypeAssertion(node)
       ? node
       : node.getFirstAncestorByKind(SyntaxKind.TypeAssertionExpression);
-    return statedAssertionType(typeAssertion?.getTypeNode());
+    if (typeAssertion) {
+      const typeNode = typeAssertion.getTypeNode();
+      if (typeNode) {
+        return typeNode;
+      }
+    }
+
+    return undefined;
   }
 
   /**
