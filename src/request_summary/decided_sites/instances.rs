@@ -1359,9 +1359,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                     return false;
                 }
             }
-            let mut hosts = self.handed_to_library(placed.file, key);
-            hosts.extend(self.handed_by_declaration(placed.file, key));
-            for (host, arg) in hosts {
+            for (host, arg) in self.hosts_of(placed.file, key) {
                 if !from_origin(host.file, host.call) {
                     continue;
                 }
@@ -1429,9 +1427,8 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             .map(|caller| self.at_call(caller.file, caller.call))
             .collect();
         out.extend(
-            self.handed_to_library(placed.file, key)
+            self.hosts_of(placed.file, key)
                 .into_iter()
-                .chain(self.handed_by_declaration(placed.file, key))
                 .map(|(host, _)| self.at_call(host.file, host.call)),
         );
         out
