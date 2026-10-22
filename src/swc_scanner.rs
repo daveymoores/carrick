@@ -14,7 +14,7 @@
 //! of the compiler sidecar architecture migration.
 
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use swc_common::{
     SourceMap, SourceMapper, Spanned,
@@ -258,6 +258,38 @@ pub struct ScanResult {
     /// own URL resolves to nothing, so the join is read off the AST and merged
     /// into the file's extraction afterwards. See `crate::local_http_wrapper`.
     pub local_wrapper_calls: Vec<LocalWrapperCall>,
+    /// The register signals ([`RegisterSignal`]) that raised each call span,
+    /// by `(span_start, span_end)`, including a span another signal raised
+    /// first. Read by the orchestrator's file-selection log only
+    /// (carrick#2613); nothing else reads it.
+    pub register_signals: BTreeMap<(u32, u32), BTreeSet<RegisterSignal>>,
+}
+
+/// The hand-written call-site signals in the #2440 register. Each is deleted
+/// once the fact layer selects its files without it (carrick#2613).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RegisterSignal {
+    /// Signal 4b: a call into a request helper the module declares.
+    C1,
+    /// Signal 4: an awaited call with a string argument.
+    C2,
+    /// Signal 5: the method-name and object-name lists.
+    C3,
+    /// Signal 2: a call rooted at an import from a detected package.
+    C4,
+}
+
+impl RegisterSignal {
+    pub const ALL: [Self; 4] = [Self::C1, Self::C2, Self::C3, Self::C4];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::C1 => "C1",
+            Self::C2 => "C2",
+            Self::C3 => "C3",
+            Self::C4 => "C4",
+        }
+    }
 }
 
 /// A pub/sub operation asserted deterministically from the AST (carrick#387):
@@ -539,6 +571,7 @@ impl SwcScanner {
                     import_sources: Vec::new(),
                     pubsub_anchor_ops: Vec::new(),
                     local_wrapper_calls: Vec::new(),
+                    register_signals: BTreeMap::new(),
                 };
             }
         };
@@ -576,6 +609,7 @@ impl SwcScanner {
             import_sources,
             pubsub_anchor_ops: visitor.pubsub_anchor_ops,
             local_wrapper_calls,
+            register_signals: visitor.register_hits,
         }
     }
 
@@ -625,6 +659,7 @@ impl SwcScanner {
                     import_sources: Vec::new(),
                     pubsub_anchor_ops: Vec::new(),
                     local_wrapper_calls: Vec::new(),
+                    register_signals: BTreeMap::new(),
                 };
             }
         };
@@ -670,6 +705,7 @@ impl SwcScanner {
             import_sources,
             pubsub_anchor_ops: visitor.pubsub_anchor_ops,
             local_wrapper_calls,
+            register_signals: visitor.register_hits,
         }
     }
 
@@ -2266,6 +2302,12 @@ struct CandidateVisitor {
     /// Spans of calls that pass a route literal to a same-module request
     /// helper (Signal 4b; see [`crate::request_helper_sites`]).
     request_helper_sites: HashSet<(u32, u32)>,
+    /// The signal whose block is running ([`RegisterSignal`]), set at the
+    /// block's edges in `visit_call_expr`.
+    register_signal: Option<RegisterSignal>,
+    /// Every call span each register signal raised, whether or not another
+    /// signal raised it first (`seen_spans` drops the second push).
+    register_hits: BTreeMap<(u32, u32), BTreeSet<RegisterSignal>>,
 }
 
 impl CandidateVisitor {
@@ -2297,6 +2339,8 @@ impl CandidateVisitor {
             messaging_import_locals,
             declarations,
             request_helper_sites,
+            register_signal: None,
+            register_hits: BTreeMap::new(),
         }
     }
 
@@ -2727,6 +2771,12 @@ impl CandidateVisitor {
         callee_property: Option<String>,
     ) {
         let (span_start, span_end) = self.span_range(call.span);
+        if let Some(signal) = self.register_signal {
+            self.register_hits
+                .entry((span_start, span_end))
+                .or_default()
+                .insert(signal);
+        }
         if !self.seen_spans.insert((span_start, span_end)) {
             return;
         }
@@ -3473,6 +3523,7 @@ impl Visit for CandidateVisitor {
             );
         }
 
+        self.register_signal = Some(RegisterSignal::C4);
         // FROZEN (old path, 2026-10-21): Signal 2's detection-list gate, this
         // block and the `network_import_locals` field (`package_import_locals`
         // stays: the messaging gate reads it). Deletions and safety fixes
@@ -3493,6 +3544,8 @@ impl Visit for CandidateVisitor {
             let property = Self::callee_member_prop(callee_expr);
             self.push_candidate(call, root, property);
         }
+
+        self.register_signal = None;
 
         // Signal 2b: the call declares its method and URL as data on a single
         // object-literal argument (`client({ method: "post", url: "/x" })`).
@@ -3523,6 +3576,7 @@ impl Visit for CandidateVisitor {
             self.push_candidate(call, obj, prop);
         }
 
+        self.register_signal = Some(RegisterSignal::C2);
         // FROZEN (old path, 2026-10-21): Signal 4, the await gate, this block,
         // `await_depth`, `visit_await_expr` and `first_arg_is_stringish`.
         // Deletions and safety fixes only. Fixes for wrong or missing rows go
@@ -3541,6 +3595,7 @@ impl Visit for CandidateVisitor {
             self.push_candidate(call, obj, prop);
         }
 
+        self.register_signal = Some(RegisterSignal::C1);
         // FROZEN (old path, 2026-10-21): Signal 4b, the stopgap in
         // `crate::request_helper_sites`. Deletions and safety fixes only.
         // Fixes for wrong or missing rows go in discovery (a call that reaches
@@ -3573,6 +3628,7 @@ impl Visit for CandidateVisitor {
             }
         }
 
+        self.register_signal = Some(RegisterSignal::C3);
         // FROZEN (old path, 2026-10-21): Signal 5, the name lists. Deletions
         // and safety fixes only. Fixes for wrong or missing rows go in
         // discovery (a call that reaches a labelled library export). Delete
@@ -3620,6 +3676,8 @@ impl Visit for CandidateVisitor {
                 }
             }
         }
+
+        self.register_signal = None;
 
         // Signal 8 (UNGATED): web-platform cross-context messaging. postMessage
         // sends a message envelope to another browsing context (parent window,
@@ -3994,6 +4052,45 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// carrick#2613: every register signal that raises a call is recorded,
+    /// including one whose push `seen_spans` dropped because another signal
+    /// raised the span first; a call only a kept signal raises records none.
+    #[test]
+    fn register_signals_record_every_signal_that_raises_a_span() {
+        let source = "import axios from \"axios\";\n\
+                      export async function load() {\n\
+                      \x20 await axios.get(\"/orders\");\n\
+                      \x20 fetch(\"/health\");\n\
+                      }\n";
+        let result = scan_test_content_with_fetchers(source, &["axios".to_string()]);
+        let span_of = |needle: &str| {
+            let call = result
+                .candidates
+                .iter()
+                .find(|candidate| candidate.code_snippet.contains(needle))
+                .unwrap_or_else(|| panic!("no candidate for {needle}"));
+            (call.span_start, call.span_end)
+        };
+        assert_eq!(
+            result.candidates.len(),
+            2,
+            "one candidate per span, whatever raised it"
+        );
+        let axios = result
+            .register_signals
+            .get(&span_of("axios.get"))
+            .expect("the register signals raised the axios call");
+        assert_eq!(
+            axios.iter().copied().collect::<Vec<_>>(),
+            vec![RegisterSignal::C2, RegisterSignal::C3, RegisterSignal::C4],
+            "the await gate, the name lists and the detected import all raised it"
+        );
+        assert!(
+            !result.register_signals.contains_key(&span_of("fetch(")),
+            "the global fetch primitive is no register signal"
+        );
     }
 
     #[test]

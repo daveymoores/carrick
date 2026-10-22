@@ -108,6 +108,9 @@ impl MultiAgentOrchestrator {
         // What each call site's callee sends (carrick#1555), possibly still
         // being composed while the library semantics settle (carrick#1564).
         request_summaries: crate::agents::file_orchestrator::SummarySource,
+        // The files the fact layer would send the reader, logged beside the
+        // ones the signals select (carrick#2613).
+        fact_files: crate::agents::file_orchestrator::FactFileSource,
     ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
         debug!("Starting AST-Gated File-Centric analysis...");
 
@@ -137,7 +140,8 @@ impl MultiAgentOrchestrator {
         debug!("=== Stage 2: AST-Gated File-Centric Analysis ===");
         let file_orchestrator = FileOrchestrator::new(self.agent_service.clone())
             .deferring_model(setup.deferred.is_some())
-            .with_request_summaries(request_summaries);
+            .with_request_summaries(request_summaries)
+            .with_fact_files(fact_files);
         let file_centric_result = file_orchestrator
             .analyze_files(
                 &files,

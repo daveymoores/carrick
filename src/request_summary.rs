@@ -198,6 +198,8 @@ use guards::{GuardIr, Subject, Tested, WrittenIn};
 // the offline census read them yet.
 #[allow(dead_code)]
 pub mod decided_sites;
+// The files the fact layer would send the file reader (carrick#2613): record-only.
+pub mod fact_files;
 #[cfg(test)]
 mod site_census;
 #[allow(dead_code)]
