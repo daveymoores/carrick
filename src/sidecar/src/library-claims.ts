@@ -2778,7 +2778,7 @@ class DeclarationReader {
       };
       receiverOf('export', type);
       for (const maker of this.makers(pkg, target, type)) {
-        const made = this.madeBy(maker.signatures, built(name, maker.receiver));
+        const made = this.madeBy(maker.signatures, built(name, maker.receiver), name === 'default');
         if (!made) continue;
         // One level below the export, what the member builds must declare a callable member.
         if (
@@ -2910,13 +2910,26 @@ class DeclarationReader {
    * type-parameter defaults where `built` (the probe's no-argument build of
    * the receiver) instantiates it (`returnOf`), less the returns that say
    * nothing, which no maker claim holds on. Listed when what is left is one
-   * object type.
+   * object type. A `default` export, which a service imports under any local
+   * name (usually the one maker a framework has), that is overloaded and so
+   * returns several types is listed for the return of the overload the
+   * probe's no-argument build resolves (`built`), when that is an object type
+   * with members of its own.
    */
-  private madeBy(signatures: readonly ts.Signature[], built: ts.Signature | undefined): ts.Type | undefined {
+  private madeBy(
+    signatures: readonly ts.Signature[],
+    built: ts.Signature | undefined,
+    isDefault: boolean
+  ): ts.Type | undefined {
     const returns = [
       ...new Set(signatures.map(sig => this.returnOf(sig, built)).filter(type => !this.returnSaysNothing(type))),
     ];
-    return returns.length === 1 && this.isObjectType(returns[0]) ? returns[0] : undefined;
+    if (returns.length === 1) return this.isObjectType(returns[0]) ? returns[0] : undefined;
+    if (!isDefault || returns.length === 0 || built === undefined) return undefined;
+    const resolved = this.checker.getReturnTypeOfSignature(built);
+    return !this.returnSaysNothing(resolved) && this.isObjectType(resolved) && this.namedProperties(resolved).length > 0
+      ? resolved
+      : undefined;
   }
 
   /** The call (or construct) signatures of `type` an installed package or the default library declares. */
