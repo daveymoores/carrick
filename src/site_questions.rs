@@ -36,6 +36,11 @@
 //!   `CACHE_VERSION` pairing: a question change moves `question_set` and the
 //!   next scan asks again by itself.
 //!
+//! - **Handler records (R4b, #2386).** A site may instead be
+//!   `{ site_id, handler }` ([`HandlerRecord`]), answered `{ site_id, ok, routes }`
+//!   ([`RoutesAnswered`]); one variant per request. Pinned in the contract's
+//!   top-level `handler` example.
+//!
 //! Both repos test against one example: `tests/fixtures/site_questions/contract.json`
 //! here, vendored byte for byte as carrick-cloud's
 //! `lambdas/site-questions/fixtures/contract.json`.
@@ -207,6 +212,190 @@ pub struct SiteQuestionsRequest {
     pub service: Option<String>,
     pub question_set: Option<String>,
     pub sites: Vec<SiteQuestion>,
+}
+
+/// The most comparisons one handler record asks in a request (R4b, #2386).
+pub const MAX_ASKED_COMPARISONS: usize = 16;
+/// The most handlers a shared record lists.
+pub const MAX_SHARED_HANDLERS: usize = 8;
+
+/// What a handler record is about (R4b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectKind {
+    Entry,
+    Label,
+    Shared,
+}
+
+/// A labelled `receive` the subject is the handler of.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubjectLabel {
+    pub package: String,
+    pub export: String,
+    pub member: Option<String>,
+}
+
+/// A handler a shared record's function is reached from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandlerRef {
+    pub at: String,
+    pub key: String,
+}
+
+/// The function the record is about: its body numbered as `point.code` is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandlerSubject {
+    pub at: String,
+    pub kind: SubjectKind,
+    pub key: String,
+    pub params: Vec<String>,
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<SubjectLabel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handlers: Option<Vec<HandlerRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler_count: Option<u32>,
+}
+
+/// Code of a comparison written in another function.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodeWindow {
+    pub at: String,
+    pub code: String,
+}
+
+/// Where a compared literal stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonPosition {
+    Equality,
+    Case,
+    TableKey,
+}
+
+/// The read of the request's path a comparison was proven to make.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComparisonRead {
+    pub param: String,
+    pub steps: Vec<String>,
+}
+
+/// Where the chain from the request to a comparison stopped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComparisonHole {
+    pub reason: String,
+    pub text: String,
+}
+
+/// One path or method comparison. `read` and `hole` are always written; at
+/// most one is not null.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandlerComparison {
+    pub id: u32,
+    pub at: String,
+    pub literal: String,
+    pub position: ComparisonPosition,
+    pub expression: String,
+    pub read: Option<ComparisonRead>,
+    pub hole: Option<ComparisonHole>,
+}
+
+/// A request-method literal the record states.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MethodLiteral {
+    pub literal: String,
+    pub at: String,
+}
+
+/// A `startsWith` prefix the record states.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopePrefix {
+    pub prefix: String,
+    pub at: String,
+    pub delegates: Vec<String>,
+}
+
+/// What the code already decides for a comparison; an absent member is asked.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ForcedRoute {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+}
+
+/// The handler record (R4b, #2386): one request handler and every path and
+/// method comparison inside it. No question text, no absolute path. Which
+/// comparisons are asked is part of the record, so part of the cache key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandlerRecord {
+    pub subject: HandlerSubject,
+    pub code: Vec<CodeWindow>,
+    pub comparisons: Vec<HandlerComparison>,
+    pub methods: Vec<MethodLiteral>,
+    pub scopes: Vec<ScopePrefix>,
+    pub asked: Vec<u32>,
+    pub forced: BTreeMap<String, ForcedRoute>,
+}
+
+/// One handler to ask about.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandlerQuestion {
+    pub site_id: String,
+    pub handler: HandlerRecord,
+}
+
+/// A request of handler records. A request holds one variant of site, never
+/// a mix of `state` and `handler` sites.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandlerQuestionsRequest {
+    pub repo: String,
+    pub service: Option<String>,
+    pub question_set: Option<String>,
+    pub sites: Vec<HandlerQuestion>,
+}
+
+/// What the model chose for one comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteChoice {
+    Route,
+    None,
+    CantTell,
+}
+
+/// The answer to one asked comparison. `method` is null for the "no method
+/// chosen" option; both are null for `none` and `cant_tell`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteAnswer {
+    pub id: u32,
+    pub choice: RouteChoice,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub confidence: f64,
+    pub orders_agree: bool,
+}
+
+/// An answered handler record: one [`RouteAnswer`] per asked id, in order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoutesAnswered {
+    pub routes: Vec<RouteAnswer>,
+}
+
+/// One element of a handler request's `answers`, or `None` when it is neither
+/// shape.
+pub fn parse_routes_answer(element: &Value) -> Option<Result<RoutesAnswered, Unanswered>> {
+    match element.get("ok")?.as_bool()? {
+        true => serde_json::from_value::<RoutesAnswered>(element.clone())
+            .ok()
+            .map(Ok),
+        false => Some(Err(Unanswered {
+            code: element.get("code")?.as_str()?.to_string(),
+            retriable: element.get("retriable")?.as_bool()?,
+        })),
+    }
 }
 
 /// An answered slot's value: a stated value's text (name, method,
