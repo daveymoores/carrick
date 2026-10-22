@@ -3,8 +3,8 @@ extern crate swc_ecma_parser;
 
 use crate::receiver_origin::origin_root;
 use crate::receiver_type::{
-    CalledType, FactoryCall, ReceiverTypes, TypedCall, annotated_type_ident, called_type,
-    class_field_types, constructed_type_ident, factory_call,
+    FactoryCall, ReceiverTypes, annotated_type_ident, class_field_types, constructed_type_ident,
+    factory_call,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -333,11 +333,6 @@ pub struct ReceiverBinding {
     /// declares the receiver's class and the callee is not itself a parameter
     /// or a destructured name (carrick#1146).
     pub factory: Option<FactoryCall>,
-    /// The same `const` receiver when the function it calls is a VALUE whose
-    /// declared type is a function type: a parameter `make: MakeClient` or
-    /// an annotated local (carrick#1561). The type, not the name, says what
-    /// the call returns.
-    pub typed_factory: Option<TypedCall>,
     /// A `const` receiver initialised by a call (`const client =
     /// make(id)`), with no class declared for it: what the call returns is
     /// the compiler's to say, through the member call's `call` row
@@ -361,9 +356,6 @@ struct LexicalBinding {
     /// parameter, a destructured name, a catch clause. Its value is whatever
     /// the caller or the destructured object supplies.
     pattern_bound: bool,
-    /// What the binding's type annotation says a call of it returns
-    /// (carrick#1561).
-    called_type: Option<CalledType>,
 }
 
 #[derive(Default)]
@@ -398,9 +390,6 @@ impl LexicalReceivers {
                 }
                 if previous.factory != binding.factory {
                     previous.factory = None;
-                }
-                if previous.called_type != binding.called_type {
-                    previous.called_type = None;
                 }
                 previous.pattern_bound |= binding.pattern_bound;
             })
@@ -437,18 +426,6 @@ impl LexicalReceivers {
                 callee: callee.0.to_string(),
                 awaited: *awaited,
             });
-        // A callee declared as a function type states its return by that
-        // type, whether it is handed in or bound locally.
-        receiver.typed_factory = binding
-            .factory
-            .as_ref()
-            .filter(|_| !receiver.declared)
-            .and_then(|(callee, awaited)| {
-                Some(TypedCall {
-                    called: self.bindings.get(callee)?.called_type.clone()?,
-                    awaited: *awaited,
-                })
-            });
         let mut current = binding;
         let mut seen = HashSet::new();
         while receiver.origin.is_none() {
@@ -484,7 +461,6 @@ impl Visit for LexicalReceivers {
                         declared: false,
                         local_member: None,
                         factory: None,
-                        typed_factory: None,
                         call_bound: false,
                         origin: (!import.type_only && !type_only)
                             .then(|| import.src.value.to_string_lossy().into_owned()),
@@ -509,7 +485,6 @@ impl Visit for LexicalReceivers {
                     declared: false,
                     local_member: None,
                     factory: None,
-                    typed_factory: None,
                     call_bound: false,
                     origin: Some(external.expr.value.to_string_lossy().into_owned()),
                 },
@@ -574,7 +549,6 @@ impl Visit for LexicalReceivers {
                                 declared: false,
                                 local_member: None,
                                 factory: None,
-                                typed_factory: None,
                                 call_bound: false,
                                 origin: Some(specifier.clone()),
                             },
@@ -612,7 +586,6 @@ impl Visit for LexicalReceivers {
                         .filter(|_| self.in_const)
                         .and_then(factory_call)
                         .map(|(callee, awaited)| (callee.to_id(), awaited)),
-                    called_type: ident.type_ann.as_deref().and_then(called_type),
                     ..Default::default()
                 },
             );
@@ -633,7 +606,6 @@ impl Visit for LexicalReceivers {
                     .as_deref()
                     .and_then(annotated_type_ident)
                     .map(Ident::to_id),
-                called_type: ident.type_ann.as_deref().and_then(called_type),
                 pattern_bound: true,
                 ..Default::default()
             },
