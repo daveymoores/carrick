@@ -4006,6 +4006,16 @@ async fn analyze_current_repo_incremental(
                 },
             )
             .await;
+            let site_payloads = site_payloads_of(
+                crate::site_payloads::enabled(),
+                &request_inputs,
+                repo_path,
+                &claims,
+                SiteContext {
+                    placements: Some(&placements),
+                    library: library_ask.as_ref().map(|ask| &ask.sites),
+                },
+            );
             let withdrawn = withdraw_model_routes_at_definitions(
                 &mut mount_graph,
                 &merged_results,
@@ -4186,6 +4196,10 @@ async fn analyze_current_repo_incremental(
                     .collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
             );
             protocol_infer.extend(site_infer_requests(&site_fold, repo_path));
+            let payload_infer = site_payloads.requests(
+                cloud_data.type_manifest.as_deref().unwrap_or_default(),
+                repo_path,
+            );
 
             crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -4201,6 +4215,7 @@ async fn analyze_current_repo_incremental(
                 &service_modules,
                 &protocol_requests,
                 &protocol_infer,
+                &payload_infer,
                 &mut cloud_data,
             );
             crate::phase_timing::mark(crate::phase_timing::Phase::Types);
@@ -4934,6 +4949,30 @@ async fn site_rows_of(
         "site questions: rows"
     );
     rows
+}
+
+/// Where the service's decided sites place their payloads (phase 3 step 1,
+/// [`crate::site_payloads`]). Built only when `enabled`
+/// (`CARRICK_SITE_PAYLOADS=1`), from the same records the site questions
+/// read; with no compiler rows (`CARRICK_POSITION_ROWS=1`) discovery finds
+/// no site and nothing moves.
+fn site_payloads_of(
+    enabled: bool,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    repo_path: &str,
+    claims: &[crate::library_claims::ExportClaims],
+    context: SiteContext<'_>,
+) -> crate::site_payloads::SitePayloads {
+    if !enabled {
+        return crate::site_payloads::SitePayloads::default();
+    }
+    let records = site_records_of(inputs, Path::new(repo_path), claims, context).records;
+    let payloads = crate::site_payloads::SitePayloads::of(&records);
+    debug!(
+        records = records.len(),
+        "site payloads: records whose slots the type capture may read"
+    );
+    payloads
 }
 
 /// What the site pass reads from the rest of the scan (carrick#2524): where
@@ -7399,6 +7438,7 @@ fn resolve_types_if_available(
     modules: &crate::workspace_resolver::WorkspaceIndex,
     extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
+    payload_infer: &[crate::services::type_sidecar::InferRequestItem],
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
     let Some(sidecar) = sidecar else {
@@ -7433,6 +7473,7 @@ fn resolve_types_if_available(
                 modules,
                 extra_explicit,
                 extra_infer,
+                payload_infer,
             ) {
                 Ok(type_resolution) => {
                     debug!(
@@ -7506,6 +7547,7 @@ fn resolve_types_if_available(
                         modules,
                         extra_explicit,
                         extra_infer,
+                        payload_infer,
                         &type_resolution,
                         cloud_data,
                     );
@@ -7564,6 +7606,7 @@ fn run_capture_for_service(
     modules: &crate::workspace_resolver::WorkspaceIndex,
     extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
+    payload_infer: &[crate::services::type_sidecar::InferRequestItem],
     type_resolution: &TypeResolutionResult,
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
@@ -7577,6 +7620,7 @@ fn run_capture_for_service(
     );
     explicit.extend_from_slice(extra_explicit);
     infer.extend_from_slice(extra_infer);
+    crate::site_payloads::take_over(&mut infer, payload_infer);
     // Mirror resolve_all_types' post-processing exactly: the #413 two-anchor
     // arbitration re-aims witnessed-borrowed pub/sub anchors at the
     // tsc-witnessed payload root BEFORE depths apply, so v2 capture anchors
@@ -10154,6 +10198,16 @@ async fn analyze_current_repo(
         },
     )
     .await;
+    let site_payloads = site_payloads_of(
+        crate::site_payloads::enabled(),
+        &request_inputs,
+        repo_path,
+        &claims,
+        SiteContext {
+            placements: Some(&placements),
+            library: library_ask.as_ref().map(|ask| &ask.sites),
+        },
+    );
     let withdrawn = withdraw_model_routes_at_definitions(
         &mut analysis_result.mount_graph,
         &analysis_result.file_results,
@@ -10295,6 +10349,10 @@ async fn analyze_current_repo(
         file_orchestrator.collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
     );
     protocol_infer.extend(site_infer_requests(&site_fold, repo_path));
+    let payload_infer = site_payloads.requests(
+        cloud_data.type_manifest.as_deref().unwrap_or_default(),
+        repo_path,
+    );
 
     crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -10309,6 +10367,7 @@ async fn analyze_current_repo(
         &service_modules,
         &protocol_requests,
         &protocol_infer,
+        &payload_infer,
         &mut cloud_data,
     );
 
@@ -11382,6 +11441,7 @@ mod tests {
             &service_module_index(root.to_str().unwrap(), &member),
             &explicit,
             &[],
+            &[],
             &resolution,
             &mut data,
         );
@@ -11395,6 +11455,7 @@ mod tests {
             &Config::default(),
             &service_module_index(root.to_str().unwrap(), &Config::default()),
             &explicit,
+            &[],
             &[],
             &resolution,
             &mut data,
@@ -11572,6 +11633,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     payload_borrow_witness: false,
                     consumer_response: false,
                 }],
+                &[],
                 &[],
                 &TypeResolutionResult {
                     dts_content: None,
