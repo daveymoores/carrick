@@ -3359,7 +3359,8 @@ export class TypeInferrer {
     // is its response, and a config's type is the config, so either one read
     // as the body publishes the wrong contract. Follow the call's signature to
     // the argument it sends as the body.
-    const inCall = this.requestBodyInCall(unwrapped);
+    let inCall = this.requestBodyInCall(unwrapped);
+    if (inCall.kind === 'none') inCall = this.bodyBuiltByCallee(unwrapped);
     if (inCall.kind === 'body') {
       this.log(
         `Request locator at ${request.file_path}:${request.line_number} names ${inCall.from}; ` +
@@ -3599,10 +3600,15 @@ export class TypeInferrer {
     // (res) => resolve(…)) })`): what the caller receives is what that
     // promise settles with, and the call made in the executor produces it.
     const nearestReturn = callExpr.getFirstAncestorByKind(SyntaxKind.ReturnStatement);
+    // A return whose value is an object or array literal built around the
+    // call (`return { ok: true, count: countOf(await client.add(…)) }`) hands
+    // back the caller's own value, which holds the result as one part: it
+    // answers for the call no more than a command table does (carrick#2628).
     const returnStmt =
       nearestReturn &&
       (this.findContainingFunctionForNode(nearestReturn) === func ||
-        this.callIsInReturnedPromiseExecutor(nearestReturn, func))
+        this.callIsInReturnedPromiseExecutor(nearestReturn, func)) &&
+      !this.callIsPartOfReturnedLiteral(callExpr, nearestReturn)
         ? nearestReturn
         : undefined;
     if (returnStmt) {
@@ -3796,6 +3802,18 @@ export class TypeInferrer {
       return lastNode;
     }
     return callExpr;
+  }
+
+  /**
+   * Between `callExpr` and the return statement around it there is an object
+   * or array literal: the call's result is one part of a value the function
+   * builds and returns.
+   */
+  private callIsPartOfReturnedLiteral(callExpr: CallExpression, returnStmt: Node): boolean {
+    const ancestors = callExpr.getAncestors();
+    return ancestors
+      .slice(0, ancestors.indexOf(returnStmt))
+      .some((a) => Node.isObjectLiteralExpression(a) || Node.isArrayLiteralExpression(a));
   }
 
   /**
@@ -8243,6 +8261,178 @@ export class TypeInferrer {
     }
 
     return { kind: 'none' };
+  }
+
+  /**
+   * carrick#2628: the located node is an argument of a call into a function
+   * whose body the program holds (an in-repo client method,
+   * `client.addTags(project, unique(tags))`), at a parameter that is not a
+   * body slot. What the call sends is decided inside that function, so the
+   * argument is the body only when the function sends it unchanged. One
+   * level, read off each use of the parameter in the function's body:
+   *
+   *  - the use IS the value of a body-named member (`body: tags`,
+   *    `body: JSON.stringify(tags)`) or of a body slot of a call: the
+   *    argument is the body, and its own type stands (`none`);
+   *  - the use sits inside such a value (`body: { tags }`,
+   *    `body: (event ?? {}) as never`): the body is that value, read at the
+   *    function without the casts around it;
+   *  - the use sits inside an object or array literal that is no body value
+   *    (`send(project, [labels])`): the body cannot be told, abstain.
+   *
+   * Uses that disagree abstain. A generic function's body may be typed by
+   * its type parameters, so it abstains too. A library's declaration
+   * (`fetch`, an installed client) has no body to read and is left alone,
+   * and so is an untyped argument (a handler's `request.body` handed to a
+   * helper): it states no contract to mistake, and the untyped-read path
+   * below reads it.
+   */
+  private bodyBuiltByCallee(
+    node: Node
+  ):
+    | { kind: 'none' }
+    | { kind: 'abstain'; why: string }
+    | { kind: 'body_type'; type: Type; at: Node; from: string } {
+    const own = node.getType();
+    if (own.isAny() || own.isUnknown()) return { kind: 'none' };
+    const call = this.receivingCallOf(node, (candidate) => Node.isCallExpression(candidate));
+    if (!call || !Node.isCallExpression(call)) return { kind: 'none' };
+    const index = call
+      .getArguments()
+      .findIndex((a) => a.getPos() <= node.getPos() && node.getEnd() <= a.getEnd());
+    if (index < 0) return { kind: 'none' };
+    if (this.requestBodySlots(call)[index]) return { kind: 'none' };
+
+    const callee = this.project.getTypeChecker().getResolvedSignature(call)?.getDeclaration();
+    if (
+      !callee ||
+      !(
+        Node.isFunctionDeclaration(callee) ||
+        Node.isMethodDeclaration(callee) ||
+        Node.isArrowFunction(callee) ||
+        Node.isFunctionExpression(callee)
+      )
+    ) {
+      return { kind: 'none' };
+    }
+    const body = callee.getBody();
+    if (!body) return { kind: 'none' };
+    const program = this.project.getProgram().compilerObject;
+    if (
+      isExternalOrigin(
+        program,
+        callee.getSourceFile().compilerNode,
+        this.repoRoot,
+        externalImportsOf(this.project)
+      )
+    ) {
+      return { kind: 'none' };
+    }
+    const param = callee.getParameters()[index];
+    if (!param || param.isRestParameter()) return { kind: 'none' };
+    const paramName = param.getNameNode();
+    if (!Node.isIdentifier(paramName)) return { kind: 'none' };
+    const paramSymbol = paramName.getSymbol()?.compilerSymbol;
+    if (!paramSymbol) return { kind: 'none' };
+
+    const checker = this.project.getTypeChecker().compilerObject;
+    const uses = body.getDescendantsOfKind(SyntaxKind.Identifier).filter((id) => {
+      const parent = id.getParent();
+      const symbol =
+        parent && Node.isShorthandPropertyAssignment(parent)
+          ? checker.getShorthandAssignmentValueSymbol(parent.compilerNode)
+          : id.getSymbol()?.compilerSymbol;
+      return symbol === paramSymbol;
+    });
+
+    const from = 'a call into a function that builds the request body inside itself';
+    let passedThrough = false;
+    const built: Node[] = [];
+    for (const use of uses) {
+      const value = this.bodyValueAround(use, body);
+      if (value === use) {
+        passedThrough = true;
+        continue;
+      }
+      if (value) {
+        built.push(value);
+        continue;
+      }
+      const ancestors = use.getAncestors();
+      const insideLiteral = ancestors
+        .slice(0, ancestors.indexOf(body))
+        .some((a) => Node.isObjectLiteralExpression(a) || Node.isArrayLiteralExpression(a));
+      if (insideLiteral) {
+        return {
+          kind: 'abstain',
+          why: `the located argument goes into a value the called function builds and does not send as a body (${from})`,
+        };
+      }
+    }
+    if (built.length === 0) return { kind: 'none' };
+    if (passedThrough) {
+      return { kind: 'abstain', why: `the called function both sends the argument and builds a body from it (${from})` };
+    }
+    if (callee.getTypeParameters().length > 0) {
+      return { kind: 'abstain', why: `the called function is generic, so the body it builds may be typed by its type parameters (${from})` };
+    }
+    const types = built.map((value) => this.unwrapJsonStringifyArg(this.unwrapExpressionNode(value)));
+    const texts = new Set(types.map((value) => typeText(value.getType(), value)));
+    if (texts.size !== 1) {
+      return { kind: 'abstain', why: `the called function builds more than one body from the argument (${from})` };
+    }
+    const at = types[0];
+    const type = at.getType();
+    if (type.isAny() || type.isUnknown() || type.isTypeParameter()) {
+      return { kind: 'abstain', why: `the body the called function builds is not typed (${from})` };
+    }
+    return { kind: 'body_type', type, at, from };
+  }
+
+  /**
+   * The request body value `use` is part of, inside `scope`: the value of a
+   * body-named object member, or the argument at a body slot of a call,
+   * looking through parentheses, casts, `await` and a `JSON.stringify`
+   * around it. `use` itself when it is that value whole.
+   */
+  private bodyValueAround(use: Node, scope: Node): Node | undefined {
+    let current: Node = use;
+    while (current !== scope) {
+      const parent = current.getParent();
+      if (!parent) return undefined;
+      if (
+        Node.isShorthandPropertyAssignment(parent) &&
+        current === use &&
+        BODY_MEMBER_NAMES.has(parent.getName())
+      ) {
+        return use;
+      }
+      if (
+        Node.isPropertyAssignment(parent) &&
+        parent.getInitializer() === current &&
+        BODY_MEMBER_NAMES.has(parent.getName())
+      ) {
+        return this.isSameValue(current, use) ? use : current;
+      }
+      if (Node.isCallExpression(parent)) {
+        const index = parent.getArguments().indexOf(current);
+        if (index >= 0 && this.requestBodySlots(parent)[index]?.kind === 'body') {
+          return this.isSameValue(current, use) ? use : current;
+        }
+      }
+      current = parent;
+    }
+    return undefined;
+  }
+
+  /** `value` is `use` behind parentheses, casts, `await` or a `JSON.stringify`. */
+  private isSameValue(value: Node, use: Node): boolean {
+    let current = value;
+    for (;;) {
+      const inner = this.unwrapJsonStringifyArg(this.unwrapExpressionNode(current));
+      if (inner === current) return current === use;
+      current = inner;
+    }
   }
 
   /** A string, a string literal, a template literal, or a union of strings. */

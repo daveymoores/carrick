@@ -190,11 +190,10 @@ describe('carrick#2282: a return statement answers only for a call of its own fu
     );
   });
 
-  it('still answers the returned expression where the function the call is in returns a wrapper', async () => {
-    assert.strictEqual(
-      await callResult('Wrapper', 'api.one(id)', 'item: await api.one(id)'),
-      '{ item: Item; at: number; }'
-    );
+  // carrick#2628: an object the function builds around the call and returns
+  // is the function's own value; the call's result is one member of it.
+  it('reads a call inside a returned object literal as its own result, not the object', async () => {
+    assert.strictEqual(await callResult('Wrapper', 'api.one(id)', 'item: await api.one(id)'), 'Item');
   });
 });
 
