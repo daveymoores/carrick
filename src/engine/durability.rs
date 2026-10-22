@@ -235,7 +235,7 @@ impl OwedWork {
     /// final ([`ServiceLosses::final_files`]). They are still missing from its
     /// index, but no re-run can mend them, so the service is complete
     /// ([`Self::thins_the_index`]) and nothing asks for them again.
-    fn owes_only_final_files(&self) -> bool {
+    pub fn owes_only_final_files(&self) -> bool {
         self.deferred.is_none()
             && self.retry_error.is_none()
             && self.losses.intents == 0

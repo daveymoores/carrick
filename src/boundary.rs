@@ -91,6 +91,14 @@ pub struct ServiceBoundary {
     /// Files the analyzer was asked about and never answered for. Their rows
     /// are whatever the deterministic layer stated and nothing more.
     pub files_lost: Counted,
+    /// The files in `files_lost` whose answer is final (carrick#2488): no
+    /// re-run mends them, so every scan of the same bytes loses them the same
+    /// way, and they are not owed. A subset of `files_lost`, never added to
+    /// it. Reasons are `path: code`, the code the loss ended on
+    /// (`file_too_large` is a file too large to analyse even split into
+    /// parts). `None` on a blob from a scanner that did not count them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_losses: Option<Counted>,
     /// Offered HTTP candidates carrying a route-shaped literal (a readable
     /// verb is not required) that no layer produced a row for and no mount
     /// answers. A bare `x.verb("/lit", arg)` states no producer/consumer role,
@@ -230,6 +238,21 @@ fn unprepared_not_stated(rows: &Option<Vec<crate::preflight::UnpreparedRow>>) ->
     rows.as_ref().is_none_or(Vec::is_empty)
 }
 
+/// This service's final losses (carrick#2488), as `path: code` with the path
+/// relative to the scan root: the run's record of them is kept in the form
+/// the walk named the file, absolute or `./`-led.
+fn final_losses(data: &CloudRepoData, repo_path: &str) -> Counted {
+    Counted::from_reasons(
+        crate::scan_health::final_losses_for(data.service_name.as_deref())
+            .into_iter()
+            .map(|lost| {
+                let path = crate::utils::repo_relative_source_path(&lost.path, repo_path);
+                format!("{path}: {}", lost.reason)
+            })
+            .collect(),
+    )
+}
+
 impl ServiceBoundary {
     /// Collect the boundary for one service from its finished blob and the
     /// stats of the scan that produced it.
@@ -275,6 +298,7 @@ impl ServiceBoundary {
             commit_hash: data.commit_hash.clone(),
             files_attempted: stats.files_model_dispatched,
             files_lost: Counted::new(stats.files_analysis_failed, lost),
+            final_losses: Some(final_losses(data, repo_path)),
             unemitted_literal_candidates: stats.unemitted_literal_candidates,
             unemitted_literal_sites: sites,
             candidates_awaiting_model: Some(stats.candidates_awaiting_model),
@@ -1066,6 +1090,73 @@ mod tests {
                 vec!["src/worker.ts:14 GET /metrics".to_string()]
             ))
         );
+    }
+
+    /// carrick#2488: a file lost for good is named apart on the blob, by its
+    /// repo-relative path and the code it ended on, spelled as the shared
+    /// contract (`tests/fixtures/final-losses/contract.json`) spells it. An
+    /// owed loss of the same service is not among them.
+    #[test]
+    fn a_final_loss_is_named_apart_on_the_blob() {
+        use crate::cloud_storage::CloudRepoData;
+        use crate::scan_health::LossReason;
+
+        const SERVICE: &str = "final-loss-boundary";
+        let repo_path = "/home/runner/work/acme-app/acme-app";
+        let contract: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/final-losses/contract.json"))
+                .unwrap();
+        let lost = &contract["write"]["final_losses"][0];
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+        crate::current_service::sync_scope(Some(SERVICE.to_string()), || {
+            crate::scan_health::record_unanalysed_file(
+                &format!("{repo_path}/{}", lost["path"].as_str().unwrap()),
+                &LossReason {
+                    code: lost["reason"].as_str().unwrap().to_string(),
+                    is_final: true,
+                },
+            );
+            crate::scan_health::record_unanalysed_file(
+                &format!("{repo_path}/src/dead.ts"),
+                &LossReason::owed("gateway_error"),
+            );
+        });
+        let data: CloudRepoData = serde_json::from_value(serde_json::json!({
+            "repo_name": "acme/app",
+            "service_name": SERVICE,
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-01-01T00:00:00Z",
+            "commit_hash": "abc1234"
+        }))
+        .expect("the blob reads");
+
+        let boundary = ServiceBoundary::collect(
+            &data,
+            &ProcessingStats::default(),
+            &HashMap::new(),
+            repo_path,
+        );
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+        let written = serde_json::to_value(&boundary).unwrap();
+        assert_eq!(
+            written["final_losses"], contract["boundary"]["final_losses"],
+            "{written:#}"
+        );
+
+        // A service that lost nothing for good says so, rather than leaving
+        // the reader to guess: absent is a blob that did not count.
+        let none = ServiceBoundary::collect(
+            &data,
+            &ProcessingStats::default(),
+            &HashMap::new(),
+            repo_path,
+        );
+        assert_eq!(none.final_losses, Some(Counted::default()));
+        let mut older = serde_json::to_value(&none).unwrap();
+        older.as_object_mut().unwrap().remove("final_losses");
+        let older: ServiceBoundary = serde_json::from_value(older).unwrap();
+        assert_eq!(older.final_losses, None, "an older blob did not count them");
     }
 
     /// A route the analysis states sends no body (a redirect, a 204) has no

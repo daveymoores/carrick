@@ -473,10 +473,11 @@ fn single_marker(tag: &str, i: usize) -> String {
     format!("[path: \\\"/{tag}/r/{i}\\\"]")
 }
 
-/// Why this run lost `path`, when it did.
+/// Why this run lost `path`, when it did: owed or for good.
 fn lost_reason(path: &str) -> Option<String> {
     carrick::scan_health::unanalysed_files_for(None)
         .into_iter()
+        .chain(carrick::scan_health::final_losses_for(None))
         .find(|lost| lost.path == path)
         .map(|lost| lost.reason)
 }
@@ -1833,10 +1834,16 @@ async fn a_candidate_inside_an_item_that_cannot_be_cut_names_the_file() {
         );
     }
     assert!(
-        carrick::scan_health::unanalysed_files_for(None)
+        carrick::scan_health::final_losses_for(None)
             .iter()
             .any(|lost| lost.path == fx.table),
-        "the file is named"
+        "the file is named, as lost for good"
+    );
+    assert!(
+        !carrick::scan_health::unanalysed_files_for(None)
+            .iter()
+            .any(|lost| lost.path == fx.table),
+        "and is not owed (carrick#2488)"
     );
 }
 

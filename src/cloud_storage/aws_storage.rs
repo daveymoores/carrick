@@ -630,6 +630,22 @@ struct LambdaRequest {
     /// field and refuse no unknown key.
     #[serde(skip_serializing_if = "Option::is_none")]
     unanalysed_total: Option<usize>,
+    /// Files the service lost for good, on the two write actions
+    /// (carrick#2488): their answer is final ([`crate::scan_health::LossReason`]
+    /// `is_final`), so every scan of the same bytes loses them the same way.
+    /// Never in `unanalysed_files`, which is what the first-scan partial rule
+    /// counts as owed: a final loss there made the cloud refuse every write of
+    /// a service that already had an index. The cloud records them; a cloud
+    /// that does not read the field ignores it, and the write lands either
+    /// way. Same entry shape, same bound and the same laptop-only rule as
+    /// `unanalysed_files`; omitted when there are none. The spelling is pinned
+    /// in `tests/fixtures/final-losses/write.json`, which the cloud pins too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_losses: Option<Vec<UnanalysedFile>>,
+    /// How many files the service lost for good, when `final_losses` names
+    /// fewer than that. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_losses_total: Option<usize>,
     /// The last write action of the run, which is what releases the cloud's
     /// in-flight scan slot. A multi-service repo sends N write actions and
     /// only this one carries it; absent, the slot falls to its TTL.
@@ -1194,6 +1210,20 @@ impl AwsStorage {
         sent
     }
 
+    /// The files this service lost for good, for the write actions
+    /// (`final_losses`, carrick#2488): their answer is final, so no re-run
+    /// mends them and the cloud does not count them as owed. Sent on the
+    /// same terms as [`Self::unanalysed_files`]: the laptop path only, this
+    /// service's files only, cut to the bound with the total beside them.
+    fn final_losses(&self, data: &CloudRepoData) -> LostFilesSent {
+        if !self.auth.is_bearer() {
+            return LostFilesSent::default();
+        }
+        lost_files_to_send(crate::scan_health::final_losses_for(
+            data.service_name.as_deref(),
+        ))
+    }
+
     /// POSTs a JSON body to the upload endpoint with the OIDC bearer header,
     /// returning the raw response body on success. OIDC tokens are short-lived
     /// and a large scan outlives one, so the token is read per attempt (the
@@ -1533,6 +1563,7 @@ impl AwsStorage {
         final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError> {
         let lost = self.unanalysed_files(data);
+        let final_losses = self.final_losses(data);
         let request = LambdaRequest {
             action: "store-metadata".to_string(),
             repo: data.repo_name.clone(),
@@ -1549,6 +1580,8 @@ impl AwsStorage {
             scan_id: self.scan_id(),
             unanalysed_files: lost.named,
             unanalysed_total: lost.total,
+            final_losses: final_losses.named,
+            final_losses_total: final_losses.total,
             scan_final: final_in_run.then_some(true),
             pending_services: self.pending_services_on(final_in_run),
             declared_services: self.declared_services(),
@@ -2054,6 +2087,8 @@ impl CloudStorage for AwsStorage {
             // check.
             unanalysed_files: None,
             unanalysed_total: None,
+            final_losses: None,
+            final_losses_total: None,
             scan_final: None,
             pending_services: None,
             declared_services: None,
@@ -2078,6 +2113,7 @@ impl CloudStorage for AwsStorage {
 
                 // Step 3: Complete the upload by storing metadata
                 let lost = self.unanalysed_files(data);
+                let final_losses = self.final_losses(data);
                 let complete_request = LambdaRequest {
                     action: "complete-upload".to_string(),
                     repo: repo.clone(),
@@ -2094,6 +2130,8 @@ impl CloudStorage for AwsStorage {
                     scan_id: self.scan_id(),
                     unanalysed_files: lost.named,
                     unanalysed_total: lost.total,
+                    final_losses: final_losses.named,
+                    final_losses_total: final_losses.total,
                     scan_final: final_in_run.then_some(true),
                     pending_services: self.pending_services_on(final_in_run),
                     declared_services: self.declared_services(),
@@ -2150,6 +2188,8 @@ impl CloudStorage for AwsStorage {
             scan_id: None,
             unanalysed_files: None,
             unanalysed_total: None,
+            final_losses: None,
+            final_losses_total: None,
             scan_final: None,
             pending_services: None,
             declared_services: None,
@@ -2578,6 +2618,8 @@ impl CloudStorage for AwsStorage {
             scan_id: None,
             unanalysed_files: None,
             unanalysed_total: None,
+            final_losses: None,
+            final_losses_total: None,
             scan_final: None,
             pending_services: None,
             declared_services: None,
@@ -2821,6 +2863,8 @@ mod tests {
             scan_id: None,
             unanalysed_files: None,
             unanalysed_total: None,
+            final_losses: None,
+            final_losses_total: None,
             scan_final: None,
             pending_services: None,
             declared_services: None,
@@ -2921,6 +2965,8 @@ mod tests {
             scan_id: None,
             unanalysed_files: None,
             unanalysed_total: None,
+            final_losses: None,
+            final_losses_total: None,
             scan_final: None,
             pending_services: None,
             declared_services: None,
@@ -2965,6 +3011,8 @@ mod tests {
             scan_id: None,
             unanalysed_files: None,
             unanalysed_total: None,
+            final_losses: None,
+            final_losses_total: None,
             scan_final: None,
             pending_services: None,
             declared_services: None,
@@ -3561,6 +3609,8 @@ mod tests {
             scan_id: None,
             unanalysed_files: None,
             unanalysed_total: None,
+            final_losses: None,
+            final_losses_total: None,
             scan_final: None,
             pending_services: None,
             declared_services: None,
@@ -3669,6 +3719,8 @@ mod tests {
             scan_id: Some("scan_01J".to_string()),
             unanalysed_files: sent.named,
             unanalysed_total: sent.total,
+            final_losses: None,
+            final_losses_total: None,
             scan_final: Some(true),
             pending_services: Some(vec!["api".to_string()]),
             declared_services: None,
@@ -4557,8 +4609,133 @@ mod tests {
     fn the_unanalysed_list_is_never_sent_on_the_ci_path() {
         let ci = AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Oidc, false);
         assert_eq!(ci.unanalysed_files(&blob()), LostFilesSent::default());
+        assert_eq!(ci.final_losses(&blob()), LostFilesSent::default());
         assert!(ci.scan_id().is_none());
         assert!(ci.uploads_run_logs());
+    }
+
+    /// The one example of a final loss both repos read (carrick#2488). The
+    /// cloud pins the same bytes by the same hash in
+    /// `lambdas/check-or-upload/final_losses_contract.fixture.json`, so a
+    /// change of spelling on either side fails a test on that side.
+    const FINAL_LOSS_CONTRACT: &str =
+        include_str!("../../tests/fixtures/final-losses/contract.json");
+    const FINAL_LOSS_CONTRACT_SHA256: &str =
+        "9b72a0481077aec2fc53b474837f75f83b7631c45bd12749489c5ad83f427c72";
+
+    #[test]
+    fn the_final_loss_contract_is_the_one_the_cloud_pins() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            format!("{:x}", Sha256::digest(FINAL_LOSS_CONTRACT.as_bytes())),
+            FINAL_LOSS_CONTRACT_SHA256
+        );
+        let contract: serde_json::Value = serde_json::from_str(FINAL_LOSS_CONTRACT).unwrap();
+        assert_eq!(
+            contract["write"]["final_losses"][0]["reason"],
+            crate::agents::file_orchestrator::FILE_TOO_LARGE_CODE,
+            "the contract's loss is the scanner's own code for a file too large to analyse"
+        );
+    }
+
+    /// carrick#2488: a service whose only loss is final names no owed file on
+    /// its write, so the cloud's first-scan partial rule has nothing to refuse
+    /// when the service already has an index. The loss goes as
+    /// `final_losses`, spelled as the shared contract spells it.
+    #[tokio::test]
+    async fn a_final_loss_is_named_apart_and_owes_the_cloud_nothing() {
+        const SERVICE: &str = "final-loss-wire";
+        let contract: serde_json::Value = serde_json::from_str(FINAL_LOSS_CONTRACT).unwrap();
+        let path = contract["write"]["final_losses"][0]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+        crate::current_service::sync_scope(Some(SERVICE.to_string()), || {
+            crate::scan_health::record_unanalysed_file(
+                &path,
+                &crate::scan_health::LossReason {
+                    code: crate::agents::file_orchestrator::FILE_TOO_LARGE_CODE.to_string(),
+                    is_final: true,
+                },
+            )
+        });
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+        let data = CloudRepoData {
+            service_name: Some(SERVICE.to_string()),
+            ..blob()
+        };
+        let uploaded = storage.upload_repo_data(&data, true).await;
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+        uploaded.expect("the write lands");
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "the existence check and one write");
+        let write = body_of(&requests[1]);
+        assert_eq!(
+            the_clouds_rule_for_unanalysed_files(&write),
+            Ok(0),
+            "the cloud counts no owed file, so a hosted index is replaced: {write}"
+        );
+        assert!(write.get("unanalysed_total").is_none(), "{write}");
+        assert_eq!(
+            write["final_losses"], contract["write"]["final_losses"],
+            "{write}"
+        );
+        assert!(write.get("final_losses_total").is_none(), "{write}");
+    }
+
+    /// One final loss beside one owed file: the owed one is named as before,
+    /// so the cloud's partial rule decides on it exactly as it did, and the
+    /// final one is named apart (carrick#2488).
+    #[tokio::test]
+    async fn an_owed_file_beside_a_final_loss_is_still_owed() {
+        const SERVICE: &str = "final-loss-beside-owed";
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+        crate::current_service::sync_scope(Some(SERVICE.to_string()), || {
+            crate::scan_health::record_unanalysed_file(
+                "src/huge.ts",
+                &crate::scan_health::LossReason {
+                    code: crate::agents::file_orchestrator::FILE_TOO_LARGE_CODE.to_string(),
+                    is_final: true,
+                },
+            );
+            crate::scan_health::record_unanalysed_file(
+                "src/orders.ts",
+                &crate::scan_health::LossReason::owed("gateway_error"),
+            );
+        });
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+        let data = CloudRepoData {
+            service_name: Some(SERVICE.to_string()),
+            ..blob()
+        };
+        let uploaded = storage.upload_repo_data(&data, true).await;
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+        uploaded.expect("the write lands");
+
+        let write = body_of(&server.join().unwrap()[1]);
+        assert_eq!(the_clouds_rule_for_unanalysed_files(&write), Ok(1));
+        assert_eq!(
+            write["unanalysed_files"],
+            serde_json::json!([{ "path": "src/orders.ts", "reason": "gateway_error" }])
+        );
+        assert_eq!(
+            write["final_losses"],
+            serde_json::json!([{ "path": "src/huge.ts", "reason": "file_too_large" }])
+        );
     }
 
     /// carrick#1897: a partial index that landed is followed by advice to run

@@ -1,0 +1,10 @@
+{
+  "write": {
+    "final_losses": [
+      { "path": "src/generated/routes.ts", "reason": "file_too_large" }
+    ]
+  },
+  "boundary": {
+    "final_losses": { "total": 1, "reasons": ["src/generated/routes.ts: file_too_large"] }
+  }
+}

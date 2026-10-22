@@ -338,10 +338,26 @@ impl Registry {
         self.time_limits.get(scope).copied().unwrap_or_default()
     }
 
+    /// The files `scope` lost that another ask may mend.
     fn unanalysed_files_for(&self, scope: &Scope) -> Vec<crate::cloud_storage::UnanalysedFile> {
+        self.lost_files_for(scope, false)
+    }
+
+    /// The files `scope` lost for good: their answer is final
+    /// ([`LossReason::is_final`]), so every scan of the same bytes loses them
+    /// the same way (carrick#2488).
+    fn final_losses_for(&self, scope: &Scope) -> Vec<crate::cloud_storage::UnanalysedFile> {
+        self.lost_files_for(scope, true)
+    }
+
+    fn lost_files_for(
+        &self,
+        scope: &Scope,
+        is_final: bool,
+    ) -> Vec<crate::cloud_storage::UnanalysedFile> {
         self.lost
             .iter()
-            .filter(|l| l.scope == *scope)
+            .filter(|l| l.scope == *scope && l.reason.is_final == is_final)
             .map(|l| crate::cloud_storage::UnanalysedFile {
                 path: l.path.clone(),
                 reason: l.reason.code.clone(),
@@ -694,11 +710,26 @@ pub fn not_refreshed_line() -> Option<String> {
 /// row the write lands on: a run-wide list made a clean service's write carry
 /// a sibling's losses, and once both had rows the clean one was refused
 /// `409 partial_refused` for files it never held.
+///
+/// Only files another ask may mend. A file whose answer is final is in
+/// [`final_losses_for`] instead: it is missing from every scan of those
+/// bytes, so naming it here made the cloud refuse every later write of a
+/// service that already had an index (carrick#2488).
 pub fn unanalysed_files_for(service: Option<&str>) -> Vec<crate::cloud_storage::UnanalysedFile> {
     registry()
         .lock()
         .expect("scan health lock")
         .unanalysed_files_for(&service.map(str::to_string))
+}
+
+/// The files ONE service lost for good, in the shape its upload reports them
+/// (`final_losses` on the write, carrick#2488): the cloud records them and
+/// does not count them as owed.
+pub fn final_losses_for(service: Option<&str>) -> Vec<crate::cloud_storage::UnanalysedFile> {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .final_losses_for(&service.map(str::to_string))
 }
 
 /// How many package names the library-pending sentence spells out.
@@ -1575,8 +1606,8 @@ mod tests {
     }
 
     /// What a service owes says how many of its lost files are final, the
-    /// summary names them by the code they ended on, and the upload's list
-    /// carries that code like any other.
+    /// summary names them by the code they ended on, and the upload names a
+    /// final one apart from the owed ones, by its code (carrick#2488).
     #[test]
     fn final_files_are_counted_apart_and_named_by_their_code() {
         let truncated = AgentCallError::from_cloud("output_truncated", "every try was cut", false);
@@ -1599,9 +1630,24 @@ mod tests {
                 .starts_with("2 of 3 files were not analysed: 1 gateway_error, 1 output_truncated"),
             "{summary}"
         );
-        let listed = run.unanalysed_files_for(&None);
-        assert_eq!(listed[0].reason, "output_truncated");
-        assert_eq!(listed[1].reason, "gateway_error");
+        let owed = run.unanalysed_files_for(&None);
+        assert_eq!(
+            owed,
+            vec![crate::cloud_storage::UnanalysedFile {
+                path: "src/orders.ts".to_string(),
+                reason: "gateway_error".to_string(),
+            }],
+            "only a file another ask may mend is owed"
+        );
+        let final_losses = run.final_losses_for(&None);
+        assert_eq!(
+            final_losses,
+            vec![crate::cloud_storage::UnanalysedFile {
+                path: "src/routes.ts".to_string(),
+                reason: "output_truncated".to_string(),
+            }],
+            "a final loss is named apart, under its code"
+        );
     }
 
     /// The sentence that stands where "run again" would: how many files, that
