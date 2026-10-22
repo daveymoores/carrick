@@ -229,6 +229,10 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    serialised itself, and at least one return builds that string in a way
  *    the inferrer cannot trace to a typed value, so it publishes no part of
  *    the contract (carrick#2200).
+ *  - `body_built_by_callee`: a request locator names an argument of a call
+ *    into a function that builds the request body from it, and the body that
+ *    function builds cannot be typed, so the argument is not the body and no
+ *    contract is published (carrick#2628).
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
@@ -243,6 +247,7 @@ export type TypeProvenanceReason =
   | 'no_request_body'
   | 'projected_value_only'
   | 'serialised_body_unread'
+  | 'body_built_by_callee'
   | 'not_recorded';
 
 /**
