@@ -1198,11 +1198,7 @@ impl Walker<'_> {
         let mut out = Outcome::default();
         for (call, construction) in body.read_calls() {
             let mut inner = self.call(file, body, call, construction);
-            if inner.ends.is_empty()
-                && inner.stop.is_none()
-                && !inner.missed
-                && self.unfollowed(file, call, construction).is_some()
-            {
+            if self.misses(file, body, call, construction, &inner) {
                 inner.missed = true;
             }
             out.absorb(inner);
@@ -1213,6 +1209,37 @@ impl Walker<'_> {
         out
     }
 
+    /// Whether `call`, whose walk gave `outcome` and found no site, passed
+    /// something it did not read (carrick#2613): a call it could not follow,
+    /// or a function written at the call that no walk entered from it (a
+    /// callback handed to a package's function) and that itself reaches a
+    /// labelled export or stops short.
+    fn misses(
+        &mut self,
+        file: &Path,
+        body: &FnIr,
+        call: &CallIr,
+        construction: bool,
+        outcome: &Outcome,
+    ) -> bool {
+        if !outcome.ends.is_empty() || outcome.stop.is_some() {
+            return false;
+        }
+        if outcome.missed || self.unfollowed(file, call, construction).is_some() {
+            return true;
+        }
+        call.args.iter().any(|arg| {
+            let Value::Callback(nested) = arg else {
+                return false;
+            };
+            let Some(callback) = body.nested.get(*nested) else {
+                return false;
+            };
+            let read = self.body(file, callback);
+            !read.ends.is_empty() || read.stop.is_some() || read.missed
+        })
+    }
+
     /// The records for every call `body` and the functions written in it
     /// make.
     fn sites(&mut self, file: &Path, body: &FnIr, discovery: &mut Discovery) {
@@ -1221,6 +1248,7 @@ impl Walker<'_> {
                 continue;
             }
             let outcome = self.call(file, body, call, construction);
+            let missed = self.misses(file, body, call, construction, &outcome);
             let record =
                 |end: Option<SiteEnd>, chain: Vec<ChainHop>, stop: Option<String>| DiscoverySite {
                     file: self.rel(file),
@@ -1251,7 +1279,7 @@ impl Walker<'_> {
                         None => {
                             *discovery.counts.entry("no_site".to_string()).or_default() += 1;
                             let at = (self.rel(file), call.site.span_start, call.site.span_end);
-                            if outcome.missed {
+                            if missed {
                                 discovery.missed_inside.push(at);
                             } else {
                                 discovery.finished.push(at);

@@ -21,7 +21,9 @@
 //! - `src/twice.ts`, the same signal on a local helper whose walk finishes
 //!   with no network call;
 //! - `src/nested.ts`, the same signal on a local helper that calls a function
-//!   a factory returned: the walk finds no site, but did not read everything.
+//!   a factory returned: the walk finds no site, but did not read everything;
+//! - `src/traced.ts`, the same signal on a local helper that hands a
+//!   package's function a callback that calls the labelled relay.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -98,6 +100,8 @@ const TWICE: &str = "async function double(text: string): Promise<string> {\n  r
 
 const NESTED: &str = "function makeSender(): (path: string) => Promise<void> {\n  return async (path) => {\n    void path;\n  };\n}\n\nconst deliver = makeSender();\n\nasync function send(path: string): Promise<void> {\n  await deliver(path);\n}\n\nexport async function nested(): Promise<void> {\n  await send(\"/nested\");\n}\n";
 
+const TRACED: &str = "import relay from \"@fixture/relay\";\nimport span from \"@fixture/span\";\n\nasync function traced(url: string): Promise<void> {\n  span(() => relay(url));\n}\n\nexport async function go(): Promise<void> {\n  await traced(\"/traced\");\n}\n";
+
 /// An answer the reader gives for one file, keyed by its stem.
 fn canned_answer(repo: &Path, stem: &str, answer: serde_json::Value) {
     let dir = repo.join("__llm__/analyze-file");
@@ -132,6 +136,13 @@ fn repo(tmp: &Path) -> PathBuf {
     fs::write(repo.join("src/hook.ts"), HOOK).unwrap();
     fs::write(repo.join("src/twice.ts"), TWICE).unwrap();
     fs::write(repo.join("src/nested.ts"), NESTED).unwrap();
+    add_package(
+        &repo,
+        "@fixture/span",
+        "1.0.0",
+        "declare function span<T>(work: () => T): T;\nexport default span;\n",
+    );
+    fs::write(repo.join("src/traced.ts"), TRACED).unwrap();
     canned_answer(
         &repo,
         "notify",
@@ -180,6 +191,15 @@ fn repo(tmp: &Path) -> PathBuf {
         "exports": [{
             "specifier": "@fixture/serve", "export": "answer", "role": "server_framework",
             "side": "server", "classifier": "fixture-classifier", "makes": [], "scopes": [],
+            "ops": [], "reserved": [], "calls": [], "patterns": []
+        }]
+    }));
+    claims.push(serde_json::json!({
+        "package": "@fixture/span", "version": "1.0.0", "status": "answered",
+        "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "exports": [{
+            "specifier": "@fixture/span", "export": "default", "role": "none",
+            "side": null, "classifier": "fixture-classifier", "makes": [], "scopes": [],
             "ops": [], "reserved": [], "calls": [], "patterns": []
         }]
     }));
@@ -492,6 +512,15 @@ fn a_register_candidate_stays_only_where_discovery_cannot_follow_its_call() {
     let nested = span_id(NESTED, "send(\"/nested\")");
     assert_eq!(off.listed("src/nested.ts"), vec![nested.clone()]);
     assert_eq!(on.listed("src/nested.ts"), vec![nested]);
+    // So has one that hands a package's function a callback that reaches a
+    // labelled export: the walk never entered it from this call.
+    let traced = span_id(TRACED, "traced(\"/traced\")");
+    assert!(off.listed("src/traced.ts").contains(&traced));
+    assert!(
+        on.listed("src/traced.ts").contains(&traced),
+        "{:?}",
+        on.listed("src/traced.ts")
+    );
     let fallbacks = on.fallbacks();
     assert!(
         fallbacks["fallback_selection_C2"].as_u64().unwrap_or(0) >= 1,
