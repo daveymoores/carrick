@@ -10,9 +10,10 @@
 
 use carrick::agent_service::{AgentCallError, AgentService};
 use carrick::site_questions::{
-    self, Answered, MAX_REQUEST_BYTES, MAX_SITES_PER_REQUEST, NO_ANSWER_CODE, ROUTE, SiteAnswer,
-    SiteQuestion, SiteQuestionsRequest, SlotAnswer, SlotValue, TOO_LARGE_CODE, Unanswered, ask,
-    ask_service, ask_within, batches, enabled_from, parse_response,
+    self, Answered, HandlerQuestionsRequest, MAX_ASKED_COMPARISONS, MAX_REQUEST_BYTES,
+    MAX_SITES_PER_REQUEST, NO_ANSWER_CODE, ROUTE, RouteChoice, SiteAnswer, SiteQuestion,
+    SiteQuestionsRequest, SlotAnswer, SlotValue, TOO_LARGE_CODE, Unanswered, ask, ask_service,
+    ask_within, batches, enabled_from, parse_response, parse_routes_answer,
 };
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -43,7 +44,7 @@ fn request() -> SiteQuestionsRequest {
 /// The same sha is pinned in carrick-cloud's
 /// `lambdas/site-questions/contract.test.js`. A change to the contract
 /// changes both repos' copies and both pins.
-const CONTRACT_SHA256: &str = "ed34dc23dc3658ea42dba792d9b27e9c8a89f1aceec1dcab35b4fb47cd97228b";
+const CONTRACT_SHA256: &str = "9034f2c74b115e9e77866b6cf79a274a57a57cf2b656e46b1be71b1be77b47c5";
 
 #[test]
 fn the_contract_file_is_the_one_the_cloud_pins() {
@@ -426,4 +427,82 @@ async fn offline_with_no_cassette_no_site_is_answered() {
     unsafe { std::env::remove_var(site_questions::SWITCH) };
     assert!(out.answered.is_empty());
     assert!(out.unanswered.values().all(|u| u.code == NO_ANSWER_CODE));
+}
+
+// ---------------------------------------------------------------------------
+// R4b, carrick#2386: the handler record and its `routes` answer. The cloud
+// pins the same file by sha and reads `handler.request`.
+
+fn handler_request() -> Value {
+    contract()["handler"]["request"].clone()
+}
+
+/// The request is what the scanner's types write: every field the cloud reads
+/// survives, and nothing is added.
+#[test]
+fn the_handler_request_is_what_the_scanner_types_write() {
+    let typed: HandlerQuestionsRequest = serde_json::from_value(handler_request()).unwrap();
+    assert_eq!(serde_json::to_value(&typed).unwrap(), handler_request());
+    assert_eq!(typed.sites.len(), 4);
+    assert!(typed.sites.iter().all(|s| {
+        s.handler.asked.len() <= MAX_ASKED_COMPARISONS
+            && s.handler
+                .asked
+                .iter()
+                .all(|id| s.handler.comparisons.iter().any(|c| c.id == *id))
+    }));
+    // `read` and `hole` are always written, null when absent.
+    let first = &serde_json::to_value(&typed).unwrap()["sites"][0]["handler"]["comparisons"][0];
+    assert!(first.get("read").is_some() && first["read"].is_null());
+    // A hole with no text (a `handed_to` hole) writes `text: null`, never omits it.
+    let hole =
+        &serde_json::to_value(&typed).unwrap()["sites"][3]["handler"]["comparisons"][1]["hole"];
+    assert_eq!(hole["reason"], "handed_to");
+    assert!(hole.get("text").is_some() && hole["text"].is_null());
+    assert!(
+        typed.sites[3].handler.comparisons[1]
+            .hole
+            .as_ref()
+            .unwrap()
+            .text
+            .is_none()
+    );
+    // A request holds one variant of site: a handler site has no `state`.
+    assert!(handler_request()["sites"][0].get("state").is_none());
+}
+
+#[test]
+fn the_handler_response_reads_as_a_route_a_none_a_cant_tell_and_a_retriable_failure() {
+    let response = &contract()["handler"]["response"];
+    let read = |i: usize| parse_routes_answer(&response["answers"][i]).unwrap();
+    let route = read(0).unwrap().routes.remove(0);
+    assert_eq!(
+        (route.choice, route.method.as_deref(), route.path.as_deref()),
+        (RouteChoice::Route, Some("GET"), Some("/reports"))
+    );
+    let none = read(1).unwrap().routes.remove(0);
+    assert_eq!(
+        (none.choice, none.method, none.path),
+        (RouteChoice::None, None, None)
+    );
+    let cant = read(2).unwrap().routes.remove(0);
+    assert_eq!(cant.choice, RouteChoice::CantTell);
+    assert!(!cant.orders_agree);
+    let failed = read(3).unwrap_err();
+    assert_eq!(
+        (failed.code.as_str(), failed.retriable),
+        ("model_error", true)
+    );
+    // Each answer holds exactly the ids its record asked, in order.
+    let request: HandlerQuestionsRequest = serde_json::from_value(handler_request()).unwrap();
+    for (i, site) in request.sites.iter().enumerate().take(3) {
+        let ids: Vec<u32> = read(i).unwrap().routes.iter().map(|r| r.id).collect();
+        assert_eq!(ids, site.handler.asked);
+    }
+}
+
+#[test]
+fn an_unreadable_routes_answer_is_not_a_shape() {
+    let bad = json!({"site_id": "h-1", "ok": true, "routes": [{"id": 0, "choice": "maybe"}]});
+    assert!(parse_routes_answer(&bad).is_none());
 }

@@ -1,6 +1,6 @@
 {
   "contract": "POST /site-questions (carrick#2437, carrick-cloud#2380), version 1",
-  "about": "The one example both repos test against: carrick tests/fixtures/site_questions/contract.json, vendored byte for byte as carrick-cloud lambdas/site-questions/fixtures/contract.json. `request` is what the scanner sends; `jev` is what a recorded Jev answers each request for the site at that point (a status alone is a failed request); `response` is what the cloud answers, with `{question_set}` standing for the cloud's current question-set id. Sites: s-0001 the slots the code decides are forced and only the name and arguments are asked; s-0002 every slot asked, the name's two orders disagree; s-0003 Jev fails and the site is retriable; s-0004 Jev's answer names no option and the site is not retriable.",
+  "about": "The one example both repos test against: carrick tests/fixtures/site_questions/contract.json, vendored byte for byte as carrick-cloud lambdas/site-questions/fixtures/contract.json. `request` is what the scanner sends; `jev` is what a recorded Jev answers each request for the site at that point (a status alone is a failed request); `response` is what the cloud answers, with `{question_set}` standing for the cloud's current question-set id. Sites: s-0001 the slots the code decides are forced and only the name and arguments are asked; s-0002 every slot asked, the name's two orders disagree; s-0003 Jev fails and the site is retriable; s-0004 Jev's answer names no option and the site is not retriable. `handler` (R4b, carrick#2386): a request of handler records and the response the cloud gives, one comparison asked per id; h-0001 an entry handler with a forced method and one asked path hole, a route answer; h-0002 a shared helper, a loop guard answered none; h-0003 below band cant_tell; h-0004 Jev fails and the record is retriable; its second comparison (not asked) is a hole with no text, written as null.",
   "request": {
     "repo": "example-org/shop",
     "service": "orders-api",
@@ -808,5 +808,269 @@
         "retriable": false
       }
     ]
+  },
+  "handler": {
+    "request": {
+      "repo": "example-org/shop",
+      "service": null,
+      "question_set": null,
+      "sites": [
+        {
+          "site_id": "h-0001",
+          "handler": {
+            "subject": {
+              "at": "src/edge.ts:10",
+              "kind": "entry",
+              "key": "handle",
+              "params": [
+                "request"
+              ],
+              "code": "10: export async function handle(request: Request) {\n11:   const path = normalise(request.url);\n12:   if (request.method === \"GET\" && path === \"/reports\") return reports();\n13:   return notFound();\n14: }"
+            },
+            "code": [],
+            "comparisons": [
+              {
+                "id": 0,
+                "at": "src/edge.ts:12",
+                "literal": "/reports",
+                "position": "equality",
+                "expression": "path",
+                "read": null,
+                "hole": {
+                  "reason": "unread_expression",
+                  "text": "normalise(request.url)"
+                }
+              }
+            ],
+            "methods": [
+              {
+                "literal": "GET",
+                "at": "src/edge.ts:12"
+              }
+            ],
+            "scopes": [],
+            "asked": [
+              0
+            ],
+            "forced": {
+              "0": {
+                "method": "GET"
+              }
+            }
+          }
+        },
+        {
+          "site_id": "h-0002",
+          "handler": {
+            "subject": {
+              "at": "src/session.ts:4",
+              "kind": "shared",
+              "key": "requireUser",
+              "params": [
+                "request"
+              ],
+              "code": "4: export function requireUser(request: Request) {\n5:   if (new URL(request.url).pathname === \"/logout\") return null;\n6:   return load(request);\n7: }",
+              "handlers": [
+                {
+                  "at": "src/pages.ts:3",
+                  "key": "ordersLoader"
+                },
+                {
+                  "at": "src/pages.ts:9",
+                  "key": "profileLoader"
+                }
+              ],
+              "handler_count": 2
+            },
+            "code": [],
+            "comparisons": [
+              {
+                "id": 0,
+                "at": "src/session.ts:5",
+                "literal": "/logout",
+                "position": "equality",
+                "expression": "new URL(request.url).pathname",
+                "read": {
+                  "param": "request",
+                  "steps": [
+                    "url",
+                    "pathname"
+                  ]
+                },
+                "hole": null
+              }
+            ],
+            "methods": [],
+            "scopes": [],
+            "asked": [
+              0
+            ],
+            "forced": {
+              "0": {
+                "path": "/logout"
+              }
+            }
+          }
+        },
+        {
+          "site_id": "h-0003",
+          "handler": {
+            "subject": {
+              "at": "src/mounted.ts:2",
+              "kind": "label",
+              "key": "stats",
+              "params": [
+                "req",
+                "res"
+              ],
+              "code": "2: export const stats = (req, res) => {\n3:   if (req.path === \"/stats\") return res.send(1);\n4: }",
+              "label": {
+                "package": "fixture-router",
+                "export": "route",
+                "member": null
+              }
+            },
+            "code": [
+              {
+                "at": "src/paths.ts:7",
+                "code": "7: export const isStats = (p: string) => p === \"/stats\";"
+              }
+            ],
+            "comparisons": [
+              {
+                "id": 0,
+                "at": "src/mounted.ts:3",
+                "literal": "/stats",
+                "position": "equality",
+                "expression": "req.path",
+                "read": null,
+                "hole": null
+              }
+            ],
+            "methods": [
+              {
+                "literal": "GET",
+                "at": "src/mounted.ts:3"
+              },
+              {
+                "literal": "POST",
+                "at": "src/mounted.ts:9"
+              }
+            ],
+            "scopes": [
+              {
+                "prefix": "/admin",
+                "at": "src/mounted.ts:5",
+                "delegates": [
+                  "adminHandler"
+                ]
+              }
+            ],
+            "asked": [
+              0
+            ],
+            "forced": {}
+          }
+        },
+        {
+          "site_id": "h-0004",
+          "handler": {
+            "subject": {
+              "at": "src/fake.ts:1",
+              "kind": "entry",
+              "key": "createFake",
+              "params": [],
+              "code": "1: export function createFake() {}"
+            },
+            "code": [],
+            "comparisons": [
+              {
+                "id": 0,
+                "at": "src/fake.ts:1",
+                "literal": "/v1/items",
+                "position": "case",
+                "expression": "u",
+                "read": null,
+                "hole": {
+                  "reason": "unread_expression",
+                  "text": "parse(req.url)"
+                }
+              },
+              {
+                "id": 1,
+                "at": "src/fake.ts:1",
+                "literal": "/v1/other",
+                "position": "equality",
+                "expression": "route",
+                "read": null,
+                "hole": {
+                  "reason": "handed_to",
+                  "text": null
+                }
+              }
+            ],
+            "methods": [],
+            "scopes": [],
+            "asked": [
+              0
+            ],
+            "forced": {}
+          }
+        }
+      ]
+    },
+    "response": {
+      "question_set": "{question_set}",
+      "answers": [
+        {
+          "site_id": "h-0001",
+          "ok": true,
+          "routes": [
+            {
+              "id": 0,
+              "choice": "route",
+              "method": "GET",
+              "path": "/reports",
+              "confidence": 0.93,
+              "orders_agree": true
+            }
+          ]
+        },
+        {
+          "site_id": "h-0002",
+          "ok": true,
+          "routes": [
+            {
+              "id": 0,
+              "choice": "none",
+              "method": null,
+              "path": null,
+              "confidence": 0.96,
+              "orders_agree": true
+            }
+          ]
+        },
+        {
+          "site_id": "h-0003",
+          "ok": true,
+          "routes": [
+            {
+              "id": 0,
+              "choice": "cant_tell",
+              "method": null,
+              "path": null,
+              "confidence": 0.41,
+              "orders_agree": false
+            }
+          ]
+        },
+        {
+          "site_id": "h-0004",
+          "ok": false,
+          "code": "model_error",
+          "retriable": true
+        }
+      ]
+    }
   }
 }
