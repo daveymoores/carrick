@@ -1,0 +1,32 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "target": "/api/login",
+      "method": "POST",
+      "pattern_matched": "login(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "/api/session",
+      "method": "DELETE",
+      "pattern_matched": "logout(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "target": "/api/login",
+      "method": "POST",
+      "pattern_matched": "send<Session>(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:16",
+      "line_number": 16,
+      "target": "/api/logout",
+      "method": "POST",
+      "pattern_matched": "send<void>(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:17",
+      "line_number": 17,
+      "target": "/api/audit",
+      "method": "POST",
+      "pattern_matched": "send<void>(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

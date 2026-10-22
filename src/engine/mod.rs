@@ -5687,6 +5687,8 @@ fn append_deterministic_protocol_operations(
             possible_calls = site.leads.len(),
             stated = site.stated.len(),
             withdrawn = site.withdrawn.len(),
+            through = extractions.site.through.len(),
+            through_folded = site.through_folded,
             "site questions: fold"
         );
     }
@@ -22098,6 +22100,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             )],
             leads: Vec::new(),
             routes: Vec::new(),
+            through: Vec::new(),
         };
         assert_eq!(blob(off), before);
         assert_eq!(blob(stray), before);
@@ -22722,6 +22725,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 ],
                 leads: Vec::new(),
                 routes: Vec::new(),
+                through: Vec::new(),
             },
             ..ProtocolExtractions::default()
         };
@@ -22796,6 +22800,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             ],
             leads: Vec::new(),
             routes: Vec::new(),
+            through: Vec::new(),
         };
         key_site_requests_canonically(&mut rows, &UrlNormalizer::new(&config));
         let keys: Vec<String> = rows.rows.iter().map(|row| row.key.canonical()).collect();
@@ -22845,6 +22850,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             leads: Vec::new(),
             route_kept_reader: 0,
             lead_on_row_line: 0,
+            through_folded: 0,
         };
         let mut entries = Vec::new();
         add_protocol_manifest_entry(
