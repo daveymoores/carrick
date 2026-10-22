@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.123](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.122...carrick-v0.3.123) (2026-10-21)
+
+
+### Features
+
+* **boundary:** state which services were scanned unprepared ([#2559](https://github.com/carrick-tools/carrick/issues/2559)) ([61d2372](https://github.com/carrick-tools/carrick/commit/61d23727dfdef8df00f619b891238a6b13b243e0))
+* **derive:** state each service's reached set and offer the rest as units ([#2550](https://github.com/carrick-tools/carrick/issues/2550)) ([9cdcbcd](https://github.com/carrick-tools/carrick/commit/9cdcbcd29d37ca4e3f945cf7fc87626594a2bb82))
+* **position-rows:** drop impl rows from the walk; rows format v4 ([#2561](https://github.com/carrick-tools/carrick/issues/2561)) ([#2570](https://github.com/carrick-tools/carrick/issues/2570)) ([5bf4514](https://github.com/carrick-tools/carrick/commit/5bf45148392d31dd57b3dce8b991fe87fd6541f9))
+
+
+### Bug Fixes
+
+* **deps:** bump rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 ([#2554](https://github.com/carrick-tools/carrick/issues/2554)) ([3d506ac](https://github.com/carrick-tools/carrick/commit/3d506ac097eb965e903c1eae59e8ac8901813679)), closes [#2551](https://github.com/carrick-tools/carrick/issues/2551)
+* **position-rows:** bound the rows join and convert spans by a per-file table ([#2574](https://github.com/carrick-tools/carrick/issues/2574)) ([f2b0557](https://github.com/carrick-tools/carrick/commit/f2b05578f3d97f653e8244fd89dd6d010c5f0113))
+* **request_summary:** read a call through an unresolved import from the call graph ([#2557](https://github.com/carrick-tools/carrick/issues/2557)) ([#2573](https://github.com/carrick-tools/carrick/issues/2573)) ([ed228a9](https://github.com/carrick-tools/carrick/commit/ed228a94739f7d423a8e10159c16084ebf369804))
+
 ## [0.3.122](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.121...carrick-v0.3.122) (2026-10-20)
 
 
