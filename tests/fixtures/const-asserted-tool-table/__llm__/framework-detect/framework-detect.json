@@ -1,0 +1,6 @@
+{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": [],
+  "notes": "A tool table whose handlers call a client; the table is a const-asserted array."
+}
