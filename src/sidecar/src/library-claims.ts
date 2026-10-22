@@ -48,6 +48,7 @@ import type {
   LibraryClaim,
   LibraryRole,
   LibrarySurface,
+  RequestAt,
   RunsSlot,
   SemanticsCheck,
   SemanticsModule,
@@ -194,8 +195,9 @@ const SERVER_RULES: RoleRules = { http: false, message: true, ops: new Set(['rec
 
 /**
  * The role table: the role alone picks the checks. A role this build does
- * not read yet (GraphQL executors, server mounts) answers `role_unsupported`,
- * and `none` has nothing on the wire to check.
+ * not read yet (GraphQL executors) answers `role_unsupported`, and `none`
+ * has nothing on the wire to check. A server's mounts are scope claims
+ * (`mounts`, #2474 R0).
  */
 const ROLE_TABLE: Readonly<Record<LibraryRole, RoleRules | undefined>> = {
   http_client: HTTP_RULES,
@@ -911,6 +913,18 @@ function placementInvalid(claim: LibraryClaim): boolean {
 }
 
 /**
+ * Where a handler's request holds its path and method (#2474 R0) is read on
+ * a receive op with a handler, and names `path` or `url`; every member path
+ * it gives is non-empty.
+ */
+function requestAtValid(claim: OpClaim): boolean {
+  const request = claim.request!;
+  if (claim.op !== 'receive' || claim.handler === undefined) return false;
+  if (request.path === undefined && request.url === undefined) return false;
+  return [request.path, request.url, request.method].every(members => members === undefined || members.length > 0);
+}
+
+/**
  * A message check names a receiver its claim can be read on (contract
  * amendment 2, B3). A maker is read on the export itself. An element with
  * `of` is read on exactly that receiver. One with `on` is read on the export
@@ -1038,7 +1052,7 @@ function readLocalRanges(fromDir: string): ReadonlyMap<string, string> {
 }
 
 /** A part of a message claim. `base` and `prefix` are a maker's string parts. */
-type PartName = 'name' | 'base' | 'prefix' | 'payload' | 'handler' | 'ack' | 'method' | 'runs';
+type PartName = 'name' | 'base' | 'prefix' | 'payload' | 'handler' | 'ack' | 'method' | 'runs' | 'mounts';
 
 /** Where the parts of a message claim sit, and which argument holds which keys. */
 interface ClaimLayout {
@@ -1731,9 +1745,24 @@ class DeclarationReader {
    * `member` (after `path`) is a home-declared callable member whose name
    * slot accepts a string, under the name-slot rules, and returns a type that
    * says something, read at its type-parameter defaults (`returnOf`).
+   *
+   * Route fields (#2474 R0, contract amendment of 2026-10-22 on carrick#2434):
+   * - `runs` with `yields`: the member runs the function at `runs` (a
+   *   function with a declared signature) and hands it, at `yields.param`,
+   *   an instance of the package's export `yields.export` (`yieldsOutcome`);
+   * - `mounts`: the receiver the claim is read on fits the parameter there
+   *   (`mountsOutcome`).
+   * Either one binds its instance through a parameter or an argument, not
+   * the member's return, so the return is not read and the claim holds no
+   * overloads: a `>scope:` receiver read through it is not resolved.
+   * `runs` without `yields` (or the reverse), or `mounts` beside either, is
+   * `claim_invalid`.
    */
   private judgeScope(receiver: MessageReceiver, claim: ScopeClaim, built?: ts.Signature): Judged {
-    const layout = this.layout({ name: claim.name });
+    if ((claim.runs === undefined) !== (claim.yields === undefined)) return { outcome: unchecked('claim_invalid') };
+    if (claim.mounts !== undefined && claim.runs !== undefined) return { outcome: unchecked('claim_invalid') };
+    const binds = claim.runs !== undefined || claim.mounts !== undefined;
+    const layout = this.layout({ name: claim.name, runs: claim.runs, mounts: claim.mounts });
     if ('failure' in layout) return { outcome: layout.failure };
     const callee = this.ownCallee(receiver, claim.path ?? [], claim.member, 'call');
     if ('failure' in callee) return { outcome: callee.failure };
@@ -1742,14 +1771,49 @@ class DeclarationReader {
     let best: RankedFailure | undefined;
     for (const signature of callee.signatures) {
       let result = this.messageSignatureOutcome(signature, layout.value, labels);
-      if (result.rank === Infinity && this.returnSaysNothing(this.returnOf(signature, built))) {
+      if (result.rank === Infinity && claim.yields !== undefined) {
+        const given = this.yieldsOutcome(signature, claim.runs!, claim.yields, receiver);
+        if (given) result = { rank: 5, outcome: given };
+      }
+      if (result.rank === Infinity && claim.mounts !== undefined) {
+        const mounted = this.mountsOutcome(signature, claim.mounts, receiver);
+        if (mounted) result = { rank: 5, outcome: mounted };
+      }
+      if (result.rank === Infinity && !binds && this.returnSaysNothing(this.returnOf(signature, built))) {
         result = { rank: 6, outcome: unchecked('scope_unresolved') };
       }
       if (result.rank === Infinity) holding.push(signature);
       else best = furthest(best, result.rank, result.outcome);
     }
-    if (holding.length > 0) return { outcome: VERIFIED, holding };
+    if (holding.length > 0) return binds ? { outcome: VERIFIED } : { outcome: VERIFIED, holding };
     return { outcome: best!.outcome };
+  }
+
+  /**
+   * `mounts: { arg, key? }` on a scope (#2474 R0): the receiver the claim is
+   * read on is assignable to the parameter there, so an instance like it can
+   * be served under the scope's name. A parameter typed `any`, `unknown`,
+   * `{}` or by an unconstrained type parameter says nothing
+   * (`mounts_untyped`). There is no separate "not a function" rule: a router
+   * type that is itself a handler is a common shape, and a parameter only a
+   * function fits fails here because the instance does not fit it.
+   * Undefined when it holds.
+   */
+  private mountsOutcome(signature: ts.Signature, mounts: ClaimSlot, receiver: Holder): Outcome | undefined {
+    let declared = this.keyParameterAt(signature, mounts.arg);
+    if (declared !== undefined && mounts.key !== undefined) {
+      const property = this.declaredProperty(declared, mounts.key);
+      declared = property ? this.checker.getTypeOfSymbol(property) : undefined;
+    }
+    if (declared === undefined) return failed('param_missing');
+    const slot = this.throughConstraint(declared);
+    if (slot === VARIADIC) return unchecked('mounts_untyped');
+    const parts = this.parts(slot);
+    if (parts.length === 0) return failed('mounts_not_instance');
+    if (parts.some(part => this.isOpenTop(part) || this.isUnconstrained(part) || this.isEmptyObject(part))) {
+      return unchecked('mounts_untyped');
+    }
+    return this.checker.isTypeAssignableTo(receiver.type, slot) ? undefined : failed('mounts_not_instance');
   }
 
   /**
@@ -1767,6 +1831,8 @@ class DeclarationReader {
     if (claim.yields !== undefined && (claim.op !== 'receive' || claim.handler === undefined)) {
       return unchecked('claim_invalid');
     }
+    // So is where the handler's request holds its path and method (#2474 R0).
+    if (claim.request !== undefined && !requestAtValid(claim)) return unchecked('claim_invalid');
     const name = claim.name;
     // A send carries a payload: a name alone on `send(data)` is the data. An
     // op that runs a function or client it is handed takes its name from
@@ -1808,6 +1874,10 @@ class DeclarationReader {
       if (result.rank === Infinity && claim.yields !== undefined) {
         const given = this.yieldsOutcome(signature, claim.handler!, claim.yields, receiver);
         if (given) result = { rank: 5, outcome: given };
+      }
+      if (result.rank === Infinity && claim.request !== undefined) {
+        const read = this.requestOutcome(signature, claim.handler!, claim.request);
+        if (read) result = { rank: 5, outcome: read };
       }
       if (result.rank === Infinity) {
         held = true;
@@ -1948,6 +2018,44 @@ class DeclarationReader {
       }
     }
     return failed('yields_not_export');
+  }
+
+  /**
+   * `request: { param, path?, url?, method? }` on a receive op (#2474 R0):
+   * some signature of the handler this overload takes declares a parameter
+   * at `param` on which every member path the claim gives resolves, step by
+   * step, through properties the library declares (`declaredProperty`).
+   * Undefined when it holds.
+   */
+  private requestOutcome(signature: ts.Signature, handler: ClaimSlot, request: RequestAt): Outcome | undefined {
+    let declared = this.keyParameterAt(signature, handler.arg);
+    if (declared !== undefined && handler.key !== undefined) {
+      const property = this.declaredProperty(declared, handler.key);
+      declared = property ? this.checker.getTypeOfSymbol(property) : undefined;
+    }
+    if (declared === undefined) return failed('param_missing');
+    const slot = this.throughConditional(this.throughConstraint(declared));
+    if (slot === VARIADIC) return unchecked('handler_untyped');
+    const paths = [request.path, request.url, request.method].filter((p): p is string[] => p !== undefined);
+    let best: Outcome = failed('param_missing');
+    for (const part of this.parts(slot)) {
+      for (const handed of part.getCallSignatures()) {
+        const given = this.parameterAt(handed, request.param);
+        if (given === undefined || given === VARIADIC) continue;
+        const resolves = paths.every(members => {
+          let at: Slot = given;
+          for (const member of members) {
+            const property = this.declaredProperty(at, member);
+            if (!property) return false;
+            at = this.checker.getTypeOfSymbol(property);
+          }
+          return true;
+        });
+        if (resolves) return undefined;
+        best = failed('request_member_missing');
+      }
+    }
+    return best;
   }
 
   /**

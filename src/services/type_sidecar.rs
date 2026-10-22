@@ -846,6 +846,22 @@ pub struct Yields {
     pub side: String,
 }
 
+/// Where a route handler's request holds its path and method (#2474 R0,
+/// contract amendment of 2026-10-22 on carrick#2434): the handler's parameter
+/// `param` is the request, and each of the others is a member path read off
+/// it, relative to that parameter (`["path"]`, `["raw", "url"]`). The
+/// verifier judges that `path` or `url` is present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestAt {
+    pub param: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<Vec<String>>,
+}
+
 /// What an `op` claim does on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -954,6 +970,16 @@ pub enum LibraryClaim {
         name_scope: Option<NameScope>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         picker: Option<String>,
+        /// Route fields (#2474 R0): the member runs the function here and
+        /// hands it, as `yields` says, an instance bound under `name`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runs: Option<ClaimSlot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        yields: Option<Box<Yields>>,
+        /// Route fields (#2474 R0): the instance handed here is served under
+        /// `name`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mounts: Option<ClaimSlot>,
     },
     /// A member that acts on the wire; `member: None` is the object `path`
     /// reaches (the receiver itself when `path` is empty).
@@ -1008,6 +1034,10 @@ pub enum LibraryClaim {
         /// Label v2, `receive` only: what the handler is handed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         yields: Option<Box<Yields>>,
+        /// Route fields (#2474 R0), `receive` only: where the handler's
+        /// request holds its path and method.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<Box<RequestAt>>,
     },
     /// A name the library emits itself, spelled in one of `member`'s
     /// parameters.
@@ -5011,6 +5041,13 @@ mod tests {
                         key_labels: key_labels(),
                         name_scope: Some(name_scope()),
                         picker: Some("model/q1".into()),
+                        runs: Some(slot()),
+                        yields: Some(Box::new(Yields {
+                            param: 0,
+                            export: "App".into(),
+                            side: "server".into(),
+                        })),
+                        mounts: Some(slot()),
                     }),
                     library(LibraryClaim::Op {
                         op: LibraryOp::Send,
@@ -5040,6 +5077,12 @@ mod tests {
                             export: "Socket".into(),
                             side: "server".into(),
                         })),
+                        request: Some(Box::new(RequestAt {
+                            param: 0,
+                            path: Some(vec!["path".into()]),
+                            url: Some(vec!["raw".into(), "url".into()]),
+                            method: Some(vec!["method".into()]),
+                        })),
                     }),
                     library(LibraryClaim::Op {
                         op: LibraryOp::Receive,
@@ -5063,6 +5106,7 @@ mod tests {
                         base: None,
                         runs: None,
                         yields: None,
+                        request: None,
                     }),
                     library(LibraryClaim::Reserved {
                         member: "on".into(),
@@ -5520,6 +5564,7 @@ mod tests {
                         base: None,
                         runs: None,
                         yields: None,
+                        request: None,
                     },
                 ),
                 check(
@@ -5549,6 +5594,7 @@ mod tests {
                         base: None,
                         runs: None,
                         yields: None,
+                        request: None,
                     },
                 ),
                 check(
@@ -5564,6 +5610,9 @@ mod tests {
                         key_labels: BTreeMap::new(),
                         name_scope: None,
                         picker: None,
+                        runs: None,
+                        yields: None,
+                        mounts: None,
                     },
                 ),
                 check(
@@ -5620,6 +5669,7 @@ mod tests {
                         base: None,
                         runs: None,
                         yields: None,
+                        request: None,
                     },
                 ),
             ],

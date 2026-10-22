@@ -2233,6 +2233,63 @@ mod tests {
         assert_eq!(answer.dropped, 5);
     }
 
+    /// carrick#2474 R0: a scope's `runs`, `yields` and `mounts` and a
+    /// receive op's `request` read off the store's answer and go to the
+    /// verifier as written (contract amendment of 2026-10-22 on #2434).
+    #[test]
+    fn the_route_fields_read_and_are_sent_as_written() {
+        let answer = parse_answer(
+            r#"{"library_claims":[{"package":"fixture-server","version":"1.0.0","status":"answered","exports":[
+                {"specifier":"fixture-server","export":"default","role":"server_framework",
+                 "makes":[{"form":"call","member":null}],
+                 "scopes":[
+                    {"member":"mount","of":"instance:()","name":{"arg":0},"mounts":{"arg":1}},
+                    {"member":"register","of":"instance:()","name":{"arg":1,"key":"prefix"},
+                     "runs":{"arg":0},"yields":{"param":0,"export":"App","side":"server"}}
+                 ],
+                 "ops":[
+                    {"op":"receive","member":"get","of":"instance:()","name":{"arg":0},"handler":{"arg":1},
+                     "method":"GET","request":{"param":0,"path":["path"],"url":["raw","url"],"method":["method"]}}
+                 ]}]}]}"#,
+        );
+        assert_eq!((answer.answered, answer.dropped), (1, 0));
+        let sent = serde_json::to_value(&answer.exports[0].claims).unwrap();
+        assert_eq!(sent[1]["mounts"], serde_json::json!({ "arg": 1 }));
+        assert_eq!(sent[2]["runs"], serde_json::json!({ "arg": 0 }));
+        assert_eq!(
+            sent[2]["yields"],
+            serde_json::json!({ "param": 0, "export": "App", "side": "server" })
+        );
+        assert_eq!(
+            sent[3]["request"],
+            serde_json::json!({ "param": 0, "path": ["path"], "url": ["raw", "url"], "method": ["method"] })
+        );
+    }
+
+    /// A route field in a shape this build cannot read drops its element and
+    /// counts it, as every other field does.
+    #[test]
+    fn a_route_field_out_of_shape_is_dropped_and_counted() {
+        let answer = parse_answer(
+            r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"answered","exports":[
+                {"specifier":"lib","export":"default","role":"server_framework",
+                 "scopes":[
+                    {"member":"mount","on":"instance","name":{"arg":0},"mounts":{"arg":1}},
+                    {"member":"mount","on":"instance","name":{"arg":0},"mounts":"child"},
+                    {"member":"register","on":"instance","name":{"arg":1},"runs":{"arg":0},
+                     "yields":{"param":0,"export":"App"}}
+                 ],
+                 "ops":[
+                    {"op":"receive","member":"get","on":"instance","name":{"arg":0},"handler":{"arg":1},
+                     "request":{"param":-1,"path":["path"]}},
+                    {"op":"receive","member":"get","on":"instance","name":{"arg":0},"handler":{"arg":1},
+                     "request":{"param":0,"path":"path"}}
+                 ]}]}]}"#,
+        );
+        assert_eq!(answer.exports[0].claims.len(), 1);
+        assert_eq!(answer.dropped, 4);
+    }
+
     /// An answer in the shape before label v2 reads as it did, and its
     /// claims go to the verifier byte for byte as before: no v2 key appears.
     #[test]
