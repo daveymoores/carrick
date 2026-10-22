@@ -63,6 +63,37 @@ pub(crate) struct DeclarationLines {
     /// Each definition the extractor keyed whose holder starts on another
     /// line than the extractor's, by the holder's line ([`Self::place`]).
     starts: HashMap<u32, Vec<String>>,
+    /// Each name a function's parameter binds (a destructured one's names
+    /// included), by the line the parameter starts on and the line the name
+    /// is written on: where a compiler row places a parameter's declaration
+    /// (carrick#2474's receiver kind).
+    pub(crate) params: HashSet<(u32, String)>,
+}
+
+/// Each name `pat` binds, with where it is written.
+fn bound_names(pat: &Pat, out: &mut Vec<(Span, String)>) {
+    match pat {
+        Pat::Ident(ident) => out.push((ident.id.span, ident.id.sym.to_string())),
+        Pat::Array(array) => {
+            for element in array.elems.iter().flatten() {
+                bound_names(element, out);
+            }
+        }
+        Pat::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectPatProp::KeyValue(entry) => bound_names(&entry.value, out),
+                    ObjectPatProp::Assign(assign) => {
+                        out.push((assign.key.id.span, assign.key.id.sym.to_string()))
+                    }
+                    ObjectPatProp::Rest(rest) => bound_names(&rest.arg, out),
+                }
+            }
+        }
+        Pat::Assign(assign) => bound_names(&assign.left, out),
+        Pat::Rest(rest) => bound_names(&rest.arg, out),
+        _ => {}
+    }
 }
 
 /// Where the function an initialiser or a property value is starts, when it
@@ -94,8 +125,37 @@ impl DeclarationLines {
             fn line(&self, span: Span) -> u32 {
                 self.source_map.lookup_char_pos(span.lo).line as u32
             }
+            /// Record the names a parameter starting at `start` binds.
+            fn param(&mut self, start: Span, pat: &Pat) {
+                let mut names = Vec::new();
+                bound_names(pat, &mut names);
+                let opens = self.line(start);
+                for (span, name) in names {
+                    let written = self.line(span);
+                    self.out.params.insert((opens, name.clone()));
+                    self.out.params.insert((written, name));
+                }
+            }
         }
         impl Visit for Lines<'_> {
+            fn visit_param(&mut self, param: &Param) {
+                self.param(param.span, &param.pat);
+                param.visit_children_with(self);
+            }
+            fn visit_ts_param_prop(&mut self, prop: &TsParamProp) {
+                let pat = match &prop.param {
+                    TsParamPropParam::Ident(ident) => Pat::Ident(ident.clone()),
+                    TsParamPropParam::Assign(assign) => Pat::Assign(assign.clone()),
+                };
+                self.param(prop.span, &pat);
+                prop.visit_children_with(self);
+            }
+            fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+                for pat in &arrow.params {
+                    self.param(pat.span(), pat);
+                }
+                arrow.visit_children_with(self);
+            }
             fn visit_export_default_decl(&mut self, export: &ExportDefaultDecl) {
                 let declared = match &export.decl {
                     DefaultDecl::Fn(FnExpr {

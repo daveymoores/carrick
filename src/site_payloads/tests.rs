@@ -65,6 +65,7 @@ fn record(role: &str, handler: bool, payloads: PayloadSlots) -> SiteRecord {
         basis: Default::default(),
         bucket: Bucket::Forced,
         lead: None,
+        receiver: None,
     }
 }
 

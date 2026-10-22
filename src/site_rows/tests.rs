@@ -76,6 +76,8 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
             span_end: 129,
         }),
         method: None,
+        receiver: None,
+        reached: None,
     }
 }
 
@@ -136,6 +138,7 @@ fn record(site: &DecidedSite, forced: &[(Slot, &str)], asked: &[Slot]) -> SiteRe
             })
             .collect(),
         lead: None,
+        receiver: None,
     }
 }
 

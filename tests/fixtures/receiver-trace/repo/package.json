@@ -1,0 +1,9 @@
+{
+  "name": "receiver-trace-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-fetcher": "^1.0.0",
+    "fixture-server": "^1.0.0"
+  }
+}

@@ -56,7 +56,9 @@ use crate::library_store::RUNTIME_TYPES;
 use crate::position_rows::{
     FLAG_DECLARATION_UNNAMED, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, Kind, Row,
 };
-use crate::services::type_sidecar::{LibraryClaim, LibraryOp, LibraryRole};
+use crate::services::type_sidecar::{
+    LibraryCheck, LibraryClaim, LibraryOp, LibraryRole, MakeForm, SemanticsResult, SemanticsVerdict,
+};
 
 /// The stop for a walk that reaches a definition the extractor keys and
 /// this pass read no body of.
@@ -85,6 +87,14 @@ pub struct DiscoverySite {
     pub chain: Vec<ChainHop>,
     /// Why a walk that entered code reached no labelled export.
     pub stop: Option<String>,
+    /// The binding the labelled call is made on (carrick#2474 R1). Only
+    /// with the receiver trace on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<ReceiverAt>,
+    /// How the labelled call was matched to its export. Only with the
+    /// receiver trace on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reached: Option<ReachedBy>,
 }
 
 /// The labelled call a site reaches.
@@ -134,6 +144,10 @@ pub struct Discovery {
 pub struct Labels<'a> {
     exports: &'a [ExportClaims],
     by_name: HashMap<(&'a str, &'a str), &'a ExportClaims>,
+    /// With the receiver trace on (carrick#2474 R1), the member
+    /// declarations verified op claims resolve to: a call to one is a site
+    /// whatever holds its receiver, and every site names its receiver.
+    declarations: Option<&'a MemberDeclarations>,
     /// Every package the store answered, with or without an export; `None`
     /// when only the exports are known ([`Labels::of`]), where no package
     /// can be told unanswered.
@@ -154,6 +168,7 @@ impl<'a> Labels<'a> {
         Labels {
             exports,
             by_name,
+            declarations: None,
             answered: None,
             networked: exports
                 .iter()
@@ -209,6 +224,14 @@ impl<'a> Labels<'a> {
             .as_ref()
             .is_some_and(unanswered)
             .then_some(UNANSWERED_PACKAGE)
+    }
+
+    /// [`Self::of`], with the receiver trace on.
+    pub fn traced(exports: &'a [ExportClaims], declarations: &'a MemberDeclarations) -> Self {
+        Labels {
+            declarations: Some(declarations),
+            ..Self::of(exports)
+        }
     }
 
     fn get(&self, package: &str, export: &str) -> Option<&'a ExportClaims> {
@@ -292,6 +315,271 @@ fn root_name(call: &CallIr) -> Option<&str> {
     .filter(|root| super::row_calls::is_identifier(root))
 }
 
+/// How the object a callee's member is read on is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectForm {
+    /// A name (`app` in `app.get(…)`).
+    Name,
+    /// A member access (`this.app`, `deps.app`).
+    Member,
+    /// A call's value (`build()` in `build().get(…)`).
+    Call,
+    /// Anything else (`this`, `new X()`, a literal).
+    Other,
+}
+
+/// The object the callee's member is read on: its span (discovery
+/// numbering) and how it is written. `None` when the callee is no member
+/// access.
+pub(crate) fn receiver_object(callee: &Expr) -> Option<(u32, u32, ObjectForm)> {
+    use crate::graphql_document_sites::unwrap_expression;
+    let object = match unwrap_expression(callee) {
+        Expr::Member(member) => &member.obj,
+        Expr::OptChain(OptChainExpr { base, .. }) => match &**base {
+            OptChainBase::Member(member) => &member.obj,
+            OptChainBase::Call(_) => return None,
+        },
+        _ => return None,
+    };
+    let object = unwrap_expression(object);
+    let form = match object {
+        Expr::Ident(_) => ObjectForm::Name,
+        Expr::Member(_) => ObjectForm::Member,
+        Expr::Call(_) => ObjectForm::Call,
+        Expr::OptChain(OptChainExpr { base, .. }) => match &**base {
+            OptChainBase::Member(_) => ObjectForm::Member,
+            OptChainBase::Call(_) => ObjectForm::Call,
+        },
+        _ => ObjectForm::Other,
+    };
+    let span = object.span();
+    Some((span.lo.0, span.hi.0, form))
+}
+
+/// The switch for the receiver trace (carrick#2474 R1): `1` only. Off, and
+/// never set by the cloud runner, so with it off every scan is byte-identical
+/// to one without it.
+pub const RECEIVER_TRACE_SWITCH: &str = "CARRICK_RECEIVER_TRACE";
+
+/// Whether the receiver trace is on in this process.
+pub fn receiver_trace_enabled() -> bool {
+    std::env::var(RECEIVER_TRACE_SWITCH).ok().as_deref() == Some("1")
+}
+
+/// What holds the receiver a labelled call is made on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiverKind {
+    /// A name a declaration binds that is no parameter (`const app = …`).
+    Binding,
+    /// A function's parameter, a callback's included.
+    Parameter,
+    /// A member read off another object (`this.app`).
+    Field,
+    /// A call's value (`build().get(…)`).
+    CallResult,
+    /// Anything else (`this`).
+    Other,
+}
+
+/// The binding a labelled call is made on (carrick#2474 R1): the compiler
+/// row at the receiver's span, as it names the receiver's declaration, and
+/// what holds it. Recorded only with the receiver trace on; never part of a
+/// record's state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiverAt {
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub decl_file: Option<String>,
+    #[serde(default)]
+    pub decl_line: Option<u32>,
+    pub kind: ReceiverKind,
+}
+
+/// How discovery matched a labelled call to its export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachedBy {
+    /// A name: the export's published name, an import binding, a global,
+    /// or a receiver's symbol or type named like the export.
+    Name,
+    /// An instance one of the export's makers built, as the library-site
+    /// reader holds it.
+    Instance,
+    /// The declaration the call's member resolves to, which a verified op
+    /// claim resolves to on a receiver the claim applies to.
+    Declaration,
+}
+
+/// One op a member declaration stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredOp {
+    /// The store's key for the package, as [`Labels`] keys an export.
+    pub package: String,
+    pub export: String,
+    pub member: String,
+    pub op: LibraryOp,
+}
+
+/// The verify request the receiver trace sends: each labelled op claim whose
+/// member a `call` row of that package names, on every receiver the claim
+/// applies to, with the export's maker claims the verifier judges an
+/// instance op with. `ops` lines up with `checks`: the op each op check
+/// stands for, `None` for a maker.
+#[derive(Debug, Default, Clone)]
+pub struct DeclarationAsk {
+    pub checks: Vec<LibraryCheck>,
+    pub ops: Vec<Option<DeclaredOp>>,
+}
+
+/// The receiver id the instances a maker claim builds are read through, as
+/// [`LibrarySite::receiver_ids`] names a site's.
+fn make_receiver(form: MakeForm, member: Option<&str>) -> String {
+    super::library_sites::maker_receiver_id(form == MakeForm::New, member)
+}
+
+/// The ask for the service `inputs` reads, under the store's answer
+/// `exports`. Nothing without rows, or with no member any op names.
+pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) -> DeclarationAsk {
+    let mut ask = DeclarationAsk::default();
+    let Some(positions) = inputs.positions.as_ref() else {
+        return ask;
+    };
+    let called: HashSet<(String, String)> = positions
+        .call_rows()
+        .filter(|row| !in_repo(row))
+        .filter_map(|row| Some((store_key(row, exports)?, row.symbol()?.to_string())))
+        .collect();
+    for export in exports
+        .iter()
+        .filter(|export| export.role != LibraryRole::None)
+    {
+        let claims = export.claims_by_id();
+        let wanted: Vec<&(String, &LibraryClaim)> = claims
+            .iter()
+            .filter(|(_, claim)| match claim {
+                LibraryClaim::Op {
+                    member: Some(member),
+                    ..
+                } => called.contains(&(export.package.clone(), member.clone())),
+                _ => false,
+            })
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let check = |id: &str, receiver: &str, claim: &LibraryClaim| LibraryCheck {
+            claim_id: id.to_string(),
+            package: export.specifier.clone(),
+            export: export.export.clone(),
+            role: export.role,
+            receiver: receiver.to_string(),
+            claim: claim.clone(),
+        };
+        let mut receivers = vec!["export".to_string()];
+        for (id, claim) in &claims {
+            if let LibraryClaim::Make { form, member, .. } = claim {
+                receivers.push(make_receiver(*form, member.as_deref()));
+                ask.checks.push(check(id, "export", claim));
+                ask.ops.push(None);
+            }
+        }
+        for (id, claim) in wanted {
+            let LibraryClaim::Op {
+                op,
+                member: Some(member),
+                on,
+                of,
+                ..
+            } = claim
+            else {
+                continue;
+            };
+            let mut on_receivers = receivers.clone();
+            on_receivers.extend(of.iter().cloned());
+            on_receivers.sort();
+            on_receivers.dedup();
+            for receiver in on_receivers
+                .iter()
+                .filter(|receiver| applies(*on, of.as_deref(), receiver))
+            {
+                ask.checks.push(check(id, receiver, claim));
+                ask.ops.push(Some(DeclaredOp {
+                    package: export.package.clone(),
+                    export: export.export.clone(),
+                    member: member.clone(),
+                    op: *op,
+                }));
+            }
+        }
+    }
+    ask
+}
+
+/// Each member declaration a verified op claim resolves to, with the ops it
+/// stands for (carrick#2474 R1), and how the ask went.
+#[derive(Debug, Default, Clone)]
+pub struct MemberDeclarations {
+    by_declaration: HashMap<(String, u32), Vec<DeclaredOp>>,
+    /// The checks asked.
+    pub checks: usize,
+    /// Of those, the ones the verifier did not reach in its time limit.
+    pub not_reached: usize,
+}
+
+impl MemberDeclarations {
+    /// The declarations the verdicts for `ask` name. A verdict counts only
+    /// for the check at its own position that it names.
+    pub fn of(ask: &DeclarationAsk, verdicts: &[SemanticsResult]) -> Self {
+        let mut out = MemberDeclarations {
+            checks: ask.checks.len(),
+            not_reached: crate::services::type_sidecar::not_reached_in_time(verdicts),
+            ..MemberDeclarations::default()
+        };
+        if verdicts.len() != ask.checks.len() {
+            return out;
+        }
+        for ((check, op), verdict) in ask.checks.iter().zip(&ask.ops).zip(verdicts) {
+            let Some(op) = op else {
+                continue;
+            };
+            if verdict.verdict != SemanticsVerdict::Verified
+                || verdict.claim_id != check.claim_id
+                || verdict.receiver != check.receiver
+            {
+                continue;
+            }
+            for declared in &verdict.declarations {
+                let ops = out
+                    .by_declaration
+                    .entry((declared.decl_file.clone(), declared.decl_line))
+                    .or_default();
+                if !ops.contains(op) {
+                    ops.push(op.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// The ops the declaration at `decl_file:decl_line` stands for.
+    fn at(&self, decl_file: &str, decl_line: u32) -> &[DeclaredOp] {
+        self.by_declaration
+            .get(&(decl_file.to_string(), decl_line))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// How many declarations are indexed.
+    pub fn len(&self) -> usize {
+        self.by_declaration.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_declaration.is_empty()
+    }
+}
+
 /// The store's key for the package a row's declaration is in: the default
 /// library's file, as the store keys it (`lib:lib.dom.d.ts`), a runtime module (`node:<module>`, the file
 /// the runtime's types declare it in), or the package the declaring package
@@ -359,6 +647,10 @@ fn type_root(text: &str) -> Option<&str> {
 struct Found {
     chain: Vec<ChainHop>,
     end: SiteEnd,
+    /// With the receiver trace on: the labelled call's receiver and how it
+    /// was matched.
+    receiver: Option<ReceiverAt>,
+    reached: Option<ReachedBy>,
 }
 
 /// What a call or a body reaches.
@@ -425,6 +717,9 @@ struct Walker<'a> {
     memo: HashMap<(PathBuf, String), Outcome>,
     /// The definitions being read, by how deep.
     reading: HashMap<(PathBuf, String), usize>,
+    /// Calls whose member declaration stands for more than one op
+    /// (carrick#2474 R1): no site.
+    ambiguous: std::cell::Cell<usize>,
 }
 
 impl Walker<'_> {
@@ -471,7 +766,56 @@ impl Walker<'_> {
             .ok()
     }
 
-    /// The labelled export `call` is made on, when it is one:
+    /// The binding `call` is made on (carrick#2474 R1): the row at the
+    /// object its member is read on, `ident` for a name, `member` for a
+    /// member access, `call` for a call's value, and what holds it. A name
+    /// is a parameter when a function of its declaring file binds that name
+    /// at the line the row names. `None` for a call with no receiver.
+    fn receiver_of(&self, file: &Path, call: &CallIr) -> Option<ReceiverAt> {
+        let (lo, hi, form) = call.receiver_object?;
+        let (kind, row_kind) = match form {
+            ObjectForm::Name => (ReceiverKind::Binding, Some(Kind::Ident)),
+            ObjectForm::Member => (ReceiverKind::Field, Some(Kind::Member)),
+            ObjectForm::Call => (ReceiverKind::CallResult, Some(Kind::Call)),
+            ObjectForm::Other => (ReceiverKind::Other, None),
+        };
+        let row = row_kind.and_then(|row_kind| {
+            let positions = self.inputs.positions.as_ref()?;
+            let ir = self.inputs.files.get(file)?;
+            positions
+                .lookup(file, ir.swc_start(lo), ir.swc_start(hi), row_kind)
+                .ok()
+        });
+        let parameter = form == ObjectForm::Name
+            && row.is_some_and(|row| {
+                if in_repo(row)
+                    && let (Some(symbol), Some(decl_file), Some(line)) =
+                        (row.symbol(), row.decl_file(), row.decl_line())
+                    && let Some(positions) = self.inputs.positions.as_ref()
+                    && let Some(declared) = self.inputs.files.get(&positions.path_of(decl_file))
+                {
+                    declared
+                        .declaration_lines
+                        .params
+                        .contains(&(line, symbol.to_string()))
+                } else {
+                    false
+                }
+            });
+        Some(ReceiverAt {
+            symbol: row.and_then(|row| row.symbol()).map(str::to_string),
+            decl_file: row.and_then(|row| row.decl_file()).map(str::to_string),
+            decl_line: row.and_then(|row| row.decl_line()),
+            kind: if parameter {
+                ReceiverKind::Parameter
+            } else {
+                kind
+            },
+        })
+    }
+
+    /// The labelled export `call` is made on, when it is one, and how it
+    /// was matched:
     ///
     /// - the name the callee's package publishes the callee's declaration
     ///   as, when the row says: its own name, or `default` / `export =` for
@@ -481,8 +825,17 @@ impl Walker<'_> {
     ///   export: the compiler names the declaration (`axios`, `lookup`);
     /// - a global of the language's own library, by its name, wherever its
     ///   types declare it;
-    /// - a receiver's symbol or type in the callee's package.
-    fn library_end(&self, file: &Path, call: &CallIr, construction: bool) -> Option<SiteEnd> {
+    /// - a receiver's symbol or type in the callee's package;
+    /// - with the receiver trace on, a member whose declaration a verified
+    ///   op claim resolves to, whatever holds the receiver
+    ///   ([`MemberDeclarations`]). A declaration that stands for more than
+    ///   one op is no site, and is counted.
+    fn library_end(
+        &self,
+        file: &Path,
+        call: &CallIr,
+        construction: bool,
+    ) -> Option<(SiteEnd, ReachedBy)> {
         let row = self.row(file, call)?;
         let symbol = row.symbol()?;
         if in_repo(row) {
@@ -518,7 +871,7 @@ impl Walker<'_> {
         if let Some(package) = &package {
             for export in published_names(row) {
                 if let Some(claims) = self.labels.get(package, export) {
-                    return Some(end(package, export, None, claims));
+                    return Some((end(package, export, None, claims), ReachedBy::Name));
                 }
             }
         }
@@ -539,7 +892,7 @@ impl Walker<'_> {
             for key in specifier_keys(&binding.specifier) {
                 for export in &exports {
                     if let Some(claims) = self.labels.get(&key, export) {
-                        return Some(end(&key, export, member, claims));
+                        return Some((end(&key, export, member, claims), ReachedBy::Name));
                     }
                 }
             }
@@ -556,7 +909,7 @@ impl Walker<'_> {
                 || row.decl_package() == Some(RUNTIME_TYPES))
             && let Some(claims) = self.labels.global(symbol)
         {
-            return Some(end(&claims.package, symbol, None, claims));
+            return Some((end(&claims.package, symbol, None, claims), ReachedBy::Name));
         }
         // `app.post(…)` where `const app = pkg()`: a member the store labels
         // on the receiver that maker builds (`instance:()`), the instance
@@ -597,32 +950,59 @@ impl Walker<'_> {
                         _ => None,
                     });
                     if let Some(op) = op {
-                        return Some(SiteEnd {
-                            op: Some(op),
-                            ..end(&key, export, Some(member), claims)
-                        });
+                        return Some((
+                            SiteEnd {
+                                op: Some(op),
+                                ..end(&key, export, Some(member), claims)
+                            },
+                            ReachedBy::Instance,
+                        ));
                     }
                 }
             }
         }
-        let package = package?;
-        let positions = self.inputs.positions.as_ref()?;
-        for (lo, hi, member) in &call.receiver_spans {
-            let kind = if *member { Kind::Member } else { Kind::Ident };
-            let Ok(receiver) = positions.lookup(file, ir.swc_start(*lo), ir.swc_start(*hi), kind)
-            else {
-                break;
-            };
-            for name in [receiver.symbol(), receiver.type_text().and_then(type_root)]
-                .into_iter()
-                .flatten()
-            {
-                if let Some(claims) = self.labels.get(&package, name) {
-                    return Some(end(&package, name, Some(symbol), claims));
+        if let Some(package) = &package
+            && let Some(positions) = self.inputs.positions.as_ref()
+        {
+            for (lo, hi, member) in &call.receiver_spans {
+                let kind = if *member { Kind::Member } else { Kind::Ident };
+                let Ok(receiver) =
+                    positions.lookup(file, ir.swc_start(*lo), ir.swc_start(*hi), kind)
+                else {
+                    break;
+                };
+                for name in [receiver.symbol(), receiver.type_text().and_then(type_root)]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(claims) = self.labels.get(package, name) {
+                        return Some((end(package, name, Some(symbol), claims), ReachedBy::Name));
+                    }
                 }
             }
         }
-        None
+        // `app.get(…)` on an app handed in as a parameter, held in a field
+        // or returned by a call: the member's declaration is one a verified
+        // op claim resolves to (carrick#2474 R1).
+        let declarations = self.labels.declarations.filter(|_| !construction)?;
+        let ops = declarations.at(row.decl_file()?, row.decl_line()?);
+        match ops {
+            [] => None,
+            [one] => {
+                let claims = self.labels.get(&one.package, &one.export)?;
+                Some((
+                    SiteEnd {
+                        op: Some(one.op),
+                        ..end(&one.package, &one.export, Some(&one.member), claims)
+                    },
+                    ReachedBy::Declaration,
+                ))
+            }
+            _ => {
+                self.ambiguous.set(self.ambiguous.get() + 1);
+                None
+            }
+        }
     }
 
     /// Whether the call row names a member an interface or type literal of
@@ -698,11 +1078,14 @@ impl Walker<'_> {
         if call.invokes_param.is_some() {
             return Outcome::stopped("injected_callee");
         }
-        if let Some(end) = self.library_end(file, call, construction) {
+        if let Some((end, reached)) = self.library_end(file, call, construction) {
+            let traced = self.labels.declarations.is_some();
             return Outcome {
                 ends: vec![Found {
                     chain: Vec::new(),
                     end,
+                    receiver: traced.then(|| self.receiver_of(file, call)).flatten(),
+                    reached: traced.then_some(reached),
                 }],
                 ..Outcome::default()
             };
@@ -828,6 +1211,8 @@ impl Walker<'_> {
                     end,
                     chain,
                     stop,
+                    receiver: None,
+                    reached: None,
                 };
             if outcome.ends.is_empty() {
                 let Some((chain, stop)) = outcome.stop else {
@@ -868,9 +1253,11 @@ impl Walker<'_> {
                     .counts
                     .entry(format!("site/{}", role_key(found.end.role)))
                     .or_default() += 1;
-                discovery
-                    .sites
-                    .push(record(Some(found.end), found.chain, None));
+                discovery.sites.push(DiscoverySite {
+                    receiver: found.receiver,
+                    reached: found.reached,
+                    ..record(Some(found.end), found.chain, None)
+                });
             }
         }
         for inner in body.nested.iter().chain(&body.detached) {
@@ -907,6 +1294,7 @@ pub fn discover(inputs: &RequestSummaryInputs, labels: &Labels<'_>, root: &Path)
         instances,
         memo: HashMap::new(),
         reading: HashMap::new(),
+        ambiguous: std::cell::Cell::new(0),
     };
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
     paths.sort();
@@ -918,6 +1306,12 @@ pub fn discover(inputs: &RequestSummaryInputs, labels: &Labels<'_>, root: &Path)
             walker.sites(path, &file.functions[key], &mut discovery);
         }
         walker.sites(path, &file.module_level, &mut discovery);
+    }
+    let ambiguous = walker.ambiguous.get();
+    if ambiguous > 0 {
+        discovery
+            .counts
+            .insert("declaration_ambiguous".to_string(), ambiguous);
     }
     discovery
         .sites
@@ -1445,18 +1839,322 @@ mod tests {
         );
     }
 
+    /// The receiver-trace fixture (carrick#2474 R1), read with rows, its
+    /// store answer, and the member declarations the real verifier returns
+    /// for the trace's ask.
+    fn traced_fixture() -> Option<(
+        super::super::fixture_walk::Walked,
+        Vec<ExportClaims>,
+        MemberDeclarations,
+    )> {
+        let on = walked("receiver-trace", ".", "web", &[], true)?;
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/receiver-trace/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let exports = answer.exports;
+        let ask = declaration_ask(&on.inputs, &exports);
+        let script = super::super::fixture_walk::sidecar()?;
+        let sidecar = crate::services::TypeSidecar::spawn(&script).expect("spawn the sidecar");
+        sidecar.start_init(&on.repo, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(120))
+            .expect("the sidecar is ready");
+        let verdicts = sidecar
+            .verify_library_claims(&on.repo, &ask.checks)
+            .expect("the verifier answers")
+            .verdicts;
+        let declarations = MemberDeclarations::of(&ask, &verdicts);
+        Some((on, exports, declarations))
+    }
+
+    /// Each site as `file:line callee -> export member op reached receiver`.
+    fn traced_records(discovery: &Discovery) -> Vec<String> {
+        discovery
+            .sites
+            .iter()
+            .filter_map(|site| {
+                let end = site.end.as_ref()?;
+                let op = end
+                    .op
+                    .map(|op| {
+                        serde_json::to_value(op)
+                            .unwrap()
+                            .as_str()
+                            .unwrap()
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                let receiver = site.receiver.as_ref().map_or("-".to_string(), |at| {
+                    format!(
+                        "{}:{}@{}:{}",
+                        serde_json::to_value(at.kind).unwrap().as_str().unwrap(),
+                        at.symbol.as_deref().unwrap_or("-"),
+                        at.decl_file.as_deref().unwrap_or("-"),
+                        at.decl_line.unwrap_or_default()
+                    )
+                });
+                let reached = site.reached.map_or("-".to_string(), |by| {
+                    serde_json::to_value(by)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                });
+                Some(format!(
+                    "{}:{} {} -> {} {} {} {} {}",
+                    site.file,
+                    site.line,
+                    site.callee,
+                    end.export,
+                    end.member.as_deref().unwrap_or("-"),
+                    op,
+                    reached,
+                    receiver
+                ))
+            })
+            .collect()
+    }
+
+    /// carrick#2474 R1: with the receiver trace on, a call whose member's
+    /// declaration a verified op claim resolves to is a site with that op,
+    /// whatever holds the receiver: a parameter (b), a callback's parameter
+    /// (c), a field set from a constructor parameter (d), a call's value
+    /// (e), and an HTTP client handed in as a parameter. The control (a)
+    /// is found as before, by its instance. The request's own `get` (f), an
+    /// in-repo class (g), an untyped receiver (h) and a local structural
+    /// copy of the app's type (i) are no site. Each site names its
+    /// receiver.
+    #[test]
+    fn a_call_on_a_labelled_member_s_declaration_is_a_site_whatever_holds_it() {
+        let Some((on, exports, declarations)) = traced_fixture() else {
+            return;
+        };
+        assert!(!declarations.is_empty(), "the verifier names declarations");
+        let discovery = discover(
+            &on.inputs,
+            &Labels::traced(&exports, &declarations),
+            &on.repo,
+        );
+        let got = traced_records(&discovery);
+        // A call into a function that reaches a labelled call is a site too
+        // (`users(app)`), naming the labelled call's receiver. The factory's
+        // result (e) is an instance the library-site reader already holds.
+        let want = texts(&[
+            "src/app.ts:12 make -> default - - name -",
+            "src/app.ts:13 app.get -> default get receive instance binding:app@src/app.ts:12",
+            "src/app.ts:16 users -> default get receive declaration parameter:app@src/users.ts:7",
+            "src/app.ts:19 withApp -> default post receive declaration parameter:inner@src/app.ts:19",
+            "src/app.ts:19 withApp -> default - - name -",
+            "src/app.ts:19 inner.post -> default post receive declaration parameter:inner@src/app.ts:19",
+            "src/app.ts:22 new Routes(app).mount -> default get receive declaration field:app@src/routes.ts:8",
+            "src/app.ts:25 build -> default - - name -",
+            "src/app.ts:25 build().get -> default get receive instance call_result:build@src/build.ts:3",
+            "src/build.ts:4 make -> default - - name -",
+            "src/client.ts:5 client.get -> default get request declaration parameter:client@src/client.ts:4",
+            "src/routes.ts:11 this.app.get -> default get receive declaration field:app@src/routes.ts:8",
+            "src/users.ts:8 app.get -> default get receive declaration parameter:app@src/users.ts:7",
+            "src/with-app.ts:4 make -> default - - name -",
+        ]);
+        assert_eq!(got, want, "{got:#?}");
+        for line in [
+            "negatives.ts:5",
+            "negatives.ts:15",
+            "negatives.ts:20",
+            "negatives.ts:28",
+        ] {
+            assert!(
+                !got.iter().any(|record| record.contains(line)),
+                "{line} is no site"
+            );
+        }
+        assert!(
+            discovery
+                .counts
+                .keys()
+                .any(|key| key.ends_with("untyped_receiver")),
+            "the untyped receiver is a hole: {:?}",
+            discovery.counts
+        );
+    }
+
+    /// carrick#2474 R1: with the trace off, discovery on the fixture is what
+    /// it was: the trace's own records add only sites and fields, and every
+    /// site found without it is the same record, with no receiver.
+    #[test]
+    fn with_the_trace_off_discovery_is_unchanged() {
+        let Some((on, exports, declarations)) = traced_fixture() else {
+            return;
+        };
+        let off = discover(&on.inputs, &Labels::of(&exports), &on.repo);
+        let traced = discover(
+            &on.inputs,
+            &Labels::traced(&exports, &declarations),
+            &on.repo,
+        );
+        let text = serde_json::to_string(&off.sites).unwrap();
+        assert!(!text.contains("\"receiver\"") && !text.contains("\"reached\""));
+        let plain: Vec<DiscoverySite> = traced
+            .sites
+            .iter()
+            .cloned()
+            .map(|site| DiscoverySite {
+                receiver: None,
+                reached: None,
+                ..site
+            })
+            .collect();
+        for site in &off.sites {
+            assert!(plain.contains(site), "{site:?} is kept with the trace on");
+        }
+        assert_eq!(
+            off.sites
+                .iter()
+                .filter(|site| site.end.is_some())
+                .map(|site| format!("{}:{}", site.file, site.line))
+                .collect::<Vec<_>>(),
+            texts(&[
+                "src/app.ts:12",
+                "src/app.ts:13",
+                "src/app.ts:19",
+                "src/app.ts:25",
+                "src/app.ts:25",
+                "src/build.ts:4",
+                "src/with-app.ts:4"
+            ]),
+            "the trace's sites are not found without it"
+        );
+    }
+
+    /// The decided sites and records of `discovery`.
+    fn records_of(
+        on: &super::super::fixture_walk::Walked,
+        exports: &[ExportClaims],
+        discovery: &Discovery,
+    ) -> (
+        super::super::decided_sites::Decided,
+        Vec<super::super::site_record::SiteRecord>,
+    ) {
+        let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
+            .collect();
+        let labels = super::super::decided_sites::SiteLabel::from_exports(exports);
+        let decided =
+            super::super::decided_sites::decided_sites(&on.inputs, &on.repo, &discovered, &labels);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+        (decided, records)
+    }
+
+    /// carrick#2474 R1: each decided site and record names the binding its
+    /// labelled call is made on, wherever its name is decided; with the
+    /// trace off none does. Every record found without the trace keeps its
+    /// state byte for byte with it on, so no site's sha moves.
+    #[test]
+    fn decided_sites_and_records_name_their_receiver_and_keep_today_s_state() {
+        let Some((on, exports, declarations)) = traced_fixture() else {
+            return;
+        };
+        let off = discover(&on.inputs, &Labels::of(&exports), &on.repo);
+        let traced = discover(
+            &on.inputs,
+            &Labels::traced(&exports, &declarations),
+            &on.repo,
+        );
+        let (decided_off, records_off) = records_of(&on, &exports, &off);
+        let (decided_on, records_on) = records_of(&on, &exports, &traced);
+        assert!(decided_off.sites.iter().all(|site| site.receiver.is_none()));
+        assert!(records_off.iter().all(|record| record.receiver.is_none()));
+        let kind_at = |file: &str, line: u32| {
+            records_on
+                .iter()
+                .find(|record| record.anchors.call.file == file && record.anchors.call.line == line)
+                .and_then(|record| record.receiver.as_ref())
+                .map(|receiver| receiver.kind)
+        };
+        assert_eq!(kind_at("src/users.ts", 8), Some(ReceiverKind::Parameter));
+        assert_eq!(kind_at("src/routes.ts", 11), Some(ReceiverKind::Field));
+        assert_eq!(kind_at("src/app.ts", 19), Some(ReceiverKind::Parameter));
+        assert_eq!(kind_at("src/app.ts", 25), Some(ReceiverKind::CallResult));
+        assert_eq!(kind_at("src/app.ts", 13), Some(ReceiverKind::Binding));
+        assert!(
+            decided_on
+                .sites
+                .iter()
+                .filter(|site| site.end.op.as_deref() == Some("receive"))
+                .all(|site| site.receiver.is_some())
+        );
+        assert!(!records_off.is_empty());
+        for record in &records_off {
+            let same = records_on
+                .iter()
+                .find(|other| other.anchors == record.anchors)
+                .expect("a record found without the trace is found with it");
+            assert_eq!(
+                serde_json::to_string(&same.state).unwrap(),
+                serde_json::to_string(&record.state).unwrap()
+            );
+        }
+    }
+
+    /// carrick#2474 R1: the ask holds each export's maker on `export` and
+    /// each op whose member a call row names, on every receiver its `of`
+    /// or `on` applies to, whether or not a library site uses it.
+    #[test]
+    fn the_declaration_ask_names_each_called_op_on_its_receivers() {
+        let Some(on) = walked("receiver-trace", ".", "web", &[], true) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/receiver-trace/library-claims.json"),
+        )
+        .unwrap();
+        let exports = crate::library_store::parse_answer(&text).exports;
+        let ask = declaration_ask(&on.inputs, &exports);
+        let got: Vec<String> = ask
+            .checks
+            .iter()
+            .map(|check| format!("{} {}", check.claim_id, check.receiver))
+            .collect();
+        assert_eq!(
+            got,
+            texts(&[
+                "fixture-server@1:default:make:call:() export",
+                "fixture-server@1:default:op:receive:get:of:instance:() instance:()",
+                "fixture-server@1:default:op:receive:post:of:instance:() instance:()",
+                "fixture-fetcher@1:default:make:call:() export",
+                "fixture-fetcher@1:default:op:request:get:of:instance:() instance:()",
+            ]),
+            "{got:#?}"
+        );
+        assert_eq!(ask.ops.iter().filter(|op| op.is_some()).count(), 3);
+    }
+
     /// The offline census over flag-on rows: every site per repo, by role,
     /// with the stops, written as JSON.
     ///
     /// `CARRICK_DISCOVERY_CENSUS='<label>=<repo>=<positions dir>=<store
     /// answer>[;…]' [CARRICK_DISCOVERY_CENSUS_OUT=<file>] cargo test --lib
     /// discovery_census -- --ignored --nocapture`
+    ///
+    /// With `CARRICK_RECEIVER_TRACE=1` the sites are discovered with the
+    /// receiver trace (carrick#2474 R1): the built sidecar verifies each
+    /// service's declaration ask from the service's root, as a scan does,
+    /// and every site names its receiver and how it was reached.
     #[test]
     #[ignore]
     fn discovery_census() {
         let Ok(spec) = std::env::var("CARRICK_DISCOVERY_CENSUS") else {
             return;
         };
+        let script = receiver_trace_enabled()
+            .then(|| super::super::fixture_walk::sidecar().expect("the built sidecar"));
         let mut all: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         for entry in spec.split(';').filter(|entry| !entry.is_empty()) {
             let parts: Vec<&str> = entry.splitn(4, '=').collect();
@@ -1499,7 +2197,41 @@ mod tests {
                     None => crate::position_rows::PositionIndex::missing(&root),
                 };
                 let inputs = crate::engine::discover_service_inputs(&root, service, Some(index));
-                let discovery = discover(&inputs, &labels, &root);
+                let declarations = script.as_ref().map(|script| {
+                    let service_root = root.join(service.directory.as_deref().unwrap_or("."));
+                    let sidecar =
+                        crate::services::TypeSidecar::spawn(script).expect("spawn the sidecar");
+                    sidecar.set_scan_root(&root);
+                    sidecar.start_init(&service_root, None);
+                    sidecar
+                        .wait_ready(std::time::Duration::from_secs(900))
+                        .expect("the sidecar is ready");
+                    let ask = declaration_ask(&inputs, &answer.exports);
+                    let verdicts = sidecar
+                        .verify_library_claims(&service_root, &ask.checks)
+                        .map(|answer| answer.verdicts)
+                        .unwrap_or_default();
+                    let declarations = MemberDeclarations::of(&ask, &verdicts);
+                    crate::outln!(
+                        "  {name}: {} check(s), {} not reached, {} declaration(s)",
+                        declarations.checks,
+                        declarations.not_reached,
+                        declarations.len()
+                    );
+                    declarations
+                });
+                let traced;
+                let labels = match &declarations {
+                    Some(declarations) => {
+                        traced = Labels {
+                            declarations: Some(declarations),
+                            ..Labels::of_answer(&answer)
+                        };
+                        &traced
+                    }
+                    None => &labels,
+                };
+                let discovery = discover(&inputs, labels, &root);
                 for (key, count) in discovery.counts {
                     *counts.entry(key).or_default() += count;
                 }
@@ -1518,5 +2250,93 @@ mod tests {
         if let Ok(out) = std::env::var("CARRICK_DISCOVERY_CENSUS_OUT") {
             std::fs::write(&out, serde_json::to_string(&all).unwrap()).expect("the census writes");
         }
+    }
+
+    /// The library-store request each service of a repo sends with site
+    /// questions on, as a scan builds it: the packages its library sites
+    /// import, at their installed versions, and the default-library files
+    /// the rows name. Offline, for answering the census from a store copy.
+    ///
+    /// `CARRICK_LIBRARY_ASK_CENSUS='<label>=<repo>=<positions dir>[;…]'
+    /// CARRICK_LIBRARY_ASK_CENSUS_OUT=<file> cargo test --lib
+    /// library_ask_census -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn library_ask_census() {
+        let Ok(spec) = std::env::var("CARRICK_LIBRARY_ASK_CENSUS") else {
+            return;
+        };
+        let mut all: BTreeMap<String, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
+        for entry in spec.split(';').filter(|entry| !entry.is_empty()) {
+            let parts: Vec<&str> = entry.splitn(3, '=').collect();
+            let [label, root, positions] = parts.as_slice() else {
+                panic!("<label>=<repo>=<positions dir>: {entry}");
+            };
+            let root = std::fs::canonicalize(root).expect("the repo exists");
+            let config = root.join("carrick.json");
+            let services = if config.exists() {
+                crate::config::Config::load_services(vec![config]).expect("carrick.json loads")
+            } else {
+                vec![crate::config::Config::default()]
+            };
+            let mut by_service: BTreeMap<String, PathBuf> = BTreeMap::new();
+            for dir_entry in std::fs::read_dir(positions).expect("the positions dir reads") {
+                let path = dir_entry.expect("dir entry").path();
+                if path.to_string_lossy().ends_with(".jsonl.gz")
+                    && let Ok(rows) = crate::position_rows::read_rows_file(&path)
+                {
+                    by_service.insert(rows.header.service.clone(), path);
+                }
+            }
+            for service in &services {
+                let name = service
+                    .service_name
+                    .clone()
+                    .unwrap_or_else(|| "(root)".to_string());
+                let index = match by_service.get(&name) {
+                    Some(path) => crate::position_rows::PositionIndex::of(
+                        &root,
+                        crate::position_rows::read_rows_file(path).expect("rows read"),
+                    ),
+                    None => crate::position_rows::PositionIndex::missing(&root),
+                };
+                let inputs = crate::engine::discover_service_inputs(&root, service, Some(index));
+                let service_root = root.join(service.directory.as_deref().unwrap_or("."));
+                let specifiers: BTreeSet<String> = super::super::library_sites(&inputs)
+                    .packages()
+                    .into_values()
+                    .flatten()
+                    .collect();
+                let asked = crate::library_store::request(
+                    &specifiers,
+                    &crate::library_store::Install {
+                        service_root: &service_root,
+                        repo_root: &root,
+                        home: None,
+                        yarn_registry_env: None,
+                        npm_registry_env: None,
+                    },
+                );
+                let library = inputs
+                    .positions
+                    .as_ref()
+                    .and_then(|positions| positions.default_library_globals())
+                    .map(|(typescript, globals)| {
+                        crate::library_store::default_library_packages(typescript, globals)
+                    })
+                    .unwrap_or_default();
+                let request = crate::library_store::Asked::with_default_library(asked, library)
+                    .map(|asked| {
+                        asked
+                            .with_roles(crate::library_store::roles_for(true))
+                            .request
+                    });
+                all.entry(label.to_string())
+                    .or_default()
+                    .insert(name, serde_json::to_value(request).unwrap());
+            }
+        }
+        let out = std::env::var("CARRICK_LIBRARY_ASK_CENSUS_OUT").expect("an out file");
+        std::fs::write(out, serde_json::to_string_pretty(&all).unwrap()).expect("the asks write");
     }
 }

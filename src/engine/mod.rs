@@ -4011,6 +4011,14 @@ async fn analyze_current_repo_incremental(
                 &semantics_root,
             );
             protocol_extractions.library = library;
+            let declarations = member_declarations(
+                crate::site_questions::enabled()
+                    && crate::request_summary::discovery::receiver_trace_enabled(),
+                &request_inputs,
+                &claims,
+                sidecar,
+                &semantics_root,
+            );
             protocol_extractions.site = site_rows_of(
                 crate::site_questions::enabled(),
                 &request_inputs,
@@ -4021,6 +4029,7 @@ async fn analyze_current_repo_incremental(
                     placements: Some(&placements),
                     library: library_ask.as_ref().map(|ask| &ask.sites),
                     prior: first_discovery.as_ref(),
+                    declarations: declarations.as_ref(),
                 },
             )
             .await;
@@ -4033,6 +4042,7 @@ async fn analyze_current_repo_incremental(
                     placements: Some(&placements),
                     library: library_ask.as_ref().map(|ask| &ask.sites),
                     prior: first_discovery.as_ref(),
+                    declarations: declarations.as_ref(),
                 },
             );
             let withdrawn = withdraw_model_routes_at_definitions(
@@ -5072,6 +5082,10 @@ struct SiteContext<'a> {
     /// The walk made on the store's first answer, read again when the settled
     /// answer is the same (carrick#2613).
     prior: Option<&'a FirstDiscovery>,
+    /// With the receiver trace on (carrick#2474 R1): the member
+    /// declarations verified op claims resolve to ([`member_declarations`]).
+    /// `None` leaves discovery as it was.
+    declarations: Option<&'a crate::request_summary::discovery::MemberDeclarations>,
 }
 
 /// Discovery run on the library store's first answer, before the file reader
@@ -5081,6 +5095,48 @@ struct SiteContext<'a> {
 struct FirstDiscovery {
     exports: Vec<crate::library_claims::ExportClaims>,
     discovery: crate::request_summary::discovery::Discovery,
+}
+
+/// The receiver trace's member declarations (carrick#2474 R1): one more
+/// verify request, beside the library rows', for each labelled op claim whose
+/// member a `call` row of that package names, on every receiver the claim
+/// applies to ([`crate::request_summary::discovery::declaration_ask`]). It
+/// runs under the library checks' time limit; the checks it does not reach
+/// are counted. `None` unless `enabled` (`CARRICK_RECEIVER_TRACE=1` with site
+/// questions on) and the service has rows. No sidecar, or a failed request,
+/// indexes nothing; the trace still records each site's receiver.
+fn member_declarations(
+    enabled: bool,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    claims: &[crate::library_claims::ExportClaims],
+    sidecar: Option<&TypeSidecar>,
+    from_dir: &Path,
+) -> Option<crate::request_summary::discovery::MemberDeclarations> {
+    use crate::request_summary::discovery::{MemberDeclarations, declaration_ask};
+    if !enabled || inputs.positions.is_none() {
+        return None;
+    }
+    let ask = declaration_ask(inputs, claims);
+    let verdicts = match sidecar {
+        Some(sidecar) if !ask.checks.is_empty() => {
+            match sidecar.verify_library_claims(from_dir, &ask.checks) {
+                Ok(answer) => answer.verdicts,
+                Err(error) => {
+                    warn!(%error, "receiver trace: the declaration ask failed; none indexed");
+                    Vec::new()
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+    let declarations = MemberDeclarations::of(&ask, &verdicts);
+    debug!(
+        checks = declarations.checks,
+        not_reached = declarations.not_reached,
+        declarations = declarations.len(),
+        "receiver trace: member declarations"
+    );
+    Some(declarations)
 }
 
 /// What a service's site questions read before anything is asked
@@ -5122,10 +5178,19 @@ fn site_records_of(
     context: SiteContext<'_>,
 ) -> SiteRecordsOf {
     let walked;
-    let discovery = match context.prior.filter(|prior| prior.exports == claims) {
+    // A walk made without the trace is not the walk the trace asks for.
+    let prior = context
+        .prior
+        .filter(|prior| prior.exports == claims && context.declarations.is_none());
+    let discovery = match prior {
         Some(prior) => &prior.discovery,
         None => {
-            let labels = crate::request_summary::discovery::Labels::of(claims);
+            let labels = match context.declarations {
+                Some(declarations) => {
+                    crate::request_summary::discovery::Labels::traced(claims, declarations)
+                }
+                None => crate::request_summary::discovery::Labels::of(claims),
+            };
             walked = crate::request_summary::discovery::discover(inputs, &labels, root);
             &walked
         }
@@ -10308,6 +10373,14 @@ async fn analyze_current_repo(
     let (library, claims) =
         library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root);
     protocol_extractions.library = library;
+    let declarations = member_declarations(
+        crate::site_questions::enabled()
+            && crate::request_summary::discovery::receiver_trace_enabled(),
+        &request_inputs,
+        &claims,
+        sidecar,
+        &service_root,
+    );
     protocol_extractions.site = site_rows_of(
         crate::site_questions::enabled(),
         &request_inputs,
@@ -10318,6 +10391,7 @@ async fn analyze_current_repo(
             placements: Some(&placements),
             library: library_ask.as_ref().map(|ask| &ask.sites),
             prior: first_discovery.as_ref(),
+            declarations: declarations.as_ref(),
         },
     )
     .await;
@@ -10330,6 +10404,7 @@ async fn analyze_current_repo(
             placements: Some(&placements),
             library: library_ask.as_ref().map(|ask| &ask.sites),
             prior: first_discovery.as_ref(),
+            declarations: declarations.as_ref(),
         },
     );
     let withdrawn = withdraw_model_routes_at_definitions(

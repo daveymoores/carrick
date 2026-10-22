@@ -113,6 +113,13 @@ pub struct DiscoverySite {
     pub chain: Vec<ChainHop>,
     #[serde(default)]
     pub stop: Option<String>,
+    /// The binding the labelled call is made on (carrick#2474 R1), with the
+    /// receiver trace on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<super::discovery::ReceiverAt>,
+    /// How discovery matched the labelled call, with the receiver trace on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reached: Option<super::discovery::ReachedBy>,
 }
 
 /// Discovery's census file: `{ "sites": [...] }`.
@@ -495,6 +502,12 @@ pub struct DecidedSite {
     pub handler: Option<HandlerAt>,
     /// What the label's method slot holds here, when it names one.
     pub method: Option<MethodValue>,
+    /// The binding the labelled call is made on (carrick#2474 R1), with the
+    /// receiver trace on: where the registration is made, wherever the name
+    /// is decided.
+    pub receiver: Option<super::discovery::ReceiverAt>,
+    /// How discovery matched the labelled call, with the receiver trace on.
+    pub reached: Option<super::discovery::ReachedBy>,
 }
 
 impl DecidedSite {
@@ -1111,6 +1124,10 @@ struct Walk<'a, 'i> {
     seen: HashSet<(String, u32, Option<String>, String)>,
     /// The label of the labelled call being walked.
     label: Option<&'i SiteLabel>,
+    /// The receiver of the labelled call being walked, and how discovery
+    /// reached it.
+    receiver: Option<super::discovery::ReceiverAt>,
+    reached: Option<super::discovery::ReachedBy>,
 }
 
 impl<'a> Walk<'a, '_> {
@@ -1162,6 +1179,8 @@ impl<'a> Walk<'a, '_> {
             payload,
             handler,
             method,
+            receiver: self.receiver.clone(),
+            reached: self.reached,
         });
     }
 
@@ -1313,6 +1332,8 @@ impl<'a> Walk<'a, '_> {
                 payload: None,
                 handler: Some(entry.handler),
                 method: None,
+                receiver: self.receiver.clone(),
+                reached: self.reached,
             });
         }
     }
@@ -1385,11 +1406,15 @@ pub fn decided_sites(
         out: &mut out,
         seen: HashSet::new(),
         label: None,
+        receiver: None,
+        reached: None,
     };
     for site in discovered {
         let Some(end) = &site.end else {
             continue;
         };
+        walk.receiver = site.receiver.clone();
+        walk.reached = site.reached;
         let Some(label) = SiteLabel::find(labels, end) else {
             // A call that hands a maker the function it runs
             // (carrick#2426): the function holds the request, found at its
@@ -2506,6 +2531,8 @@ pub(crate) mod tests {
             end: Some(end),
             chain: Vec::new(),
             stop: None,
+            receiver: None,
+            reached: None,
         };
         let answer: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
@@ -2708,6 +2735,8 @@ pub(crate) mod tests {
             end: Some(end.clone()),
             chain: Vec::new(),
             stop: None,
+            receiver: None,
+            reached: None,
         }
     }
 
@@ -2794,6 +2823,8 @@ pub(crate) mod tests {
                 },
             ],
             stop: None,
+            receiver: None,
+            reached: None,
         };
         let decided = decided_sites(&inputs, &root, &[site], &[send]);
         assert_eq!(
