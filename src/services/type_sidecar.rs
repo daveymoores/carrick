@@ -478,6 +478,47 @@ pub struct PositionRowsCounts {
     pub walk_ms: u64,
 }
 
+/// One `implementations` question (carrick#2432): a call that goes through a
+/// bodyless declaration, as the span of its `call` (or `member`) position
+/// row in `file`, in the rows' numbering (UTF-16 code units, what
+/// `sidecar_position` gives).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ImplementationsQuery {
+    /// Absolute path of the file holding the call.
+    pub file: String,
+    pub start: u32,
+    pub end: u32,
+}
+
+/// A declaration as a position row names one: what `row_calls::join` reads.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct NamedDeclaration {
+    pub symbol: Option<String>,
+    pub decl_file: Option<String>,
+    pub decl_line: Option<u32>,
+    pub decl_package: Option<String>,
+}
+
+/// The answer to one [`ImplementationsQuery`].
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ImplementationsAnswer {
+    /// The declaration the call goes through, as its row names it.
+    pub declaration: Option<NamedDeclaration>,
+    /// By file, then position; empty when `too_many`.
+    pub implementations: Vec<NamedDeclaration>,
+    /// More than the sidecar's cap (16) were found, and none is listed.
+    pub too_many: bool,
+    /// Why nothing was searched: `not_in_program`, `no_call`, `no_symbol`,
+    /// `no_declaration`, `has_body` or `checker_threw`.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImplementationsResult {
+    answers: Vec<ImplementationsAnswer>,
+}
+
 /// Result of a `capture_v2` action (mirrors `CaptureStubResult`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CaptureV2Result {
@@ -1237,6 +1278,12 @@ enum SidecarRequest {
         out_path: String,
         service: String,
     },
+    #[serde(rename = "implementations")]
+    Implementations {
+        request_id: String,
+        queries: Vec<ImplementationsQuery>,
+        scan_root: String,
+    },
     #[serde(rename = "add_program_files")]
     AddProgramFiles {
         request_id: String,
@@ -1262,6 +1309,7 @@ impl SidecarRequest {
             SidecarRequest::CheckV2 { pairs, .. } => pairs.len(),
             SidecarRequest::ResolveDefinitions { aliases, .. } => aliases.len(),
             SidecarRequest::RetypeCheck { items, .. } => items.len(),
+            SidecarRequest::Implementations { queries, .. } => queries.len(),
             SidecarRequest::VerifyClientSemantics { checks, .. } => checks.len(),
             SidecarRequest::VerifyLibraryClaims { checks, .. } => checks.len(),
         }
@@ -3291,6 +3339,37 @@ impl TypeSidecar {
         .map_err(|e| SidecarError::DeserializationError(e.to_string()))
     }
 
+    /// The implementations of the bodyless declaration each call in `queries`
+    /// goes through, one answer per query in order (carrick#2432). Asked of
+    /// the service's analysis process: go-to-implementation runs over the
+    /// programs its other actions read, and releases none of them. Every
+    /// name in an answer is relative to `scan_root`, as the position rows'.
+    pub fn implementations(
+        &self,
+        queries: &[ImplementationsQuery],
+        scan_root: &Path,
+    ) -> Result<Vec<ImplementationsAnswer>, SidecarError> {
+        self.ensure_ready()?;
+        let request_id = self.next_request_id();
+        let request = SidecarRequest::Implementations {
+            request_id: request_id.clone(),
+            queries: queries.to_vec(),
+            scan_root: scan_root.to_string_lossy().into_owned(),
+        };
+        self.send_request(&request)?;
+        // A progress frame follows each answer, so the deadline is a silence.
+        let value = self.operation_result(&request_id)?;
+        if value.get("status").and_then(|s| s.as_str()) != Some("success") {
+            return Err(SidecarError::ImplementationsFailed(frame_errors(&value)));
+        }
+        let result: ImplementationsResult =
+            serde_json::from_value(value.get("result").cloned().ok_or_else(|| {
+                SidecarError::ImplementationsFailed("no result in the answer".to_string())
+            })?)
+            .map_err(|e| SidecarError::DeserializationError(e.to_string()))?;
+        Ok(result.answers)
+    }
+
     /// Run the v2 "tsc as the judge" check over assembled capture stubs.
     ///
     /// The sidecar runs this async (spawned pnpm install + tsc) and emits
@@ -4219,6 +4298,8 @@ pub enum SidecarError {
     ProgramFilesFailed(String),
     /// The sidecar answered a position-rows walk with an error (carrick#2405)
     PositionRowsFailed(String),
+    /// The sidecar answered an implementations request with an error (carrick#2432)
+    ImplementationsFailed(String),
     /// This process was signalled while the wait was on (carrick#1387).
     Interrupted(crate::shutdown::Interrupted),
 }
@@ -4269,7 +4350,8 @@ impl SidecarError {
             | SidecarError::CaptureFailed(_)
             | SidecarError::CheckFailed(_)
             | SidecarError::ProgramFilesFailed(_)
-            | SidecarError::PositionRowsFailed(_) => false,
+            | SidecarError::PositionRowsFailed(_)
+            | SidecarError::ImplementationsFailed(_) => false,
             SidecarError::SpawnFailed(_)
             | SidecarError::InitFailed(_)
             | SidecarError::NotReady(_)
@@ -4296,6 +4378,9 @@ impl std::fmt::Display for SidecarError {
             SidecarError::CheckFailed(e) => write!(f, "v2 check failed: {}", e),
             SidecarError::ProgramFilesFailed(e) => write!(f, "Program files request failed: {}", e),
             SidecarError::PositionRowsFailed(e) => write!(f, "Position rows walk failed: {}", e),
+            SidecarError::ImplementationsFailed(e) => {
+                write!(f, "Implementations request failed: {}", e)
+            }
             SidecarError::Interrupted(e) => write!(f, "{e}"),
         }
     }
@@ -5276,6 +5361,58 @@ mod tests {
             let parsed: VerdictBucket = serde_json::from_str(&format!(r#""{}""#, wire)).unwrap();
             assert_eq!(parsed, bucket);
         }
+    }
+
+    /// The `implementations` wire names must match the sidecar's
+    /// `ImplementationsRequestSchema` and `ImplementationsAnswer` exactly
+    /// (carrick#2432).
+    #[test]
+    fn implementations_wire_shape() {
+        let request = SidecarRequest::Implementations {
+            request_id: "req-3".into(),
+            queries: vec![ImplementationsQuery {
+                file: "/repo/src/handlers.ts".into(),
+                start: 120,
+                end: 151,
+            }],
+            scan_root: "/repo".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "action": "implementations",
+                "request_id": "req-3",
+                "queries": [{ "file": "/repo/src/handlers.ts", "start": 120, "end": 151 }],
+                "scan_root": "/repo"
+            })
+        );
+        assert_eq!(request.item_count(), 1);
+
+        let result: ImplementationsResult = serde_json::from_value(serde_json::json!({
+            "answers": [
+                {
+                    "declaration": { "symbol": "send", "decl_file": "src/port.ts", "decl_line": 2, "decl_package": "svc" },
+                    "implementations": [
+                        { "symbol": "send", "decl_file": "src/http-port.ts", "decl_line": 4, "decl_package": "svc" }
+                    ],
+                    "too_many": false
+                },
+                { "declaration": null, "implementations": [], "too_many": false, "reason": "no_call" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            result.answers[0].implementations,
+            vec![NamedDeclaration {
+                symbol: Some("send".into()),
+                decl_file: Some("src/http-port.ts".into()),
+                decl_line: Some(4),
+                decl_package: Some("svc".into()),
+            }]
+        );
+        assert_eq!(result.answers[0].reason, None);
+        assert_eq!(result.answers[1].declaration, None);
+        assert_eq!(result.answers[1].reason.as_deref(), Some("no_call"));
     }
 
     /// The `verify_client_semantics` wire names must match the sidecar's

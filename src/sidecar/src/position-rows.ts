@@ -446,8 +446,12 @@ interface RequireBinding {
   exportName?: string;
 }
 
-/** The rows of one program's files. */
-class PositionWalker {
+/**
+ * The rows of one program's files. The `implementations` action
+ * (`implementations.ts`, carrick#2432) reads a call's symbol and names its
+ * answers through the same walker, so they join as the rows do.
+ */
+export class PositionWalker {
   private readonly checker: ts.TypeChecker;
   /** Each module's exports by name, and its `export =` and `default` targets, aliases followed. */
   private readonly moduleExports = new Map<ts.Symbol, { byName: Map<string, ts.Symbol>; wholes: ts.Symbol[] }>();
@@ -533,7 +537,7 @@ class PositionWalker {
   }
 
   /** How rows name a position in a program file: its file, 1-based line and package. */
-  private located(
+  located(
     declaringFile: ts.SourceFile,
     position: number
   ): { declFile: string | null; declLine: number; declPackage: string | null } {
@@ -682,7 +686,7 @@ class PositionWalker {
   }
 
   /** The row's symbol, following aliases to a target that has a declaration. */
-  private symbolOf(kind: PositionKind, node: ts.Node): ts.Symbol | undefined {
+  symbolOf(kind: PositionKind, node: ts.Node): ts.Symbol | undefined {
     let symbol: ts.Symbol | undefined;
     if (kind === 'ident' && ts.isShorthandPropertyAssignment(node.parent) && node.parent.name === node) {
       symbol = this.checker.getShorthandAssignmentValueSymbol(node.parent);
@@ -816,7 +820,7 @@ function tail(row: PositionRow): [string | null, string | null, number | null, s
 }
 
 /** Order two `decl_file` names, `null` last. */
-function compareNames(a: string | null, b: string | null): number {
+export function compareNames(a: string | null, b: string | null): number {
   if (a === b) return 0;
   if (a === null) return 1;
   if (b === null) return -1;
