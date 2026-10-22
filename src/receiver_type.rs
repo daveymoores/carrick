@@ -264,6 +264,13 @@ pub struct FactoryTables {
     pub aliases: HashMap<String, StatedReturn>,
 }
 
+// FROZEN (old path, 2026-10-21): from `CalledType` through
+// `function_type_return` below, and `annotated_return` (shared with
+// `stated_return`, so only its function-type use goes). Deletions and safety
+// fixes only. Fixes for wrong or missing rows go in the compiler rows (the
+// `call` row's declaration, carrick#2413 slices D and E). Delete after
+// carrick#2413 slice D, with discovery on by default and a clean four-repo
+// replay (carrick#2440, target 5).
 /// What a binding's declared type says a call of it returns, when the binding
 /// is a function value rather than a function declaration: a parameter or a
 /// local whose annotation is a function type (carrick#1561).
@@ -486,6 +493,12 @@ fn stated_return(
     })
 }
 
+// FROZEN (old path, 2026-10-21), in part: `function_type_return` reads this
+// for the receiver-type helpers above; `stated_return` reads it too. Deletions
+// and safety fixes only. Fixes for wrong or missing rows go in the compiler
+// rows (the `call` row's declaration, carrick#2413 slices D and E). Delete its
+// function-type use after carrick#2413 slice D, with discovery on by default
+// and a clean four-repo replay (carrick#2440, target 5).
 /// The class a return annotation names: one type, or `Promise` of one. A
 /// union, a qualified name or a type parameter `own` declares states nothing.
 fn annotated_return(

@@ -440,6 +440,13 @@ fn body_presence(call: &CallExpr, options: Option<(usize, &ObjectLit)>) -> Optio
     }
 }
 
+// FROZEN (old path, 2026-10-21): `fold_module` and `fold_wrappers` only (the
+// request predicates above stay and move first; `wrapper_call_method` also
+// reads `fold_module`). Deletions and safety fixes only. Fixes for wrong or
+// missing rows go in per-function composition in request summaries
+// (`crate::request_summary`). Delete when summaries give the same or better
+// rows on this pass's fixtures and the four-repo replay, with no true row lost
+// (carrick#1561).
 /// The shape a whole module fixes, folded over its call sites.
 ///
 /// `None` — no propagation — whenever the module issues no readable request,
@@ -470,6 +477,11 @@ pub fn fold_module<'a>(
     folded
 }
 
+// FROZEN (old path, 2026-10-21): this function only. Deletions and safety
+// fixes only. Fixes for wrong or missing rows go in per-function composition
+// in request summaries (`crate::request_summary`). Delete when summaries give
+// the same or better rows on this pass's fixtures and the four-repo replay,
+// with no true row lost (carrick#1561).
 /// The shape one importing file may propagate, folded over every wrapper module
 /// its imports resolved to. An unknown shape on any of them makes the whole
 /// thing unknown: the file could be delegating to either.

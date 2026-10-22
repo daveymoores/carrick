@@ -177,6 +177,12 @@ export const MACHINERY_MEMBER_INDICATORS = new Set<string>([
   'clone',
   'json',
   'statusText',
+  // FROZEN (old path, 2026-10-21): the reply-object half below only (the
+  // fetch half above and the threshold stay). Deletions and safety fixes
+  // only. Fixes for wrong or missing types go in labelled reply objects
+  // (carrick#2472 C4) and the language library rows (carrick#2445). Delete
+  // when a delete-and-replay on the four repos moves no row wrongly, after
+  // carrick-cloud#2379 and carrick#2445 (carrick#2472, C6).
   // Node http ServerResponse / reply-object surface
   'statusCode',
   'statusMessage',
@@ -2210,6 +2216,8 @@ export class TypeInferrer {
       branches = [
         ...returnedBranches,
         ...statementSends
+          // FROZEN (old path, 2026-10-21): the `statementEndsFunctionPath` test
+          // here; see that method.
           .filter((s) => s.send === locatedBranch || this.statementEndsFunctionPath(s.statement, func))
           .map((s) => s.send),
       ];
@@ -2296,6 +2304,10 @@ export class TypeInferrer {
     return sends;
   }
 
+  // FROZEN (old path, 2026-10-21): this method and its one use. Deletions and
+  // safety fixes only. Fixes for wrong or missing types go in send versus
+  // setter, read from the framework label (carrick#2472 C4). Delete when C4 is
+  // released (carrick#2472, C6).
   /**
    * True when nothing in `func` runs after `statement`: a bare `return;`
    * follows it, or it is the last statement of its block and the statement
@@ -2336,6 +2348,11 @@ export class TypeInferrer {
     }
   }
 
+  // FROZEN (old path, 2026-10-21): this method's structural test (the whole
+  // method is the upper bound). Deletions and safety fixes only. Fixes for
+  // wrong or missing types go in labelled sends (carrick#2472 C4). Delete when
+  // a delete-and-replay on the four repos moves no row wrongly, after
+  // carrick-cloud#2379 and carrick#2445 (carrick#2472, C6).
   /**
    * True when `candidate` is a response send: a call or `new` whose result is
    * transport machinery (by the extraction config's verified rule or the
@@ -6456,6 +6473,10 @@ export class TypeInferrer {
     return flattened;
   }
 
+  // FROZEN (old path, 2026-10-21): this method only. Deletions and safety fixes
+  // only. Fixes for wrong or missing types go in labelled sends (carrick#2472
+  // C4). Delete when a delete-and-replay on the four repos moves no row
+  // wrongly, after carrick-cloud#2379 and carrick#2445 (carrick#2472, C6).
   /**
    * The callees these returned expressions PROVE are response serialisers.
    *

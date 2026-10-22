@@ -1217,6 +1217,11 @@ fn declared_route_methods(pat: &Pat, init: &Expr) -> Vec<(String, Vec<String>)> 
         .collect()
 }
 
+// FROZEN (old path, 2026-10-21): `collect_method_guards` and
+// `MethodGuardVisitor` only. Deletions and safety fixes only. Fixes for wrong
+// or missing rows go in the guard chain's conjoined method comparison
+// (carrick#2474 R4). Delete after R4, with discovery on by default and a clean
+// four-repo replay (carrick#2474).
 fn collect_method_guards<N>(node: &N) -> Vec<String>
 where
     N: VisitWith<MethodGuardVisitor> + ?Sized,
@@ -2295,6 +2300,12 @@ impl CandidateVisitor {
         }
     }
 
+    // FROZEN (old path, 2026-10-21): Signal 5's name lists,
+    // `is_potential_api_object` and `is_potential_api_method`. Deletions and
+    // safety fixes only. Fixes for wrong or missing rows go in discovery (a
+    // call that reaches a labelled library export). Delete when discovery is
+    // on by default and the four-repo replay shows no site only this signal
+    // raised (carrick#2440, target 3).
     /// Check if an identifier looks like an API-related object
     fn is_potential_api_object(&self, name: &str) -> bool {
         // Common API object patterns (framework-agnostic)
@@ -2344,6 +2355,11 @@ impl CandidateVisitor {
             || lower.ends_with("controller")
     }
 
+    // FROZEN (old path, 2026-10-21): Signal 5's name lists. Deletions and
+    // safety fixes only. Fixes for wrong or missing rows go in discovery (a
+    // call that reaches a labelled library export). Delete when discovery is
+    // on by default and the four-repo replay shows no site only this signal
+    // raised (carrick#2440, target 3).
     /// Check if a method name looks like an API method
     fn is_potential_api_method(&self, name: &str) -> bool {
         let api_methods = [
@@ -2453,6 +2469,11 @@ impl CandidateVisitor {
         }
     }
 
+    // FROZEN (old path, 2026-10-21): Signal 4, the await gate. Deletions and
+    // safety fixes only. Fixes for wrong or missing rows go in discovery (a
+    // call that reaches a labelled library export). Delete when discovery is
+    // on by default and the four-repo replay shows no site only this signal
+    // raised (carrick#2440, target 2).
     /// Is the first argument a string or template literal? Combined with an
     /// enclosing `await`, this flags awaited calls like `await load('/data')`.
     fn first_arg_is_stringish(call: &CallExpr) -> bool {
@@ -3263,6 +3284,12 @@ impl Visit for CandidateVisitor {
         node.visit_children_with(self);
     }
 
+    // FROZEN (old path, 2026-10-21): Signal 4, the await gate (this visitor
+    // only keeps `await_depth`). Deletions and safety fixes only. Fixes for
+    // wrong or missing rows go in discovery (a call that reaches a labelled
+    // library export). Delete when discovery is on by default and the
+    // four-repo replay shows no site only this signal raised (carrick#2440,
+    // target 2).
     fn visit_await_expr(&mut self, node: &AwaitExpr) {
         self.await_depth += 1;
         node.visit_children_with(self);
@@ -3446,6 +3473,13 @@ impl Visit for CandidateVisitor {
             );
         }
 
+        // FROZEN (old path, 2026-10-21): Signal 2's detection-list gate, this
+        // block and the `network_import_locals` field (`package_import_locals`
+        // stays: the messaging gate reads it). Deletions and safety fixes
+        // only. Fixes for wrong or missing rows go in discovery (a call that
+        // reaches a labelled library export). Delete when discovery is on by
+        // default and the four-repo replay shows no site only this signal
+        // raised (carrick#2440, target 4).
         // Signal 2: call rooted at an identifier imported from a known
         // network/data-fetching package (covers wrappers regardless of method
         // name), or direct invocation of such an import (`client(url)`).
@@ -3489,6 +3523,12 @@ impl Visit for CandidateVisitor {
             self.push_candidate(call, obj, prop);
         }
 
+        // FROZEN (old path, 2026-10-21): Signal 4, the await gate, this block,
+        // `await_depth`, `visit_await_expr` and `first_arg_is_stringish`.
+        // Deletions and safety fixes only. Fixes for wrong or missing rows go
+        // in discovery (a call that reaches a labelled library export). Delete
+        // when discovery is on by default and the four-repo replay shows no
+        // site only this signal raised (carrick#2440, target 2).
         // Signal 4: awaited call with a string/template argument.
         if self.await_depth > 0 && Self::first_arg_is_stringish(call) {
             let (obj, prop) = match &call.callee {
@@ -3501,6 +3541,12 @@ impl Visit for CandidateVisitor {
             self.push_candidate(call, obj, prop);
         }
 
+        // FROZEN (old path, 2026-10-21): Signal 4b, the stopgap in
+        // `crate::request_helper_sites`. Deletions and safety fixes only.
+        // Fixes for wrong or missing rows go in discovery (a call that reaches
+        // a labelled library export, reported where its name is decided).
+        // Delete when discovery is on by default and the four-repo replay
+        // shows no site only this signal raised (carrick#2440, target 1).
         // Signal 4b: a call into a request helper this module declares, with a
         // route literal where the helper builds its URL, awaited or not
         // (carrick-cloud#2373). Signal 4 needs an `await`, and a client object
@@ -3527,6 +3573,11 @@ impl Visit for CandidateVisitor {
             }
         }
 
+        // FROZEN (old path, 2026-10-21): Signal 5, the name lists. Deletions
+        // and safety fixes only. Fixes for wrong or missing rows go in
+        // discovery (a call that reaches a labelled library export). Delete
+        // when discovery is on by default and the four-repo replay shows no
+        // site only this signal raised (carrick#2440, target 3).
         // Signal 5 (existing): method calls matching the API name heuristics.
         if let Callee::Expr(callee_expr) = &call.callee
             && let Expr::Member(member) = &**callee_expr

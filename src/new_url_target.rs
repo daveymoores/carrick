@@ -1,3 +1,8 @@
+// FROZEN (old path, 2026-10-21): deletions and safety fixes only. Fixes for
+// wrong or missing rows go in request summaries (`crate::request_summary`).
+// Delete when summaries give the same or better rows on this pass's fixtures
+// and the four-repo replay, with no true row lost (carrick#1561).
+
 //! Request targets built with the `URL` constructor's path-plus-base form.
 //!
 //! `new URL(path, base)` is how a client assembles a request URL when the

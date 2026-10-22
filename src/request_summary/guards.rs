@@ -881,6 +881,13 @@ impl Reader<'_> {
         if guards.declared.declares_name(&name) {
             return Subject::hole(HoleReason::UnreadExpression);
         }
+        // FROZEN (old path, 2026-10-21): this fallback only (a name the file
+        // neither declares nor imports is read as a global, which a typo or an
+        // ambient name also lands on). Deletions and safety fixes only. Fixes
+        // for wrong or missing rows go in the compiler's position rows (a
+        // default-library or ambient declaration, carrick#2413 slice C).
+        // Delete at carrick#2413 slice F, once the unresolved-import (#2573)
+        // and rows-join budget (#2574) fallbacks count zero (carrick#2413).
         Subject::of(Root::Global(name))
     }
 
@@ -2200,6 +2207,13 @@ impl<'a> Chains<'a> {
                 _ => None,
             };
         }
+        // FROZEN (old path, 2026-10-21): the branch without rows below only
+        // (the import read by its specifier through the SWC resolver).
+        // Deletions and safety fixes only. Fixes for wrong or missing rows go in
+        // the compiler's position rows (the import's declaration and
+        // `decl_package`, carrick#2413 slice E). Delete at carrick#2413 slice
+        // F, once the unresolved-import (#2573) and rows-join budget (#2574)
+        // fallbacks count zero (carrick#2413).
         match self.inputs.bindings.get(file, local)? {
             ImportedBinding::Unresolved => Some(HoleReason::UnresolvedImport),
             ImportedBinding::Binding { .. }

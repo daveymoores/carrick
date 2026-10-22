@@ -43,6 +43,12 @@ export const MACHINERY_MEMBER_INDICATORS = new Set<string>([
   'clone',
   'json',
   'statusText',
+  // FROZEN (old path, 2026-10-21): the reply-object half below only (the
+  // fetch half above and the threshold stay). Deletions and safety fixes
+  // only. Fixes for wrong or missing types go in labelled reply objects
+  // (carrick#2472 C4) and the language library rows (carrick#2445). Delete
+  // when a delete-and-replay on the four repos moves no row wrongly, after
+  // carrick-cloud#2379 and carrick#2445 (carrick#2472, C6).
   // Node http ServerResponse / reply-object surface
   'statusCode',
   'statusMessage',
