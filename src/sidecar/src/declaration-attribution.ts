@@ -40,6 +40,28 @@ export function attributedDeclaration<T extends ts.Node>(
 }
 
 /**
+ * The declaration a member is attributed to when it is read on `holder`: its
+ * own ({@link attributedDeclaration}), or, for a member with none (a mapped
+ * type's), the declaration of the holder's type: its symbol's, else its alias
+ * symbol's (carrick#2448). The per-position rows and a library verdict's
+ * `declarations` (carrick#2654) both name a member this way, so a verdict
+ * joins the row of the call it judges.
+ */
+export function memberDeclaration(
+  programOf: () => ts.Program,
+  member: ts.Symbol,
+  holder: ts.Type
+): ts.Declaration | undefined {
+  return attributedDeclaration(programOf, member.declarations ?? []) ?? typeDeclaration(programOf, holder);
+}
+
+/** The declaration of a type's symbol, else of its alias symbol: a mapped type node, or the alias naming it. */
+export function typeDeclaration(programOf: () => ts.Program, type: ts.Type): ts.Declaration | undefined {
+  const owner = type.getSymbol() ?? type.aliasSymbol;
+  return attributedDeclaration(programOf, owner?.declarations ?? []);
+}
+
+/**
  * The npm package a declaring file belongs to, by the module graph where
  * there is one and by its path otherwise. `undefined` when neither names one.
  *

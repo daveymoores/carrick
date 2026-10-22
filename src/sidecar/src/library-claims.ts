@@ -61,6 +61,7 @@ import type {
   SurfaceReceiver,
   SurfaceSignature,
 } from './types.js';
+import { memberDeclaration } from './declaration-attribution.js';
 
 /** The methods a `verb` claim may name, and a method key may accept. */
 const HTTP_METHODS: ReadonlySet<string> = new Set([
@@ -266,7 +267,14 @@ type Read<T> = { value: T } | { reason: string };
 
 /** The callee's signatures, or the verdict when there is nothing to call. */
 /** A callee's signatures, and the type its member was read from. */
-type Callable = { signatures: readonly ts.Signature[]; holder: ts.Type } | { failure: Outcome };
+/** A member a path reaches and the type it is read on. */
+interface NamedMember {
+  property: ts.Symbol;
+  holder: ts.Type;
+}
+
+/** `named` is unset when the callee is the receiver itself. */
+type Callable = { signatures: readonly ts.Signature[]; holder: ts.Type; named?: NamedMember } | { failure: Outcome };
 
 interface ModuleRead {
   entry: SemanticsModule;
@@ -1874,7 +1882,7 @@ class DeclarationReader {
     }
     if (holding.length > 0) {
       // The member's own declarations, as a verified op carries them (#2636).
-      const declarations = this.declarationsOf(holding);
+      const declarations = this.declarationsOf({ signatures: holding, named: callee.named });
       const outcome: Outcome = declarations.length > 0 ? { verdict: 'verified', declarations } : VERIFIED;
       return binds ? { outcome } : { outcome, holding };
     }
@@ -2069,20 +2077,26 @@ class DeclarationReader {
     }
     if (!held) return best!.outcome;
     if (boundRuns) return this.boundRunsOutcome(receiver.makerHolding!, boundRuns);
-    const declarations = this.declarationsOf(callee.signatures);
+    const declarations = this.declarationsOf(callee);
     return declarations.length > 0 ? { verdict: 'verified', declarations } : VERIFIED;
   }
 
   /**
-   * Where the signatures a verified op resolved to are declared, as position
-   * rows spell it (`decl_file`, `decl_line`): the member on this receiver, so
-   * two members of one name on two types give two answers. A declaration no
-   * row could name is left out.
+   * Where a verified op or scope's member is declared, as position rows spell
+   * it (`decl_file`, `decl_line`): the declaration the call row names for the
+   * member symbol on this receiver ({@link memberDeclaration}), so two members
+   * of one name on two types give two answers, and a property typed by an
+   * interface with call signatures names the property, not the signatures
+   * (carrick#2654). A callee that is the receiver itself has no member symbol
+   * and names its signatures' declarations. A declaration no row could name is
+   * left out.
    */
-  private declarationsOf(signatures: readonly ts.Signature[]): DeclaredAt[] {
+  private declarationsOf(callee: { signatures: readonly ts.Signature[]; named?: NamedMember }): DeclaredAt[] {
     const found: DeclaredAt[] = [];
-    for (const signature of signatures) {
-      const declaration = signature.getDeclaration();
+    const named = callee.named
+      ? [memberDeclaration(() => this.program, callee.named.property, callee.named.holder)]
+      : callee.signatures.map(signature => signature.getDeclaration());
+    for (const declaration of named) {
       if (!declaration) continue;
       const file = declaration.getSourceFile();
       const decl_file = declaringFileName(this.program, this.pathNames, file);
@@ -2776,11 +2790,15 @@ class DeclarationReader {
     form: 'call' | 'new'
   ): Callable {
     let holder: Holder = receiver;
+    // The last member the path reaches, with the type it is read on: the
+    // symbol the call row names (carrick#2654).
+    let named: NamedMember | undefined;
     for (const hop of hops) {
       const step = this.ownMember(holder, hop);
       if ('failure' in step) return step;
       const type = step.type;
       if (this.saysNothing(type)) return { failure: unchecked('member_untyped') };
+      named = { property: step.property, holder: holder.type };
       holder = { type, home: this.homeOf(receiver.pkg, typeSymbols(type), holder.home) };
     }
     let type = holder.type;
@@ -2791,6 +2809,7 @@ class DeclarationReader {
       if ('failure' in step) return step;
       type = step.type;
       boundBase = step.bound;
+      named = { property: step.property, holder: holder.type };
     }
     const all =
       form === 'new'
@@ -2804,7 +2823,7 @@ class DeclarationReader {
     const own = boundBase
       ? library
       : library.filter(signature => this.isOwnFile(this.signatureFile(signature, type, form)!, home));
-    if (own.length > 0) return { signatures: own, holder: holder.type };
+    if (own.length > 0) return { signatures: own, holder: holder.type, named };
     if (library.length > 0) return { failure: failed('member_inherited') };
     return { failure: this.slotFailure(type, form === 'new' ? 'member_not_constructible' : 'member_not_callable') };
   }
@@ -2814,13 +2833,16 @@ class DeclarationReader {
    * sits on another package's base that the holder binds with its own type
    * (`bound`).
    */
-  private ownMember(holder: Holder, name: string): { type: ts.Type; bound: boolean } | { failure: Outcome } {
+  private ownMember(
+    holder: Holder,
+    name: string
+  ): { type: ts.Type; bound: boolean; property: ts.Symbol } | { failure: Outcome } {
     const apparent = this.checker.getApparentType(this.checker.getNonNullableType(holder.type));
     const property = this.declaredProperty(holder.type, name);
     if (!property) return { failure: failed('member_missing') };
     const type = this.checker.getTypeOfSymbol(property);
-    if (this.isOwnMember(property, apparent, holder.home)) return { type, bound: false };
-    if (this.isBoundByOwnType(property, holder)) return { type, bound: true };
+    if (this.isOwnMember(property, apparent, holder.home)) return { type, bound: false, property };
+    if (this.isBoundByOwnType(property, holder)) return { type, bound: true, property };
     return { failure: failed('member_inherited') };
   }
 

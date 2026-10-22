@@ -54,7 +54,7 @@ import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { ts, type Project } from 'ts-morph';
 import { WriteGuard, installedPackageDirectory, isDeclarationFileName, moduleExport } from './capture/index.js';
-import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
+import { attributedDeclaration, installedPackageOf, typeDeclaration } from './declaration-attribution.js';
 import { typeToStringAsDeclared } from './print-type.js';
 import type { ProjectLoader } from './project-loader.js';
 import type { PositionRowsCounts } from './types.js';
@@ -678,8 +678,7 @@ export class PositionWalker {
 
   /** The declaration of a type's symbol, else of its alias symbol: a mapped type node, or the alias naming it. */
   private typeDeclaration(type: ts.Type): ts.Declaration | undefined {
-    const owner = type.getSymbol() ?? type.aliasSymbol;
-    return attributedDeclaration(() => this.program, owner?.declarations ?? []);
+    return typeDeclaration(() => this.program, type);
   }
 
   /**
