@@ -5288,6 +5288,28 @@ fn log_dispatch_routes(
         ms = started.elapsed().as_millis() as u64,
         "receiver trace: dispatch routes"
     );
+    // The handler records (carrick#2474 R4b T3a): counted, then dropped.
+    let started = std::time::Instant::now();
+    let records = crate::request_summary::dispatch::handler_records(
+        inputs,
+        discovered,
+        labels,
+        root,
+        crate::request_summary::dispatch::HoleReach::Nested,
+    );
+    let read = |what: &str| records.counts.get(what).copied().unwrap_or_default() as u64;
+    debug!(
+        records = read("records"),
+        shared = read("records_shared"),
+        asked_records = read("records_asked"),
+        asked = read("asked"),
+        forced = read("forced"),
+        no_method = read("no_method"),
+        holes = read("holes"),
+        not_attached = records.not_attached.values().sum::<usize>() as u64,
+        ms = started.elapsed().as_millis() as u64,
+        "receiver trace: handler records"
+    );
 }
 
 /// `sites` read through `claims`, each verified by the sidecar against the
