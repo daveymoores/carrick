@@ -21,3 +21,21 @@ site, sorted by file and span.
 A site that reaches several labelled calls has one record per labelled call.
 Two sites can share one end (`traced-load.ts:4`: the `traced(…)` call and the
 `fetch` it runs). A reader that folds records by their end must dedupe them.
+
+## Calls discovery could not follow (carrick#2613)
+
+`sites.expected.json` also carries `unfollowed`: a call that reached no
+labelled export and entered no code, with its reason as `stop` (`end` null,
+`chain` empty). It is not a site; nothing decided reads it.
+
+| `stop` | Meaning |
+|---|---|
+| `value_callee` | The callee is an in-repo value that is no definition: a parameter, a field, a function a factory returned |
+| `outside_service` | The callee is a function of this repo outside the service's files |
+| `package_unmatched` | Declared in a package the store answered with network-role exports, and none of its labels matched the call (an export the store labelled with no role is `no_site`) |
+| `unanswered_package` | Declared in a package the answer holds nothing for |
+| the row's hole | The call's own row names none (`unreadable`, and so on) |
+
+A call into the default library is never `package_unmatched`. A body that
+calls only local helpers and the default library gives `no_site`. A class
+built in the repo is not `value_callee`.
