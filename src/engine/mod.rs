@@ -6684,19 +6684,42 @@ fn site_infer_requests(
     use crate::services::type_sidecar::InferRequestItem;
     use crate::site_rows::RowSide;
     let root = Path::new(repo_path);
+    // The anchors' spans are SWC's (bytes from `SWC_SPAN_BASE`); the sidecar
+    // locates in TypeScript positions (UTF-16 units from 0), as
+    // `collect_type_requests` converts them (carrick#806, carrick#2604). One
+    // offset table per file; an unreadable file is read as ASCII, as the
+    // base subtraction alone.
+    let tables: std::cell::RefCell<HashMap<String, Option<crate::utils::Utf16Offsets>>> =
+        std::cell::RefCell::new(HashMap::new());
     let at = |anchor: &crate::request_summary::site_record::AnchorAt,
               infer_kind: InferKind,
               alias: String,
-              param_name: Option<String>| InferRequestItem {
-        file_path: root.join(&anchor.file).to_string_lossy().into_owned(),
-        line_number: anchor.line,
-        span_start: Some(anchor.span_start),
-        span_end: Some(anchor.span_end),
-        expression_text: None,
-        expression_line: None,
-        infer_kind,
-        alias: Some(alias),
-        param_name,
+              param_name: Option<String>| {
+        let path = root.join(&anchor.file);
+        let mut tables = tables.borrow_mut();
+        let table = tables
+            .entry(anchor.file.clone())
+            .or_insert_with(|| {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|text| crate::utils::Utf16Offsets::new(&text))
+            })
+            .as_ref();
+        let position = |span: u32| match table {
+            Some(table) => table.position(span),
+            None => span.saturating_sub(crate::swc_scanner::SWC_SPAN_BASE),
+        };
+        InferRequestItem {
+            file_path: path.to_string_lossy().into_owned(),
+            line_number: anchor.line,
+            span_start: Some(position(anchor.span_start)),
+            span_end: Some(position(anchor.span_end)),
+            expression_text: None,
+            expression_line: None,
+            infer_kind,
+            alias: Some(alias),
+            param_name,
+        }
     };
     let mut requests = Vec::new();
     for row in &fold.stated {
