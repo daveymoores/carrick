@@ -595,7 +595,7 @@ pub(crate) fn hole_key(reason: HoleReason) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixture_walk::{Walked, walked};
+    use super::super::fixture_walk::{NODENEXT, Walked, walked};
     use super::*;
 
     fn calls(edit: &[(&str, &str)], with_rows: bool) -> Option<Walked> {
@@ -709,14 +709,6 @@ mod tests {
             plain(every_row(&off, &without))
         );
     }
-
-    /// The wrapper fixture's own config reads its extensionless imports under
-    /// bundler resolution. Under NodeNext they do not resolve (the package is
-    /// `"type": "module"`), which is the unresolved import these tests need.
-    const NODENEXT: (&str, &str) = (
-        "web/tsconfig.json",
-        r#"{ "compilerOptions": { "target": "ES2020", "module": "NodeNext", "moduleResolution": "NodeNext", "jsx": "react-jsx", "strict": true }, "include": ["src"] }"#,
-    );
 
     /// carrick#2557: a service rooted above the directory that holds its
     /// tsconfig, whose components call service functions that call a shared
