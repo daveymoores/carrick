@@ -5219,7 +5219,7 @@ fn site_records_of(
             &crate::request_summary::decided_sites::MakerLabel::from_exports(claims),
             &crate::request_summary::decided_sites::ScopeLabel::from_exports(
                 claims,
-                Some(&declarations.verified_scopes),
+                &declarations.verified_scopes,
             ),
         ),
         None => {

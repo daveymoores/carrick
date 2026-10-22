@@ -61,6 +61,12 @@ struct RepoCensus {
     busiest_file: String,
     /// Records naming a line of a file, on average over files holding any.
     edit_reasks_mean: f64,
+    /// The scope claims the trace's own verify request verified, by claim
+    /// and receiver, over every service (carrick#2474 R2b).
+    scopes_verified: usize,
+    /// How long deciding the sites with the receiver trace took, over
+    /// every service (instance walks and composed paths included).
+    traced_ms: u128,
     /// The route sites against the scan's endpoint rows (carrick#2474 R1),
     /// when the census is handed the scan's blobs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,6 +129,8 @@ struct RoutesCensus {
     /// Composed paths by where their walk up ends: `top`, a hole's reason,
     /// `cycle`.
     composed_ends: BTreeMap<String, usize>,
+    /// Route sites whose composed paths stopped at the cap.
+    composed_trimmed: usize,
     /// Every composed path: `file:line METHOD path <- edges`.
     composed: Vec<String>,
 }
@@ -196,6 +204,7 @@ struct Routed {
     no_method: bool,
     instances: Vec<InstanceEnd>,
     composed: Vec<super::decided_sites::Composed>,
+    composed_trimmed: bool,
 }
 
 /// The routes section: `records` against the scan's endpoint rows in
@@ -206,7 +215,8 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
     use crate::site_questions::Slot;
     let mut census = RoutesCensus::default();
     let mut stated: Vec<(String, String, String)> = Vec::new();
-    let mut composed_at: Vec<(String, String, Vec<super::decided_sites::Composed>)> = Vec::new();
+    type Site = (String, String, String);
+    let mut composed_at: Vec<(Site, Vec<super::decided_sites::Composed>)> = Vec::new();
     for routed in records {
         let record = &routed.record;
         let forced = |slot| record.state.forced.get(&slot).cloned();
@@ -272,6 +282,7 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
             census.mount_shaped.push(format!("{at} {method} {name}"));
             continue;
         }
+        census.composed_trimmed += usize::from(routed.composed_trimmed);
         for composed in &routed.composed {
             *census
                 .composed_ends
@@ -283,8 +294,9 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
                 composed.edges.join(" > ")
             ));
         }
-        composed_at.push((method.clone(), at.clone(), routed.composed.clone()));
-        stated.push((method, name, at));
+        let site = (method, name, at);
+        composed_at.push((site.clone(), routed.composed.clone()));
+        stated.push(site);
     }
     let rows = endpoint_rows(blobs);
     census.endpoint_rows = rows.len();
@@ -308,8 +320,8 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
     for row in &rows {
         let here: Vec<&Vec<super::decided_sites::Composed>> = composed_at
             .iter()
-            .filter(|(method, at, _)| (method.is_empty() || row.0 == *method) && row.2 == *at)
-            .map(|(_, _, composed)| composed)
+            .filter(|(site, _)| same_place(row, site))
+            .map(|(_, composed)| composed)
             .collect();
         if here.is_empty() {
             continue;
@@ -402,8 +414,9 @@ fn census_repo(
     .exports;
     let labels = SiteLabel::from_exports(&exports);
     let makers = MakerLabel::from_exports(&exports);
-    // The census verifies nothing: every scope claim of the answer counts.
-    let scopes = ScopeLabel::from_exports(&exports, None);
+    // The scope claims count as a scan counts them: those the trace's own
+    // verify request verifies, per service (carrick#2474 R2b).
+    let script = super::fixture_walk::sidecar().expect("the built sidecar");
     let mut by_service: BTreeMap<String, PathBuf> = BTreeMap::new();
     for entry in std::fs::read_dir(positions).expect("the positions dir reads") {
         let path = entry.expect("dir entry").path();
@@ -451,9 +464,15 @@ fn census_repo(
             .filter(|site| files.contains(&site.file))
             .cloned()
             .collect();
+        let declarations =
+            super::fixture_walk::census_declarations(&script, &root, service, &inputs, &exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        census.scopes_verified += declarations.verified_scopes.len();
         // Traced: each site also names its instance (carrick#2474 R2a),
         // which only the routes section reads.
+        let started = std::time::Instant::now();
         let decided = decided_sites_traced(&inputs, &root, &mine, &labels, &makers, &scopes);
+        census.traced_ms += started.elapsed().as_millis();
         census.decided_sites += decided.sites.len();
         census.unplaced += decided.unplaced.len();
         census.walked += decided.walked.len();
@@ -493,6 +512,7 @@ fn census_repo(
                     }),
                 instances: site.map(|site| site.instances.clone()).unwrap_or_default(),
                 composed: site.map(|site| site.composed.clone()).unwrap_or_default(),
+                composed_trimmed: site.is_some_and(|site| site.composed_trimmed),
             });
         }
         for record in &records {

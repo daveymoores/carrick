@@ -525,6 +525,10 @@ pub struct DecidedSite {
     /// down (carrick#2474 R2b). Read by nothing; never part of a record's
     /// state.
     pub composed: Vec<Composed>,
+    /// Whether `composed` stopped at its cap
+    /// ([`composed::MAX_COMPOSED`] chains, and paths): some paths are
+    /// left out.
+    pub composed_trimmed: bool,
 }
 
 impl DecidedSite {
@@ -849,14 +853,6 @@ impl<'a> Calls<'a> {
         self.callers
             .get(&(file.to_path_buf(), key.to_string()))
             .map_or(&[], Vec::as_slice)
-    }
-
-    /// Every call written in `file`.
-    fn in_file<'s>(&'s self, file: &'s Path) -> impl Iterator<Item = &'s Placed<'a>> + 's {
-        self.by_span
-            .iter()
-            .filter(move |((at, ..), _)| *at == file)
-            .map(|(_, placed)| placed)
     }
 }
 
@@ -1227,6 +1223,9 @@ struct Walk<'a, 'i> {
     /// With the receiver trace on, the scope members the store labels
     /// (carrick#2474 R2b).
     scopes: &'i [ScopeLabel],
+    /// With the receiver trace on, what every instance walk of the service
+    /// reads, built once.
+    index: Option<&'i instances::WalkIndex<'a>>,
     out: &'i mut Decided,
     seen: HashSet<(String, u32, Option<String>, String)>,
     /// The label of the labelled call being walked.
@@ -1291,22 +1290,24 @@ impl<'a> Walk<'a, '_> {
             reached: self.reached,
             instances,
             composed: Vec::new(),
+            composed_trimmed: false,
         });
     }
 
     /// With the receiver trace on, the instance ends of the site whose
     /// calls are `down` ([`instances`]); none with it off.
     fn instances(&self, down: &[Placed<'a>]) -> Vec<InstanceEnd> {
-        match self.makers {
-            Some(makers) => instances::InstanceWalk::new(
+        match (self.makers, self.index) {
+            (Some(makers), Some(index)) => instances::InstanceWalk::new(
                 self.calls,
                 self.inputs,
                 self.root,
                 makers,
                 self.scopes,
+                index,
             )
             .of(down),
-            None => Vec::new(),
+            _ => Vec::new(),
         }
     }
 
@@ -1463,6 +1464,7 @@ impl<'a> Walk<'a, '_> {
                 reached: self.reached,
                 instances: instances.clone(),
                 composed: Vec::new(),
+                composed_trimmed: false,
             });
         }
     }
@@ -1545,6 +1547,7 @@ fn decide(
     scopes: &[ScopeLabel],
 ) -> Decided {
     let calls = Calls::index(inputs);
+    let index = makers.map(|_| instances::WalkIndex::of(&calls, inputs, scopes));
     let mut out = Decided::default();
     // The functions some listed site's chain enters: a site whose value
     // still holds a parameter is decided by those callers, which discovery
@@ -1563,6 +1566,7 @@ fn decide(
         root,
         makers,
         scopes,
+        index: index.as_ref(),
         out: &mut out,
         seen: HashSet::new(),
         label: None,
@@ -1687,10 +1691,10 @@ fn decide(
             walk.up(&chain, &top, end, &mut Vec::new());
         }
     }
-    if let Some(makers) = makers {
-        let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes);
+    if let (Some(makers), Some(index)) = (makers, &index) {
+        let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes, index);
         for site in &mut out.sites {
-            site.composed =
+            (site.composed, site.composed_trimmed) =
                 composed::compose(&site.instances, site.name_text().as_deref(), &mounts);
         }
     }

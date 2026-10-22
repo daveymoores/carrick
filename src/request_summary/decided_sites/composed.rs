@@ -19,7 +19,8 @@ use serde::Serialize;
 
 use super::super::RequestSummaryInputs;
 use super::instances::{
-    InstanceAt, InstanceEnd, InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, prefix_of,
+    InstanceAt, InstanceEnd, InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, WalkIndex,
+    prefix_of,
 };
 use super::{Calls, Placed, relative};
 
@@ -63,6 +64,7 @@ pub(super) fn mount_edges<'a>(
     root: &Path,
     makers: &[MakerLabel],
     scopes: &[ScopeLabel],
+    index: &WalkIndex<'a>,
 ) -> Vec<MountEdge> {
     let mounts: Vec<&ScopeLabel> = scopes
         .iter()
@@ -88,7 +90,7 @@ pub(super) fn mount_edges<'a>(
             b.call.site.span_end,
         ))
     });
-    let walk = || InstanceWalk::new(calls, inputs, root, makers, scopes);
+    let walk = || InstanceWalk::new(calls, inputs, root, makers, scopes, index);
     let mut edges = Vec::new();
     for placed in placed {
         if !walk().library_call(placed.file, placed.call) {
@@ -145,38 +147,74 @@ fn edge_text(at: &str, member: &str, prefix: &Prefix) -> String {
     format!("{at} {member} {prefix}")
 }
 
-fn chains(end: &InstanceEnd, mounts: &[MountEdge], seen: &mut Vec<(String, u32)>) -> Vec<Chain> {
+/// The most chains and paths one site composes: each mount edge and each
+/// scope's parent multiplies the chains, and each stated value the paths,
+/// with no bound of their own.
+pub(super) const MAX_COMPOSED: usize = 64;
+
+/// What is left of one site's [`MAX_COMPOSED`], and whether it trimmed.
+struct Budget {
+    left: usize,
+    trimmed: bool,
+}
+
+impl Budget {
+    /// Takes one, or says the cap is reached.
+    fn take(&mut self) -> bool {
+        if self.left == 0 {
+            self.trimmed = true;
+            return false;
+        }
+        self.left -= 1;
+        true
+    }
+}
+
+/// One chain per walk up from `end` to where it ends, each walk's end
+/// taking one of `budget`.
+fn chains(
+    end: &InstanceEnd,
+    mounts: &[MountEdge],
+    seen: &mut Vec<(String, u32)>,
+    budget: &mut Budget,
+) -> Vec<Chain> {
+    if budget.left == 0 {
+        budget.trimmed = true;
+        return Vec::new();
+    }
+    let ended = |end: String, budget: &mut Budget| {
+        if budget.take() {
+            vec![Chain {
+                prefixes: Vec::new(),
+                edges: Vec::new(),
+                end,
+            }]
+        } else {
+            Vec::new()
+        }
+    };
     match &end.end {
-        InstanceAt::Hole { reason, .. } => vec![Chain {
-            prefixes: Vec::new(),
-            edges: Vec::new(),
-            end: serde_json::to_value(reason)
+        InstanceAt::Hole { reason, .. } => ended(
+            serde_json::to_value(reason)
                 .ok()
                 .and_then(|reason| reason.as_str().map(str::to_string))
                 .unwrap_or_default(),
-        }],
+            budget,
+        ),
         InstanceAt::Root { file, line, .. } => {
             let here = (file.clone(), *line);
             if seen.contains(&here) {
-                return vec![Chain {
-                    prefixes: Vec::new(),
-                    edges: Vec::new(),
-                    end: "cycle".to_string(),
-                }];
+                return ended("cycle".to_string(), budget);
             }
             let served: Vec<&MountEdge> = mounts.iter().filter(|edge| edge.child == here).collect();
             if served.is_empty() {
-                return vec![Chain {
-                    prefixes: Vec::new(),
-                    edges: Vec::new(),
-                    end: "top".to_string(),
-                }];
+                return ended("top".to_string(), budget);
             }
             seen.push(here);
             let mut out = Vec::new();
             for edge in served {
                 for parent in &edge.parents {
-                    for mut chain in chains(parent, mounts, seen) {
+                    for mut chain in chains(parent, mounts, seen, budget) {
                         chain.prefixes.push(edge.prefix.clone());
                         chain
                             .edges
@@ -199,7 +237,7 @@ fn chains(end: &InstanceEnd, mounts: &[MountEdge], seen: &mut Vec<(String, u32)>
             let at = format!("{file}:{line}");
             let mut out = Vec::new();
             for parent in parents {
-                for mut chain in chains(parent, mounts, seen) {
+                for mut chain in chains(parent, mounts, seen, budget) {
                     chain.prefixes.push(prefix.clone());
                     chain.edges.push(edge_text(&at, member, prefix));
                     out.push(chain);
@@ -219,56 +257,139 @@ fn join_path(parts: &[&str]) -> String {
 }
 
 /// The paths a route site whose call writes `route`, made on `ends`, is
-/// served at: one per chain up each end, and per stated prefix value.
+/// served at: one per chain up each end, and per stated prefix value, at
+/// most [`MAX_COMPOSED`] of each; true where the cap left some out.
 pub(super) fn compose(
     ends: &[InstanceEnd],
     route: Option<&str>,
     mounts: &[MountEdge],
-) -> Vec<Composed> {
+) -> (Vec<Composed>, bool) {
     let mut out: Vec<Composed> = Vec::new();
+    let mut budget = Budget {
+        left: MAX_COMPOSED,
+        trimmed: false,
+    };
+    let mut all: Vec<Chain> = Vec::new();
     for end in ends {
-        for chain in chains(end, mounts, &mut Vec::new()) {
-            // Every stated value, one path each.
-            let mut paths: Vec<Option<Vec<String>>> = vec![Some(Vec::new())];
-            let mut unread = false;
-            for prefix in &chain.prefixes {
-                match prefix {
-                    Prefix::Unstated => {}
-                    Prefix::Stated { values } => {
-                        paths = paths
-                            .into_iter()
-                            .flat_map(|path| {
-                                values.iter().map(move |value| {
-                                    path.clone().map(|mut parts| {
-                                        parts.push(value.clone());
-                                        parts
-                                    })
+        all.extend(chains(end, mounts, &mut Vec::new(), &mut budget));
+    }
+    for chain in all {
+        // Every stated value, one path each.
+        let mut paths: Vec<Option<Vec<String>>> = vec![Some(Vec::new())];
+        let mut unread = false;
+        for prefix in &chain.prefixes {
+            match prefix {
+                Prefix::Unstated => {}
+                Prefix::Stated { values } => {
+                    paths = paths
+                        .into_iter()
+                        .flat_map(|path| {
+                            values.iter().map(move |value| {
+                                path.clone().map(|mut parts| {
+                                    parts.push(value.clone());
+                                    parts
                                 })
                             })
-                            .collect();
+                        })
+                        .take(MAX_COMPOSED + 1)
+                        .collect();
+                    if paths.len() > MAX_COMPOSED {
+                        paths.truncate(MAX_COMPOSED);
+                        budget.trimmed = true;
                     }
-                    Prefix::Unread { .. } => unread = true,
                 }
-            }
-            for parts in paths {
-                let path = match (!unread, route, parts) {
-                    (true, Some(route), Some(mut parts)) => {
-                        parts.push(route.to_string());
-                        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
-                        Some(join_path(&parts))
-                    }
-                    _ => None,
-                };
-                let composed = Composed {
-                    path,
-                    edges: chain.edges.clone(),
-                    end: chain.end.clone(),
-                };
-                if !out.contains(&composed) {
-                    out.push(composed);
-                }
+                Prefix::Unread { .. } => unread = true,
             }
         }
+        for parts in paths {
+            let path = match (!unread, route, parts) {
+                (true, Some(route), Some(mut parts)) => {
+                    parts.push(route.to_string());
+                    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+                    Some(join_path(&parts))
+                }
+                _ => None,
+            };
+            let composed = Composed {
+                path,
+                edges: chain.edges.clone(),
+                end: chain.end.clone(),
+            };
+            if out.contains(&composed) {
+                continue;
+            }
+            if out.len() == MAX_COMPOSED {
+                budget.trimmed = true;
+                break;
+            }
+            out.push(composed);
+        }
     }
-    out
+    (out, budget.trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root(line: u32) -> InstanceEnd {
+        InstanceEnd {
+            at: format!("src/app.ts:{line}"),
+            end: InstanceAt::Root {
+                file: "src/app.ts".to_string(),
+                line,
+                package: "fixture-server".to_string(),
+                export: "default".to_string(),
+                member: None,
+                receiver: "instance:()".to_string(),
+            },
+        }
+    }
+
+    fn scope(values: Vec<String>, parents: Vec<InstanceEnd>) -> InstanceEnd {
+        InstanceEnd {
+            at: "src/routes.ts:3".to_string(),
+            end: InstanceAt::Scope {
+                file: "src/plugin.ts".to_string(),
+                line: 5,
+                member: "register".to_string(),
+                prefix: Prefix::Stated { values },
+                package: "fixture-server".to_string(),
+                export: "default".to_string(),
+                receiver: "instance:()".to_string(),
+                parents,
+            },
+        }
+    }
+
+    /// carrick#2474 R2b: the chains and paths one site composes stop at
+    /// [`MAX_COMPOSED`], and the site says the cap trimmed them: a scope
+    /// with more stated values than the cap, and one under more parents.
+    #[test]
+    fn the_composed_paths_of_one_site_stop_at_the_cap() {
+        let values: Vec<String> = (0..100).map(|n| format!("/v{n}")).collect();
+        let (paths, trimmed) = compose(&[scope(values, vec![root(1)])], Some("/x"), &[]);
+        assert_eq!(paths.len(), MAX_COMPOSED);
+        assert!(trimmed);
+        let parents: Vec<InstanceEnd> = (1..=100).map(root).collect();
+        let (paths, trimmed) = compose(&[scope(vec!["/a".to_string()], parents)], Some("/x"), &[]);
+        assert!(paths.len() <= MAX_COMPOSED, "{}", paths.len());
+        assert!(trimmed);
+        let (paths, trimmed) = compose(
+            &[scope(
+                vec!["/a".to_string(), "/b".to_string()],
+                vec![root(1)],
+            )],
+            Some("/x"),
+            &[],
+        );
+        assert_eq!(
+            paths
+                .iter()
+                .map(|composed| composed.path.clone().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["/a/x", "/b/x"]
+        );
+        assert!(!trimmed);
+    }
 }
