@@ -10556,6 +10556,7 @@ impl FileOrchestrator {
         modules: &WorkspaceIndex,
         extra_explicit: &[SymbolRequest],
         extra_infer: &[InferRequestItem],
+        payload_infer: &[InferRequestItem],
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
         let (mut explicit, mut infer, inline_aliases) =
             self.collect_type_requests(file_results, repo_path, mount_graph, config, modules);
@@ -10573,6 +10574,9 @@ impl FileOrchestrator {
         // bundle path — bundling the SDL anchor would emit the generic wrapper.
         // The alias each carries matches its manifest entry so the join lands.
         infer.extend_from_slice(extra_infer);
+        // A payload the fact layer places is read there, not at the model
+        // reader's locator (`CARRICK_SITE_PAYLOADS=1`; empty otherwise).
+        crate::site_payloads::take_over(&mut infer, payload_infer);
 
         debug!(
             "[FileOrchestrator] Resolving types: {} explicit ({} from non-HTTP protocols), {} inferred ({} from non-HTTP protocols)",

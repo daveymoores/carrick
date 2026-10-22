@@ -122,6 +122,7 @@ fn record(site: &DecidedSite, forced: &[(Slot, &str)], asked: &[Slot]) -> SiteRe
                 param_name: Some("message".to_string()),
             }),
         },
+        payloads: Default::default(),
         // A forced name is the code's; every other forced slot the label's.
         basis: forced
             .keys()

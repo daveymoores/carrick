@@ -244,6 +244,70 @@ pub struct HandlerAnchor {
     pub param_name: Option<String>,
 }
 
+/// Where a decided site's payloads are written in place (phase 3, step 1):
+/// the fact layer says which expression holds each payload, and the type
+/// capture prints its type there. A call's request is its body argument and
+/// its response is its own result; a handler's request is the parameter it
+/// is run with. A slot is filled only where the site's own call or handler
+/// states it, in the same function: a payload a call below builds, a value
+/// a caller hands in, and a route handler's body read and response value
+/// (which need the label fields carrick#2474 lists) are left empty.
+///
+/// Scanner-side only, like the anchors, and outside [`SiteState`], so no
+/// site's sha and no cache key moves.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PayloadSlots {
+    /// What the site sends, or what its handler is run with.
+    pub request: Option<PayloadAt>,
+    /// What the site's call gives back.
+    pub response: Option<PayloadAt>,
+}
+
+/// One payload's place, and how its type is read there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadAt {
+    /// The value an expression holds: a call's body argument.
+    Value(AnchorAt),
+    /// What a call gives back, read at the call.
+    Result(AnchorAt),
+    /// What a handler is run with: its parameter, as the source writes it,
+    /// in the function at `at`.
+    Param { at: AnchorAt, name: String },
+}
+
+impl PayloadAt {
+    pub fn at(&self) -> &AnchorAt {
+        match self {
+            PayloadAt::Value(at) | PayloadAt::Result(at) | PayloadAt::Param { at, .. } => at,
+        }
+    }
+}
+
+/// The payload slots a site's own call or handler fills ([`PayloadSlots`]):
+/// a send's body at the argument its label names (`payload_at`), a call's
+/// result at the call, a receive's parameter at its handler.
+fn payload_slots(
+    call: &AnchorAt,
+    payload_at: Option<&AnchorAt>,
+    handler: Option<&HandlerAnchor>,
+) -> PayloadSlots {
+    match handler {
+        // A receive: the payload arrives in the handler's parameter. What
+        // it responds with is not stated by any label yet.
+        Some(handler) => PayloadSlots {
+            request: handler.param_name.as_ref().map(|name| PayloadAt::Param {
+                at: handler.at.clone(),
+                name: name.clone(),
+            }),
+            response: None,
+        },
+        None => PayloadSlots {
+            request: payload_at.cloned().map(PayloadAt::Value),
+            response: Some(PayloadAt::Result(call.clone())),
+        },
+    }
+}
+
 /// Which bucket a site falls in under the slot rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -276,6 +340,9 @@ pub struct SiteRecord {
     /// What crosses the wire (carrick#2437).
     pub state: SiteState,
     pub anchors: TypeAnchors,
+    /// Where the site's payloads are written in place. Off the wire.
+    #[serde(skip)]
+    pub payloads: PayloadSlots,
     /// What each forced slot rests on (carrick#2520). Scanner-side only,
     /// like the anchors: off the wire, so no cache key moves.
     pub basis: BTreeMap<Slot, Basis>,
@@ -1655,9 +1722,15 @@ fn record(
         payload_at,
         handler,
     };
+    let payloads = payload_slots(
+        &anchors.call,
+        anchors.payload_at.as_ref(),
+        anchors.handler.as_ref(),
+    );
     Some(SiteRecord {
         state,
         anchors,
+        payloads,
         basis,
         bucket,
         lead: (bucket == Bucket::Lead).then_some("name_unstated"),
@@ -2635,6 +2708,44 @@ mod tests {
             ),
             (ROOMS, line_of(&text, "{ shipped }"), start, end)
         );
+    }
+
+    /// A send's slots (phase 3 step 1): its request is the body argument the
+    /// label names, its response the call's own result. A receive's request
+    /// is its handler's parameter, and nothing states what it responds with.
+    /// Neither moves the state.
+    #[test]
+    fn a_sites_payload_slots_are_its_body_its_result_and_its_handlers_parameter() {
+        let (records, text) = rooms_records(false);
+        let settle = rooms_record(&records, &text, "wire.emit(topic");
+        let (start, end) = span_of(&text, "{ shipped }");
+        let body = AnchorAt {
+            file: ROOMS.to_string(),
+            line: line_of(&text, "{ shipped }"),
+            span_start: start,
+            span_end: end,
+        };
+        assert_eq!(settle.payloads.request, Some(PayloadAt::Value(body)));
+        assert_eq!(
+            settle.payloads.response,
+            Some(PayloadAt::Result(settle.anchors.call.clone()))
+        );
+
+        let joined = rooms_record(&records, &text, "wire.on(\"user.joined\"");
+        let handler = joined.anchors.handler.clone().expect("a handler");
+        assert_eq!(
+            joined.payloads.request,
+            Some(PayloadAt::Param {
+                at: handler.at,
+                name: "data".to_string(),
+            })
+        );
+        assert_eq!(joined.payloads.response, None);
+
+        let state = serde_json::to_value(&settle.state).unwrap();
+        let whole = serde_json::to_value(settle).unwrap();
+        assert!(whole.get("payloads").is_none(), "{whole}");
+        assert!(!state.to_string().contains("payloads"), "{state}");
     }
 
     /// The state's parts as the contract writes them: the object entries
