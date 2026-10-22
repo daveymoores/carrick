@@ -140,12 +140,24 @@ fn a_call_in_a_const_asserted_table_keeps_its_inferred_response_type() {
         "capture decayed the call's type: {captured}"
     );
     let surface = files["types/surface.d.ts"].as_str().expect("surface stub");
-    let surface_line = surface
-        .lines()
-        .find(|l| l.contains(&format!("type {alias} =")))
-        .unwrap_or_else(|| panic!("no stub line for {alias}:\n{surface}"));
-    assert!(
-        surface_line.contains("installEnabled: boolean"),
-        "stub alias is not the inferred type: {surface_line}"
-    );
+    // The stub prints an object alias across lines: read up to the next
+    // declaration.
+    let start = surface
+        .find(&format!("type {alias} ="))
+        .unwrap_or_else(|| panic!("no stub declaration for {alias}:\n{surface}"));
+    let declaration = &surface[start..];
+    let declaration = declaration
+        .find("\nexport ")
+        .map_or(declaration, |end| &declaration[..end]);
+    let declaration = declaration.split_whitespace().collect::<Vec<_>>().join(" ");
+    for member in [
+        "installEnabled: boolean",
+        "projectEnabled: boolean",
+        "evaluator: string",
+    ] {
+        assert!(
+            declaration.contains(member),
+            "stub alias lost `{member}`: {declaration}"
+        );
+    }
 }
