@@ -364,6 +364,17 @@ fn stand_in_recipe(script: &Path, timeout: Duration) -> SidecarRecipe {
         .expect("spawn the stand-in")
         .with_operation_timeout(timeout);
     let recipe = sidecar.recipe();
+    // The count of processes starts at this one. Dropping it before node has
+    // run its first line would kill it unrecorded and the count would be short.
+    let pids = script.with_file_name("pids");
+    let started = std::time::Instant::now();
+    while fs::read_to_string(&pids).unwrap_or_default().is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the stand-in never recorded its start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     drop(sidecar);
     recipe
 }
