@@ -81,6 +81,17 @@ export const FLAG_TOO_MANY = 16;
 export const FLAG_PUBLISHED = 32;
 /** The declaration is what its module exports as `export =` or `default` (carrick#2508). */
 export const FLAG_MODULE_DEFAULT = 64;
+/**
+ * A `call` row only: the call's declared return is the result of the
+ * function it is handed (`ReturnType<F>`, a bare type parameter the handed
+ * function returns, or an awaitable of one), so the library runs it and
+ * hands its result back (carrick#2634). Set when the call passes at least
+ * one argument at a function-typed parameter and every such parameter
+ * meets that return. The last free bit of the `u8`: the next flag widens
+ * the field and bumps the format. Pinned to `FLAG_RUNS_HANDED` in
+ * `src/position_rows.rs` by `position-rows-runs-handed.test.ts`.
+ */
+export const FLAG_RUNS_HANDED = 128;
 
 /** The most `decl` rows one position lists. */
 export const DECL_CAP = 16;
@@ -491,6 +502,7 @@ class PositionWalker {
       if (type.flags & ts.TypeFlags.Any) {
         flags |= (type as { intrinsicName?: string }).intrinsicName === 'error' ? FLAG_ERROR_TYPE : FLAG_ANY;
       }
+      if (kind === 'call' && this.runsHanded(node)) flags |= FLAG_RUNS_HANDED;
       const typeText = this.paths.scrubType(typeToStringAsDeclared(this.checker, type, undefined));
       if (!symbol) return [kind, start, end, null, null, null, null, typeText, flags];
       const declaration =
@@ -516,6 +528,92 @@ class PositionWalker {
     } catch {
       return [kind, start, end, null, null, null, null, null, FLAG_CHECKER_THREW];
     }
+  }
+
+  /**
+   * Whether a call's declared return is the result of the function it is
+   * handed (carrick#2634), read from the declared signature through public
+   * checker calls. See {@link FLAG_RUNS_HANDED}.
+   */
+  private runsHanded(node: ts.Node): boolean {
+    if (!ts.isCallExpression(node) && !ts.isNewExpression(node)) return false;
+    const args = node.arguments ?? [];
+    if (args.length === 0) return false;
+    try {
+      const declaration = this.checker.getResolvedSignature(node)?.declaration;
+      if (!declaration || ts.isJSDocSignature(declaration)) return false;
+      const declared = this.checker.getSignatureFromDeclaration(declaration);
+      if (!declared) return false;
+      const own = new Set<ts.Type>(declared.getTypeParameters() ?? []);
+      const results = new Map<ts.Type, object>();
+      const resultOf = (f: ts.Type): object => {
+        let atom = results.get(f);
+        if (!atom) results.set(f, (atom = {}));
+        return atom;
+      };
+      const atoms = (t: ts.Type, out: Set<unknown>, depth = 0): Set<unknown> => {
+        if (depth > 8) return out;
+        if (t.flags & ts.TypeFlags.TypeParameter) {
+          if (own.has(t)) out.add(t);
+        } else if (t.flags & ts.TypeFlags.UnionOrIntersection) {
+          for (const member of (t as ts.UnionOrIntersectionType).types) atoms(member, out, depth + 1);
+        } else if (t.flags & ts.TypeFlags.Conditional) {
+          const f = resultOfConditional(t as ts.ConditionalType, own);
+          if (f) out.add(resultOf(f));
+        } else if (isReference(t) && this.isAwaitable(t)) {
+          for (const arg of this.checker.getTypeArguments(t)) atoms(arg, out, depth + 1);
+        }
+        return out;
+      };
+      const returned = atoms(this.checker.getReturnTypeOfSignature(declared), new Set());
+      if (returned.size === 0) return false;
+      const parameters = declared.getParameters();
+      let handed = 0;
+      for (let i = 0; i < args.length; i++) {
+        const parameter = parameters[Math.min(i, parameters.length - 1)];
+        if (!parameter) continue;
+        const isRest =
+          parameter.valueDeclaration !== undefined &&
+          ts.isParameter(parameter.valueDeclaration) &&
+          parameter.valueDeclaration.dotDotDotToken !== undefined;
+        if (!isRest && i >= parameters.length) continue;
+        let type = this.checker.getTypeOfSymbolAtLocation(parameter, declaration);
+        if (isRest) {
+          if (!isReference(type)) continue;
+          const [element] = this.checker.getTypeArguments(type);
+          if (!element) continue;
+          type = element;
+        }
+        const signatures = this.callSignaturesOf(type);
+        if (signatures.length === 0) continue;
+        handed++;
+        const mine = new Set<unknown>();
+        if (type.flags & ts.TypeFlags.TypeParameter) mine.add(resultOf(type));
+        else for (const signature of signatures) atoms(this.checker.getReturnTypeOfSignature(signature), mine);
+        if (![...mine].some((atom) => returned.has(atom))) return false;
+      }
+      return handed > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The call signatures of a parameter's type, a type parameter read through its constraint, `null` and `undefined` skipped. */
+  private callSignaturesOf(type: ts.Type): readonly ts.Signature[] {
+    let t = type;
+    if (t.flags & ts.TypeFlags.TypeParameter) t = this.checker.getBaseConstraintOfType(t) ?? t;
+    if (t.flags & ts.TypeFlags.Union) {
+      const kept = (t as ts.UnionType).types.filter((m) => !(m.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)));
+      if (kept.length !== 1) return [];
+      t = kept[0];
+    }
+    return this.checker.getSignaturesOfType(t, ts.SignatureKind.Call);
+  }
+
+  /** The compiler's own awaited type differs from the type: `Promise<R>`, `PromiseLike<R>`. */
+  private isAwaitable(t: ts.Type): boolean {
+    const awaited = this.checker.getAwaitedType(t);
+    return awaited !== undefined && awaited !== t;
   }
 
   /**
@@ -821,6 +919,26 @@ function compareNames(a: string | null, b: string | null): number {
   if (a === null) return 1;
   if (b === null) return -1;
   return a < b ? -1 : 1;
+}
+
+function isReference(t: ts.Type): t is ts.TypeReference {
+  return !!(t.flags & ts.TypeFlags.Object) && !!((t as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference);
+}
+
+/**
+ * The type parameter `F` of a conditional written `F extends (...) => infer R ? R : _`
+ * (`ReturnType<F>`): the result of `F`. `Parameters<F>` and the like infer
+ * elsewhere and give nothing.
+ */
+function resultOfConditional(t: ts.ConditionalType, own: ReadonlySet<ts.Type>): ts.Type | undefined {
+  if (!(t.checkType.flags & ts.TypeFlags.TypeParameter) || !own.has(t.checkType)) return undefined;
+  const node = t.root.node;
+  if (!ts.isFunctionTypeNode(node.extendsType)) return undefined;
+  const returns = node.extendsType.type;
+  if (!ts.isInferTypeNode(returns)) return undefined;
+  const yielded = node.trueType;
+  if (!ts.isTypeReferenceNode(yielded) || !ts.isIdentifier(yielded.typeName)) return undefined;
+  return yielded.typeName.text === returns.typeParameter.name.text ? t.checkType : undefined;
 }
 
 /** The kind of row a node gives, if any (exported for the editor-parity test, carrick#2418). */
