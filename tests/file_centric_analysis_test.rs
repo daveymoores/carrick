@@ -317,6 +317,8 @@ fn test_processing_stats_tracking() {
         files_parse_failed: 1,
         files_analysis_failed: 0,
         files_skipped_unrouted_protocol: 0,
+        fact_layer_files: 0,
+        fallback_selection: Default::default(),
         deterministic_rows_emitted: Default::default(),
         summary_rows_withdrawn: 0,
         summary_dispatch_settled: 0,
