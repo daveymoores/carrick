@@ -12,11 +12,13 @@
 
 import { Project, getCompilerOptionsFromTsConfig, type CompilerOptions, type FileSystemHost } from 'ts-morph';
 import * as path from 'node:path';
+import ts from 'typescript';
 import * as fs from 'node:fs';
 import type { TsconfigSnapshot, PinnedDependencySnapshot } from './types.js';
 import {
   DenoProject,
   findDenoConfig,
+  fileConfigPath,
   findServiceTsconfig,
   referenceRedirectOf,
   serviceConfigPath,
@@ -148,6 +150,14 @@ const TARGET_MAP: Record<string, number> = {
   'ESNext': 99,
 };
 
+/** Whether the config's own `compilerOptions` state `maxNodeModuleJsDepth`. */
+function statesJsDepth(configPath: string): boolean {
+  const raw = ts.readConfigFile(configPath, ts.sys.readFile).config as
+    | { compilerOptions?: Record<string, unknown> }
+    | undefined;
+  return raw?.compilerOptions?.maxNodeModuleJsDepth !== undefined;
+}
+
 /**
  * ProjectLoader - Manages ts-morph Project initialization and access
  *
@@ -182,6 +192,16 @@ export class ProjectLoader {
   private denoProject: DenoProject | undefined;
   /** The tsconfig the service names, when the project is built from one. */
   private namedTsconfigPath: string | undefined;
+  /**
+   * Set when the service has no config at or above its root: each file is then
+   * typed under the nearest `tsconfig.json`/`jsconfig.json` on its way up to
+   * the service root (carrick#1604), and the default project holds the rest.
+   */
+  private inferredService = false;
+  /** The per-directory answers of `fileConfigPath` for this service. */
+  private readonly fileConfigs = new Map<string, string | undefined>();
+  /** The reference owner rule of each config a file was found under. */
+  private readonly ownerRules = new Map<string, (file?: string) => string>();
   /** Each file's owning config (carrick#1604), resolved on first use. */
   private configPathFor: ((file?: string) => string) | undefined;
   /** Programs built for owning projects other than the named tsconfig. */
@@ -294,6 +314,7 @@ export class ProjectLoader {
           this.buildProject = (kind) => this.projectFromConfig(tsconfigPath, kind);
         } else {
           this.log('No tsconfig.json found, using default compiler options');
+          this.inferredService = true;
           this.buildProject = (kind) => {
             const project = new Project({
               ...this.fileSystemOption(),
@@ -301,7 +322,7 @@ export class ProjectLoader {
               skipAddingFilesFromTsConfig: true,
             });
             // Add source files from common locations
-            if (kind === 'listed') this.addDefaultSourceFiles(project);
+            if (kind === 'listed') this.addDefaultSourceFiles(project, (file) => this.projectKeyFor(file) === '');
             return project;
           };
         }
@@ -411,11 +432,18 @@ export class ProjectLoader {
    */
   private projectFromConfig(configPath: string, kind: BuildKind = 'listed'): Project {
     const imports = new ExternalImports();
+    const options = getCompilerOptionsFromTsConfig(configPath).options;
+    // TypeScript reads a `jsconfig.json` with an implicit depth of 2, which
+    // loads the JavaScript sources of installed packages; every other program
+    // here reads 0. A depth the config states is kept (carrick#1604).
+    if (this.inferredService && path.basename(configPath) === 'jsconfig.json' && !statesJsDepth(configPath)) {
+      options.maxNodeModuleJsDepth = 0;
+    }
     const project = new Project({
       ...this.fileSystemOption(),
       tsConfigFilePath: configPath,
       // Over the tsconfig's own options: ts-morph lays these on top.
-      compilerOptions: sidecarCompilerOptions(optionsFor(kind, getCompilerOptionsFromTsConfig(configPath).options)),
+      compilerOptions: sidecarCompilerOptions(optionsFor(kind, options)),
       skipAddingFilesFromTsConfig: kind === 'scripts',
       // Each import resolves in its file's own module format (carrick#1619),
       // a referenced project's unbuilt output reads as its source, under its
@@ -438,10 +466,29 @@ export class ProjectLoader {
    * as before.
    */
   projectKeyFor(file?: string): string {
+    if (this.inferredService) return this.inferredKeyFor(file);
     if (!this.namedTsconfigPath || file === undefined) return '';
     this.configPathFor ??= serviceConfigPath(this.namedTsconfigPath, (d) => this.logError(d));
     const config = this.configPathFor(path.resolve(this.repoRoot, file));
     return config === this.namedTsconfigPath ? '' : config;
+  }
+
+  /**
+   * `projectKeyFor` for a service with no config at its root: the owner of the
+   * nearest config on the file's way up to the service root, or `''` (the
+   * default project, under the inferred options) for a file with none.
+   */
+  private inferredKeyFor(file?: string): string {
+    if (file === undefined) return '';
+    const absolute = path.resolve(this.repoRoot, file);
+    const config = fileConfigPath(absolute, this.repoRoot, this.fileConfigs);
+    if (config === undefined) return '';
+    let owner = this.ownerRules.get(config);
+    if (!owner) {
+      owner = serviceConfigPath(config, (d) => this.logError(d));
+      this.ownerRules.set(config, owner);
+    }
+    return owner(absolute);
   }
 
   /**
@@ -593,7 +640,7 @@ export class ProjectLoader {
    * dependencies installed it cost 40 s and added nothing the compiler needs
    * (carrick#749).
    */
-  private addDefaultSourceFiles(project: Project): void {
+  private addDefaultSourceFiles(project: Project, keep: (file: string) => boolean = () => true): void {
     const globs = DEFAULT_SOURCE_PATTERNS.map((pattern) =>
       path.join(this.repoRoot, pattern)
     );
@@ -611,6 +658,7 @@ export class ProjectLoader {
     }
 
     for (const filePath of filePaths) {
+      if (!keep(filePath)) continue;
       try {
         project.addSourceFileAtPath(filePath);
       } catch {

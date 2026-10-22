@@ -682,16 +682,53 @@ mod tests {
         out
     }
 
+    /// carrick#1604: the wrapper fixture's service is rooted above the
+    /// `web/` folder that holds its tsconfig. Each file is typed under that
+    /// config, so the rows resolve every import and no call is read around
+    /// them, and the summaries state the rows the call graph alone states.
+    #[test]
+    fn a_service_whose_config_sits_below_its_root_is_read_through_the_rows() {
+        let Some(off) = walked("position-rows-wrapper", ".", "web", &[], false) else {
+            return;
+        };
+        let without = summarize(&off.inputs, &LibrarySemantics::default());
+        let on = walked("position-rows-wrapper", ".", "web", &[], true).unwrap();
+        let with = summarize(&on.inputs, &LibrarySemantics::default());
+        assert!(with.row_count() > 0);
+        assert_eq!(with.fell_back(), 0);
+        assert_eq!(with.unfollowed_count(), 0, "{:?}", with.unfollowed());
+        // The call graph writes a path through the service root as `/./`,
+        // the rows as `/`: the same file.
+        let plain = |rows: Vec<String>| -> Vec<String> {
+            let mut rows: Vec<String> = rows.iter().map(|row| row.replace("/./", "/")).collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(
+            plain(every_row(&on, &with)),
+            plain(every_row(&off, &without))
+        );
+    }
+
+    /// The wrapper fixture's own config reads its extensionless imports under
+    /// bundler resolution. Under NodeNext they do not resolve (the package is
+    /// `"type": "module"`), which is the unresolved import these tests need.
+    const NODENEXT: (&str, &str) = (
+        "web/tsconfig.json",
+        r#"{ "compilerOptions": { "target": "ES2020", "module": "NodeNext", "moduleResolution": "NodeNext", "jsx": "react-jsx", "strict": true }, "include": ["src"] }"#,
+    );
+
     /// carrick#2557: a service rooted above the directory that holds its
     /// tsconfig, whose components call service functions that call a shared
     /// fetch wrapper. The call graph follows every import; the compiler's
-    /// rows, walked with no tsconfig at the service root, resolve none of
-    /// them. An import the compiler cannot resolve tells it nothing about
+    /// rows, walked under a config whose resolution cannot read the
+    /// extensionless imports, resolve none of them. An import the compiler cannot resolve tells it nothing about
     /// the callee, so each such call is read from the call graph as without
     /// rows, and counted as such: the summaries state the same rows.
     #[test]
     fn a_call_through_an_unresolved_import_is_read_from_the_call_graph() {
-        let Some(off) = walked("position-rows-wrapper", ".", "web", &[], false) else {
+        let edit = [NODENEXT];
+        let Some(off) = walked("position-rows-wrapper", ".", "web", &edit, false) else {
             return;
         };
         let without = summarize(&off.inputs, &LibrarySemantics::default());
@@ -701,7 +738,7 @@ mod tests {
         );
         assert_eq!(without.fell_back(), 0, "no rows, nothing read around them");
 
-        let on = walked("position-rows-wrapper", ".", "web", &[], true).unwrap();
+        let on = walked("position-rows-wrapper", ".", "web", &edit, true).unwrap();
         let with = summarize(&on.inputs, &LibrarySemantics::default());
         assert_eq!(every_row(&on, &with), every_row(&off, &without));
         assert_eq!(with.silent_count(), without.silent_count());
@@ -725,7 +762,7 @@ mod tests {
     /// under that reason.
     #[test]
     fn a_call_the_rows_cannot_follow_for_another_reason_states_no_row() {
-        let edit = [(PROBE_FILE, PROBE)];
+        let edit = [NODENEXT, (PROBE_FILE, PROBE)];
         let Some(off) = walked("position-rows-wrapper", ".", "web", &edit, false) else {
             return;
         };

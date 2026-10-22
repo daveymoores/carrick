@@ -852,6 +852,93 @@ fn a_scan_writes_rows_only_when_asked_and_its_blob_never_moves() {
     assert_eq!(read_as(&died), BTreeSet::from(["missing".to_string()]));
 }
 
+/// carrick#1604: a service with no config at its root, scanned with rows on,
+/// types each file under the nearest `tsconfig.json` or `jsconfig.json` on its
+/// way up. Every use of an imported name then has a row whose declaration is
+/// the repo file that exports it, and no row is the error type.
+#[test]
+fn imports_resolve_through_the_nearest_config_of_a_service_with_none_at_its_root() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    // (fixture, caller, declared name, declaring file, calls the caller makes)
+    let uses: [(&str, &str, &str, &str, usize); 3] = [
+        (
+            "configs-below-root",
+            "web/src/api/accounts.ts",
+            "getJson",
+            "web/src/lib/http.ts",
+            3,
+        ),
+        (
+            "configs-below-root",
+            "cli/src/main.ts",
+            "fetchStatus",
+            "cli/src/util.ts",
+            1,
+        ),
+        (
+            "jsconfig-root",
+            "src/page.js",
+            "request",
+            "src/utils/http.js",
+            2,
+        ),
+    ];
+    for fixture_name in ["configs-below-root", "jsconfig-root"] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = fs::canonicalize(dir.path()).unwrap().join("repo");
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(fixture_name)
+                .join("repo"),
+            &repo,
+        );
+        let store = tempfile::tempdir().unwrap();
+        let on = scan(&repo, true, false, Some(store.path()), None);
+        let rows_file = on
+            .positions
+            .as_ref()
+            .expect("a scan with the flag wrote rows")
+            .join(format!(
+                "{}.jsonl.gz",
+                on.blobs.keys().next().unwrap().trim_end_matches(".json")
+            ));
+        let rows = read_rows_file(&rows_file).expect("the scan's rows file reads");
+        for file in &rows.files {
+            assert!(file.skip.is_none(), "{} is not in a program", file.f);
+            for row in &file.r {
+                assert_eq!(
+                    row.flags() & FLAG_ERROR_TYPE,
+                    0,
+                    "{}: a row is the error type: {row:?}",
+                    file.f
+                );
+            }
+        }
+        for (_, file, name, declared_in, calls) in
+            uses.iter().filter(|u| u.0 == fixture_name && u.4 > 0)
+        {
+            let rows_of = rows.files.iter().find(|f| f.f == *file).unwrap();
+            let found = rows_of
+                .r
+                .iter()
+                .filter(|row| {
+                    row.kind() == Kind::Call
+                        && row.symbol() == Some(*name)
+                        && row.decl_file() == Some(*declared_in)
+                })
+                .count();
+            assert_eq!(
+                found, *calls,
+                "{file}: calls of {name} declared in {declared_in}"
+            );
+        }
+    }
+}
+
 /// The census (`#[ignore]`): for each `<repo>:<rows file>` in
 /// `CARRICK_POSITION_ROWS_CENSUS` (`;`-separated), parse every file the rows
 /// name with SWC and print, per kind, the share of SWC positions that found a
