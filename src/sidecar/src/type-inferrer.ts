@@ -3617,8 +3617,9 @@ export class TypeInferrer {
     // the response, so the walk below has nothing to follow, and the call
     // itself would stand as the terminal and publish the transport object.
     // The read is the terminal, as it is when the walk finds it on a binding,
-    // and a call that takes the read and states what it returns says more
-    // than the read does (carrick#1382).
+    // and a call that takes the read and states it (a schema, or a function
+    // that returns it unchanged) says more than the read does (carrick#1382,
+    // carrick#2595).
     const inPlaceRead = this.bodyReadOnCallValue(callExpr);
     if (inPlaceRead) {
       return {
@@ -3637,8 +3638,11 @@ export class TypeInferrer {
       /** The value itself was read: returned, passed, aliased, or body-read. */
       let sawWholeRead = false;
       // Where the call's own value states no type, a call that takes it whole
-      // is the first place the source states one, and the walk follows it
-      // (`parse(raw)` after `const raw = await readRaw()`, carrick#1375).
+      // and states it (a schema, or a function that returns it unchanged) is
+      // the first place the source states one, and the walk follows it
+      // (`parse(raw)` after `const raw = await readRaw()`, carrick#1375). A
+      // converter, or a declaration whose body cannot be read, states nothing
+      // about the value (carrick#2595).
       const callValue = this.unwrapPromiseType(callExpr.getType());
       const callValueIsUntyped = callValue.isAny() || callValue.isUnknown();
       // A transport response handed whole to a helper is a body read through

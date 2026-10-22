@@ -14,7 +14,10 @@
  *
  * Both now take a call only where it states its argument: a schema validates
  * it, or the callee returns it unchanged (through casts) or an empty default.
- * No library, method or framework name is matched.
+ * A function declared without a body (`declare`, a `.d.ts`) cannot be read,
+ * and a parser and a converter share the signature `(value: unknown) => T`,
+ * so its return type is not taken either. No library, method or framework
+ * name is matched.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -49,6 +52,8 @@ function asPull(value: unknown): Pull {
   return value as Pull;
 }
 
+declare function fromDeclaration(value: unknown): Pull;
+
 const PullSchema = schemaOf<Pull>();
 
 export async function readConverted() {
@@ -67,6 +72,18 @@ export async function readValidated() {
   const response = await request('/v1/read/validated');
   const pull = PullSchema.parse(await response.json());
   return pull;
+}
+
+export async function readDeclared() {
+  const response = await request('/v1/read/declared');
+  const pull = fromDeclaration(await response.json());
+  return pull;
+}
+
+export async function laterDeclared() {
+  const raw = await readRaw('/v1/later/declared');
+  const pull = fromDeclaration(raw);
+  console.log(pull);
 }
 
 export async function laterConverted() {
@@ -170,6 +187,15 @@ describe('carrick#2595: a converter is not the body it was handed', () => {
     assert.strictEqual(text, 'any');
   });
 
+  it('leaves a body read handed to a function declared without a body untyped', async () => {
+    const text = await callResult(
+      'ReadDeclared',
+      "request('/v1/read/declared')",
+      "request('/v1/read/declared')"
+    );
+    assert.strictEqual(text, 'any');
+  });
+
   it('still reads a body read handed to a function that returns it unchanged', async () => {
     assertPull(await callResult('ReadNarrowed', "request('/v1/read/narrowed')", "request('/v1/read/narrowed')"));
   });
@@ -184,6 +210,15 @@ describe('carrick#2595: a converter is not the body it was handed', () => {
       'LaterConverted',
       "readRaw('/v1/later/converted')",
       "readRaw('/v1/later/converted')"
+    );
+    assert.strictEqual(text, 'unknown');
+  });
+
+  it('leaves an untyped call value handed later to a function declared without a body untyped', async () => {
+    const text = await callResult(
+      'LaterDeclared',
+      "readRaw('/v1/later/declared')",
+      "readRaw('/v1/later/declared')"
     );
     assert.strictEqual(text, 'unknown');
   });

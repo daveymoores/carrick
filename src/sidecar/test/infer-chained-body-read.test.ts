@@ -10,8 +10,9 @@
  *
  * The read is now the terminal where its receiver is the call itself, through
  * the wrappers that leave a value as it is (parentheses, `await`, `!`). What
- * the binding walk does with a read then holds here too: a call that takes
- * the read and states what it returns says more than the read (carrick#1382),
+ * the binding walk does with a read then holds here too: a parser that takes
+ * the read, validates it and returns it says more than the read (carrick#1382,
+ * carrick#2595),
  * and a text read publishes `string` marked as raw text, which is what keeps
  * it from being judged against a JSON body (carrick#1842).
  *
@@ -32,7 +33,7 @@ const SERVICE_TS = `export interface Receipt {
   settled: boolean;
 }
 
-declare function parseReceipt(value: unknown): Receipt;
+function parseReceipt(value: unknown): Receipt { if (typeof value !== "object" || value === null) throw new Error("not a receipt"); return value as Receipt; }
 
 /** A request that is a promise and also reads its own body. */
 interface PendingReply extends Promise<{ status: number }> {
@@ -263,7 +264,7 @@ describe("carrick#1851: a body read taken in place on the call's value is the te
   });
 
   describe('what the binding walk does with a read holds here too', () => {
-    it('a call that takes the json read and states what it returns says more', async () => {
+    it('a parser that takes the json read and returns it says more', async () => {
       const chained = await infer('/chain/parsed');
       const bound = await infer('/bound/parsed');
       assert.strictEqual(collapse(chained.type_string), 'Receipt');
