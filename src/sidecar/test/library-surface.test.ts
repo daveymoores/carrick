@@ -297,6 +297,7 @@ declare namespace createApp {
   const version: string;
 }
 export default createApp;
+export { createApp as makeApp };
 export declare function named(): App;
 export declare function named(options: { secure: true }): SecureApp;
 `;
@@ -501,8 +502,16 @@ describe('list_library_surface (carrick#1660)', () => {
       const post = instance.members.find(m => m.name === 'post')!;
       assert.deepStrictEqual(post.signatures[0].params.map(p => p.name), ['path', 'handler']);
     }
-    // Only a default export is read by its no-argument build: an overloaded named maker still lists no instance.
+    // A different overloaded maker exported by name returns several types: it still lists no instance.
     assert.deepStrictEqual(es.exports.find(e => e.export === 'named')!.receivers.map(r => r.receiver), ['export']);
+  });
+
+  it('lists the instance of an overloaded maker exported by name as its default export lists it (carrick#2640)', async () => {
+    const [es] = (await surface(['fixture-default-maker'])).surfaces;
+    const members = (name: string) =>
+      es.exports.find(e => e.export === name)!.receivers.find(r => r.receiver === 'instance:()')?.members.map(m => m.name);
+    assert.deepStrictEqual(members('default'), ['get', 'post']);
+    assert.deepStrictEqual(members('makeApp'), ['get', 'post']);
   });
 
   it('lists each export, its receivers and members with the verifier predicates', async () => {

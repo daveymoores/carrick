@@ -2947,6 +2947,9 @@ class DeclarationReader {
     const names: Array<() => void> = [];
     const fills: Array<() => void> = [];
 
+    // What the package's default export names: a maker also exported by name
+    // under this declaration is imported the same way, so it is read the same.
+    const defaultTarget = exported.find(each => each.name === 'default')?.target;
     for (const { name, target, type } of exported) {
       if (!take()) continue;
       const entry: SurfaceExport = { export: name, receivers: [] };
@@ -2959,7 +2962,7 @@ class DeclarationReader {
       };
       receiverOf('export', type);
       for (const maker of this.makers(pkg, target, type)) {
-        const made = this.madeBy(maker.signatures, built(name, maker.receiver), name === 'default');
+        const made = this.madeBy(maker.signatures, built(name, maker.receiver), target === defaultTarget);
         if (!made) continue;
         // One level below the export, what the member builds must declare a callable member.
         if (
@@ -3097,7 +3100,8 @@ class DeclarationReader {
    * the receiver) instantiates it (`returnOf`), less the returns that say
    * nothing, which no maker claim holds on. Listed when what is left is one
    * object type. A `default` export, which a service imports under any local
-   * name (usually the one maker a framework has), that is overloaded and so
+   * name (usually the one maker a framework has), or the same declaration
+   * exported by name (carrick#2640), that is overloaded and so
    * returns several types is listed for the return of the overload the
    * probe's no-argument build resolves (`built`), when that is an object type
    * with members of its own.
