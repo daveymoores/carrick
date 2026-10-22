@@ -194,6 +194,32 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
     );
   });
 
+  it('a verified scope names the declarations its member resolves to (carrick#2636)', async () => {
+    const lineOf = (needle: string): number => SERVER.split('\n').findIndex(line => line.includes(needle)) + 1;
+    const file = 'node_modules/fixture-server/index.d.ts';
+    const prefix = { name: { arg: 1, key: 'prefix' }, key_labels: { retries: 'not_name' } };
+    const checks = [
+      ...makers,
+      onApp(scope('register', { ...prefix, runs: { arg: 0 }, yields: { param: 0, export: 'App', side: 'server' } })),
+      onApp(scope('mount', { name: { arg: 0 }, mounts: { arg: 1 } })),
+      // Returned scope: the member's return is read as the next receiver.
+      onApp(scope('mount', { name: { arg: 0 } })),
+      // Not verified: no declarations on the wire.
+      onApp(scope('mount', { name: { arg: 0 }, mounts: { arg: 4 } })),
+    ];
+    const response = await client.send<{ status: string; verdicts?: Array<Record<string, unknown>> }>(
+      { request_id: `routes-${requestId++}`, action: 'verify_library_claims', from_dir: root, checks },
+      60_000
+    );
+    assert.strictEqual(response.status, 'success');
+    const [runs, mounts, returned, failed] = response.verdicts!.slice(makers.length);
+    assert.deepStrictEqual(runs.declarations, [{ decl_file: file, decl_line: lineOf('register(fn') }]);
+    assert.deepStrictEqual(mounts.declarations, [{ decl_file: file, decl_line: lineOf('mount(prefix') }]);
+    assert.deepStrictEqual(returned.declarations, [{ decl_file: file, decl_line: lineOf('mount(prefix') }]);
+    assert.strictEqual(failed.verdict, 'failed');
+    assert.strictEqual('declarations' in failed, false);
+  });
+
   it('a scope that binds through runs or mounts is never read through its return', async () => {
     // The plugin member's return says nothing: without `runs` it is unresolved, as before.
     const prefix = { name: { arg: 1, key: 'prefix' }, key_labels: { retries: 'not_name' } };

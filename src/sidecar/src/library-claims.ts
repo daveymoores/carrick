@@ -1836,7 +1836,12 @@ class DeclarationReader {
       if (result.rank === Infinity) holding.push(signature);
       else best = furthest(best, result.rank, result.outcome);
     }
-    if (holding.length > 0) return binds ? { outcome: VERIFIED } : { outcome: VERIFIED, holding };
+    if (holding.length > 0) {
+      // The member's own declarations, as a verified op carries them (#2636).
+      const declarations = this.declarationsOf(holding);
+      const outcome: Outcome = declarations.length > 0 ? { verdict: 'verified', declarations } : VERIFIED;
+      return binds ? { outcome } : { outcome, holding };
+    }
     return { outcome: best!.outcome };
   }
 
