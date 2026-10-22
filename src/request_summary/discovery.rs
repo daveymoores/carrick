@@ -972,6 +972,10 @@ struct Walker<'a> {
     /// Each function's callers, through what the rows say each call reaches:
     /// what fills a parameter a callee's value is read from (carrick#2432).
     callers: super::decided_sites::Calls<'a>,
+    /// Each class of the service read through its constructions, with them
+    /// (carrick#2452): what fills a field its constructor sets from a
+    /// parameter.
+    constructed: HashMap<(&'a Path, u32), Vec<super::decided_sites::Placed<'a>>>,
     memo: HashMap<(PathBuf, String), Outcome<'a>>,
     /// The definitions being read, by how deep.
     reading: HashMap<(PathBuf, String), usize>,
@@ -1443,7 +1447,11 @@ impl<'a> Walker<'a> {
         // member the compiler declares in a package or the language's
         // library (`res.json()` on a parameter) is that library's
         // ([`Self::declared_here`]).
-        if !call.callee_values.is_empty() && !construction && self.declared_here(file, call) {
+        if !call.callee_values.is_empty()
+            && !construction
+            && !self.unbound_fields(file, call)
+            && self.declared_here(file, call)
+        {
             let mut values = Vec::new();
             for value in &call.callee_values {
                 values.extend(self.read_value(file, value, invoke, false));
@@ -1734,6 +1742,22 @@ impl<'a> Walker<'a> {
             ValueAt::Param { depth, index, keys } => {
                 vec![Held::Param(*depth, *index, keys.clone())]
             }
+            ValueAt::Field {
+                lo,
+                hi,
+                class,
+                field,
+            } => match self.field_values(file, *class, field, invoke) {
+                Some(held) => held,
+                None => {
+                    let read = ValueAt::Read {
+                        lo: *lo,
+                        hi: *hi,
+                        member: true,
+                    };
+                    self.read_value(file, &read, invoke, at_caller)
+                }
+            },
             ValueAt::Read { lo, hi, member } => {
                 let kind = if *member { Kind::Member } else { Kind::Ident };
                 if let Some(end) = self.value_end(file, *lo, *hi, kind, invoke) {
@@ -1859,6 +1883,87 @@ impl<'a> Walker<'a> {
         self.bind(inner, invoke, callee).under(hop)
     }
 
+    /// The constructions of the class whose span starts at `class` in
+    /// `file`, and where its constructor sets `field` from, when the class
+    /// is read through its constructions (carrick#2452).
+    fn field_origin(
+        &self,
+        file: &'a Path,
+        class: u32,
+        field: &str,
+    ) -> Option<(
+        &'a super::constructions::ClassOrigin,
+        &'a super::constructions::FieldOrigin,
+        Vec<super::decided_sites::Placed<'a>>,
+    )> {
+        let built = self.constructed.get(&(file, class))?;
+        let origin = self.inputs.files.get(file)?.class_origins.get(&class)?;
+        let from = origin.fields.get(field)?;
+        Some((origin, from, built.clone()))
+    }
+
+    /// What `field` of the class whose span starts at `class` in `file` may
+    /// hold when `invoke` runs it (carrick#2452): each value the constructor
+    /// sets it from, a parameter read at every construction as a call's
+    /// argument is, and from the construction's own callers where it hands
+    /// its own parameter on. `None` when the class is not read through its
+    /// constructions: the member is read as itself.
+    fn field_values(
+        &mut self,
+        file: &'a Path,
+        class: u32,
+        field: &str,
+        invoke: Invoke<'a>,
+    ) -> Option<Vec<Held<'a>>> {
+        let (origin, from, built) = self.field_origin(file, class, field)?;
+        let defaults: Defaults<'a> = (file, origin.defaults.as_slice());
+        let mut out = Vec::new();
+        for value in &from.values {
+            match value {
+                ValueAt::Param {
+                    depth: 0,
+                    index,
+                    keys,
+                } => {
+                    for placed in &built {
+                        let at = Invoke {
+                            file: placed.file,
+                            call: placed.call,
+                            construction: true,
+                        };
+                        for held in self.passed(Some(at), *index, keys, Some(defaults), invoke) {
+                            match held {
+                                Held::Param(out_depth, index, keys) => {
+                                    out.extend(self.callers_pass(
+                                        (placed.file, placed.key, placed.depth),
+                                        (out_depth, index, &keys),
+                                        invoke,
+                                        &mut Vec::new(),
+                                    ));
+                                }
+                                other => out.push(other),
+                            }
+                        }
+                    }
+                }
+                // A parameter of a function the constructor is written in.
+                ValueAt::Param { .. } => out.push(Held::Reached(Outcome::default())),
+                other => out.extend(self.read_value(file, other, invoke, false)),
+            }
+        }
+        Some(out)
+    }
+
+    /// Whether every value `call`'s callee may hold is a field whose class
+    /// is not read through its constructions: the callee is read as itself,
+    /// as a member is.
+    fn unbound_fields(&self, file: &'a Path, call: &CallIr) -> bool {
+        call.callee_values.iter().all(|value| {
+            matches!(value, ValueAt::Field { class, field, .. }
+                if self.field_origin(file, *class, field).is_none())
+        })
+    }
+
     /// `inner`, what a function `invoke` calls reaches, with each value its
     /// own parameters hold filled from what `invoke` passes there, or the
     /// default `callee` gives. What is left open is a parameter of the body
@@ -1878,7 +1983,13 @@ impl<'a> Walker<'a> {
                     values.push(Held::Reached(Outcome::default()));
                     continue;
                 }
-                values.extend(self.passed(Some(invoke), index, &keys, callee, open.invoke));
+                values.extend(self.passed(
+                    Some(invoke),
+                    index,
+                    &keys,
+                    defaults_of(callee),
+                    open.invoke,
+                ));
             }
             let settled = self.agree(values, open.invoke, open.chain);
             inner.absorb(settled);
@@ -1913,12 +2024,14 @@ impl<'a> Walker<'a> {
     /// each value it writes there, read where `at` is written, or the
     /// callee's default where it writes nothing (or there is no call, `at`
     /// `None`). Empty when nothing is handed and there is no default.
+    /// `defaults` are the callee's parameters' defaults, read in its file
+    /// (a function's [`FnIr::param_defaults`], or a constructor's).
     fn passed(
         &mut self,
         at: Option<Invoke<'a>>,
         index: usize,
         keys: &[String],
-        callee: Option<(&'a Path, &'a FnIr)>,
+        defaults: Option<Defaults<'a>>,
         invoke: Invoke<'a>,
     ) -> Vec<Held<'a>> {
         let mut written: Vec<ValueAt> = Vec::new();
@@ -1947,8 +2060,8 @@ impl<'a> Walker<'a> {
                 out.extend(self.read_value(at.file, value, invoke, true));
             }
         }
-        if defaulted && let Some((file, callee)) = callee {
-            for (position, path, values) in &callee.param_defaults {
+        if defaulted && let Some((file, defaults)) = defaults {
+            for (position, path, values) in defaults {
                 if *position != index || !keys.starts_with(path) {
                     continue;
                 }
@@ -2095,7 +2208,7 @@ impl<'a> Walker<'a> {
             return Vec::new();
         }
         passing.push(id);
-        let callee = self.function(file, key);
+        let callee = defaults_of(self.function(file, key));
         let callers: Vec<_> = self.callers.callers_of(file, key).to_vec();
         let mut values = Vec::new();
         if callers.is_empty() {
@@ -2123,6 +2236,13 @@ impl<'a> Walker<'a> {
         passing.pop();
         values
     }
+}
+
+/// A callee's parameters' defaults, with the file they are read in.
+type Defaults<'a> = (&'a Path, &'a [(usize, Vec<String>, Vec<ValueAt>)]);
+
+fn defaults_of<'a>(callee: Option<(&'a Path, &'a FnIr)>) -> Option<Defaults<'a>> {
+    callee.map(|(file, callee)| (file, callee.param_defaults.as_slice()))
 }
 
 fn role_key(role: LibraryRole) -> String {
@@ -2166,6 +2286,7 @@ pub fn discover_with(
         root,
         instances,
         callers: super::decided_sites::Calls::through_reach(inputs),
+        constructed: super::constructions::constructed(inputs),
         memo: HashMap::new(),
         reading: HashMap::new(),
         ambiguous: std::cell::Cell::new(0),
