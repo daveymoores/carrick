@@ -422,6 +422,14 @@ interface DeclaredContract {
   provenance?: TypeProvenance[];
 }
 
+/** A type the function a value is made in states for it (carrick#2594). */
+interface StatedInFunction extends DeclaredContract {
+  /** Where the statement is: the annotation's owner, the cast or the call. */
+  at: Node;
+  /** Which statement it is, for the log. */
+  how: string;
+}
+
 /**
  * Print a `Type` to its string form WITHOUT the compiler's default truncation.
  *
@@ -2643,6 +2651,30 @@ export class TypeInferrer {
 
     typeString = this.unwrapPromise(typeString, returnType);
 
+    // carrick#2594: the call's value is untyped (`Promise<any>`,
+    // `Promise<unknown>`), and the function it is made in states its type:
+    // it returns the value from a function with a declared return type, holds
+    // it in an annotated name, validates it with a schema, narrows it with a
+    // function that returns it unchanged, casts it whole, or hands it to a
+    // typed parameter. A function that converts the value into something new
+    // states nothing about it, and neither does a use on a failure path.
+    const untypedAnswer = typeString.trim() === 'any' || typeString.trim() === 'unknown';
+    if (untypedAnswer && func && !explicitType && !unwrapResult.wasUnwrapped && !carrierPayload) {
+      const stated = this.statedInFunction(callExpr, func, {
+        returned: true,
+        parameters: true,
+        skipFailurePaths: true,
+      });
+      if (stated) {
+        this.log(
+          `Call result at ${where} is untyped, and its function states its type ` +
+            `(${stated.how}); publishing that type`
+        );
+        typeString = stated.text;
+        isExplicit = true;
+      }
+    }
+
     // #336: consumer analogue of the #306 producer anchor. Anchor on the
     // CALL's own payload (the rule-extracted Type, else the awaited call
     // type), peeling array levels to the element symbol + depth. Without the
@@ -3484,21 +3516,25 @@ export class TypeInferrer {
     }
 
     // carrick#1166: the read itself is untyped (`await c.req.json()` is `any`
-    // or `unknown`), and the handler validates it by handing it to a schema:
-    // `Schema.safeParse(body)`, `Schema.parse(await c.req.json())`. The schema
-    // declares what a caller may send, so its INPUT is the request contract,
-    // read the way every other request anchor reads a schema (carrick#1101).
+    // or `unknown`), and the handler states its type further on: it validates
+    // it with a schema (`Schema.safeParse(body ?? {})`, whose INPUT is the
+    // request contract, carrick#1101), assigns it to an annotated name
+    // (`let body: T; body = await c.req.json()`), narrows it with a function
+    // that returns it unchanged, or casts the whole value (carrick#2594).
     const readType = this.unwrapPromiseType(payloadType);
     if (
       !explicitType &&
       !unwrapResult.wasUnwrapped &&
       (readType.isAny() || readType.isUnknown())
     ) {
-      const parsedWith = this.schemaConsumingRead(node);
+      const func = this.findContainingFunctionForNode(node);
+      const parsedWith = func
+        ? this.statedInFunction(node, func, { returned: false, parameters: false, skipFailurePaths: false })
+        : null;
       if (parsedWith) {
         this.log(
           `Request locator at ${request.file_path}:${request.line_number} is an untyped read ` +
-            "the handler validates with a schema; publishing the schema's input"
+            `its handler states a type for (${parsedWith.how}); publishing that type`
         );
         return this.declaredRequestInferredType(
           request,
@@ -7860,8 +7896,10 @@ export class TypeInferrer {
    *  - a cast on it: `(await request.json()) as NewWidget`;
    *  - the annotation of the binding it initialises:
    *    `const input: NewWidget = await request.json()`;
-   *  - a schema the read, or the binding that holds it, is handed to
-   *    (`schemaConsumingRead`): the schema's input is what a caller may send.
+   *  - a type the handler states for the read further on
+   *    (`statedInFunction`): a schema it is handed to, the annotation of a
+   *    name it is assigned to, a pass-through function, a cast of the whole
+   *    value.
    *
    * The first two are `typeNodeStatedAtRead`, the reading a consumer's
    * response read already gets. An annotation further out is not one of them:
@@ -7883,11 +7921,14 @@ export class TypeInferrer {
       return this.createInferredType(request, statedText, true, this.getNodeLocation(read));
     }
 
-    const validated = this.schemaConsumingRead(read);
+    const func = this.findContainingFunctionForNode(read);
+    const validated = func
+      ? this.statedInFunction(read, func, { returned: false, parameters: false, skipFailurePaths: false })
+      : null;
     if (validated) {
       this.log(
         `Request at ${request.file_path}:${request.line_number} is the body its handler ` +
-          "reads off the platform request and validates with a schema; publishing the schema's input"
+          `reads off the platform request and states a type for (${validated.how}); publishing that type`
       );
       return this.declaredRequestInferredType(request, validated, this.getNodeLocation(read));
     }
@@ -8630,72 +8671,312 @@ export class TypeInferrer {
   }
 
   /**
-   * The contract of the schema a handler validates an untyped body read with
-   * (carrick#1166), or null.
+   * The type the function a value is made in states for it, where the
+   * compiler types the value itself `any` or `unknown` (carrick#2594), or
+   * null.
    *
-   * `read` is the located expression: the read call, or the binding that holds
-   * it. Every call in the enclosing function that takes that value as an
-   * argument is a candidate, and the schema is the call's receiver
-   * (`Schema.safeParse(body)`) or one of its other arguments
-   * (`parse(Schema, body)`). A candidate counts only when it declares schema
-   * types (`schemaOutputType` / `schemaInputType`), so a logger or a service
-   * call the body is also handed to is never read as a contract. No method or
-   * library name is matched.
+   * `value` is the located expression: a body read, or a call whose result is
+   * untyped. The value is followed through the names that hold it: a
+   * declaration it initialises, and a name it is assigned to later
+   * (`let body: unknown; body = await read()`). At each place the value or
+   * one of those names is used whole, the source can state a type:
+   *
+   *  0. the annotation of the name that holds it (`let body: Upload`), or the
+   *     declared return type of the function that returns it unchanged (only
+   *     with `reads.returned`);
+   *  1. a schema it is handed to (`Schema.safeParse(body ?? {})`,
+   *     `parse(Schema, body)`): the schema's input is what a sender may send
+   *     (carrick#1166). A candidate counts only when it declares schema types,
+   *     so no method or library name is matched;
+   *  2. a function of the project it is handed to that returns that argument
+   *     unchanged (through casts) or an empty default: its declared return
+   *     type. A function that builds a new value from its argument is a
+   *     converter, and its return type describes what it built, never the
+   *     value it was handed, so it states nothing here;
+   *  3. a cast of the whole value (`(body as { phone: string }).phone`);
+   *  4. the parameter of a call it is handed to (only with
+   *     `reads.parameters`), where that parameter's type is a body shape once
+   *     any callable member is dropped (a function never crosses the wire).
+   *
+   * The first rank with an answer decides. A placeholder (`unknown`,
+   * `Record<string, unknown>`, any type node with `any` or `unknown` written
+   * in it) states nothing, and two different statements in one rank decide
+   * nothing: the answer is null.
    */
-  private schemaConsumingRead(read: Node): DeclaredContract | null {
-    const func = this.findContainingFunctionForNode(read);
-    if (!func) return null;
-
-    const bindings = new Set<unknown>();
-    const addBinding = (identifier: Node | undefined): void => {
-      const symbol = identifier?.getSymbol()?.compilerSymbol;
-      if (symbol) bindings.add(symbol);
+  private statedInFunction(
+    value: Node,
+    func: FunctionLike,
+    reads: { returned: boolean; parameters: boolean; skipFailurePaths: boolean }
+  ): StatedInFunction | null {
+    const holders = new Set<ts.Symbol>();
+    const positions: Node[] = [value];
+    const holderUse = (node: Node): boolean => {
+      if (!Node.isIdentifier(node)) return false;
+      const symbol = node.getSymbol()?.compilerSymbol;
+      return !!symbol && holders.has(symbol);
     };
-    if (Node.isIdentifier(read)) {
-      addBinding(read);
-    } else {
-      const declaration = read.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
-      const initializer = declaration?.getInitializer();
-      if (
-        declaration &&
-        initializer &&
-        this.unwrapExpressionNode(initializer) === read &&
-        Node.isIdentifier(declaration.getNameNode())
-      ) {
-        addBinding(declaration.getNameNode());
-      }
-    }
-    const carriesRead = (argument: Node): boolean =>
-      argument === read ||
-      (Node.isIdentifier(argument) &&
-        bindings.has(argument.getSymbol()?.compilerSymbol));
-
-    for (const call of func.getDescendantsOfKind(SyntaxKind.CallExpression)) {
-      const args = call.getArguments().map((arg) => this.unwrapExpressionNode(arg));
-      const carrier = args.findIndex(carriesRead);
-      if (carrier < 0) continue;
-
-      const candidates: Node[] = [];
-      const callee = call.getExpression();
-      if (Node.isPropertyAccessExpression(callee)) {
-        candidates.push(callee.getExpression());
-      }
-      args.forEach((arg, index) => {
-        if (index !== carrier) candidates.push(arg);
-      });
-      for (const candidate of candidates) {
-        const candidateType = candidate.getType();
+    const hold = (name: Node): void => {
+      if (!Node.isIdentifier(name)) return;
+      const symbol = name.getSymbol()?.compilerSymbol;
+      if (!symbol || holders.has(symbol)) return;
+      holders.add(symbol);
+      for (const id of func.getDescendantsOfKind(SyntaxKind.Identifier)) {
+        if (id === name || id.getSymbol()?.compilerSymbol !== symbol) continue;
+        const parent = id.getParent();
+        if (Node.isVariableDeclaration(parent) && parent.getNameNode() === id) continue;
         if (
-          !this.schemaOutputType(candidateType, candidate) &&
-          !this.schemaInputType(candidateType, candidate)
+          Node.isBinaryExpression(parent) &&
+          parent.getLeft() === id &&
+          parent.getOperatorToken().getKind() === SyntaxKind.EqualsToken
         ) {
           continue;
         }
-        const contract = this.schemaContract(candidate, 'input');
-        if (contract) return contract;
+        positions.push(id);
+      }
+    };
+    hold(value);
+
+    const found: Array<{ rank: number; text: string; provenance?: TypeProvenance[]; at: Node; how: string }> = [];
+    const stateNode = (rank: number, typeNode: Node | undefined, at: Node, how: string): void => {
+      if (!typeNode || this.leavesAPositionOpen(typeNode)) return;
+      const text = this.structuralTextFromTypeNode(typeNode);
+      if (text) found.push({ rank, text, at, how });
+    };
+
+    for (let i = 0; i < positions.length; i++) {
+      const position = positions[i];
+      if (
+        reads.skipFailurePaths &&
+        position !== value &&
+        reachedOnlyOnFailure(position, func, holderUse)
+      ) {
+        continue;
+      }
+
+      // Climb the wrappers that leave the value what it was: parentheses,
+      // `await`, `!`, `satisfies`, a placeholder cast, and an empty default
+      // (`body ?? {}`).
+      let outer: Node = position;
+      for (;;) {
+        const parent = outer.getParent();
+        if (!parent) break;
+        if (
+          (Node.isParenthesizedExpression(parent) ||
+            Node.isAwaitExpression(parent) ||
+            Node.isNonNullExpression(parent) ||
+            Node.isSatisfiesExpression(parent)) &&
+          parent.getExpression() === outer
+        ) {
+          outer = parent;
+          continue;
+        }
+        if (
+          (Node.isAsExpression(parent) || Node.isTypeAssertion(parent)) &&
+          parent.getExpression() === outer
+        ) {
+          const typeNode = parent.getTypeNode();
+          if (typeNode && !this.leavesAPositionOpen(typeNode)) {
+            stateNode(3, typeNode, parent, 'a cast of the whole value');
+            break;
+          }
+          outer = parent;
+          continue;
+        }
+        if (
+          Node.isBinaryExpression(parent) &&
+          parent.getLeft() === outer &&
+          [SyntaxKind.QuestionQuestionToken, SyntaxKind.BarBarToken].includes(
+            parent.getOperatorToken().getKind()
+          ) &&
+          this.isEmptyDefault(parent.getRight())
+        ) {
+          outer = parent;
+          continue;
+        }
+        break;
+      }
+
+      const parent = outer.getParent();
+      if (!parent) continue;
+
+      if (Node.isVariableDeclaration(parent) && parent.getInitializer() === outer) {
+        stateNode(0, parent.getTypeNode(), parent, 'the annotation of the name that holds it');
+        hold(parent.getNameNode());
+        continue;
+      }
+
+      if (
+        Node.isBinaryExpression(parent) &&
+        parent.getRight() === outer &&
+        parent.getOperatorToken().getKind() === SyntaxKind.EqualsToken &&
+        Node.isIdentifier(parent.getLeft())
+      ) {
+        const declaration = parent.getLeft().getSymbol()?.getValueDeclaration();
+        if (declaration && Node.isVariableDeclaration(declaration)) {
+          stateNode(0, declaration.getTypeNode(), declaration, 'the annotation of the name it is assigned to');
+        }
+        hold(parent.getLeft());
+        continue;
+      }
+
+      if (reads.returned) {
+        const returnedHere =
+          (Node.isReturnStatement(parent) &&
+            parent.getExpression() === outer &&
+            this.findContainingFunctionForNode(parent) === func) ||
+          (Node.isArrowFunction(parent) && parent === func && parent.getBody() === outer);
+        if (returnedHere) {
+          stateNode(0, func.getReturnTypeNode(), func, 'the declared return type of the function that returns it');
+          continue;
+        }
+      }
+
+      if (Node.isCallExpression(parent) && parent.getArguments().includes(outer)) {
+        this.stateAtReceivingCall(parent, parent.getArguments().indexOf(outer as never), reads, found, stateNode);
       }
     }
-    return null;
+
+    if (found.length === 0) return null;
+    const rank = Math.min(...found.map((entry) => entry.rank));
+    const decided = found.filter((entry) => entry.rank === rank);
+    if (new Set(decided.map((entry) => entry.text)).size !== 1) {
+      this.log(
+        `A value at ${this.getNodeLocation(value).file_path}:${this.getNodeLocation(value).start_line} ` +
+          `is stated as ${decided.length} different types in its function; stating none`
+      );
+      return null;
+    }
+    const [first] = decided;
+    return { text: first.text, provenance: first.provenance, at: first.at, how: first.how };
+  }
+
+  /**
+   * What a call that takes the value at argument `index` states for it:
+   * a schema among its receiver and other arguments (rank 1), a callee of the
+   * project that returns that argument unchanged (rank 2), or, with
+   * `reads.parameters`, the parameter's own type (rank 4).
+   */
+  private stateAtReceivingCall(
+    call: CallExpression,
+    index: number,
+    reads: { parameters: boolean },
+    found: Array<{ rank: number; text: string; provenance?: TypeProvenance[]; at: Node; how: string }>,
+    stateNode: (rank: number, typeNode: Node | undefined, at: Node, how: string) => void
+  ): void {
+    const schemaCandidates: Node[] = [];
+    const callee = call.getExpression();
+    if (Node.isPropertyAccessExpression(callee)) schemaCandidates.push(callee.getExpression());
+    call.getArguments().forEach((argument, at) => {
+      if (at !== index) schemaCandidates.push(this.unwrapExpressionNode(argument));
+    });
+    for (const candidate of schemaCandidates) {
+      const candidateType = candidate.getType();
+      if (
+        !this.schemaOutputType(candidateType, candidate) &&
+        !this.schemaInputType(candidateType, candidate)
+      ) {
+        continue;
+      }
+      const contract = this.schemaContract(candidate, 'input');
+      if (contract) {
+        found.push({ rank: 1, text: contract.text, provenance: contract.provenance, at: call, how: 'a schema it is handed to' });
+        return;
+      }
+    }
+
+    const passThrough = this.passThroughFunction(call, index);
+    if (passThrough) {
+      stateNode(2, passThrough.getReturnTypeNode(), call, 'a function that returns it unchanged');
+      return;
+    }
+
+    if (!reads.parameters) return;
+    const signature = this.project.getTypeChecker().getResolvedSignature(call);
+    const parameter = signature?.getParameters()[index];
+    const declaration = parameter?.getValueDeclaration();
+    if (!parameter || (declaration && Node.isParameterDeclaration(declaration) && declaration.isRestParameter())) {
+      return;
+    }
+    let parameterType = parameter.getTypeAtLocation(call);
+    if (parameterType.isUnion()) {
+      const bodies = parameterType.getUnionTypes().filter((part) => !this.isCallableType(part));
+      if (bodies.length !== 1) return;
+      parameterType = bodies[0];
+    }
+    if (!this.isObjectShape(parameterType)) return;
+    const text = this.structuralTextFromType(parameterType, call);
+    if (!text || /\b(any|unknown)\b/.test(text)) return;
+    found.push({ rank: 4, text, at: call, how: 'the parameter of a call it is handed to' });
+  }
+
+  /**
+   * The project function `call` invokes, when every value it returns is its
+   * argument at `index` as it was handed in (through parentheses, casts,
+   * `satisfies` and `!`) or an empty default (`{}`, `[]`, `null`,
+   * `undefined`), and at least one return is that argument. Such a function
+   * narrows its argument, so its declared return type describes the value it
+   * was handed. Any other function builds something new from it, and is not
+   * this.
+   */
+  private passThroughFunction(call: CallExpression, index: number): FunctionLike | undefined {
+    let symbol = call.getExpression().getSymbol();
+    if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
+    for (const declaration of symbol?.getDeclarations() ?? []) {
+      const fn =
+        Node.isFunctionDeclaration(declaration) || Node.isMethodDeclaration(declaration)
+          ? declaration
+          : Node.isVariableDeclaration(declaration)
+            ? this.unwrapExpressionNode(declaration.getInitializer())
+            : undefined;
+      if (
+        !fn ||
+        !(Node.isFunctionDeclaration(fn) ||
+          Node.isMethodDeclaration(fn) ||
+          Node.isArrowFunction(fn) ||
+          Node.isFunctionExpression(fn)) ||
+        !fn.getBody() ||
+        fn.getSourceFile().isDeclarationFile() ||
+        fn.getSourceFile().isInNodeModules()
+      ) {
+        continue;
+      }
+      const parameter = fn.getParameters()[index];
+      const parameterSymbol = parameter?.getNameNode().getSymbol()?.compilerSymbol;
+      if (!parameter || parameter.isRestParameter() || !parameterSymbol) continue;
+
+      const returned = this.returnedExpressions(fn);
+      let returnsArgument = false;
+      const everyReturnPasses = returned.every((expression) => {
+        let node: Node = expression;
+        while (
+          Node.isParenthesizedExpression(node) ||
+          Node.isAsExpression(node) ||
+          Node.isTypeAssertion(node) ||
+          Node.isSatisfiesExpression(node) ||
+          Node.isNonNullExpression(node)
+        ) {
+          node = node.getExpression();
+        }
+        if (Node.isIdentifier(node) && node.getSymbol()?.compilerSymbol === parameterSymbol) {
+          returnsArgument = true;
+          return true;
+        }
+        return this.isEmptyDefault(node);
+      });
+      if (everyReturnPasses && returnsArgument) return fn;
+    }
+    return undefined;
+  }
+
+  /** `{}`, `[]`, `null` or `undefined`: a default that states no member. */
+  private isEmptyDefault(node: Node): boolean {
+    const bare = this.unwrapExpressionNode(node);
+    return (
+      (Node.isObjectLiteralExpression(bare) && bare.getProperties().length === 0) ||
+      (Node.isArrayLiteralExpression(bare) && bare.getElements().length === 0) ||
+      Node.isNullLiteral(bare) ||
+      (Node.isIdentifier(bare) && bare.getText() === 'undefined')
+    );
   }
 
   /**
