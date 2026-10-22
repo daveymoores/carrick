@@ -15,12 +15,19 @@ site, sorted by file and span.
 | `span_start`, `span_end` | The call expression's SWC span in the file parsed on its own (byte offset + 1) |
 | `callee` | The callee as written |
 | `end` | The labelled call the walk reached: the store `package`, `export`, `member` (`null` for the export itself), `role`, `op` (the claim's op for that member, `null` for a construction), and that call's `file`, `line`, `span_start`, `span_end`. `null` when the walk stopped |
-| `chain` | Each in-repo function the walk entered, outermost first: the definition key, its file and line. `<callback>` is a function written at the call and run by the callee |
-| `stop` | Why a walk that entered code ended with no labelled export: a `HoleReason`, `interface_member`, `injected_callee`, `cycle` or `no_body` (a definition whose body the pass did not read). `null` when `end` is set |
+| `chain` | Each in-repo function the walk entered, outermost first: the definition key, its file and line. `<callback>` is a function written at the call and run by the callee; `<value>` is a function entered because the call runs it as a value (carrick#2432) |
+| `stop` | Why a walk ended with no labelled export: a `HoleReason`, `interface_member`, `injected_callee`, `cycle`, `no_body` (a definition whose body the pass did not read), or for a callee that is a value `value_never_bound` (no caller fills it and it has no default) or `values_over_cap`. `null` when `end` is set, except `several_values`: the callee's values reach different labelled exports, or one reaches none, and each end is kept with this stop (the call is a lead, not a site) |
 
 A site that reaches several labelled calls has one record per labelled call.
 Two sites can share one end (`traced-load.ts:4`: the `traced(…)` call and the
 `fetch` it runs). A reader that folds records by their end must dedupe them.
+
+A callee that is a value (`values.ts`, `passed-in.ts`, carrick#2432) is
+followed through what its callers pass: a destructured parameter's default
+(`values.ts:6`), a field filled two calls up (`values.ts:19`), and two
+callers handing two labelled exports (`values.ts:32`, `several_values`, while
+each caller reaches its own). `fixture-http` is a second labelled HTTP export
+for that case.
 
 ## Calls discovery could not follow (carrick#2613)
 

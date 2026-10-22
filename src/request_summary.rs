@@ -227,6 +227,11 @@ pub(crate) mod discovery;
 // logged by a scan with the receiver trace on and dropped.
 pub(crate) mod dispatch;
 
+// What a callee that is a value may hold, read where each value is written,
+// for discovery's value walk (carrick#2432).
+mod values;
+use values::ValueAt;
+
 // One fixture service walked with or without rows, for the tests of what
 // the summaries read through them.
 #[cfg(test)]
@@ -864,6 +869,14 @@ struct CallIr {
     callee_subject: Option<Subject>,
     /// The callee as written.
     callee_text: String,
+    /// What the callee may hold, when it is a value rather than a name the
+    /// rows' call target reads (carrick#2432): a parameter, a key of one, a
+    /// local holding one, each side of a fallback. Read by discovery alone.
+    callee_values: Vec<ValueAt>,
+    /// What each argument may hold, by position (carrick#2432): the values a
+    /// parameter of the callee is handed. A spread is an empty entry, and
+    /// the last ([`values`]). Read by discovery alone.
+    arg_values: Vec<Vec<ValueAt>>,
     /// The call is what an `if`, a ternary or a `&&` tests: the branch its
     /// result guards.
     tested: Option<Tested>,
@@ -1038,6 +1051,14 @@ struct FnIr {
     /// discovery and the rows' call targets alone (carrick#2431): the
     /// summaries compose none, so the body stays [`Self::unfollowed`].
     optional_calls: Vec<CallIr>,
+    /// Each default a parameter, or a key of a destructured one, is given:
+    /// its position, the keys down to it and what it may hold, read in the
+    /// function's own scope (carrick#2432). Read by discovery alone.
+    param_defaults: Vec<(usize, Vec<String>, Vec<ValueAt>)>,
+    /// What each `return` (an arrow's expression body included) may hand
+    /// back, for a callee an own factory returns (carrick#2432). Read by
+    /// discovery alone.
+    returned_values: Vec<ValueAt>,
 }
 
 impl FnIr {
@@ -3525,6 +3546,8 @@ struct Captured {
     /// [`Scope::subjects`], each parameter of the enclosing functions read
     /// as an enclosing one ([`Subject::enclosed`]).
     subjects: HashMap<BindingKey, Subject>,
+    /// [`Scope::held`], each parameter one function further out.
+    held: HashMap<BindingKey, Vec<ValueAt>>,
 }
 
 /// One module-scope binding an import introduces.
@@ -4016,6 +4039,11 @@ struct Scope<'a> {
     /// hold, comes from, as a guard reads it (carrick#2386). The send side
     /// never reads it.
     subjects: HashMap<BindingKey, Subject>,
+    /// What each key of a destructured parameter, and each local the body
+    /// declares once and never assigns again, may hold, the enclosing
+    /// functions' included (carrick#2432). Read by discovery's value walk
+    /// alone ([`values::ValueAt`]).
+    held: HashMap<BindingKey, Vec<ValueAt>>,
     /// The names the function writes a member of (`url.pathname = …`),
     /// anywhere in it: a guard reads no such binding as what it was declared
     /// with (carrick#2386). The send side never reads it.
@@ -4043,6 +4071,7 @@ impl<'a> Scope<'a> {
             reassigned: HashSet::new(),
             written_through: HashSet::new(),
             subjects: HashMap::new(),
+            held: HashMap::new(),
             fields: None,
             module,
         }
@@ -4728,6 +4757,7 @@ impl Reader<'_> {
             reassigned: HashSet::new(),
             written_through: HashSet::new(),
             subjects: captured.subjects.clone(),
+            held: captured.held.clone(),
             fields,
             module,
         };
@@ -4737,6 +4767,8 @@ impl Reader<'_> {
             module,
             &type_param_names(function.type_params.as_deref()),
         );
+        let values = self.param_values(function.params.iter().map(|param| &param.pat), &scope);
+        scope.held.extend(values.held);
         let mut ir = FnIr {
             params: ParamDecl::all(
                 function.params.iter().map(|param| &param.pat),
@@ -4745,6 +4777,7 @@ impl Reader<'_> {
             ),
             type_params: type_param_names(function.type_params.as_deref()),
             site: Some(self.site(function.span)),
+            param_defaults: values.defaults,
             ..FnIr::default()
         };
         match &function.body {
@@ -4783,6 +4816,7 @@ impl Reader<'_> {
             reassigned: HashSet::new(),
             written_through: HashSet::new(),
             subjects: captured.subjects.clone(),
+            held: captured.held.clone(),
             fields,
             module,
         };
@@ -4792,10 +4826,13 @@ impl Reader<'_> {
             module,
             &type_param_names(arrow.type_params.as_deref()),
         );
+        let values = self.param_values(&arrow.params, &scope);
+        scope.held.extend(values.held);
         let mut ir = FnIr {
             params: ParamDecl::all(&arrow.params, Some(&*arrow.body), self.source_map),
             type_params: type_param_names(arrow.type_params.as_deref()),
             site: Some(self.site(arrow.span)),
+            param_defaults: values.defaults,
             ..FnIr::default()
         };
         match &*arrow.body {
@@ -4806,6 +4843,8 @@ impl Reader<'_> {
                 let returned = self.returned_instances(expr, &scope);
                 ir.returns.push((expr.span().lo.0, returned));
                 ir.body_returns.push(body_return(expr, &scope.bodies));
+                ir.returned_values
+                    .extend(self.value_of(expr, &scope, &guards::Bound::default()));
                 ir.returns_tests.push(guards::is_test(expr));
                 self.walk_returned(expr, &scope, &mut ir);
             }
@@ -4848,6 +4887,17 @@ impl Reader<'_> {
                         &reassigned,
                         &declared,
                     );
+                    // What a local declared once and never assigned again may
+                    // hold, for a call through it (carrick#2432).
+                    if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init)
+                        && !reassigned.names.contains(ident.id.sym.as_ref())
+                        && declared.binding_count(&ident_key(&ident.id)) == 1
+                    {
+                        let values = self.value_of(init, scope, &guards::Bound::default());
+                        if values.iter().any(|value| *value != ValueAt::Unread) {
+                            scope.held.insert(ident_key(&ident.id), values);
+                        }
+                    }
                     // A `let` set again on every path to one of a few makers'
                     // instances, read where it is returned (carrick#1689).
                     // One never set again is a local receiver, below. Its
@@ -6476,6 +6526,11 @@ impl Visit for CallWalker<'_, '_, '_> {
         let handed = self.reader.handed(&call.args, self.scope, bound);
         let names = self.reader.arg_names(&call.args, self.scope);
         let spread_args = self.reader.spread_args(&call.args, self.scope);
+        let callee_values = match &call.callee {
+            Callee::Expr(callee) => self.reader.callee_values(callee, self.scope, bound),
+            _ => Vec::new(),
+        };
+        let arg_values = self.reader.arg_values(&call.args, self.scope, bound);
         self.ir.calls.push(CallIr {
             site: call_site,
             callee,
@@ -6491,6 +6546,8 @@ impl Visit for CallWalker<'_, '_, '_> {
             arg_subjects,
             callee_subject,
             callee_text,
+            callee_values,
+            arg_values,
             tested: self.guard.tested(call.span),
             handed,
             names,
@@ -6570,6 +6627,8 @@ impl Visit for CallWalker<'_, '_, '_> {
                 arg_subjects: Vec::new(),
                 callee_subject: None,
                 callee_text: String::new(),
+                callee_values: Vec::new(),
+                arg_values: Vec::new(),
                 tested: None,
                 handed: Vec::new(),
                 names: Vec::new(),
@@ -6663,6 +6722,10 @@ impl Visit for CallWalker<'_, '_, '_> {
             .as_deref()
             .map(|arg| self.reader.returned_instances(arg, self.scope))
             .unwrap_or_default();
+        if let Some(arg) = ret.arg.as_deref() {
+            let values = self.reader.value_of(arg, self.scope, &self.guard.bound);
+            self.ir.returned_values.extend(values);
+        }
         self.ir.returns.push((ret.span.lo.0, returned));
         self.ir
             .body_returns
@@ -6838,6 +6901,12 @@ impl CallWalker<'_, '_, '_> {
             receivers: self.scope.local_receivers.clone(),
             fetches: self.scope.fetches.clone(),
             subjects: guards::captured_subjects(self.scope, &self.guard.bound),
+            held: self
+                .scope
+                .held
+                .iter()
+                .map(|(key, values)| (key.clone(), values.iter().map(ValueAt::enclosed).collect()))
+                .collect(),
         }
     }
 }

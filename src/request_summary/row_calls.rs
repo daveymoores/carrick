@@ -519,13 +519,20 @@ impl RequestSummaryInputs {
 
     /// What the call row at `lo..hi` in `file` names.
     fn row_reach(&self, file: &Path, lo: u32, hi: u32) -> Reach {
+        self.row_names(file, lo, hi, Kind::Call)
+    }
+
+    /// The definition the row of `kind` at `lo..hi` in `file` names: for a
+    /// name or a member read as a value (carrick#2432), the function it
+    /// holds when it holds one of the repository's.
+    pub(super) fn row_names(&self, file: &Path, lo: u32, hi: u32, kind: Kind) -> Reach {
         let Some(positions) = &self.positions else {
             return Reach::Unknown(HoleReason::RowsMissing);
         };
         let Some(ir) = self.files.get(file) else {
             return Reach::Unknown(HoleReason::RowsMissing);
         };
-        let row = match positions.lookup(file, ir.swc_start(lo), ir.swc_start(hi), Kind::Call) {
+        let row = match positions.lookup(file, ir.swc_start(lo), ir.swc_start(hi), kind) {
             Ok(row) => row,
             Err(reason) => return Reach::Unknown(reason),
         };

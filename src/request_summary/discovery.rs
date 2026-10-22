@@ -28,6 +28,20 @@
 //! a [`HoleReason`], `interface_member`, `injected_callee`, `cycle` or
 //! `no_body` (a definition whose body this pass did not read).
 //!
+//! A callee that is a value the repository declares (a parameter, a key of
+//! one, a parameter's default, a local or an inline `a ?? b`, a function an
+//! in-repo factory returns) is followed through each value it may hold
+//! (carrick#2432, [`super::values`]): what each caller passes at that
+//! position and key, one caller up at a time, the default where a caller
+//! passes nothing. A value the compiler's row names as a labelled export is
+//! that export, called at the call that runs the value; a function of the
+//! repository is entered under a `<value>` hop. Values that all reach the
+//! same labelled exports are those ends. Values that disagree, or one that
+//! reaches none, keep their ends with the stop `several_values` (decided
+//! sites make the call a lead); more than [`MAX_VALUES`] is
+//! `values_over_cap`; none at all is `value_never_bound`; only functions
+//! written at the callers stay `injected_callee`.
+//!
 //! A call that reached nothing and entered no code says why, on
 //! [`Discovery::unfollowed`], and never in `sites`: `value_callee` (an in-repo
 //! value that is not a definition: a parameter, a field, a returned
@@ -49,6 +63,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::row_calls::Reach;
+use super::values::ValueAt;
 use super::*;
 use crate::library_claims::{ExportClaims, applies, runtime_package_of};
 use crate::library_store::LibraryAnswer;
@@ -70,6 +85,21 @@ const VALUE_CALLEE: &str = "value_callee";
 const OUTSIDE_SERVICE: &str = "outside_service";
 const PACKAGE_UNMATCHED: &str = "package_unmatched";
 const UNANSWERED_PACKAGE: &str = "unanswered_package";
+
+/// Why a walk through a callee that is a value reached no one labelled
+/// export (carrick#2432): its values disagree or one reaches none, it holds
+/// more than [`MAX_VALUES`], nothing binds it, or each is a function written
+/// at a caller (what runs it decides).
+const SEVERAL_VALUES: &str = "several_values";
+const VALUES_OVER_CAP: &str = "values_over_cap";
+const VALUE_NEVER_BOUND: &str = "value_never_bound";
+const INJECTED_CALLEE: &str = "injected_callee";
+
+/// How many values a callee may hold before the walk stops reading them.
+const MAX_VALUES: usize = 16;
+
+/// The hop a walk records where it enters a function through a value.
+use super::decided_sites::VALUE_HOP;
 
 /// One discovered site, or one walk that entered code and stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -787,11 +817,14 @@ struct Found {
     /// was matched.
     receiver: Option<ReceiverAt>,
     reached: Option<ReachedBy>,
+    /// Reached through a callee whose values reach different labelled
+    /// exports (carrick#2432): one of several, so no site.
+    several: bool,
 }
 
 /// What a call or a body reaches.
 #[derive(Debug, Clone, Default)]
-struct Outcome {
+struct Outcome<'a> {
     ends: Vec<Found>,
     /// The first stop, when the walk entered code and found nothing there.
     stop: Option<(Vec<ChainHop>, String)>,
@@ -802,9 +835,48 @@ struct Outcome {
     /// (one of [`Discovery::unfollowed`]'s reasons): a walk that found no
     /// site has not read everything the call runs (carrick#2613).
     missed: bool,
+    /// Each callee whose value a caller of the body decides (carrick#2432).
+    open: Vec<Open<'a>>,
 }
 
-impl Outcome {
+/// The call that invokes a value, where it is written.
+#[derive(Debug, Clone, Copy)]
+struct Invoke<'a> {
+    file: &'a Path,
+    call: &'a CallIr,
+    construction: bool,
+}
+
+/// A callee that is a value some of whose values are parameters of the body
+/// walked (carrick#2432): what the call `invoke` runs is one of the values
+/// the callers pass there, or one of `known`.
+#[derive(Debug, Clone)]
+struct Open<'a> {
+    /// Each parameter: how many functions out of the body walked (0: its
+    /// own), its position and the keys read down from it.
+    refs: Vec<(u8, usize, Vec<String>)>,
+    /// The values already read.
+    known: Vec<Held<'a>>,
+    invoke: Invoke<'a>,
+    /// The functions entered from where the walk started down to the body
+    /// that holds `invoke`.
+    chain: Vec<ChainHop>,
+}
+
+/// One value a callee may hold, read (carrick#2432).
+#[derive(Debug, Clone)]
+enum Held<'a> {
+    /// A parameter of the body it is read in: how many functions out, its
+    /// position and keys.
+    Param(u8, usize, Vec<String>),
+    /// A function written at a caller, or a parameter of a function written
+    /// in the body: what runs it decides, which no caller here states.
+    Callback,
+    /// What the value reaches when the call invoking it runs it.
+    Reached(Outcome<'a>),
+}
+
+impl<'a> Outcome<'a> {
     fn stopped(reason: impl Into<String>) -> Self {
         Outcome {
             stop: Some((Vec::new(), reason.into())),
@@ -818,19 +890,38 @@ impl Outcome {
             found.chain.insert(0, hop.clone());
         }
         if let Some((chain, _)) = &mut self.stop {
-            chain.insert(0, hop);
+            chain.insert(0, hop.clone());
+        }
+        for open in &mut self.open {
+            open.chain.insert(0, hop.clone());
         }
         self
     }
 
-    fn absorb(&mut self, other: Outcome) {
+    /// The same, seen from where `chain` starts.
+    fn below(mut self, chain: &[ChainHop]) -> Self {
+        for hop in chain.iter().rev() {
+            self = self.under(hop.clone());
+        }
+        self
+    }
+
+    fn absorb(&mut self, other: Outcome<'a>) {
+        // One end per labelled call and label: a call that runs a value may
+        // run one of several labelled exports (carrick#2432).
+        let key = |end: &SiteEnd| {
+            (
+                end.file.clone(),
+                end.span_start,
+                end.span_end,
+                end.package.clone(),
+                end.export.clone(),
+                end.member.clone(),
+            )
+        };
         for found in other.ends {
-            let at = (&found.end.file, found.end.span_start, found.end.span_end);
-            match self
-                .ends
-                .iter_mut()
-                .find(|known| (&known.end.file, known.end.span_start, known.end.span_end) == at)
-            {
+            let at = key(&found.end);
+            match self.ends.iter_mut().find(|known| key(&known.end) == at) {
                 Some(known) if known.chain.len() > found.chain.len() => *known = found,
                 Some(_) => {}
                 None => self.ends.push(found),
@@ -844,6 +935,21 @@ impl Outcome {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        self.open.extend(other.open);
+    }
+
+    /// The labelled exports the outcome reaches, as the store names them.
+    fn labels(&self) -> BTreeSet<(String, String, Option<String>)> {
+        self.ends
+            .iter()
+            .map(|found| {
+                (
+                    found.end.package.clone(),
+                    found.end.export.clone(),
+                    found.end.member.clone(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -855,15 +961,20 @@ struct Walker<'a> {
     /// a package export's maker built (`const app = pkg(); app.post(…)`),
     /// by its file and SWC span ([`super::library_sites`]).
     instances: HashMap<(&'a Path, u32, u32), &'a LibrarySite>,
-    memo: HashMap<(PathBuf, String), Outcome>,
+    /// Each function's callers, through what the rows say each call reaches:
+    /// what fills a parameter a callee's value is read from (carrick#2432).
+    callers: super::decided_sites::Calls<'a>,
+    memo: HashMap<(PathBuf, String), Outcome<'a>>,
     /// The definitions being read, by how deep.
     reading: HashMap<(PathBuf, String), usize>,
     /// Calls whose member declaration stands for more than one op
     /// (carrick#2474 R1): no site.
     ambiguous: std::cell::Cell<usize>,
+    /// How many own factories' returns the value being read is inside.
+    returns_depth: usize,
 }
 
-impl Walker<'_> {
+impl<'a> Walker<'a> {
     fn rel(&self, file: &Path) -> String {
         let relative = file.strip_prefix(self.root).unwrap_or(file);
         relative
@@ -890,6 +1001,42 @@ impl Walker<'_> {
             function: key.to_string(),
             file: self.rel(file),
             line,
+        }
+    }
+
+    /// The labelled call `invoke` is, on `export` (and `member` of it) of
+    /// `package`, as `claims` label it.
+    fn end_at(
+        &self,
+        invoke: Invoke<'_>,
+        package: &str,
+        export: &str,
+        member: Option<&str>,
+        claims: &ExportClaims,
+    ) -> SiteEnd {
+        let op = (!invoke.construction)
+            .then(|| {
+                claims.claims.iter().find_map(|claim| match claim {
+                    LibraryClaim::Op {
+                        op,
+                        member: claimed,
+                        ..
+                    } if claimed.as_deref() == member => Some(*op),
+                    _ => None,
+                })
+            })
+            .flatten();
+        SiteEnd {
+            package: package.to_string(),
+            export: export.to_string(),
+            member: member.map(str::to_string),
+            role: claims.role,
+            op,
+            file: self.rel(invoke.file),
+            line: invoke.call.site.line,
+            span_start: invoke.call.site.span_start,
+            span_end: invoke.call.site.span_end,
+            new: invoke.construction,
         }
     }
 
@@ -982,31 +1129,13 @@ impl Walker<'_> {
         if in_repo(row) {
             return None;
         }
+        let invoke = Invoke {
+            file,
+            call,
+            construction,
+        };
         let end = |package: &str, export: &str, member: Option<&str>, claims: &ExportClaims| {
-            let op = (!construction)
-                .then(|| {
-                    claims.claims.iter().find_map(|claim| match claim {
-                        LibraryClaim::Op {
-                            op,
-                            member: claimed,
-                            ..
-                        } if claimed.as_deref() == member => Some(*op),
-                        _ => None,
-                    })
-                })
-                .flatten();
-            SiteEnd {
-                package: package.to_string(),
-                export: export.to_string(),
-                member: member.map(str::to_string),
-                role: claims.role,
-                op,
-                file: self.rel(file),
-                line: call.site.line,
-                span_start: call.site.span_start,
-                span_end: call.site.span_end,
-                new: construction,
-            }
+            self.end_at(invoke, package, export, member, claims)
         };
         let package = store_key(row, self.labels.exports);
         if let Some(package) = &package {
@@ -1144,6 +1273,15 @@ impl Walker<'_> {
         }
     }
 
+    /// Whether the callee is a value the repository declares: the call row
+    /// names a declaration in one of its files (a parameter, a key of a type
+    /// it writes, a local), or the callee is no name at all (`(a ?? b)(…)`),
+    /// which no row names. A name or member the compiler cannot type stays
+    /// what the rows say of it.
+    fn declared_here(&self, file: &Path, call: &CallIr) -> bool {
+        call.callee.is_empty() || self.row(file, call).is_some_and(in_repo)
+    }
+
     /// Whether the call row names a member an interface or type literal of
     /// the service declares: no body here implements it.
     fn interface_member(&self, file: &Path, call: &CallIr) -> bool {
@@ -1213,10 +1351,13 @@ impl Walker<'_> {
     }
 
     /// What `call`, written in `body` of `file`, reaches.
-    fn call(&mut self, file: &Path, body: &FnIr, call: &CallIr, construction: bool) -> Outcome {
-        if call.invokes_param.is_some() {
-            return Outcome::stopped("injected_callee");
-        }
+    fn call(
+        &mut self,
+        file: &'a Path,
+        body: &'a FnIr,
+        call: &'a CallIr,
+        construction: bool,
+    ) -> Outcome<'a> {
         if let Some((end, reached)) = self.library_end(file, call, construction) {
             let traced = self.labels.declarations.is_some();
             return Outcome {
@@ -1225,29 +1366,50 @@ impl Walker<'_> {
                     end,
                     receiver: traced.then(|| self.receiver_of(file, call)).flatten(),
                     reached: traced.then_some(reached),
+                    several: false,
                 }],
                 ..Outcome::default()
             };
+        }
+        let invoke = Invoke {
+            file,
+            call,
+            construction,
+        };
+        // A callee that is a value (carrick#2432): followed through each
+        // value it may hold, before the interface member that types it. A
+        // member the compiler declares in a package or the language's
+        // library (`res.json()` on a parameter) is that library's
+        // ([`Self::declared_here`]).
+        if !call.callee_values.is_empty() && !construction && self.declared_here(file, call) {
+            let mut values = Vec::new();
+            for value in &call.callee_values {
+                values.extend(self.read_value(file, value, invoke, false));
+            }
+            return self.agree(values, invoke, Vec::new());
+        }
+        if call.invokes_param.is_some() {
+            return Outcome::stopped(INJECTED_CALLEE);
         }
         match self.inputs.reach(file, call.site.lo, call.site.hi) {
             Reach::Function(target, key) => {
                 let hop = self.hop(&target, &key);
                 let id = (target, key);
+                let callee = self.function(&id.0, &id.1);
                 let mut out = match self.reading.get(&id) {
                     // The walk came back to a definition it is reading.
                     Some(depth) => Outcome {
                         cycle_at: Some(*depth),
                         ..Outcome::stopped("cycle")
                     },
-                    None => self.definition(&id).under(hop.clone()),
+                    None => {
+                        let inner = self.definition(&id);
+                        self.bind(inner, invoke, callee).under(hop.clone())
+                    }
                 };
                 // A function written at the call that the callee runs.
-                let runs = self
-                    .inputs
-                    .files
-                    .get(&id.0)
-                    .and_then(|ir| ir.functions.get(&id.1))
-                    .map(|callee| callee.invoked_params.clone())
+                let runs = callee
+                    .map(|(_, callee)| callee.invoked_params.clone())
                     .unwrap_or_default();
                 for (index, arg) in call.args.iter().enumerate() {
                     if let Value::Callback(nested) = arg
@@ -1262,7 +1424,8 @@ impl Walker<'_> {
                                 .as_ref()
                                 .map_or(call.site.line, |site| site.line),
                         };
-                        let inner = self.body(file, callback).under(written).under(hop.clone());
+                        let inner = self.body(file, callback);
+                        let inner = self.lifted(inner).under(written).under(hop.clone());
                         out.absorb(inner);
                     }
                 }
@@ -1281,19 +1444,14 @@ impl Walker<'_> {
     }
 
     /// What the definition `id` reaches, read once it is final.
-    fn definition(&mut self, id: &(PathBuf, String)) -> Outcome {
+    fn definition(&mut self, id: &(PathBuf, String)) -> Outcome<'a> {
         if let Some(known) = self.memo.get(id) {
             return known.clone();
         }
-        let inputs = self.inputs;
         // A definition the extractor keys whose body this pass did not read
         // (an object's method, a function written inside another): what it
         // calls is not known, so the walk stops there and says so.
-        let Some(ir) = inputs
-            .files
-            .get(&id.0)
-            .and_then(|ir| ir.functions.get(&id.1))
-        else {
+        let Some((file, ir)) = self.function(&id.0, &id.1) else {
             return Outcome::stopped(NO_BODY);
         };
         if ir.bodyless {
@@ -1301,7 +1459,7 @@ impl Walker<'_> {
         }
         let depth = self.reading.len();
         self.reading.insert(id.clone(), depth);
-        let mut out = self.body(&id.0, ir);
+        let mut out = self.body(file, ir);
         self.reading.remove(id);
         if out.cycle_at.is_none_or(|at| at >= depth) {
             out.cycle_at = None;
@@ -1321,7 +1479,7 @@ impl Walker<'_> {
     }
 
     /// What the calls `body` makes reach.
-    fn body(&mut self, file: &Path, body: &FnIr) -> Outcome {
+    fn body(&mut self, file: &'a Path, body: &'a FnIr) -> Outcome<'a> {
         let mut out = Outcome::default();
         for (call, construction) in body.read_calls() {
             let mut inner = self.call(file, body, call, construction);
@@ -1343,8 +1501,8 @@ impl Walker<'_> {
     /// labelled export or stops short.
     fn misses(
         &mut self,
-        file: &Path,
-        body: &FnIr,
+        file: &'a Path,
+        body: &'a FnIr,
         call: &CallIr,
         construction: bool,
         outcome: &Outcome,
@@ -1368,13 +1526,23 @@ impl Walker<'_> {
     }
 
     /// The records for every call `body` and the functions written in it
-    /// make.
-    fn sites(&mut self, file: &Path, body: &FnIr, discovery: &mut Discovery) {
+    /// make. `body` is `depth` functions inside the definition `key` of
+    /// `file` (`None` at module level): a value a parameter of that
+    /// definition holds is read from its callers.
+    fn sites(
+        &mut self,
+        file: &'a Path,
+        key: Option<&'a str>,
+        depth: u8,
+        body: &'a FnIr,
+        discovery: &mut Discovery,
+    ) {
         for (call, construction) in body.read_calls() {
             if call.jsx {
                 continue;
             }
             let outcome = self.call(file, body, call, construction);
+            let outcome = self.settle_at_callers(outcome, file, key, depth);
             let missed = self.misses(file, body, call, construction, &outcome);
             let record =
                 |end: Option<SiteEnd>, chain: Vec<ChainHop>, stop: Option<String>| DiscoverySite {
@@ -1417,7 +1585,16 @@ impl Walker<'_> {
                 };
                 // A call whose own row says nothing: the walk never entered
                 // code. Listed with the hole the row names.
-                if chain.is_empty() && stop != "injected_callee" && stop != "interface_member" {
+                if chain.is_empty()
+                    && ![
+                        INJECTED_CALLEE,
+                        "interface_member",
+                        SEVERAL_VALUES,
+                        VALUES_OVER_CAP,
+                        VALUE_NEVER_BOUND,
+                    ]
+                    .contains(&stop.as_str())
+                {
                     *discovery
                         .counts
                         .entry(format!("unread/{stop}"))
@@ -1430,20 +1607,457 @@ impl Walker<'_> {
                 continue;
             }
             for found in outcome.ends {
-                *discovery
-                    .counts
-                    .entry(format!("site/{}", role_key(found.end.role)))
-                    .or_default() += 1;
+                // One of the labelled exports a callee's disagreeing values
+                // reach: the end is kept, with why it is no site.
+                let stop = found.several.then(|| SEVERAL_VALUES.to_string());
+                let count = match &stop {
+                    Some(stop) => format!("stop/{stop}"),
+                    None => format!("site/{}", role_key(found.end.role)),
+                };
+                *discovery.counts.entry(count).or_default() += 1;
                 discovery.sites.push(DiscoverySite {
                     receiver: found.receiver,
                     reached: found.reached,
-                    ..record(Some(found.end), found.chain, None)
+                    ..record(Some(found.end), found.chain, stop)
                 });
             }
         }
         for inner in body.nested.iter().chain(&body.detached) {
-            self.sites(file, inner, discovery);
+            self.sites(file, key, depth.saturating_add(1), inner, discovery);
         }
+    }
+
+    /// The definition `key` of `file`, the file as `inputs` keys it.
+    fn function(&self, file: &Path, key: &str) -> Option<(&'a Path, &'a FnIr)> {
+        let (path, ir) = self.inputs.files.get_key_value(file)?;
+        Some((path.as_path(), ir.functions.get(key)?))
+    }
+
+    /// The function written in `file` whose node starts at `start`, at any
+    /// depth of any body.
+    fn written_function(&self, file: &Path, start: u32) -> Option<&'a FnIr> {
+        fn find(ir: &FnIr, start: u32) -> Option<&FnIr> {
+            if ir.site.as_ref().is_some_and(|site| site.lo == start) {
+                return Some(ir);
+            }
+            ir.nested
+                .iter()
+                .chain(&ir.detached)
+                .find_map(|inner| find(inner, start))
+        }
+        let ir = self.inputs.files.get(file)?;
+        let mut keys: Vec<&String> = ir.functions.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|key| &ir.functions[key])
+            .chain(std::iter::once(&ir.module_level))
+            .find_map(|body| find(body, start))
+    }
+
+    /// What `value`, read in a body of `file`, reaches when `invoke` runs it
+    /// (carrick#2432): a parameter of that body is left for its callers; a
+    /// labelled export is the labelled call `invoke` itself; a function of
+    /// the repository is read as a call of it is, `invoke` filling its
+    /// parameters. `at_caller` reads a function written in place as a
+    /// callback, whatever runs it filling it.
+    fn read_value(
+        &mut self,
+        file: &'a Path,
+        value: &ValueAt,
+        invoke: Invoke<'a>,
+        at_caller: bool,
+    ) -> Vec<Held<'a>> {
+        let nothing = || vec![Held::Reached(Outcome::default())];
+        match value {
+            ValueAt::Param { depth, index, keys } => {
+                vec![Held::Param(*depth, *index, keys.clone())]
+            }
+            ValueAt::Read { lo, hi, member } => {
+                let kind = if *member { Kind::Member } else { Kind::Ident };
+                if let Some(end) = self.value_end(file, *lo, *hi, kind, invoke) {
+                    return vec![Held::Reached(Outcome {
+                        ends: vec![Found {
+                            chain: Vec::new(),
+                            end,
+                            receiver: None,
+                            reached: None,
+                            several: false,
+                        }],
+                        ..Outcome::default()
+                    })];
+                }
+                match self.inputs.row_names(file, *lo, *hi, kind) {
+                    Reach::Function(target, key) => {
+                        vec![Held::Reached(self.enter_value(target, key, invoke))]
+                    }
+                    _ => nothing(),
+                }
+            }
+            ValueAt::Returned { lo, hi } => {
+                let Reach::Function(target, key) = self.inputs.reach(file, *lo, *hi) else {
+                    return nothing();
+                };
+                let Some((factory_file, factory)) = self.function(&target, &key) else {
+                    return nothing();
+                };
+                if self.returns_depth >= MAX_VALUES {
+                    return nothing();
+                }
+                self.returns_depth += 1;
+                let mut out = Vec::new();
+                for returned in &factory.returned_values {
+                    match returned {
+                        // A parameter of the factory: its own call fills it.
+                        ValueAt::Param { .. } => out.extend(nothing()),
+                        other => out.extend(self.read_value(factory_file, other, invoke, false)),
+                    }
+                }
+                self.returns_depth -= 1;
+                if out.is_empty() { nothing() } else { out }
+            }
+            ValueAt::Function(_) if at_caller => vec![Held::Callback],
+            ValueAt::Function(start) => match self.written_function(file, *start) {
+                Some(function) => {
+                    let line = function.site.as_ref().map_or(0, |site| site.line);
+                    let hop = ChainHop {
+                        function: VALUE_HOP.to_string(),
+                        file: self.rel(file),
+                        line,
+                    };
+                    let inner = self.body(file, function);
+                    vec![Held::Reached(
+                        self.bind(inner, invoke, Some((file, function))).under(hop),
+                    )]
+                }
+                None => nothing(),
+            },
+            ValueAt::Object { .. } | ValueAt::Unread => nothing(),
+        }
+    }
+
+    /// The labelled call `invoke` is when the name or member read at
+    /// `lo..hi` in `file` holds a labelled export: by the name its package
+    /// publishes the declaration the compiler's row there names, or a
+    /// global of the language's own library or the runtime's types.
+    fn value_end(
+        &self,
+        file: &Path,
+        lo: u32,
+        hi: u32,
+        kind: Kind,
+        invoke: Invoke<'_>,
+    ) -> Option<SiteEnd> {
+        let positions = self.inputs.positions.as_ref()?;
+        let ir = self.inputs.files.get(file)?;
+        let row = positions
+            .lookup(file, ir.swc_start(lo), ir.swc_start(hi), kind)
+            .ok()?;
+        let symbol = row.symbol()?;
+        if in_repo(row) {
+            return None;
+        }
+        if let Some(package) = store_key(row, self.labels.exports) {
+            for export in published_names(row) {
+                if let Some(claims) = self.labels.get(&package, export) {
+                    return Some(self.end_at(invoke, &package, export, None, claims));
+                }
+            }
+        }
+        if kind == Kind::Ident
+            && (row
+                .decl_file()
+                .is_some_and(|declared| declared.starts_with("lib:"))
+                || row.decl_package() == Some(RUNTIME_TYPES))
+            && let Some(claims) = self.labels.global(symbol)
+        {
+            return Some(self.end_at(invoke, &claims.package, symbol, None, claims));
+        }
+        None
+    }
+
+    /// What `invoke` reaches when the value it runs is the definition `key`
+    /// of `target`: read as a call of it is, `invoke` filling its
+    /// parameters, under a `<value>` hop.
+    fn enter_value(&mut self, target: PathBuf, key: String, invoke: Invoke<'a>) -> Outcome<'a> {
+        let hop = ChainHop {
+            function: VALUE_HOP.to_string(),
+            ..self.hop(&target, &key)
+        };
+        let id = (target, key);
+        if let Some(depth) = self.reading.get(&id) {
+            return Outcome {
+                cycle_at: Some(*depth),
+                ..Outcome::stopped("cycle")
+            };
+        }
+        let inner = self.definition(&id);
+        let callee = self.function(&id.0, &id.1);
+        self.bind(inner, invoke, callee).under(hop)
+    }
+
+    /// `inner`, what a function `invoke` calls reaches, with each value its
+    /// own parameters hold filled from what `invoke` passes there, or the
+    /// default `callee` gives. What is left open is a parameter of the body
+    /// that holds `invoke`.
+    fn bind(
+        &mut self,
+        mut inner: Outcome<'a>,
+        invoke: Invoke<'a>,
+        callee: Option<(&'a Path, &'a FnIr)>,
+    ) -> Outcome<'a> {
+        for open in std::mem::take(&mut inner.open) {
+            let mut values = open.known;
+            for (depth, index, keys) in open.refs {
+                if depth != 0 {
+                    // A parameter of the function the callee is written in:
+                    // the callee's own caller does not fill it.
+                    values.push(Held::Reached(Outcome::default()));
+                    continue;
+                }
+                values.extend(self.passed(Some(invoke), index, &keys, callee, open.invoke));
+            }
+            let settled = self.agree(values, open.invoke, open.chain);
+            inner.absorb(settled);
+        }
+        inner
+    }
+
+    /// `inner`, what a function written in a body reaches, as that body
+    /// reads it: its own parameters are whatever runs it fills, and each
+    /// parameter of an enclosing function is one function nearer.
+    fn lifted(&mut self, mut inner: Outcome<'a>) -> Outcome<'a> {
+        for mut open in std::mem::take(&mut inner.open) {
+            let mut refs = Vec::new();
+            for (depth, index, keys) in open.refs {
+                match depth.checked_sub(1) {
+                    Some(depth) => refs.push((depth, index, keys)),
+                    None => open.known.push(Held::Callback),
+                }
+            }
+            if refs.is_empty() {
+                let settled = self.agree(open.known, open.invoke, open.chain);
+                inner.absorb(settled);
+            } else {
+                open.refs = refs;
+                inner.open.push(open);
+            }
+        }
+        inner
+    }
+
+    /// What the call `at` hands its callee's parameter `index` at `keys`:
+    /// each value it writes there, read where `at` is written, or the
+    /// callee's default where it writes nothing (or there is no call, `at`
+    /// `None`). Empty when nothing is handed and there is no default.
+    fn passed(
+        &mut self,
+        at: Option<Invoke<'a>>,
+        index: usize,
+        keys: &[String],
+        callee: Option<(&'a Path, &'a FnIr)>,
+        invoke: Invoke<'a>,
+    ) -> Vec<Held<'a>> {
+        let mut written: Vec<ValueAt> = Vec::new();
+        let mut defaulted = at.is_none();
+        if let Some(at) = at {
+            let args = &at.call.arg_values;
+            // A spread (an empty entry) at or before the position moves it.
+            let spread = args.iter().take(index + 1).any(Vec::is_empty);
+            match args.get(index) {
+                _ if spread => written.push(ValueAt::Unread),
+                Some(values) => {
+                    for value in values {
+                        match value.at(keys) {
+                            Some(values) => written.extend(values),
+                            None => defaulted = true,
+                        }
+                    }
+                }
+                None => defaulted = true,
+            }
+        }
+        written.dedup();
+        let mut out = Vec::new();
+        if let Some(at) = at {
+            for value in &written {
+                out.extend(self.read_value(at.file, value, invoke, true));
+            }
+        }
+        if defaulted && let Some((file, callee)) = callee {
+            for (position, path, values) in &callee.param_defaults {
+                if *position != index || !keys.starts_with(path) {
+                    continue;
+                }
+                for value in values {
+                    for value in value.at(&keys[path.len()..]).unwrap_or_default() {
+                        match value {
+                            // A default read from another parameter.
+                            ValueAt::Param { .. } => out.push(Held::Reached(Outcome::default())),
+                            other => out.extend(self.read_value(file, &other, invoke, false)),
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// One outcome for the values a callee may hold (carrick#2432), the
+    /// call `invoke` running it: every value reaches the same labelled
+    /// exports, as the store names them, and those are its ends. Values
+    /// that reach different ones, or one that reaches none, are one of
+    /// several (`several_values`); no value at all is `value_never_bound`;
+    /// more than [`MAX_VALUES`] is `values_over_cap`; only callbacks stay
+    /// `injected_callee`, what runs them decides. A parameter among them
+    /// stays open for the callers of the body that holds `invoke`.
+    fn agree(
+        &mut self,
+        values: Vec<Held<'a>>,
+        invoke: Invoke<'a>,
+        chain: Vec<ChainHop>,
+    ) -> Outcome<'a> {
+        let (refs, known): (Vec<_>, Vec<_>) = values
+            .into_iter()
+            .partition(|value| matches!(value, Held::Param(..)));
+        if !refs.is_empty() {
+            let refs = refs
+                .into_iter()
+                .filter_map(|value| match value {
+                    Held::Param(depth, index, keys) => Some((depth, index, keys)),
+                    _ => None,
+                })
+                .collect();
+            return Outcome {
+                open: vec![Open {
+                    refs,
+                    known,
+                    invoke,
+                    chain,
+                }],
+                ..Outcome::default()
+            };
+        }
+        if known.is_empty() {
+            return Outcome::stopped(VALUE_NEVER_BOUND).below(&chain);
+        }
+        if known.len() > MAX_VALUES {
+            return Outcome::stopped(VALUES_OVER_CAP).below(&chain);
+        }
+        if known.iter().all(|value| matches!(value, Held::Callback)) {
+            return Outcome::stopped(INJECTED_CALLEE).below(&chain);
+        }
+        let mut outcomes: Vec<Outcome<'a>> = known
+            .into_iter()
+            .map(|value| match value {
+                Held::Reached(outcome) => outcome,
+                _ => Outcome::default(),
+            })
+            .collect();
+        if outcomes.len() == 1 {
+            return outcomes.remove(0).below(&chain);
+        }
+        let first = outcomes[0].labels();
+        let agree = !first.is_empty() && outcomes.iter().all(|outcome| outcome.labels() == first);
+        let mut out = Outcome::default();
+        for mut outcome in outcomes {
+            if !agree {
+                for found in &mut outcome.ends {
+                    found.several = true;
+                }
+                outcome.stop = None;
+            }
+            out.absorb(outcome);
+        }
+        if !agree && out.ends.is_empty() {
+            out.stop = Some((Vec::new(), SEVERAL_VALUES.to_string()));
+        }
+        out.below(&chain)
+    }
+
+    /// `outcome`, read at a call of the body `depth` functions inside the
+    /// definition `key` of `file`, with each value left open read from what
+    /// the definition's callers pass, one caller up at a time until a value
+    /// is no parameter. A cycle ends.
+    fn settle_at_callers(
+        &mut self,
+        mut outcome: Outcome<'a>,
+        file: &'a Path,
+        key: Option<&'a str>,
+        depth: u8,
+    ) -> Outcome<'a> {
+        for open in std::mem::take(&mut outcome.open) {
+            let mut values = open.known;
+            for (out, index, keys) in &open.refs {
+                values.extend(self.callers_pass(
+                    (file, key, depth),
+                    (*out, *index, keys),
+                    open.invoke,
+                    &mut Vec::new(),
+                ));
+            }
+            let settled = self.agree(values, open.invoke, open.chain);
+            outcome.absorb(settled);
+        }
+        if !outcome.ends.is_empty() {
+            outcome.stop = None;
+        }
+        outcome
+    }
+
+    /// The values the parameter `param` (how many functions out of the body
+    /// `at`, its position and keys) holds, read at every caller of the
+    /// definition that body is in, and from theirs where a caller passes a
+    /// parameter of its own. `passing` holds the definitions on the way: a
+    /// cycle ends.
+    fn callers_pass(
+        &mut self,
+        at: (&'a Path, Option<&'a str>, u8),
+        param: (u8, usize, &[String]),
+        invoke: Invoke<'a>,
+        passing: &mut Vec<(PathBuf, String)>,
+    ) -> Vec<Held<'a>> {
+        let (file, key, depth) = at;
+        let (out, index, keys) = param;
+        // A parameter of a function written in the body: what runs it
+        // fills it.
+        if out < depth {
+            return vec![Held::Callback];
+        }
+        let Some(key) = key.filter(|_| out == depth) else {
+            return vec![Held::Reached(Outcome::default())];
+        };
+        let id = (file.to_path_buf(), key.to_string());
+        if passing.contains(&id) {
+            return Vec::new();
+        }
+        passing.push(id);
+        let callee = self.function(file, key);
+        let callers: Vec<_> = self.callers.callers_of(file, key).to_vec();
+        let mut values = Vec::new();
+        if callers.is_empty() {
+            // Nothing calls it: what it holds is its default, if any.
+            values.extend(self.passed(None, index, keys, callee, invoke));
+        }
+        for caller in callers {
+            let at = Invoke {
+                file: caller.file,
+                call: caller.call,
+                construction: false,
+            };
+            for value in self.passed(Some(at), index, keys, callee, invoke) {
+                match value {
+                    Held::Param(out, index, keys) => values.extend(self.callers_pass(
+                        (caller.file, caller.key, caller.depth),
+                        (out, index, &keys),
+                        invoke,
+                        passing,
+                    )),
+                    other => values.push(other),
+                }
+            }
+        }
+        passing.pop();
+        values
     }
 }
 
@@ -1473,9 +2087,11 @@ pub fn discover(inputs: &RequestSummaryInputs, labels: &Labels<'_>, root: &Path)
         labels,
         root,
         instances,
+        callers: super::decided_sites::Calls::through_reach(inputs),
         memo: HashMap::new(),
         reading: HashMap::new(),
         ambiguous: std::cell::Cell::new(0),
+        returns_depth: 0,
     };
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
     paths.sort();
@@ -1484,9 +2100,15 @@ pub fn discover(inputs: &RequestSummaryInputs, labels: &Labels<'_>, root: &Path)
         let mut keys: Vec<&String> = file.functions.keys().collect();
         keys.sort();
         for key in keys {
-            walker.sites(path, &file.functions[key], &mut discovery);
+            walker.sites(
+                path,
+                Some(key.as_str()),
+                0,
+                &file.functions[key],
+                &mut discovery,
+            );
         }
-        walker.sites(path, &file.module_level, &mut discovery);
+        walker.sites(path, None, 0, &file.module_level, &mut discovery);
     }
     let ambiguous = walker.ambiguous.get();
     if ambiguous > 0 {

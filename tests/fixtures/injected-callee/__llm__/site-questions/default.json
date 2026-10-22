@@ -1,0 +1,16 @@
+{
+  "question_set": "qs-injected-callee",
+  "answers": [
+    {
+      "site_id": "src/items.ts:295-320",
+      "ok": true,
+      "kind": null,
+      "role": null,
+      "name": null,
+      "method": { "value": "GET", "confidence": 0.95, "orders_agree": true },
+      "namespace": null,
+      "name_argument": null,
+      "payload_argument": null
+    }
+  ]
+}
