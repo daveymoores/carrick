@@ -118,9 +118,13 @@ pub(crate) fn walked_within(
             std::fs::write(&path, text).unwrap();
         }
     }
-    let config = Config::load_services(vec![repo.join("carrick.json")])
-        .unwrap()
-        .remove(0);
+    // The service named `service`, else the first.
+    let mut services = Config::load_services(vec![repo.join("carrick.json")]).unwrap();
+    let at = services
+        .iter()
+        .position(|config| config.service_name.as_deref() == Some(service))
+        .unwrap_or(0);
+    let config = services.remove(at);
     let positions = with_rows.then(|| {
         let mut files =
             crate::file_finder::walk_service(&repo.to_string_lossy(), &config, &[]).files;

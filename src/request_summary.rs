@@ -896,9 +896,29 @@ enum HeldInstance {
     /// What the library-site reader reads a holder as: a maker's instance,
     /// or what an own factory call returns ([`Reader::written_instance`]).
     Client(Box<ClientRef>),
-    /// A name an import binds, at its span (discovery numbering): which
-    /// declaration it reaches is the compiler's to say.
+    /// A name an import binds, or a module-scope instance's name a scope
+    /// below declares again (carrick#2474 R2b), at its span (discovery
+    /// numbering): which declaration it reaches is the compiler's to say.
     Imported(u32, u32),
+    /// A call of a member that is no maker's and no own factory's, or a
+    /// module-scope binding such a call initialises, at the call's span
+    /// (discovery numbering): a scope a labelled member returns, which the
+    /// walk reads (carrick#2474 R2b).
+    Returned(u32, u32),
+}
+
+/// A call of a member (`app.basePath("/v2")`), as the scope it may return
+/// ([`HeldInstance::Returned`]).
+fn returned_call(expr: &Expr) -> Option<HeldInstance> {
+    match unwrap_value(expr) {
+        Expr::Call(call) => match &call.callee {
+            Callee::Expr(callee) if matches!(unwrap_value(callee), Expr::Member(_)) => {
+                Some(HeldInstance::Returned(call.span.lo.0, call.span.hi.0))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// What one argument holds, whole, and what each plain key of an object
@@ -907,6 +927,10 @@ enum HeldInstance {
 struct ArgHeld {
     whole: Option<HeldInstance>,
     keys: BTreeMap<String, HeldInstance>,
+    /// The argument's span (discovery numbering), where no spread comes
+    /// before it: where a compiler row names what a name there declares
+    /// (carrick#2474 R2b).
+    span: Option<(u32, u32)>,
 }
 
 /// What the receiver trace reads at one call (carrick#2474 R2a): the
@@ -1212,6 +1236,11 @@ pub struct FileIr {
     /// `const` a factory call built, and an anonymous `export default
     /// <factory call>` under [`DEFAULT_EXPORT`].
     module_clients: HashMap<String, ClientRef>,
+    /// What each module-scope binding left out of `module_clients` because
+    /// a scope below declares its name again holds (carrick#2474 R2b): read
+    /// only by the receiver trace, through the declaration the compiler
+    /// names at a use, which tells the two bindings apart.
+    shadowed_clients: HashMap<String, ClientRef>,
     /// Every import binding the file uses, with how it uses it. What a module
     /// that declares one of them holds is changed by these uses too.
     imported: HashMap<String, BindingUse>,
@@ -1449,6 +1478,8 @@ pub fn extract_file_ir(
         query_builders: module_query_builders(module, &reassigned),
         receivers: HashMap::new(),
         lazy_clients: HashMap::new(),
+        shadowed_clients: HashSet::new(),
+        returned_consts: HashMap::new(),
         imports: HashSet::new(),
         uses: uses.uses,
         object_consts: object_consts(module),
@@ -1608,12 +1639,21 @@ pub fn extract_file_ir(
                     // ([`ClientInstance::http_factory`]), and a service that
                     // held none before held no HTTP instance a specifier
                     // could take away.
-                    if let Some(client) = client
+                    if client.is_none()
                         && !redeclared.declares_name(&name)
+                        && let Some(HeldInstance::Returned(lo, hi)) = returned_call(init)
                     {
+                        module_scope.returned_consts.insert(name.clone(), (lo, hi));
+                    }
+                    if let Some(client) = client {
                         let client = module_scope.with_uses(client, &name);
-                        file.module_clients.insert(name.clone(), client.clone());
-                        module_scope.receivers.insert(name, client);
+                        if redeclared.declares_name(&name) {
+                            module_scope.shadowed_clients.insert(name.clone());
+                            file.shadowed_clients.insert(name, client);
+                        } else {
+                            file.module_clients.insert(name.clone(), client.clone());
+                            module_scope.receivers.insert(name, client);
+                        }
                     }
                     if let Some(text) = text {
                         module_scope.texts.insert(ident_key(&ident.id), text);
@@ -1949,6 +1989,13 @@ struct ModuleScope {
     /// [`Reader::lazy_clients`]). Read only where a function returns it: no
     /// call is read through the `let`, for any role.
     lazy_clients: HashMap<BindingKey, ClientRef>,
+    /// The module-scope bindings that hold an instance a scope below
+    /// declares the name of again ([`FileIr::shadowed_clients`]).
+    shadowed_clients: HashSet<String>,
+    /// Each module-scope `const` a member call that is no maker's
+    /// initialises, by name, at the call's span (discovery numbering):
+    /// [`HeldInstance::Returned`] (carrick#2474 R2b).
+    returned_consts: HashMap<String, (u32, u32)>,
     /// Import bindings no scope below declares again, other than namespace
     /// imports: each may hold an instance the module it names declares
     /// (carrick#1568).
@@ -4137,14 +4184,21 @@ impl Reader<'_> {
                     return Some(HeldInstance::Client(Box::new(client.clone())));
                 }
                 let key = ident_key(ident);
-                (!scope.locals.contains_key(&key)
-                    && !scope.local_receivers.contains_key(&key)
-                    && scope.module.imports.contains(ident.sym.as_ref()))
+                let name = ident.sym.as_ref();
+                if scope.locals.contains_key(&key) || scope.local_receivers.contains_key(&key) {
+                    return None;
+                }
+                if let Some((lo, hi)) = scope.module.returned_consts.get(name) {
+                    return Some(HeldInstance::Returned(*lo, *hi));
+                }
+                (scope.module.imports.contains(name)
+                    || scope.module.shadowed_clients.contains(name))
                 .then_some(HeldInstance::Imported(ident.span.lo.0, ident.span.hi.0))
             }
             call @ (Expr::Call(_) | Expr::New(_)) => self
                 .written_instance(call, scope)
-                .map(|client| HeldInstance::Client(Box::new(client))),
+                .map(|client| HeldInstance::Client(Box::new(client)))
+                .or_else(|| returned_call(call)),
             _ => None,
         }
     }
@@ -4176,6 +4230,7 @@ impl Reader<'_> {
                 if arg.spread.is_some() {
                     return ArgHeld::default();
                 }
+                let span = unwrap_value(&arg.expr).span();
                 let keys = match unwrap_value(&arg.expr) {
                     Expr::Object(object) => object
                         .props
@@ -4206,6 +4261,7 @@ impl Reader<'_> {
                 ArgHeld {
                     whole: self.held(&arg.expr, scope),
                     keys,
+                    span: Some((span.lo.0, span.hi.0)),
                 }
             })
             .collect();

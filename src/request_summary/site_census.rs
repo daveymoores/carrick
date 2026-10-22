@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::decided_sites::{
-    DiscoveryFile, InstanceAt, InstanceEnd, MakerLabel, SiteLabel, decided_sites_traced, relative,
+    DiscoveryFile, InstanceAt, InstanceEnd, MakerLabel, ScopeLabel, SiteLabel,
+    decided_sites_traced, relative,
 };
 use super::site_record::{Bucket, site_records};
 use crate::config::Config;
@@ -112,16 +113,41 @@ struct RoutesCensus {
     /// Every instance end: `file:line <- at root file:line` or `<- at
     /// <reason> [text]`.
     instances: Vec<String>,
+    /// Endpoint rows a route site at the same `file:line` (and method,
+    /// where the site forces one) composes the row's full path for
+    /// (carrick#2474 R2b), both read without a trailing `/`.
+    composed_recalled: usize,
+    /// Endpoint rows with a route site at the same place that composes
+    /// another path or none: `row <- each composed path, or (why none)`.
+    composed_differs: Vec<String>,
+    /// Composed paths by where their walk up ends: `top`, a hole's reason,
+    /// `cycle`.
+    composed_ends: BTreeMap<String, usize>,
+    /// Every composed path: `file:line METHOD path <- edges`.
+    composed: Vec<String>,
 }
 
 /// An instance end's kind: `root`, or the hole's reason.
 fn end_kind(end: &InstanceEnd) -> String {
+    if matches!(end.end, InstanceAt::Scope { .. }) {
+        return "scope".to_string();
+    }
     match end.hole() {
         None => "root".to_string(),
         Some(reason) => serde_json::to_value(reason)
             .ok()
             .and_then(|reason| reason.as_str().map(str::to_string))
             .unwrap_or_default(),
+    }
+}
+
+/// A composed path as the census lists it: the path (`?` where it is not
+/// text), with where its walk ends after it unless that is the top.
+fn composed_text(composed: &super::decided_sites::Composed) -> String {
+    let path = composed.path.as_deref().unwrap_or("?");
+    match composed.end.as_str() {
+        "top" => path.to_string(),
+        end => format!("{path} ({end})"),
     }
 }
 
@@ -169,6 +195,7 @@ struct Routed {
     written: Option<String>,
     no_method: bool,
     instances: Vec<InstanceEnd>,
+    composed: Vec<super::decided_sites::Composed>,
 }
 
 /// The routes section: `records` against the scan's endpoint rows in
@@ -179,6 +206,7 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
     use crate::site_questions::Slot;
     let mut census = RoutesCensus::default();
     let mut stated: Vec<(String, String, String)> = Vec::new();
+    let mut composed_at: Vec<(String, String, Vec<super::decided_sites::Composed>)> = Vec::new();
     for routed in records {
         let record = &routed.record;
         let forced = |slot| record.state.forced.get(&slot).cloned();
@@ -230,6 +258,7 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
             *census.instance_ends.entry(end_kind(end)).or_default() += 1;
             let what = match &end.end {
                 InstanceAt::Root { file, line, .. } => format!("root {file}:{line}"),
+                InstanceAt::Scope { file, line, .. } => format!("scope {file}:{line}"),
                 InstanceAt::Hole { text, .. } => match text {
                     Some(text) => format!("{} {text}", end_kind(end)),
                     None => end_kind(end),
@@ -243,6 +272,18 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
             census.mount_shaped.push(format!("{at} {method} {name}"));
             continue;
         }
+        for composed in &routed.composed {
+            *census
+                .composed_ends
+                .entry(composed.end.clone())
+                .or_default() += 1;
+            census.composed.push(format!(
+                "{at} {method} {} <- {}",
+                composed_text(composed),
+                composed.edges.join(" > ")
+            ));
+        }
+        composed_at.push((method.clone(), at.clone(), routed.composed.clone()));
         stated.push((method, name, at));
     }
     let rows = endpoint_rows(blobs);
@@ -264,6 +305,46 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
             census.missed.push(format!("{} {} {}", row.2, row.0, row.1));
         }
     }
+    for row in &rows {
+        let here: Vec<&Vec<super::decided_sites::Composed>> = composed_at
+            .iter()
+            .filter(|(method, at, _)| (method.is_empty() || row.0 == *method) && row.2 == *at)
+            .map(|(_, _, composed)| composed)
+            .collect();
+        if here.is_empty() {
+            continue;
+        }
+        // Both read without a trailing `/` (a route `/` under a prefix).
+        let bare = |path: &str| match path.trim_end_matches('/') {
+            "" => "/".to_string(),
+            path => path.to_string(),
+        };
+        let path = bare(&row.1);
+        if here
+            .iter()
+            .flat_map(|composed| composed.iter())
+            .any(|composed| composed.path.as_deref().map(bare).as_deref() == Some(path.as_str()))
+        {
+            census.composed_recalled += 1;
+        } else {
+            let got: Vec<String> = here
+                .iter()
+                .flat_map(|composed| composed.iter())
+                .map(composed_text)
+                .collect();
+            census.composed_differs.push(format!(
+                "{} {} {} <- {}",
+                row.2,
+                row.0,
+                row.1,
+                if got.is_empty() {
+                    "(no instance)".to_string()
+                } else {
+                    got.join(" | ")
+                }
+            ));
+        }
+    }
     for site in &stated {
         if !rows.iter().any(|row| same_place(row, site)) {
             census
@@ -278,6 +359,8 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
         &mut census.mount_shaped,
         &mut census.sites,
         &mut census.instances,
+        &mut census.composed_differs,
+        &mut census.composed,
     ] {
         list.sort();
         list.dedup();
@@ -319,6 +402,8 @@ fn census_repo(
     .exports;
     let labels = SiteLabel::from_exports(&exports);
     let makers = MakerLabel::from_exports(&exports);
+    // The census verifies nothing: every scope claim of the answer counts.
+    let scopes = ScopeLabel::from_exports(&exports, None);
     let mut by_service: BTreeMap<String, PathBuf> = BTreeMap::new();
     for entry in std::fs::read_dir(positions).expect("the positions dir reads") {
         let path = entry.expect("dir entry").path();
@@ -368,7 +453,7 @@ fn census_repo(
             .collect();
         // Traced: each site also names its instance (carrick#2474 R2a),
         // which only the routes section reads.
-        let decided = decided_sites_traced(&inputs, &root, &mine, &labels, &makers);
+        let decided = decided_sites_traced(&inputs, &root, &mine, &labels, &makers, &scopes);
         census.decided_sites += decided.sites.len();
         census.unplaced += decided.unplaced.len();
         census.walked += decided.walked.len();
@@ -407,6 +492,7 @@ fn census_repo(
                         })
                     }),
                 instances: site.map(|site| site.instances.clone()).unwrap_or_default(),
+                composed: site.map(|site| site.composed.clone()).unwrap_or_default(),
             });
         }
         for record in &records {

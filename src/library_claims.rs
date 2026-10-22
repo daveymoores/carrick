@@ -162,6 +162,18 @@ impl ExportClaims {
     /// dropped. Scope claims are left out: no reader reads the receivers a
     /// scope returns yet (carrick#1678).
     pub fn claims_by_id(&self) -> Vec<(String, &LibraryClaim)> {
+        self.by_id(false)
+    }
+
+    /// [`Self::claims_by_id`] with the scope claims in too
+    /// (`<prefix>:scope:<path.member>`): what the receiver trace sends in
+    /// its own request (carrick#2474 R2b, carrick#1678), never the library
+    /// check's.
+    pub fn claims_with_scopes_by_id(&self) -> Vec<(String, &LibraryClaim)> {
+        self.by_id(true)
+    }
+
+    fn by_id(&self, scopes: bool) -> Vec<(String, &LibraryClaim)> {
         let prefix = format!(
             "{}@{}:{}",
             self.specifier,
@@ -171,6 +183,9 @@ impl ExportClaims {
         let mut stated: Vec<(String, &LibraryClaim)> = Vec::new();
         let mut twice: HashSet<String> = HashSet::new();
         for claim in &self.claims {
+            if !scopes && matches!(claim, LibraryClaim::Scope { .. }) {
+                continue;
+            }
             let Some(id) = claim_id(&prefix, claim) else {
                 continue;
             };
@@ -334,7 +349,17 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
             hops(path, Some(member)),
             selector(on, of)
         )),
-        LibraryClaim::Scope { .. } => None,
+        LibraryClaim::Scope {
+            member,
+            path,
+            on,
+            of,
+            ..
+        } => Some(format!(
+            "{prefix}:scope:{}{}",
+            hops(path, Some(member)),
+            selector(on, of)
+        )),
     }
 }
 
