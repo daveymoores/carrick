@@ -130,7 +130,7 @@ mod tests {
     use super::*;
     use crate::client_semantics::LibrarySemantics;
     use crate::position_rows::PositionIndex;
-    use crate::request_summary::fixture_walk::{walked, walked_within};
+    use crate::request_summary::fixture_walk::{NODENEXT, walked, walked_within};
     use crate::request_summary::summarize;
 
     fn tally(inputs: &RequestSummaryInputs) -> ServiceFallbacks {
@@ -194,7 +194,7 @@ mod tests {
     /// the call graph, and the tally counts each one.
     #[test]
     fn a_call_read_from_the_call_graph_is_counted_beside_rows_that_were_read() {
-        let Some(on) = walked("position-rows-wrapper", ".", "web", &[], true) else {
+        let Some(on) = walked("position-rows-wrapper", ".", "web", &[NODENEXT], true) else {
             return;
         };
         let fallbacks = tally(&on.inputs);

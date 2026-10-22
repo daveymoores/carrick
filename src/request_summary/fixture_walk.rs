@@ -39,6 +39,15 @@ pub(crate) fn sidecar() -> Option<PathBuf> {
     None
 }
 
+/// An edit of the wrapper fixture's config (`position-rows-wrapper`): its own
+/// config reads the extensionless imports under bundler resolution. Under
+/// NodeNext they do not resolve (the package is `"type": "module"`), which is
+/// the unresolved import the tests of the call-graph fallback need.
+pub(crate) const NODENEXT: (&str, &str) = (
+    "web/tsconfig.json",
+    r#"{ "compilerOptions": { "target": "ES2020", "module": "NodeNext", "moduleResolution": "NodeNext", "jsx": "react-jsx", "strict": true }, "include": ["src"] }"#,
+);
+
 /// A fixture service, read.
 pub(crate) struct Walked {
     _dir: tempfile::TempDir,
