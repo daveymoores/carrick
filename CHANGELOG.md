@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.124](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.123...carrick-v0.3.124) (2026-10-22)
+
+
+### Features
+
+* **change-scope:** a carried service states its call-through facts from the stored blob ([#2577](https://github.com/carrick-tools/carrick/issues/2577)) ([c2992bf](https://github.com/carrick-tools/carrick/commit/c2992bff040ed3d3b126726561e77d60d084fb75)), closes [#2378](https://github.com/carrick-tools/carrick/issues/2378)
+* **change-scope:** an untracked runner config and a version-only manifest bump no longer re-analyse every service ([#2571](https://github.com/carrick-tools/carrick/issues/2571)) ([8a47c83](https://github.com/carrick-tools/carrick/commit/8a47c83e8fcff67c5a6a11078af6aded6d050524))
+* **scan:** state each service's fallbacks to the old path for the parent reading the scan ([#2579](https://github.com/carrick-tools/carrick/issues/2579)) ([18e075b](https://github.com/carrick-tools/carrick/commit/18e075bf59662e8ab4ad94854bc1367931f8a304))
+* **sidecar:** a verified op verdict carries the declarations its member resolves to ([#2582](https://github.com/carrick-tools/carrick/issues/2582)) ([4c0a5f1](https://github.com/carrick-tools/carrick/commit/4c0a5f129863c472f9b2efe79671132b1480eef1))
+* **sidecar:** route fields in label v2 ([#2474](https://github.com/carrick-tools/carrick/issues/2474) R0) ([#2583](https://github.com/carrick-tools/carrick/issues/2583)) ([2042710](https://github.com/carrick-tools/carrick/commit/2042710db7863d8063d0ab9aa941a6a019558dcc))
+
+
+### Bug Fixes
+
+* **retype:** retype a carried consumer's calls under --changed-only ([#2576](https://github.com/carrick-tools/carrick/issues/2576)) ([0227289](https://github.com/carrick-tools/carrick/commit/02272893ec93f5c7ec9d01a5d0797e89122e1738)), closes [#2567](https://github.com/carrick-tools/carrick/issues/2567)
+* **sidecar:** a verified op's declarations are named from the scan root, as position rows are ([#2584](https://github.com/carrick-tools/carrick/issues/2584)) ([2070d40](https://github.com/carrick-tools/carrick/commit/2070d40c73d6244b98d00ef4c27e87bc3aff6074))
+
 ## [0.3.123](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.122...carrick-v0.3.123) (2026-10-21)
 
 
