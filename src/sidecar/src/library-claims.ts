@@ -1905,7 +1905,97 @@ class DeclarationReader {
     if (parts.some(part => this.isOpenTop(part) || this.isUnconstrained(part) || this.isEmptyObject(part))) {
       return unchecked('mounts_untyped');
     }
+    const erased = this.fitsErased(receiver.type, slot, signature.typeParameters ?? []);
+    if (erased !== undefined) return erased ? undefined : failed('mounts_not_instance');
     return this.checker.isTypeAssignableTo(receiver.type, slot) ? undefined : failed('mounts_not_instance');
+  }
+
+  /**
+   * `receiver` fits `slot` with the signature's own type parameters
+   * (`own`) erased to their constraints (carrick#2652), or undefined when
+   * that reading does not apply. The receiver is built at its defaults, so a
+   * parameter typed `Tree<SubEnv, SubBase>` has free arguments that no default
+   * instance is assignable to. It applies when `slot` and `receiver` are
+   * references to the same generic type and no argument mixes an own type
+   * parameter into a larger type: an argument that is an own type parameter
+   * takes any receiver argument its constraint takes (none: any), every other
+   * argument must be the receiver's.
+   */
+  private fitsErased(receiver: ts.Type, slot: ts.Type, own: readonly ts.TypeParameter[]): boolean | undefined {
+    if (own.length === 0) return undefined;
+    const from = this.referenceOf(receiver);
+    const to = this.referenceOf(slot);
+    if (from === undefined || to === undefined) return undefined;
+    const count = (to.target.typeParameters ?? []).length;
+    const given = this.argumentsAs(from.target, this.checker.getTypeArguments(from), to.target);
+    const wanted = this.checker.getTypeArguments(to);
+    if (count === 0 || given === undefined || given.length < count || wanted.length < count) return undefined;
+    for (let i = 0; i < count; i++) {
+      if (own.includes(wanted[i] as ts.TypeParameter)) {
+        const constraint = this.checker.getBaseConstraintOfType(wanted[i]);
+        if (constraint === undefined || this.isOpenTop(constraint)) continue;
+        if (own.some(parameter => this.mentions(constraint, parameter))) return undefined;
+        if (!this.checker.isTypeAssignableTo(given[i], constraint)) return false;
+      } else if (own.some(parameter => this.mentions(wanted[i], parameter))) {
+        return undefined;
+      } else if (
+        given[i] !== wanted[i] &&
+        !(this.checker.isTypeAssignableTo(given[i], wanted[i]) && this.checker.isTypeAssignableTo(wanted[i], given[i]))
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * The type arguments the instance `current<args>` has as an instance of
+   * `target`: its own when it is one, else through the base types its class
+   * extends, where each base argument is a type parameter of the class
+   * (replaced by the matching argument) or names none. Undefined when
+   * `target` is not reached that way.
+   */
+  private argumentsAs(
+    current: ts.GenericType,
+    args: readonly ts.Type[],
+    target: ts.GenericType,
+    depth = 0
+  ): readonly ts.Type[] | undefined {
+    if (current === target) return args;
+    if (depth > 6) return undefined;
+    const parameters = current.typeParameters ?? [];
+    for (const base of this.checker.getBaseTypes(current)) {
+      const reference = this.referenceOf(base);
+      if (reference === undefined) continue;
+      const mapped: ts.Type[] = [];
+      let usable = true;
+      for (const argument of this.checker.getTypeArguments(reference)) {
+        const index = parameters.indexOf(argument as ts.TypeParameter);
+        if (index >= 0) mapped.push(args[index]);
+        else if (parameters.some(parameter => this.mentions(argument, parameter))) usable = false;
+        else mapped.push(argument);
+      }
+      const found = usable ? this.argumentsAs(reference.target, mapped, target, depth + 1) : undefined;
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+
+  private referenceOf(type: ts.Type): ts.TypeReference | undefined {
+    if (!(type.flags & ts.TypeFlags.Object)) return undefined;
+    return (type as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference ? (type as ts.TypeReference) : undefined;
+  }
+
+  /** `type` names `parameter` anywhere in its arguments or members of a union or intersection. */
+  private mentions(type: ts.Type, parameter: ts.TypeParameter, depth = 0): boolean {
+    if (type === parameter) return true;
+    if (depth > 6) return true;
+    if (type.isUnionOrIntersection()) return type.types.some(part => this.mentions(part, parameter, depth + 1));
+    const reference = this.referenceOf(type);
+    if (reference !== undefined) {
+      return this.checker.getTypeArguments(reference).some(argument => this.mentions(argument, parameter, depth + 1));
+    }
+    return false;
   }
 
   /**
