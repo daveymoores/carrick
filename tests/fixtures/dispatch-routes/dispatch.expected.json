@@ -1,6 +1,6 @@
 {
   "counts": {
-    "path_guards": 25,
+    "path_guards": 33,
     "starts_with": 1,
     "table_keys": 2
   },
@@ -8,7 +8,8 @@
     "end:global": 1,
     "handler_slot_mismatch": 1,
     "handoff_unlabelled:callback_into_own_function": 1,
-    "label_without_request": 1,
+    "hole:unread_expression": 4,
+    "label_without_request": 2,
     "negated": 1,
     "steps_not_path": 1
   },
@@ -160,6 +161,42 @@
     {
       "branch": [
         {
+          "callee": "send",
+          "file": "src/mounted.ts",
+          "kind": "call",
+          "line": 5,
+          "target": null
+        }
+      ],
+      "evidence": {
+        "at": "src/mounted.ts:8",
+        "export": "route",
+        "kind": "label",
+        "member": null,
+        "package": "fixture-router"
+      },
+      "file": "src/mounted.ts",
+      "handler": {
+        "file": "src/mounted.ts",
+        "function": "stats",
+        "line": 4
+      },
+      "kind_slot": "forced",
+      "line": 5,
+      "method": null,
+      "method_from": "none",
+      "path": "/stats",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "path"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
           "callee": "end",
           "file": "src/negatives.ts",
           "kind": "call",
@@ -262,6 +299,34 @@
         "param": 0,
         "steps": [
           "url"
+        ]
+      }
+    },
+    {
+      "branch": [],
+      "evidence": {
+        "at": "src/nested.ts:1",
+        "function": "items",
+        "kind": "entry_point"
+      },
+      "file": "src/nested.ts",
+      "handler": {
+        "file": "src/nested.ts",
+        "function": "items",
+        "line": 1
+      },
+      "kind_slot": "asked",
+      "line": 3,
+      "method": null,
+      "method_from": "none",
+      "path": "/items",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
         ]
       }
     },
@@ -553,6 +618,34 @@
       "method": "HEAD",
       "method_from": "enclosing",
       "path": "/feed",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [],
+      "evidence": {
+        "at": "src/pages.ts:13",
+        "function": "billingLoader",
+        "kind": "entry_point"
+      },
+      "file": "src/session.ts",
+      "handler": {
+        "file": "src/pages.ts",
+        "function": "billingLoader",
+        "line": 13
+      },
+      "kind_slot": "asked",
+      "line": 2,
+      "method": null,
+      "method_from": "none",
+      "path": "/logout",
       "position": "equality",
       "request": {
         "param": 0,

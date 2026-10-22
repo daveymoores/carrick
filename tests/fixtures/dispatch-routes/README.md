@@ -24,3 +24,27 @@ It was written from the source, file by file:
   another test), a browser global, a handler
   handed to an in-repo wrapper, a label with no `request`, and a handler in
   another slot than the label's.
+
+`records.expected.json` is the key of the handler records (carrick#2474
+R4b): one record per request handler, a shared record for a comparison
+several handlers reach, each comparison forced or asked. Every route of
+`dispatch.expected.json` is a comparison of a record. The files added for
+it (R4a's are unchanged):
+
+- `session.ts` + `pages.ts`: a `/logout` check in an exported helper that
+  three exported page loaders call. One shared record, asked once.
+- `edge.ts`: an entry handler whose path comes from an in-repo function
+  (`normalise(request.url)`): a hole in the handler, asked, `GET` forced.
+- `nested.ts`: a path whose branch compares two methods
+  (`methods_in_branch`): one question among both methods.
+- `mounted.ts`: `stats` handed to `fixture-router`'s `route`, whose label
+  has a `name` slot: the path is forced and no method is stated, so nothing
+  is asked. `use` takes its handler in another slot than the call's:
+  `handler_slot_mismatch`. The closure handed to `route("/files", …)`
+  compares `trimmed(req.path)`: a hole in a label handler, asked.
+- `fake.ts`: an exported factory nothing calls, whose closure is handed to
+  the in-repo `listen` and compares `parse(req.url)`: the hole attaches
+  through nesting to the factory.
+- `report.ts` + `check.ts`: a predicate called from an entry handler with
+  an unread argument (`resolve(request)`): the chain stops in the handler,
+  so the predicate's comparison is the handler's.

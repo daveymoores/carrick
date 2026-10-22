@@ -1,0 +1,940 @@
+{
+  "counts": {
+    "asked": 21,
+    "comparisons": 29,
+    "forced": 7,
+    "handlers": 15,
+    "holes": 4,
+    "methods_in_branch": 2,
+    "no_method": 1,
+    "records": 13,
+    "records_asked": 11,
+    "records_shared": 1
+  },
+  "not_attached": {
+    "end:global": 1,
+    "handler_slot_mismatch": 2,
+    "handoff_unlabelled:callback_into_own_function": 1,
+    "negated": 1,
+    "steps_not_path": 1
+  },
+  "records": [
+    {
+      "asked": [
+        0
+      ],
+      "code": [
+        {
+          "at": "src/report.ts:1",
+          "code": "1: export const isReport = (path: string): boolean => path === \"/report\";"
+        }
+      ],
+      "comparisons": [
+        {
+          "at": "src/report.ts:1",
+          "expression": "path",
+          "hole": {
+            "reason": "unread_expression",
+            "text": "resolve(request)"
+          },
+          "id": 0,
+          "literal": "/report",
+          "position": "equality",
+          "read": null
+        }
+      ],
+      "forced": {},
+      "methods": [],
+      "scopes": [],
+      "subject": {
+        "at": "src/check.ts:7",
+        "code": "7: export function check(request: Request): Response {\n8:   if (isReport(resolve(request))) return new Response(\"report\");\n9:   return new Response(\"no\", { status: 404 });\n10: }",
+        "key": "check",
+        "kind": "entry",
+        "params": [
+          "request"
+        ]
+      }
+    },
+    {
+      "asked": [
+        0
+      ],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/edge.ts:7",
+          "expression": "path",
+          "hole": {
+            "reason": "unread_expression",
+            "text": "normalise(request.url)"
+          },
+          "id": 0,
+          "literal": "/reports",
+          "position": "equality",
+          "read": null
+        }
+      ],
+      "forced": {
+        "0": {
+          "method": "GET"
+        }
+      },
+      "methods": [
+        {
+          "at": "src/edge.ts:7",
+          "literal": "GET"
+        }
+      ],
+      "scopes": [],
+      "subject": {
+        "at": "src/edge.ts:5",
+        "code": "5: export async function handle(request: Request): Promise<Response> {\n6:   const path = normalise(request.url);\n7:   if (request.method === \"GET\" && path === \"/reports\") return new Response(\"reports\");\n8:   return new Response(\"not found\", { status: 404 });\n9: }",
+        "key": "handle",
+        "kind": "entry",
+        "params": [
+          "request"
+        ]
+      }
+    },
+    {
+      "asked": [
+        0
+      ],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/fake.ts:10",
+          "expression": "u",
+          "hole": {
+            "reason": "unread_expression",
+            "text": "parse(req.url)"
+          },
+          "id": 0,
+          "literal": "/v1/items",
+          "position": "equality",
+          "read": null
+        }
+      ],
+      "forced": {},
+      "methods": [],
+      "scopes": [],
+      "subject": {
+        "at": "src/fake.ts:7",
+        "code": "7: export function createFake(): void {\n8:   listen((req, res) => {\n9:     const u = parse(req.url);\n10:     if (u === \"/v1/items\") {\n11:       res.end(\"items\");\n12:     }\n13:   });\n14: }",
+        "key": "createFake",
+        "kind": "entry",
+        "params": []
+      }
+    },
+    {
+      "asked": [
+        0,
+        1
+      ],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/middleware.ts:12",
+          "expression": "req.url",
+          "hole": null,
+          "id": 0,
+          "literal": "/api/one",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url"
+            ]
+          }
+        },
+        {
+          "at": "src/middleware.ts:20",
+          "expression": "req.url",
+          "hole": null,
+          "id": 1,
+          "literal": "/api/two",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url"
+            ]
+          }
+        }
+      ],
+      "forced": {
+        "0": {
+          "method": "GET"
+        },
+        "1": {
+          "method": "POST"
+        }
+      },
+      "methods": [
+        {
+          "at": "src/middleware.ts:12",
+          "literal": "GET"
+        },
+        {
+          "at": "src/middleware.ts:20",
+          "literal": "POST"
+        }
+      ],
+      "scopes": [],
+      "subject": {
+        "at": "src/middleware.ts:10",
+        "code": "10: export const fake = (req, res, next) => {\n11:   // The first route.\n12:   if (req.method === 'GET' && req.url === '/api/one') {\n13:     res.end('one');\n14:     return;\n15:   }\n16:   //\n17:   //\n18:   //\n19:   // The second route.\n20:   if (req.method === 'POST' && req.url === '/api/two') {\n21:     res.end('two');\n22:     return;\n23:   }\n24:   next();\n25: };",
+        "key": "fake",
+        "kind": "entry",
+        "params": [
+          "req",
+          "res",
+          "next"
+        ]
+      }
+    },
+    {
+      "asked": [],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/mounted.ts:5",
+          "expression": "req.path",
+          "hole": null,
+          "id": 0,
+          "literal": "/stats",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "path"
+            ]
+          }
+        }
+      ],
+      "forced": {
+        "0": {
+          "path": "/stats"
+        }
+      },
+      "methods": [],
+      "scopes": [],
+      "subject": {
+        "at": "src/mounted.ts:4",
+        "code": "4: export const stats = (req: RouterRequest, res: RouterResponse): void => {\n5:   if (req.path === \"/stats\") res.send(1);\n6: };",
+        "key": "stats",
+        "kind": "label",
+        "label": {
+          "export": "route",
+          "member": null,
+          "package": "fixture-router"
+        },
+        "params": [
+          "req",
+          "res"
+        ]
+      }
+    },
+    {
+      "asked": [
+        0
+      ],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/mounted.ts:20",
+          "expression": "at",
+          "hole": {
+            "reason": "unread_expression",
+            "text": "trimmed(req.path)"
+          },
+          "id": 0,
+          "literal": "/files/list",
+          "position": "equality",
+          "read": null
+        }
+      ],
+      "forced": {},
+      "methods": [],
+      "scopes": [],
+      "subject": {
+        "at": "src/mounted.ts:18",
+        "code": "18: route(\"/files\", (req: RouterRequest, res: RouterResponse) => {\n19:   const at = trimmed(req.path);\n20:   if (at === \"/files/list\") res.send(3);\n21: });",
+        "key": "route_files_handler",
+        "kind": "label",
+        "label": {
+          "export": "route",
+          "member": null,
+          "package": "fixture-router"
+        },
+        "params": [
+          "req",
+          "res"
+        ]
+      }
+    },
+    {
+      "asked": [
+        0,
+        1,
+        2
+      ],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/negatives.ts:20",
+          "expression": "req.url",
+          "hole": null,
+          "id": 0,
+          "literal": "/mixed",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url"
+            ]
+          }
+        },
+        {
+          "at": "src/negatives.ts:23",
+          "expression": "req.url",
+          "hole": null,
+          "id": 1,
+          "literal": "/both",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url"
+            ]
+          }
+        },
+        {
+          "at": "src/negatives.ts:26",
+          "expression": "req.url",
+          "hole": null,
+          "id": 2,
+          "literal": "/either",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url"
+            ]
+          }
+        }
+      ],
+      "forced": {
+        "0": {
+          "path": "/mixed"
+        },
+        "1": {
+          "path": "/both"
+        },
+        "2": {
+          "path": "/either"
+        }
+      },
+      "methods": [
+        {
+          "at": "src/negatives.ts:20",
+          "literal": "GET"
+        },
+        {
+          "at": "src/negatives.ts:23",
+          "literal": "GET"
+        },
+        {
+          "at": "src/negatives.ts:23",
+          "literal": "HEAD"
+        },
+        {
+          "at": "src/negatives.ts:26",
+          "literal": "POST"
+        }
+      ],
+      "scopes": [],
+      "subject": {
+        "at": "src/negatives.ts:8",
+        "code": "8: createServer((req, res) => {\n9:   const url = new URL(req.url ?? \"/\", \"http://localhost\");\n10:   if (url.pathname !== \"/admin\") {\n11:     res.end(\"no\");\n12:     return;\n13:   }\n14:   if (req.headers[\"x-prefix\"] === \"/edge\") {\n15:     res.end(\"edge\");\n16:   }\n17:   if (req.url === \"*\") {\n18:     res.end(\"star\");\n19:   }\n20:   if (other.method === \"GET\" && req.url === \"/mixed\") {\n21:     res.end(\"mixed\");\n22:   }\n23:   if ((req.method === \"GET\" || req.method === \"HEAD\") && req.url === \"/both\") {\n24:     res.end(\"both\");\n25:   }\n26:   if ((req.method === \"POST\" || req.headers[\"x-admin\"] === \"yes\") && req.url === \"/either\") {\n27:     res.end(\"either\");\n28:   }\n29: });",
+        "key": "createServer_handler",
+        "kind": "label",
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "params": [
+          "req",
+          "res"
+        ]
+      }
+    },
+    {
+      "asked": [
+        0
+      ],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/negatives.ts:42",
+          "expression": "req.url",
+          "hole": null,
+          "id": 0,
+          "literal": "/legacy",
+          "position": "equality",
+          "read": null
+        }
+      ],
+      "forced": {},
+      "methods": [],
+      "scopes": [],
+      "subject": {
+        "at": "src/negatives.ts:41",
+        "code": "41: createLegacyServer((req, res) => {\n42:   if (req.url === \"/legacy\") {\n43:     res.end(\"legacy\");\n44:   }\n45: });",
+        "key": "createLegacyServer_handler",
+        "kind": "label",
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "fixture-legacy-server"
+        },
+        "params": [
+          "req",
+          "res"
+        ]
+      }
+    },
+    {
+      "asked": [
+        0
+      ],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/nested.ts:3",
+          "expression": "url.pathname",
+          "hole": null,
+          "id": 0,
+          "literal": "/items",
+          "position": "equality",
+          "read": {
+            "param": "request",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        }
+      ],
+      "forced": {},
+      "methods": [
+        {
+          "at": "src/nested.ts:4",
+          "literal": "GET"
+        },
+        {
+          "at": "src/nested.ts:5",
+          "literal": "POST"
+        }
+      ],
+      "scopes": [],
+      "subject": {
+        "at": "src/nested.ts:1",
+        "code": "1: export function items(request: Request): Response {\n2:   const url = new URL(request.url);\n3:   if (url.pathname === \"/items\") {\n4:     if (request.method === \"GET\") return new Response(\"list\");\n5:     if (request.method === \"POST\") return new Response(\"made\", { status: 201 });\n6:   }\n7:   return new Response(\"no\", { status: 404 });\n8: }",
+        "key": "items",
+        "kind": "entry",
+        "params": [
+          "request"
+        ]
+      }
+    },
+    {
+      "asked": [],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/server.ts:11",
+          "expression": "req.url",
+          "hole": null,
+          "id": 0,
+          "literal": "/orders",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url"
+            ]
+          }
+        },
+        {
+          "at": "src/server.ts:13",
+          "expression": "req.url",
+          "hole": null,
+          "id": 1,
+          "literal": "/orders",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url"
+            ]
+          }
+        },
+        {
+          "at": "src/server.ts:15",
+          "expression": "req.url",
+          "hole": null,
+          "id": 2,
+          "literal": "/status",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url"
+            ]
+          }
+        }
+      ],
+      "forced": {
+        "0": {
+          "method": "GET",
+          "path": "/orders"
+        },
+        "1": {
+          "method": "POST",
+          "path": "/orders"
+        },
+        "2": {
+          "method": "GET",
+          "path": "/status"
+        }
+      },
+      "methods": [
+        {
+          "at": "src/server.ts:11",
+          "literal": "GET"
+        },
+        {
+          "at": "src/server.ts:13",
+          "literal": "POST"
+        },
+        {
+          "at": "src/server.ts:15",
+          "literal": "GET"
+        }
+      ],
+      "scopes": [],
+      "subject": {
+        "at": "src/server.ts:10",
+        "code": "10: createServer((req, res) => {\n11:   if (req.method === \"GET\" && req.url === \"/orders\") {\n12:     send(res, \"list\");\n13:   } else if (req.method === \"POST\" && req.url === \"/orders\") {\n14:     send(res, \"created\");\n15:   } else if (req.method === \"GET\" && req.url === \"/status\") {\n16:     send(res, \"up\");\n17:   }\n18: });",
+        "key": "createServer_handler",
+        "kind": "label",
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "params": [
+          "req",
+          "res"
+        ]
+      }
+    },
+    {
+      "asked": [
+        3,
+        5
+      ],
+      "code": [
+        {
+          "at": "src/api.ts:3",
+          "code": "3: export function api(req: IncomingMessage, res: ServerResponse): void {\n4:   const { pathname } = new URL(req.url ?? \"/\", \"http://localhost\");\n5:   if (req.method === \"GET\" && pathname === \"/api/items\") {\n6:     res.end(\"items\");\n7:   } else if (req.method === \"PUT\" && pathname === \"/api/items\") {\n8:     res.end(\"saved\");\n9:   }\n10: }"
+        },
+        {
+          "at": "src/routes.ts:1",
+          "code": "1: export const isExportRoute = (url: URL): boolean => url.pathname === \"/orders/export\";"
+        }
+      ],
+      "comparisons": [
+        {
+          "at": "src/api.ts:5",
+          "expression": "pathname",
+          "hole": null,
+          "id": 0,
+          "literal": "/api/items",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        },
+        {
+          "at": "src/api.ts:7",
+          "expression": "pathname",
+          "hole": null,
+          "id": 1,
+          "literal": "/api/items",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        },
+        {
+          "at": "src/routes.ts:1",
+          "expression": "url.pathname",
+          "hole": null,
+          "id": 2,
+          "literal": "/orders/export",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        },
+        {
+          "at": "src/server.ts:30",
+          "expression": "pathname",
+          "hole": null,
+          "id": 3,
+          "literal": "/profile",
+          "position": "case",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        },
+        {
+          "at": "src/server.ts:35",
+          "expression": "pathname",
+          "hole": null,
+          "id": 4,
+          "literal": "/cache",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        },
+        {
+          "at": "src/server.ts:42",
+          "expression": "pathname",
+          "hole": null,
+          "id": 5,
+          "literal": "/feed",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        }
+      ],
+      "forced": {
+        "0": {
+          "method": "GET",
+          "path": "/api/items"
+        },
+        "1": {
+          "method": "PUT",
+          "path": "/api/items"
+        },
+        "2": {
+          "method": "POST",
+          "path": "/orders/export"
+        },
+        "3": {
+          "path": "/profile"
+        },
+        "4": {
+          "method": "DELETE",
+          "path": "/cache"
+        },
+        "5": {
+          "path": "/feed"
+        }
+      },
+      "methods": [
+        {
+          "at": "src/api.ts:5",
+          "literal": "GET"
+        },
+        {
+          "at": "src/api.ts:7",
+          "literal": "PUT"
+        },
+        {
+          "at": "src/server.ts:26",
+          "literal": "POST"
+        },
+        {
+          "at": "src/server.ts:34",
+          "literal": "DELETE"
+        },
+        {
+          "at": "src/server.ts:40",
+          "literal": "GET"
+        },
+        {
+          "at": "src/server.ts:41",
+          "literal": "HEAD"
+        }
+      ],
+      "scopes": [
+        {
+          "at": "src/server.ts:23",
+          "delegates": [
+            "api"
+          ],
+          "prefix": "/api/"
+        }
+      ],
+      "subject": {
+        "at": "src/server.ts:20",
+        "code": "20: function route(req: IncomingMessage, res: ServerResponse): void {\n21:   const url = new URL(req.url ?? \"/\", \"http://localhost\");\n22:   const pathname = url.pathname;\n23:   if (pathname.startsWith(\"/api/\")) {\n24:     return api(req, res);\n25:   }\n26:   if (req.method === \"POST\" && isExportRoute(url)) {\n27:     return send(res, \"exported\");\n28:   }\n29:   switch (pathname) {\n30:     case \"/profile\":\n31:       send(res, \"profile\");\n32:       return;\n33:   }\n34:   if (req.method === \"DELETE\") {\n35:     if (pathname === \"/cache\") {\n36:       send(res, \"cleared\");\n37:     }\n38:   }\n39:   switch (req.method) {\n40:     case \"GET\":\n41:     case \"HEAD\":\n42:       if (pathname === \"/feed\") {\n43:         send(res, \"feed\");\n44:       }\n45:   }\n46: }",
+        "key": "route",
+        "kind": "label",
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "params": [
+          "req",
+          "res"
+        ]
+      }
+    },
+    {
+      "asked": [
+        0
+      ],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/session.ts:2",
+          "expression": "new URL(request.url).pathname",
+          "hole": null,
+          "id": 0,
+          "literal": "/logout",
+          "position": "equality",
+          "read": {
+            "param": "request",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        }
+      ],
+      "forced": {},
+      "methods": [],
+      "scopes": [],
+      "subject": {
+        "at": "src/session.ts:1",
+        "code": "1: export function requireUser(request: Request): string | null {\n2:   if (new URL(request.url).pathname === \"/logout\") return null;\n3:   return request.headers.get(\"x-user\");\n4: }",
+        "handler_count": 3,
+        "handlers": [
+          {
+            "at": "src/pages.ts:3",
+            "key": "ordersLoader"
+          },
+          {
+            "at": "src/pages.ts:8",
+            "key": "profileLoader"
+          },
+          {
+            "at": "src/pages.ts:13",
+            "key": "billingLoader"
+          }
+        ],
+        "key": "requireUser",
+        "kind": "shared",
+        "params": [
+          "request"
+        ]
+      }
+    },
+    {
+      "asked": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/worker.ts:2",
+          "expression": "url.pathname as keyof typeof ROUTES",
+          "hole": null,
+          "id": 0,
+          "literal": "/assets/logo",
+          "position": "table_key",
+          "read": {
+            "param": "request",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        },
+        {
+          "at": "src/worker.ts:3",
+          "expression": "url.pathname as keyof typeof ROUTES",
+          "hole": null,
+          "id": 1,
+          "literal": "/assets/font",
+          "position": "table_key",
+          "read": {
+            "param": "request",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        },
+        {
+          "at": "src/worker.ts:13",
+          "expression": "url.pathname",
+          "hole": null,
+          "id": 2,
+          "literal": "/home",
+          "position": "equality",
+          "read": {
+            "param": "request",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        },
+        {
+          "at": "src/worker.ts:15",
+          "expression": "url.pathname",
+          "hole": null,
+          "id": 3,
+          "literal": "/orders",
+          "position": "equality",
+          "read": {
+            "param": "request",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        },
+        {
+          "at": "src/worker.ts:19",
+          "expression": "url.pathname",
+          "hole": null,
+          "id": 4,
+          "literal": "/health",
+          "position": "case",
+          "read": {
+            "param": "request",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        },
+        {
+          "at": "src/worker.ts:20",
+          "expression": "url.pathname",
+          "hole": null,
+          "id": 5,
+          "literal": "/ready",
+          "position": "case",
+          "read": {
+            "param": "request",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        },
+        {
+          "at": "src/worker.ts:22",
+          "expression": "url.pathname",
+          "hole": null,
+          "id": 6,
+          "literal": "/version",
+          "position": "case",
+          "read": {
+            "param": "request",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        }
+      ],
+      "forced": {
+        "2": {
+          "method": "GET"
+        },
+        "3": {
+          "method": "POST"
+        }
+      },
+      "methods": [
+        {
+          "at": "src/worker.ts:13",
+          "literal": "GET"
+        },
+        {
+          "at": "src/worker.ts:15",
+          "literal": "POST"
+        }
+      ],
+      "scopes": [],
+      "subject": {
+        "at": "src/worker.ts:11",
+        "code": "11:   async fetch(request: Request): Promise<Response> {\n12:     const url = new URL(request.url);\n13:     if (request.method === \"GET\" && url.pathname === \"/home\") {\n14:       return reply(\"home\");\n15:     } else if (request.method === \"POST\" && url.pathname === \"/orders\") {\n16:       return reply(\"created\");\n17:     }\n18:     switch (url.pathname) {\n19:       case \"/health\":\n20:       case \"/ready\":\n21:         return reply(\"ok\");\n22:       case \"/version\":\n23:         return reply(\"1\");\n24:     }\n25:     const asset = ROUTES[url.pathname as keyof typeof ROUTES];\n26:     if (asset) {\n27:       return reply(asset);\n28:     }\n29:     return reply(\"not found\");\n30:   },",
+        "key": "default.fetch",
+        "kind": "entry",
+        "params": [
+          "request"
+        ]
+      }
+    }
+  ]
+}
