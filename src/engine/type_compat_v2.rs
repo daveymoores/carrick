@@ -405,10 +405,12 @@ pub(crate) const CAPTURE_FINDINGS_CAP: usize = 32;
 /// names every position a top type sits at, with a cause. So the answer
 /// qualifies only when all of these hold:
 ///
-///  - the text writes no more `any` tokens than the findings name as `any`
-///    (carrick#2591). `any` is bidirectionally assignable and the walk does
-///    not read parameter positions, so the text is the one place a parameter
-///    `any` shows: it adds a token no finding accounts for;
+///  - the text writes exactly as many `any` tokens as the findings name as
+///    `any` (carrick#2591). `any` is bidirectionally assignable and the walk
+///    does not read parameter positions, so the text is the one place a
+///    parameter `any` shows: it adds a token no finding accounts for. A
+///    finding that names an `any` the text does not print disagrees with the
+///    answer it describes, so it vouches for nothing;
 ///  - the record names at least one finding and fewer than the walk lists
 ///    before it stops ([`CAPTURE_FINDINGS_CAP`]), so every position the text
 ///    holds is accounted for. A root that is itself a top type has no members
@@ -433,7 +435,7 @@ pub(crate) fn top_types_are_declared_open_members(
         .iter()
         .filter(|finding| finding.kind == "any")
         .count();
-    count_keyword_as_type(&strip_string_literal_contents(expanded), "any") <= named_any
+    count_keyword_as_type(&strip_string_literal_contents(expanded), "any") == named_any
         && !record.any_provenance.is_empty()
         && record.any_provenance.len() < CAPTURE_FINDINGS_CAP
         && findings().all(is_declared_open_member)
@@ -7751,15 +7753,16 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
     /// carrick#1833: a failed install leaves standing every verdict the
     /// capture had already decided. The sidecar still answers one verdict per
     /// pair when its install fails; a pair whose consumer type carries a deep
-    /// `any` keeps `gate_caught_baked_any`, while the pair the check would
-    /// have probed says the install stopped it.
+    /// `any` the pre-gate still refuses (a callable's return, not a declared
+    /// open member: carrick#2591) keeps `gate_caught_baked_any`, while the
+    /// pair the check would have probed says the install stopped it.
     #[test]
     #[serial(v2_capture_sidecar)]
     fn a_failed_install_keeps_the_verdicts_the_capture_decided() {
         let Some((sidecar, _key, mut all_repo_data)) = corpus_pair_with(&[LiteralPair {
             key: OperationKey::http("GET", "/orders/summary"),
             producer_type: "{ id: string; total: number }",
-            consumer_type: "{ id: string; total: any }",
+            consumer_type: "{ id: string; total: () => any }",
         }]) else {
             return;
         };
