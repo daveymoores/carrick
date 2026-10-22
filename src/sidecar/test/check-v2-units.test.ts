@@ -209,7 +209,7 @@ describe('four-bucket classifier precedence', () => {
       assert.strictEqual(v.resolved, true);
     });
 
-    it('a member-level any leaves a compatible verdict not-a-fact', () => {
+    it('a declared open any member leaves the closed members judged: a fact (carrick#2591)', () => {
       const v = classifyPair({
         plan,
         probeDiags: [],
@@ -220,11 +220,29 @@ describe('four-bucket classifier precedence', () => {
           expected: [],
         },
       });
-      // The bucket is deliberately unchanged: no verdict moves because of R1d.
       assert.strictEqual(v.bucket, 'compatible');
-      assert.strictEqual(v.resolved, false);
-      assert.match(v.unresolved_reason!, /producer/);
-      assert.match(v.unresolved_reason!, /meta\.owner/);
+      assert.strictEqual(v.resolved, true);
+    });
+
+    it('an unknown member, a root any and a callable-return any leave a compatible verdict not-a-fact', () => {
+      for (const finding of [
+        { path: 'meta.owner', kind: 'unknown' as const, reason: 'declared' as const },
+        { path: '', kind: 'any' as const, reason: 'declared' as const },
+        { path: 'getData()', kind: 'any' as const, reason: 'declared' as const },
+        { path: 'meta', kind: 'any' as const, reason: 'unresolved_import' as const },
+      ]) {
+        const v = classifyPair({
+          plan,
+          probeDiags: [],
+          poisonReason: noPoison,
+          scrubCtx,
+          deepFindings: { sent: [finding], expected: [] },
+        });
+        // The bucket is deliberately unchanged: no verdict moves because of R1d.
+        assert.strictEqual(v.bucket, 'compatible');
+        assert.strictEqual(v.resolved, false, JSON.stringify(finding));
+        assert.match(v.unresolved_reason!, /producer/);
+      }
     });
 
     it('a walk that could not run is not evidence of cleanliness', () => {
