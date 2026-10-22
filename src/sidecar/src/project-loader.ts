@@ -580,6 +580,28 @@ export class ProjectLoader {
   }
 
   /**
+   * The installed package directory a resolved file lies in, and its name,
+   * when the module graph places it (carrick#2599). `undefined` for a project
+   * that did not resolve through Deno: there the path says it.
+   */
+  packageDirectoryOf(filePath: string): { directory: string; name: string } | undefined {
+    return this.denoProject?.packageDirectoryOf(filePath);
+  }
+
+  /**
+   * How the module graph resolves `name` from `from`, as the program did
+   * (carrick#2599). `undefined` for a project that did not resolve through
+   * Deno: there Node resolution is the program's.
+   */
+  resolveThroughGraph(
+    name: string,
+    from: string,
+    options: import('typescript').CompilerOptions
+  ): import('typescript').ResolvedModuleFull | undefined {
+    return this.denoProject?.resolve(name, from, options) as import('typescript').ResolvedModuleFull | undefined;
+  }
+
+  /**
    * Check if the project has been successfully initialized
    */
   isInitialized(): boolean {

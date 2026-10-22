@@ -40,7 +40,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
-import { PathNames, declaringFileName } from './position-rows.js';
+import { PathNames, declaringFileName, type PackageDirectoryOf } from './position-rows.js';
 import type {
   ClaimSlot,
   KeyLabel,
@@ -402,8 +402,27 @@ function sortedDeclarations(declarations: readonly DeclaredAt[]): DeclaredAt[] {
 
 let probeSequence = 0;
 
+/**
+ * What a project's module graph says, where it resolved through one rather
+ * than through `node_modules` (carrick#2599). Such a resolver serves a package
+ * from a cache whose path has no `node_modules` segment, so neither the path
+ * nor a Node resolution of the package name finds the files the program
+ * loaded.
+ */
+export interface ModuleGraph {
+  /** The installed package directory a file lies in, and its name. */
+  packageDirectoryOf: PackageDirectoryOf;
+  /** How the program resolves `name` from `from`; `undefined` where there is no graph, and Node resolution answers. */
+  resolveModule(name: string, from: string, options: ts.CompilerOptions): ts.ResolvedModuleFull | undefined;
+}
+
+const NO_MODULE_GRAPH: ModuleGraph = { packageDirectoryOf: () => undefined, resolveModule: () => undefined };
+
 export class LibraryClaimsVerifier {
-  constructor(private readonly project: Project) {}
+  constructor(
+    private readonly project: Project,
+    private readonly graph: ModuleGraph = NO_MODULE_GRAPH
+  ) {}
 
   /**
    * Judge every check, in request order, spending at most `budgetMs`. Checks
@@ -494,7 +513,14 @@ export class LibraryClaimsVerifier {
       const checker = program.getTypeChecker();
       const file = program.getSourceFile(probe.getFilePath());
       if (!file) throw new Error(`probe file ${probePath} is not in the program`);
-      const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir, scanRoot);
+      const reader = new DeclarationReader(
+        program,
+        file,
+        this.project.getModuleResolutionHost(),
+        fromDir,
+        scanRoot,
+        this.graph
+      );
       const localRanges = readLocalRanges(fromDir);
 
       const moduleReads = new Map<string, ModuleRead>();
@@ -800,7 +826,14 @@ export class LibraryClaimsVerifier {
       const program = this.project.getProgram().compilerObject;
       const file = program.getSourceFile(probe.getFilePath());
       if (!file) throw new Error(`probe file ${probePath} is not in the program`);
-      const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir);
+      const reader = new DeclarationReader(
+        program,
+        file,
+        this.project.getModuleResolutionHost(),
+        fromDir,
+        undefined,
+        this.graph
+      );
       return read(program.getTypeChecker(), reader, file);
     } finally {
       this.project.removeSourceFile(probe);
@@ -1089,10 +1122,11 @@ class DeclarationReader {
     private readonly probe: ts.SourceFile,
     private readonly host: ts.ModuleResolutionHost,
     serviceRoot: string,
-    scanRoot?: string
+    scanRoot: string | undefined,
+    private readonly graph: ModuleGraph
   ) {
     this.checker = program.getTypeChecker();
-    this.pathNames = new PathNames(scanRoot ?? serviceRoot);
+    this.pathNames = new PathNames(scanRoot ?? serviceRoot, graph.packageDirectoryOf);
     this.root = this.realpath(serviceRoot);
     this.printedRoots = [...new Set([this.root, serviceRoot])]
       .filter(root => root.length > 1)
@@ -1136,15 +1170,17 @@ class DeclarationReader {
    */
   readModule(pkg: string, declaration: ts.ImportDeclaration, runtimeModules = false): ModuleRead {
     const specifier = declaration.moduleSpecifier as ts.StringLiteral;
-    const resolved = ts.resolveModuleName(
-      pkg,
-      this.probe.fileName,
-      this.program.getCompilerOptions(),
-      this.host,
-      undefined,
-      undefined,
-      this.program.getModeForUsageLocation(this.probe, specifier)
-    ).resolvedModule;
+    const resolved =
+      this.graph.resolveModule(pkg, this.probe.fileName, this.program.getCompilerOptions()) ??
+      ts.resolveModuleName(
+        pkg,
+        this.probe.fileName,
+        this.program.getCompilerOptions(),
+        this.host,
+        undefined,
+        undefined,
+        this.program.getModeForUsageLocation(this.probe, specifier)
+      ).resolvedModule;
     const entry: SemanticsModule = { package: pkg };
     const done = (reason?: string): ModuleRead =>
       reason ? { entry: { ...entry, reason }, reason } : { entry };
@@ -3347,22 +3383,32 @@ class DeclarationReader {
    * source file in a directory that happens to be named `node_modules`, or a
    * repository checked out under a `node_modules` ancestor, is not installed.
    * An install hoisted above the service root (`../../node_modules/pkg`) and
-   * a pnpm store (`node_modules/.pnpm/pkg@1/node_modules/pkg`) are.
+   * a pnpm store (`node_modules/.pnpm/pkg@1/node_modules/pkg`) are. A path
+   * with no `node_modules` segment is placed by the module graph, where there
+   * is one (carrick#2599).
    * Mirrored by `installedPackageDirectory` in capture/, which the capture
    * seam keeps from being shared.
    */
   private installedPackage(fileName: string): InstalledPackage | undefined {
-    const segments = path.relative(this.root, this.realpath(fileName)).split(path.sep);
+    const real = this.realpath(fileName);
+    const segments = path.relative(this.root, real).split(path.sep);
     const last = segments.lastIndexOf('node_modules');
-    if (last < 0) return undefined;
-    const width = segments[last + 1]?.startsWith('@') ? 2 : 1;
-    const nameSegments = segments.slice(last + 1, last + 1 + width);
+    let placed: { directory: string; name: string } | undefined;
+    if (last >= 0) {
+      const width = segments[last + 1]?.startsWith('@') ? 2 : 1;
+      placed = {
+        directory: path.resolve(this.root, ...segments.slice(0, last + 1 + width)),
+        name: segments.slice(last + 1, last + 1 + width).join('/'),
+      };
+    } else {
+      placed = this.graph.packageDirectoryOf(real);
+    }
+    if (placed === undefined) return undefined;
     // No package.json there (a file directly under node_modules included) means no package.
-    const directory = path.resolve(this.root, ...segments.slice(0, last + 1 + width));
-    let known = this.packageDirectories.get(directory);
+    let known = this.packageDirectories.get(placed.directory);
     if (known === undefined) {
-      known = readInstalledPackage(this.host, directory, nameSegments.join('/'));
-      this.packageDirectories.set(directory, known);
+      known = readInstalledPackage(this.host, placed.directory, placed.name);
+      this.packageDirectories.set(placed.directory, known);
     }
     return known ?? undefined;
   }

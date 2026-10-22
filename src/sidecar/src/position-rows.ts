@@ -146,7 +146,7 @@ export function writePositionRows(options: PositionRowsOptions): PositionRowsCou
   const { loader, files, scanRoot, outPath, service } = options;
   const outDir = path.dirname(outPath);
   const guard = WriteGuard.of({ dirs: [outDir], protect: [loader.getRepoRoot(), scanRoot] });
-  const paths = new PathNames(scanRoot);
+  const paths = new PathNames(scanRoot, (file) => loader.packageDirectoryOf(file));
   const lines = new Array<string>(files.length);
   const counts: PositionRowsCounts = {
     files: files.length,
@@ -299,12 +299,21 @@ function fileLine(line: FileLine): string {
   return JSON.stringify(line);
 }
 
+/** The installed package directory a resolved file lies in, and its name, as the module graph places it. */
+export type PackageDirectoryOf = (fileName: string) => { directory: string; name: string } | undefined;
+
 /**
  * Names for the files rows point at, never an absolute path: relative to the
  * scanned repo's root when inside it (its real path too, so a root reached
  * through a link still contains its files), `lib:<name>` for the compiler's
  * default library, `pkg:<name>/<path>` for an installed package outside the
  * root, and nothing otherwise.
+ *
+ * An installed package outside the root is found by its path's last
+ * `node_modules` segment, else by `packageDirectoryOf`: the module graph's
+ * answer where the resolver serves a package from a cache whose path has no
+ * `node_modules` segment (carrick#2599). Either way the directory must hold a
+ * package.json.
  */
 export class PathNames {
   private readonly roots: string[];
@@ -317,7 +326,10 @@ export class PathNames {
   private readonly declaringFiles = new Map<string, string | null>();
   private readonly declaringPackages = new Map<string, string | null>();
 
-  constructor(scanRoot: string) {
+  constructor(
+    scanRoot: string,
+    private readonly packageDirectoryOf: PackageDirectoryOf = () => undefined
+  ) {
     const resolved = path.resolve(scanRoot);
     let real = resolved;
     try {
@@ -357,7 +369,7 @@ export class PathNames {
   private nameDeclaringFile(fileName: string): string | null {
     const inside = this.inside(fileName);
     if (inside) return toSlashes(inside.rel);
-    const installed = installedPackageDirectory(this.roots[0], fileName);
+    const installed = installedPackageDirectory(this.roots[0], fileName) ?? this.packageDirectoryOf(fileName);
     if (installed && fs.existsSync(path.join(installed.directory, 'package.json'))) {
       return `pkg:${installed.name}/${toSlashes(path.relative(installed.directory, fileName))}`;
     }

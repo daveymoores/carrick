@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
 import { ProjectLoader } from '../src/project-loader.js';
 import { captureStub, runCheck } from '../src/capture/index.js';
@@ -515,6 +516,62 @@ export const hex = encodeHex(new Uint8Array());
     } finally {
       await client.stop();
       fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('names a package served from the Deno npm cache in rows and verdicts alike (carrick#2599)', async () => {
+    // The cache path (`<DENO_DIR>/npm/<registry>/<name>/<version>/…`) is
+    // outside the repo and has no `node_modules` segment: only the graph
+    // places the package directory.
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-deno-rows-')));
+    const store = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-deno-rows-out-')));
+    const client = new SidecarClient();
+    try {
+      fs.writeFileSync(path.join(root, 'deno.json'), JSON.stringify({ imports: { hono: 'npm:hono@4.12.12' } }));
+      const mainPath = path.join(root, 'main.ts');
+      fs.writeFileSync(mainPath, [
+        'import { Hono } from "hono";',
+        'const app = new Hono();',
+        'app.get("/a", (c) => c.text("a"));',
+      ].join('\n'));
+      const installed = spawnSync('deno', ['install', '--node-modules-dir=none'], { cwd: root, encoding: 'utf8' });
+      assert.equal(installed.status, 0, installed.stderr);
+      await client.start();
+      await client.send({ action: 'init', request_id: 'init', repo_root: root, scan_root: root });
+      const outPath = path.join(store, 'rows.jsonl.gz');
+      const answer = (await client.send({
+        action: 'position_rows', request_id: 'rows', files: [mainPath], scan_root: root, out_path: outPath, service: 'deno',
+      }, 120_000)) as { status: string; errors?: string[] };
+      assert.equal(answer.status, 'success', JSON.stringify(answer.errors));
+      const rows = zlib.gunzipSync(fs.readFileSync(outPath)).toString('utf8').trimEnd().split('\n').slice(1)
+        .flatMap(line => (JSON.parse(line) as { r: unknown[][] }).r);
+      const packaged = rows.filter(row => row[0] === 'call' && row[6] === 'hono');
+      assert.ok(packaged.length > 0, JSON.stringify(rows));
+      for (const row of packaged) {
+        assert.match(String(row[4]), /^pkg:hono\/dist\/types\/.+\.d\.ts$/, JSON.stringify(row));
+        assert.equal((row[8] as number) & 8, 0, `no FLAG_DECLARATION_UNNAMED: ${JSON.stringify(row)}`);
+      }
+      const get = rows.filter(row => row[0] === 'call' && row[3] === 'get');
+      assert.equal(get.length, 1, JSON.stringify(rows));
+
+      const claims = (await client.send({
+        action: 'verify_library_claims', request_id: 'claims', from_dir: root, scan_root: root,
+        checks: [
+          { claim_id: 'make', package: 'hono', export: 'Hono', role: 'server_framework', receiver: 'export',
+            claim: { kind: 'make', form: 'new', member: null } },
+          { claim_id: 'get', package: 'hono', export: 'Hono', role: 'server_framework', receiver: 'instance:new',
+            claim: { kind: 'op', op: 'receive', member: 'get', name: { arg: 0 }, of: 'instance:new' } },
+        ],
+      }, 120_000)) as { status: string; verdicts?: Array<{ verdict: string; declarations?: Array<{ decl_file: string; decl_line: number }> }>; errors?: string[] };
+      assert.equal(claims.status, 'success', JSON.stringify(claims.errors));
+      const verdict = claims.verdicts![1];
+      assert.equal(verdict.verdict, 'verified', JSON.stringify(verdict));
+      assert.ok(verdict.declarations?.length, JSON.stringify(verdict));
+      for (const declared of verdict.declarations!) assert.match(declared.decl_file, /^pkg:hono\/dist\/types\//);
+    } finally {
+      await client.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(store, { recursive: true, force: true });
     }
   });
 });
