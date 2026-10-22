@@ -270,6 +270,11 @@ type Callable = { signatures: readonly ts.Signature[]; holder: ts.Type } | { fai
 
 interface ModuleRead {
   entry: SemanticsModule;
+  /**
+   * A `node:` key that names a file of the runtime's types package, not a
+   * module (carrick#2445): the file whose globals the key's exports are.
+   */
+  globalFile?: ts.SourceFile;
   /** The reason every check on this package is unchecked, when there is one. */
   reason?: string;
 }
@@ -485,7 +490,18 @@ export class LibraryClaimsVerifier {
       builtIndex.set(key, importLines.length + builtLines.length);
       builtLines.push(`${expression};`);
     }
-    const probeText = [...importLines, ...builtLines].join('\n');
+    // A `node:` key may name a file of the runtime's types, whose exports are
+    // globals (`runtimeGlobalFile`): the probe reads each as `globalThis` holds
+    // it, beside its import, and the reader takes the one the key resolves to.
+    const globalIndex = new Map<string, number>();
+    const globalLines: string[] = [];
+    importKeys.forEach((key, i) => {
+      const [pkg, name] = JSON.parse(key) as [string, string];
+      if (!RUNTIME_MODULE.test(pkg)) return;
+      globalIndex.set(key, importLines.length + builtLines.length + globalLines.length);
+      globalLines.push(globalRead(name, `__carrick_g${i}`));
+    });
+    const probeText = [...importLines, ...builtLines, ...globalLines].join('\n');
 
     const probePath = path.join(fromDir, `__carrick_claims_probe_${process.pid}_${probeSequence++}.ts`);
     const probe = this.project.createSourceFile(probePath, `${probeText}\n`, { overwrite: true });
@@ -504,6 +520,7 @@ export class LibraryClaimsVerifier {
 
       /** The probe's import of the check's export, or its read of a global (`probeLine`). */
       const statementOf = (check: LibraryCheck) => file.statements[importIndex.get(exportKey(check))!];
+      const globalStatementOf = (check: LibraryCheck) => file.statements[globalIndex.get(exportKey(check)) ?? -1];
 
       /** The probe's no-argument build of `receiver` on the check's export, resolved. */
       const atDefaults = (check: LibraryCheck, receiver: string): ts.Signature | undefined => {
@@ -528,9 +545,12 @@ export class LibraryClaimsVerifier {
         const key = exportKey(check);
         let exportRead = exportReads.get(key);
         if (!exportRead) {
+          const globalFile = RUNTIME_MODULE.test(check.package) ? readModule(check, rulesFor(check)?.message ?? false).globalFile : undefined;
           exportRead = DEFAULT_LIBRARY.test(check.package)
-            ? reader.readGlobal(check.package, statementOf(check))
-            : reader.readExport(statementOf(check) as ts.ImportDeclaration);
+            ? reader.readGlobal(reader.defaultLibraryFile(check.package), statementOf(check))
+            : globalFile
+              ? reader.readGlobal(globalFile, globalStatementOf(check))
+              : reader.readExport(statementOf(check) as ts.ImportDeclaration);
           exportReads.set(key, exportRead);
         }
         return exportRead;
@@ -1002,7 +1022,11 @@ function typeSymbols(type: ts.Type): (ts.Symbol | undefined)[] {
  * declares one.
  */
 function probeLine(pkg: string, name: string, local: string): string {
-  if (!DEFAULT_LIBRARY.test(pkg)) return importLine(pkg, name, local);
+  return DEFAULT_LIBRARY.test(pkg) ? globalRead(name, local) : importLine(pkg, name, local);
+}
+
+/** The probe's read of the global `name`, bound to `local`. */
+function globalRead(name: string, local: string): string {
   const access = IDENTIFIER.test(name) ? `.${name}` : `[${JSON.stringify(name)}]`;
   return `const ${local} = globalThis${access};`;
 }
@@ -1151,6 +1175,13 @@ class DeclarationReader {
 
     const moduleSymbol = this.checker.getSymbolAtLocation(specifier);
     const declarations = moduleSymbol?.declarations ?? [];
+    const globalFile = declarations.length === 0 ? this.runtimeGlobalFile(pkg) : undefined;
+    if (globalFile) {
+      entry.resolved_file = globalFile.fileName;
+      const version = this.installedPackage(globalFile.fileName)?.version;
+      if (version) entry.installed_version = version;
+      return { entry, globalFile };
+    }
     if (runtimeModules && RUNTIME_MODULE.test(pkg)) return this.readRuntimeModule(declarations, entry, done);
     // The module itself, not a service-side augmentation of it.
     const primary = declarations.find(ts.isSourceFile) ?? declarations[0];
@@ -1243,8 +1274,28 @@ class DeclarationReader {
     return { entry };
   }
 
+  /**
+   * The runtime types' file a `node:<path>` key names, when no module has
+   * that name (carrick#2445): `node:web-globals/fetch` is the file
+   * `web-globals/fetch.d.ts` (or `.../index.d.ts`) of the installed runtime
+   * types package, which declares globals. Undefined when the program loads
+   * no such file; the key is then a module name, read as one.
+   */
+  private runtimeGlobalFile(pkg: string): ts.SourceFile | undefined {
+    if (!RUNTIME_MODULE.test(pkg)) return undefined;
+    const relative = pkg.slice('node:'.length);
+    return this.program.getSourceFiles().find(file => {
+      const owner = this.packageOf(file);
+      if (owner === undefined || !RUNTIME_TYPE_PACKAGES.has(owner)) return false;
+      const name = this.realpath(file.fileName).split(path.sep).join('/');
+      const marker = `/node_modules/${owner}/`;
+      const inside = name.slice(name.lastIndexOf(marker) + marker.length);
+      return inside === `${relative}.d.ts` || inside === `${relative}/index.d.ts`;
+    });
+  }
+
   /** The default-library file a `lib:` key names, when the program loads it. */
-  private defaultLibraryFile(pkg: string): ts.SourceFile | undefined {
+  defaultLibraryFile(pkg: string): ts.SourceFile | undefined {
     const name = pkg.slice('lib:'.length);
     return this.program
       .getSourceFiles()
@@ -1257,7 +1308,7 @@ class DeclarationReader {
    * key's lib file declares; one only another file declares (the runtime's
    * types, the service) is missing from it.
    */
-  readGlobal(pkg: string, statement: ts.Statement | undefined): Read<ExportRead> {
+  readGlobal(file: ts.SourceFile | undefined, statement: ts.Statement | undefined): Read<ExportRead> {
     const declaration =
       statement && ts.isVariableStatement(statement) ? statement.declarationList.declarations[0] : undefined;
     const access = declaration?.initializer;
@@ -1268,7 +1319,6 @@ class DeclarationReader {
           ? access.argumentExpression
           : undefined;
     const target = name ? this.checker.getSymbolAtLocation(name) : undefined;
-    const file = this.defaultLibraryFile(pkg);
     if (
       !declaration ||
       !target ||
@@ -2749,7 +2799,7 @@ class DeclarationReader {
     if (moduleRead.entry.resolved_file) surface.resolved_file = moduleRead.entry.resolved_file;
     if (moduleRead.entry.installed_version) surface.installed_version = moduleRead.entry.installed_version;
     if (moduleRead.reason) return { ...surface, reason: moduleRead.reason };
-    const exported = this.listedExports(probe, only);
+    const exported = this.listedExports(probe, only, moduleRead.globalFile);
     if (!exported) return { ...surface, reason: 'module_unresolved' };
 
     let budget = maxEntries;
@@ -2804,8 +2854,9 @@ class DeclarationReader {
    */
   makersOf(pkg: string, probe: SurfaceProbe, only: readonly string[] | undefined): { export: string; receivers: string[] }[] {
     this.setPackage(pkg);
-    if ('namespace' in probe && this.readModule(pkg, probe.namespace, true).reason) return [];
-    return (this.listedExports(probe, only) ?? [])
+    const moduleRead = 'namespace' in probe ? this.readModule(pkg, probe.namespace, true) : undefined;
+    if (moduleRead?.reason) return [];
+    return (this.listedExports(probe, only, moduleRead?.globalFile) ?? [])
       .filter(({ type }) => !this.isOpenTop(type))
       .map(({ name, target, type }) => ({
         export: name,
@@ -2823,8 +2874,13 @@ class DeclarationReader {
    * `prototype`, which no service imports. Undefined when the specifier
    * resolves to no module symbol.
    */
-  private listedExports(probe: SurfaceProbe, only: readonly string[] | undefined): ListedExport[] | undefined {
-    if ('defaultLibrary' in probe) return this.listedGlobals(probe.defaultLibrary, only);
+  private listedExports(
+    probe: SurfaceProbe,
+    only: readonly string[] | undefined,
+    globalFile?: ts.SourceFile
+  ): ListedExport[] | undefined {
+    if ('defaultLibrary' in probe) return this.listedGlobals(this.defaultLibraryFile(probe.defaultLibrary), only);
+    if (globalFile) return this.listedGlobals(globalFile, only);
     const moduleSymbol = this.checker.getSymbolAtLocation(probe.namespace.moduleSpecifier);
     if (!moduleSymbol) return undefined;
     const wanted = (name: string) => only === undefined || only.includes(name);
@@ -2858,8 +2914,7 @@ class DeclarationReader {
    * `only` names), sorted by name, each with its declared type: none when the
    * program's `lib` setting does not load the file.
    */
-  private listedGlobals(pkg: string, only: readonly string[] | undefined): ListedExport[] {
-    const file = this.defaultLibraryFile(pkg);
+  private listedGlobals(file: ts.SourceFile | undefined, only: readonly string[] | undefined): ListedExport[] {
     if (!file) return [];
     return this.checker
       .getSymbolsInScope(this.probe, ts.SymbolFlags.Value)
