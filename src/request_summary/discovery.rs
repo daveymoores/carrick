@@ -136,6 +136,10 @@ pub struct Discovery {
     /// The calls the walk could not follow, each with its reason as `stop`
     /// (`end` and `chain` empty). Not sites: nothing decided reads them.
     pub unfollowed: Vec<DiscoverySite>,
+    /// The calls whose walk ended with nothing missed and no site (`no_site`),
+    /// by file and SWC span: the calls the fact layer reads as followed to
+    /// the end (carrick#2613).
+    pub finished: Vec<(String, u32, u32)>,
     pub counts: BTreeMap<String, usize>,
 }
 
@@ -187,15 +191,15 @@ impl<'a> Labels<'a> {
     /// a package it did not answer (still building, skipped, not asked) is
     /// told from one it answered with nothing to label.
     pub fn of_answer(answer: &'a LibraryAnswer) -> Self {
+        Labels::of_answered(&answer.exports, &answer.answered_packages)
+    }
+
+    /// [`Labels::of_answer`] from the exports and the packages answered, as
+    /// the store's first answer to a scan holds them (carrick#2613).
+    pub fn of_answered(exports: &'a [ExportClaims], answered: &'a BTreeSet<String>) -> Self {
         Labels {
-            answered: Some(
-                answer
-                    .answered_packages
-                    .iter()
-                    .map(String::as_str)
-                    .collect(),
-            ),
-            ..Labels::of(&answer.exports)
+            answered: Some(answered.iter().map(String::as_str).collect()),
+            ..Labels::of(exports)
         }
     }
 
@@ -1230,6 +1234,11 @@ impl Walker<'_> {
                         }
                         None => {
                             *discovery.counts.entry("no_site".to_string()).or_default() += 1;
+                            discovery.finished.push((
+                                self.rel(file),
+                                call.site.span_start,
+                                call.site.span_end,
+                            ));
                         }
                     }
                     continue;
@@ -1321,6 +1330,8 @@ pub fn discover(inputs: &RequestSummaryInputs, labels: &Labels<'_>, root: &Path)
         .unfollowed
         .sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
     discovery.unfollowed.dedup();
+    discovery.finished.sort();
+    discovery.finished.dedup();
     discovery
 }
 

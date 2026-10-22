@@ -263,6 +263,10 @@ pub struct ScanResult {
     /// first. Read by the orchestrator's file-selection log only
     /// (carrick#2613); nothing else reads it.
     pub register_signals: BTreeMap<(u32, u32), BTreeSet<RegisterSignal>>,
+    /// Every call span a signal outside the register raised. A candidate
+    /// whose span is in `register_signals` and not here was raised by the
+    /// register signals alone (carrick#2613, ticket T3).
+    pub kept_spans: BTreeSet<(u32, u32)>,
 }
 
 /// The hand-written call-site signals in the #2440 register. Each is deleted
@@ -572,6 +576,7 @@ impl SwcScanner {
                     pubsub_anchor_ops: Vec::new(),
                     local_wrapper_calls: Vec::new(),
                     register_signals: BTreeMap::new(),
+                    kept_spans: BTreeSet::new(),
                 };
             }
         };
@@ -610,6 +615,7 @@ impl SwcScanner {
             pubsub_anchor_ops: visitor.pubsub_anchor_ops,
             local_wrapper_calls,
             register_signals: visitor.register_hits,
+            kept_spans: visitor.kept_hits,
         }
     }
 
@@ -624,6 +630,39 @@ impl SwcScanner {
         content: &str,
         data_fetchers: &[String],
         messaging_clients: &[String],
+    ) -> ScanResult {
+        self.scan_content_with(file_path, content, data_fetchers, messaging_clients, None)
+    }
+
+    /// The HTTP candidates at the calls the fact layer found in a file
+    /// (carrick#2613, ticket T3), at `spans` in SWC's numbering, built as
+    /// [`SwcScanner::scan_content`] builds any candidate, on the same fresh
+    /// source map, whatever signal would or would not raise them. A span that
+    /// is no call expression (a `new` construction) gets none. The file's
+    /// same-module wrapper calls come back with them, as they do from a scan.
+    pub fn scan_sites(
+        &self,
+        file_path: &Path,
+        content: &str,
+        spans: &BTreeSet<(u32, u32)>,
+    ) -> ScanResult {
+        let mut result = self.scan_content_with(file_path, content, &[], &[], Some(spans.clone()));
+        result
+            .candidates
+            .retain(|candidate| spans.contains(&(candidate.span_start, candidate.span_end)));
+        for candidate in &mut result.candidates {
+            candidate.protocol = Protocol::Http;
+        }
+        result
+    }
+
+    fn scan_content_with(
+        &self,
+        file_path: &Path,
+        content: &str,
+        data_fetchers: &[String],
+        messaging_clients: &[String],
+        wanted: Option<BTreeSet<(u32, u32)>>,
     ) -> ScanResult {
         use swc_common::{FileName, GLOBALS, Globals, Mark};
         use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
@@ -660,6 +699,7 @@ impl SwcScanner {
                     pubsub_anchor_ops: Vec::new(),
                     local_wrapper_calls: Vec::new(),
                     register_signals: BTreeMap::new(),
+                    kept_spans: BTreeSet::new(),
                 };
             }
         };
@@ -697,6 +737,7 @@ impl SwcScanner {
             Declarations::of(&module),
             request_helper_sites,
         );
+        visitor.wanted = wanted;
         module.visit_with(&mut visitor);
 
         ScanResult {
@@ -706,6 +747,7 @@ impl SwcScanner {
             pubsub_anchor_ops: visitor.pubsub_anchor_ops,
             local_wrapper_calls,
             register_signals: visitor.register_hits,
+            kept_spans: visitor.kept_hits,
         }
     }
 
@@ -2308,6 +2350,12 @@ struct CandidateVisitor {
     /// Every call span each register signal raised, whether or not another
     /// signal raised it first (`seen_spans` drops the second push).
     register_hits: BTreeMap<(u32, u32), BTreeSet<RegisterSignal>>,
+    /// Every call span a signal outside the register raised
+    /// ([`ScanResult::kept_spans`]).
+    kept_hits: BTreeSet<(u32, u32)>,
+    /// Set by [`SwcScanner::scan_sites`]: no signal runs, and a candidate is
+    /// raised at each of these call spans and nowhere else.
+    wanted: Option<BTreeSet<(u32, u32)>>,
 }
 
 impl CandidateVisitor {
@@ -2341,6 +2389,8 @@ impl CandidateVisitor {
             request_helper_sites,
             register_signal: None,
             register_hits: BTreeMap::new(),
+            kept_hits: BTreeSet::new(),
+            wanted: None,
         }
     }
 
@@ -2771,11 +2821,16 @@ impl CandidateVisitor {
         callee_property: Option<String>,
     ) {
         let (span_start, span_end) = self.span_range(call.span);
-        if let Some(signal) = self.register_signal {
-            self.register_hits
-                .entry((span_start, span_end))
-                .or_default()
-                .insert(signal);
+        match self.register_signal {
+            Some(signal) => {
+                self.register_hits
+                    .entry((span_start, span_end))
+                    .or_default()
+                    .insert(signal);
+            }
+            None => {
+                self.kept_hits.insert((span_start, span_end));
+            }
         }
         if !self.seen_spans.insert((span_start, span_end)) {
             return;
@@ -3499,6 +3554,22 @@ impl Visit for CandidateVisitor {
     }
 
     fn visit_call_expr(&mut self, call: &CallExpr) {
+        // The fact layer's calls (carrick#2613): a candidate at each, built
+        // as any signal builds one, and no signal runs.
+        if let Some(wanted) = &self.wanted {
+            if wanted.contains(&self.span_range(call.span)) {
+                let (obj, prop) = match &call.callee {
+                    Callee::Expr(e) => (
+                        Self::extract_callee_object(e).unwrap_or_else(|| "<fact-site>".to_string()),
+                        Self::callee_member_prop(e),
+                    ),
+                    _ => ("<fact-site>".to_string(), None),
+                };
+                self.push_candidate(call, obj, prop);
+            }
+            call.visit_children_with(self);
+            return;
+        }
         // Snapshot the Signal-7 position flag set by the enclosing
         // `visit_expr_stmt` / `visit_var_declarator`, then clear it so calls
         // nested inside this call's arguments/callee don't inherit the position.
@@ -4091,6 +4162,40 @@ mod tests {
             !result.register_signals.contains_key(&span_of("fetch(")),
             "the global fetch primitive is no register signal"
         );
+        // carrick#2613 (T3): the kept signal's span is recorded as kept, the
+        // span only register signals raised is not.
+        assert!(result.kept_spans.contains(&span_of("fetch(")));
+        assert!(!result.kept_spans.contains(&span_of("axios.get")));
+    }
+
+    /// carrick#2613 (T3): the fact layer's calls get candidates built as any
+    /// signal builds one, whatever signal would raise them, and nothing else
+    /// in the file does.
+    #[test]
+    fn scan_sites_builds_a_candidate_at_each_given_call_only() {
+        let source = "import relay from \"relay\";\n\
+                      export function ping(url: string): void {\n\
+                      \x20 relay(url);\n\
+                      \x20 fetch(\"/health\");\n\
+                      }\n";
+        let start = source.find("relay(url)").unwrap() as u32 + 1;
+        let span = (start, start + "relay(url)".len() as u32);
+        let scanner = SwcScanner::new();
+        let result = scanner.scan_sites(
+            Path::new("ping.ts"),
+            source,
+            &std::collections::BTreeSet::from([span]),
+        );
+        assert_eq!(result.candidates.len(), 1, "{:?}", result.candidates);
+        let candidate = &result.candidates[0];
+        assert_eq!((candidate.span_start, candidate.span_end), span);
+        assert_eq!(
+            candidate.candidate_id,
+            format!("span:{}-{}", span.0, span.1)
+        );
+        assert_eq!(candidate.callee_object, "relay");
+        assert_eq!(candidate.line_number, 3);
+        assert_eq!(candidate.enclosing_function.as_deref(), Some("ping"));
     }
 
     #[test]
