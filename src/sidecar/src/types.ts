@@ -329,6 +329,54 @@ export interface PositionRowsRequest extends BaseRequest {
 }
 
 /**
+ * The implementations of the bodyless declarations some calls go through
+ * (carrick#2432 slice B), asked of the analysis process: one batch per
+ * service.
+ */
+export interface ImplementationsRequest extends BaseRequest {
+  action: 'implementations';
+  /** One question per call, each the span of its `call` (or `member`) position row. */
+  queries: ImplementationsQuery[];
+  /** The scanned repo's root: every name in an answer is relative to it. */
+  scan_root: string;
+}
+
+export interface ImplementationsQuery {
+  /** Absolute path of the file holding the call. */
+  file: string;
+  /** The row's span: UTF-16 code units from the start of the file. */
+  start: number;
+  end: number;
+}
+
+/** A declaration as a position row names one. */
+export interface NamedDeclaration {
+  symbol: string | null;
+  decl_file: string | null;
+  decl_line: number | null;
+  decl_package: string | null;
+}
+
+/** Why an answer names no implementation, where it is not because there is none. */
+export type ImplementationsReason =
+  | 'not_in_program'
+  | 'no_call'
+  | 'no_symbol'
+  | 'no_declaration'
+  | 'has_body'
+  | 'checker_threw';
+
+export interface ImplementationsAnswer {
+  /** The declaration the call goes through, as its row names it. */
+  declaration: NamedDeclaration | null;
+  /** By file, then position; empty when `too_many`. */
+  implementations: NamedDeclaration[];
+  /** More than the cap (16) were found, and none is listed. */
+  too_many: boolean;
+  reason?: ImplementationsReason;
+}
+
+/**
  * Request to resolve type definitions from a v2 capture stub package.
  * Returns both the original declaration and the compiler-expanded form for
  * each surface alias (design doc: `resolve_per_endpoint_definitions` is
@@ -666,7 +714,8 @@ export type SidecarRequest =
   | ShutdownRequest
   | ListProgramFilesRequest
   | AddProgramFilesRequest
-  | PositionRowsRequest;
+  | PositionRowsRequest
+  | ImplementationsRequest;
 
 /**
  * Request for a specific symbol to be bundled
@@ -872,6 +921,12 @@ export interface HealthResponse extends BaseResponse {
  */
 export interface ShutdownResponse extends BaseResponse {
   status: 'success';
+}
+
+/** Response for implementations: one answer per question, in request order. */
+export interface ImplementationsResponse extends BaseResponse {
+  result?: { answers: ImplementationsAnswer[] };
+  errors?: string[];
 }
 
 /** Response for position_rows: what was written, counted. */
@@ -1098,6 +1153,7 @@ export type SidecarResponse =
   | ListProgramFilesResponse
   | AddProgramFilesResponse
   | PositionRowsResponse
+  | ImplementationsResponse
   | ErrorResponse;
 
 /**

@@ -109,13 +109,14 @@ A client must skip progress frames rather than treat the first frame as the answ
 | `capture_v2` | One as it reaches each stage, `phase` naming it: `program` (the program the anchors are read in is being built), `anchors` (they are being resolved; `message` is `<done> of <total>`, starting at `0`, then at most one every 1.5 s), `emit` (declarations), `self-check` (the stub). The last one written says how far a capture whose process died had got. |
 | `check_v2` | A keepalive every 1.5 s while it installs and checks; `phase` names the stage. |
 | `position_rows` | As `infer`, counting the files walked, with `phase` `positions`. |
+| `implementations` | As `infer`, counting the questions answered, with `phase` `implementations`. |
 | every other action | None. |
 
 Frames are written by the work itself, between units, except for `check_v2`, whose work runs in child processes. A handler that stops finishing units stops writing them.
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `infer`, `retype_check`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files`, `add_program_files` and `position_rows` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
+`init` resolves a project; `bundle`, `infer`, `retype_check`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files`, `add_program_files`, `position_rows` and `implementations` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
 
 `capture_v2`, `check_v2`, `resolve_definitions`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
@@ -136,6 +137,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `list_program_files` | yes | The files the program was built from, in order |
 | `add_program_files` | yes | Add files to the program in a given order |
 | `position_rows` | yes | Write the compiler's rows for every call, member access, comparison and identifier of a service's files (record-only) |
+| `implementations` | yes | The implementations of the bodyless declaration each given call goes through |
 | `resolve_definitions` | no | As-written and structural form of captured aliases |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
 | `health` | no | Readiness and init cost |
@@ -898,6 +900,35 @@ Each row is `[kind, start, end, symbol, decl_file, decl_line, decl_package, type
 | `decl` | after a `call` or `member` row, at its span, when the member is read on a union whose constituents declare it at more than one place (carrick#2448) | one of those declarations, sorted by file then position | nothing |
 
 The symbol follows aliases to a target that has a declaration. The declaration is the one the inferrer attributes it to (carrick#2031). `decl_file` is repo-relative (`node_modules/...` included), `lib:<file>` for the compiler's default library (its line is in ts-morph's copy of the library), `pkg:<name>/<path>` for an installed package outside the repo root, or `null`. `decl_package` is the module graph's or the path's package, else the `name` of the nearest `package.json` up to the repo root. `type_text` is the compiler's print of the type at the node with no enclosing declaration (`typeToString(getTypeAtLocation(node))`, default truncation), through `print-type.ts`, so one type reads the same from every file; a declaring file's path in it is written as `decl_file` names it. Flags: 1 `any`, 2 the error type (never with 1), 4 the checker threw at the node, 8 the declaration is outside the checkout and unnamed, 16 a `decl` row standing for more than 16 rows. The scanner pins the format in `src/position_rows.rs`.
+
+#### `implementations` - What implements the declaration a call goes through (carrick#2432)
+
+Asked where discovery stops at a call through a bodyless declaration: an interface's or type literal's method, a function-typed property signature, an abstract member, or a function-typed class property or parameter with no initializer. Asked of the service's analysis process, over the language service's program of the project that owns each file; nothing is released. One batch per service.
+
+```json
+{
+  "request_id": "15",
+  "action": "implementations",
+  "queries": [{ "file": "/repo/apps/api/src/handlers.ts", "start": 120, "end": 151 }],
+  "scan_root": "/repo"
+}
+```
+
+Each query is the span of a `call` (or `member`) position row: `start` and `end` in UTF-16 code units, as the rows key them. The call's symbol and declaration are read as that row reads them, and go-to-implementation is asked once per declaration, at its name.
+
+```json
+{
+  "request_id": "15",
+  "status": "success",
+  "result": { "answers": [{
+    "declaration": { "symbol": "send", "decl_file": "apps/api/src/port.ts", "decl_line": 2, "decl_package": "api" },
+    "implementations": [{ "symbol": "send", "decl_file": "apps/api/src/http-port.ts", "decl_line": 4, "decl_package": "api" }],
+    "too_many": false
+  }] }
+}
+```
+
+One answer per query, in request order. A declaration and each implementation are named as a position row names a declaration, so an implementation joins to a definition as a `call` row at it would; its line is where the implementation's declaration starts, decorators included. Implementations are sorted by `decl_file`, then position, and never include the declaration's own signatures. More than 16 → `too_many: true` and none listed. `reason`, when nothing was searched: `not_in_program`, `no_call` (no `call` or `member` node has that span), `no_symbol`, `no_declaration`, `has_body` (the declaration runs its own body) or `checker_threw`. The position rows carry no implementations (version 4).
 
 #### `resolve_definitions` - Read aliases out of a capture stub
 
