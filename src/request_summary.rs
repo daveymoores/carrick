@@ -884,6 +884,40 @@ struct CallIr {
     /// as: its span (discovery numbering) and form. `None` when the callee
     /// is no member access. Read by the receiver trace alone (carrick#2474).
     receiver_object: Option<(u32, u32, discovery::ObjectForm)>,
+    /// What the receiver trace walks an instance from (carrick#2474 R2a).
+    /// Read by the trace alone.
+    instance: InstanceIr,
+}
+
+/// The instance an expression holds where it is written, as the syntax
+/// names one (carrick#2474 R2a): where the receiver trace's walk ends.
+#[derive(Debug, Clone)]
+enum HeldInstance {
+    /// What the library-site reader reads a holder as: a maker's instance,
+    /// or what an own factory call returns ([`Reader::written_instance`]).
+    Client(Box<ClientRef>),
+    /// A name an import binds, at its span (discovery numbering): which
+    /// declaration it reaches is the compiler's to say.
+    Imported(u32, u32),
+}
+
+/// What one argument holds, whole, and what each plain key of an object
+/// literal written there holds (`{ app }`).
+#[derive(Debug, Clone, Default)]
+struct ArgHeld {
+    whole: Option<HeldInstance>,
+    keys: BTreeMap<String, HeldInstance>,
+}
+
+/// What the receiver trace reads at one call (carrick#2474 R2a): the
+/// receiver object's value as the body reads it (a parameter, a key of
+/// one, an enclosing function's), the instance the receiver holds where
+/// the syntax names one, and each argument's.
+#[derive(Debug, Clone, Default)]
+struct InstanceIr {
+    receiver_value: Option<Value>,
+    receiver_held: Option<HeldInstance>,
+    args: Vec<ArgHeld>,
 }
 
 /// What a call's argument puts in place of the callee's spread of that
@@ -4086,6 +4120,102 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
+    /// The instance `expr` holds where it is written (carrick#2474 R2a): a
+    /// name the scope holds an instance in, a maker or own factory call
+    /// ([`Reader::written_instance`]), or a name an import binds, whose
+    /// declaration the compiler names. A parameter is the walk's to fill,
+    /// and anything else holds nothing the syntax names.
+    fn held(&self, expr: &Expr, scope: &Scope<'_>) -> Option<HeldInstance> {
+        match unwrap_value(expr) {
+            Expr::Ident(ident) => {
+                if scope.param_index(ident).is_some() {
+                    return None;
+                }
+                if let Some(client) = scope.receiver(ident)
+                    && client.instance.is_some()
+                {
+                    return Some(HeldInstance::Client(Box::new(client.clone())));
+                }
+                let key = ident_key(ident);
+                (!scope.locals.contains_key(&key)
+                    && !scope.local_receivers.contains_key(&key)
+                    && scope.module.imports.contains(ident.sym.as_ref()))
+                .then_some(HeldInstance::Imported(ident.span.lo.0, ident.span.hi.0))
+            }
+            call @ (Expr::Call(_) | Expr::New(_)) => self
+                .written_instance(call, scope)
+                .map(|client| HeldInstance::Client(Box::new(client))),
+            _ => None,
+        }
+    }
+
+    /// What the receiver trace reads at a call whose callee is `callee`,
+    /// handed `args` ([`InstanceIr`]). The receiver's value is read only
+    /// for a name or a member read: a call's value is no parameter.
+    fn instance_ir(
+        &self,
+        callee: Option<&Expr>,
+        args: &[ExprOrSpread],
+        scope: &Scope<'_>,
+    ) -> InstanceIr {
+        let object = callee.and_then(|callee| match unwrap_value(callee) {
+            Expr::Member(member) => Some(&*member.obj),
+            Expr::OptChain(OptChainExpr { base, .. }) => match &**base {
+                OptChainBase::Member(member) => Some(&*member.obj),
+                OptChainBase::Call(_) => None,
+            },
+            _ => None,
+        });
+        let receiver_value = object
+            .filter(|object| matches!(unwrap_value(object), Expr::Ident(_) | Expr::Member(_)))
+            .map(|object| self.eval(unwrap_value(object), scope));
+        let receiver_held = object.and_then(|object| self.held(object, scope));
+        let args = args
+            .iter()
+            .map(|arg| {
+                if arg.spread.is_some() {
+                    return ArgHeld::default();
+                }
+                let keys = match unwrap_value(&arg.expr) {
+                    Expr::Object(object) => object
+                        .props
+                        .iter()
+                        .filter_map(|prop| match prop {
+                            PropOrSpread::Prop(prop) => match &**prop {
+                                Prop::Shorthand(ident) => {
+                                    let held = self.held(&Expr::Ident(ident.clone()), scope)?;
+                                    Some((ident.sym.to_string(), held))
+                                }
+                                Prop::KeyValue(entry) => {
+                                    let name = match &entry.key {
+                                        PropName::Ident(name) => name.sym.to_string(),
+                                        PropName::Str(text) => {
+                                            text.value.to_string_lossy().into_owned()
+                                        }
+                                        _ => return None,
+                                    };
+                                    Some((name, self.held(&entry.value, scope)?))
+                                }
+                                _ => None,
+                            },
+                            PropOrSpread::Spread(_) => None,
+                        })
+                        .collect(),
+                    _ => BTreeMap::new(),
+                };
+                ArgHeld {
+                    whole: self.held(&arg.expr, scope),
+                    keys,
+                }
+            })
+            .collect();
+        InstanceIr {
+            receiver_value,
+            receiver_held,
+            args,
+        }
+    }
+
     fn text(&self, span: Span) -> String {
         self.source_map
             .span_to_snippet(span)
@@ -6313,6 +6443,14 @@ impl Visit for CallWalker<'_, '_, '_> {
                 Callee::Expr(callee) => discovery::receiver_object(callee),
                 _ => None,
             },
+            instance: self.reader.instance_ir(
+                match &call.callee {
+                    Callee::Expr(callee) => Some(&**callee),
+                    _ => None,
+                },
+                &call.args,
+                self.scope,
+            ),
         });
     }
 
@@ -6378,6 +6516,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 spread_args: Vec::new(),
                 receiver_spans: Vec::new(),
                 receiver_object: None,
+                instance: InstanceIr::default(),
             });
         }
         element.visit_children_with(self);

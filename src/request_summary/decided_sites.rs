@@ -57,6 +57,9 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use super::{CallIr, FnIr, Piece, RequestSummaryInputs, Value, concat, render_target};
 
+mod instances;
+pub use instances::{InstanceAt, InstanceEnd, InstanceHole, MakerLabel};
+
 /// The labelled call a discovery site reaches: the store key of the package
 /// (`lib:lib.dom.d.ts` for the language's own library), the export and member, the
 /// store role and op, and where the call is.
@@ -508,6 +511,10 @@ pub struct DecidedSite {
     pub receiver: Option<super::discovery::ReceiverAt>,
     /// How discovery matched the labelled call, with the receiver trace on.
     pub reached: Option<super::discovery::ReachedBy>,
+    /// With the receiver trace on, the instance the labelled call is made
+    /// on, one end per caller that hands one in (carrick#2474 R2a). Read by
+    /// nothing; never part of a record's state.
+    pub instances: Vec<InstanceEnd>,
 }
 
 impl DecidedSite {
@@ -676,6 +683,11 @@ struct Placed<'a> {
     key: Option<&'a str>,
     depth: u8,
     call: &'a CallIr,
+    /// For a call inside a function written as a call's argument, that
+    /// call: what runs the innermost function the call is written in
+    /// (carrick#2474 R2a). `None` at depth 0, and for a function written
+    /// anywhere else.
+    host: Option<&'a CallIr>,
 }
 
 /// Every call of the service, by file and span, by the function whose body
@@ -695,6 +707,7 @@ impl<'a> Calls<'a> {
             key: Option<&'a str>,
             depth: u8,
             ir: &'a FnIr,
+            host: Option<&'a CallIr>,
             out: &mut Calls<'a>,
         ) {
             for call in ir.calls.iter().chain(&ir.constructions) {
@@ -703,6 +716,7 @@ impl<'a> Calls<'a> {
                     key,
                     depth,
                     call,
+                    host,
                 };
                 out.by_span
                     .entry((file, call.site.span_start, call.site.span_end))
@@ -714,8 +728,16 @@ impl<'a> Calls<'a> {
                     out.callers.entry(target.clone()).or_default().push(placed);
                 }
             }
-            for inner in ir.nested.iter().chain(&ir.detached) {
-                walk(file, key, depth.saturating_add(1), inner, out);
+            for (index, inner) in ir.nested.iter().enumerate() {
+                let host = ir.calls.iter().find(|call| {
+                    call.args
+                        .iter()
+                        .any(|arg| matches!(arg, Value::Callback(at) if *at == index))
+                });
+                walk(file, key, depth.saturating_add(1), inner, host, out);
+            }
+            for inner in &ir.detached {
+                walk(file, key, depth.saturating_add(1), inner, None, out);
             }
         }
         let mut calls = Calls {
@@ -736,10 +758,11 @@ impl<'a> Calls<'a> {
                     Some(key.as_str()),
                     0,
                     &file.functions[key],
+                    None,
                     &mut calls,
                 );
             }
-            walk(path, None, 0, &file.module_level, &mut calls);
+            walk(path, None, 0, &file.module_level, None, &mut calls);
         }
         calls
     }
@@ -757,6 +780,14 @@ impl<'a> Calls<'a> {
         self.callers
             .get(&(file.to_path_buf(), key.to_string()))
             .map_or(&[], Vec::as_slice)
+    }
+
+    /// Every call written in `file`.
+    fn in_file<'s>(&'s self, file: &'s Path) -> impl Iterator<Item = &'s Placed<'a>> + 's {
+        self.by_span
+            .iter()
+            .filter(move |((at, ..), _)| *at == file)
+            .map(|(_, placed)| placed)
     }
 }
 
@@ -1119,7 +1150,11 @@ pub(crate) fn relative(root: &Path, file: &Path) -> String {
 
 struct Walk<'a, 'i> {
     calls: &'i Calls<'a>,
+    inputs: &'i RequestSummaryInputs,
     root: &'i Path,
+    /// With the receiver trace on, the makers the store labels: each site's
+    /// instance is walked to them ([`instances`]).
+    makers: Option<&'i [MakerLabel]>,
     out: &'i mut Decided,
     seen: HashSet<(String, u32, Option<String>, String)>,
     /// The label of the labelled call being walked.
@@ -1166,6 +1201,7 @@ impl<'a> Walk<'a, '_> {
             .and_then(|label| label.method.as_ref())
             .and_then(|method| method.from.as_ref())
             .and_then(|slot| method_value(down, slot));
+        let instances = self.instances(down);
         self.out.sites.push(DecidedSite {
             file,
             line: placed.call.site.line,
@@ -1181,7 +1217,19 @@ impl<'a> Walk<'a, '_> {
             method,
             receiver: self.receiver.clone(),
             reached: self.reached,
+            instances,
         });
+    }
+
+    /// With the receiver trace on, the instance ends of the site whose
+    /// calls are `down` ([`instances`]); none with it off.
+    fn instances(&self, down: &[Placed<'a>]) -> Vec<InstanceEnd> {
+        match self.makers {
+            Some(makers) => {
+                instances::InstanceWalk::new(self.calls, self.inputs, self.root, makers).of(down)
+            }
+            None => Vec::new(),
+        }
     }
 
     fn lead(&mut self, placed: &Placed<'a>, end: &LabelledEnd, why: Undecided) {
@@ -1302,6 +1350,7 @@ impl<'a> Walk<'a, '_> {
     /// a loop, at the line of the function under each key.
     fn table(&mut self, placed: &Placed<'a>, end: &LabelledEnd, keys: Vec<TableKey>) {
         let file = relative(self.root, placed.file);
+        let instances = self.instances(std::slice::from_ref(placed));
         for entry in keys {
             if self
                 .label
@@ -1334,6 +1383,7 @@ impl<'a> Walk<'a, '_> {
                 method: None,
                 receiver: self.receiver.clone(),
                 reached: self.reached,
+                instances: instances.clone(),
             });
         }
     }
@@ -1387,6 +1437,30 @@ pub fn decided_sites(
     discovered: &[DiscoverySite],
     labels: &[SiteLabel],
 ) -> Decided {
+    decide(inputs, root, discovered, labels, None)
+}
+
+/// [`decided_sites`] with the receiver trace on (carrick#2474 R2a): each
+/// site also names the instance its labelled call is made on, walked to the
+/// makers the store labels (`makers`), one end per caller that hands one in
+/// ([`DecidedSite::instances`]).
+pub fn decided_sites_traced(
+    inputs: &RequestSummaryInputs,
+    root: &Path,
+    discovered: &[DiscoverySite],
+    labels: &[SiteLabel],
+    makers: &[MakerLabel],
+) -> Decided {
+    decide(inputs, root, discovered, labels, Some(makers))
+}
+
+fn decide(
+    inputs: &RequestSummaryInputs,
+    root: &Path,
+    discovered: &[DiscoverySite],
+    labels: &[SiteLabel],
+    makers: Option<&[MakerLabel]>,
+) -> Decided {
     let calls = Calls::index(inputs);
     let mut out = Decided::default();
     // The functions some listed site's chain enters: a site whose value
@@ -1402,7 +1476,9 @@ pub fn decided_sites(
     let mut unplaced: Vec<String> = Vec::new();
     let mut walk = Walk {
         calls: &calls,
+        inputs,
         root,
+        makers,
         out: &mut out,
         seen: HashSet::new(),
         label: None,

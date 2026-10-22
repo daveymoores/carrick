@@ -1367,6 +1367,7 @@ impl CallWalker<'_, '_, '_> {
             spread_args: Vec::new(),
             receiver_spans: super::discovery::receiver_spans(&new.callee),
             receiver_object: super::discovery::receiver_object(&new.callee),
+            instance: super::InstanceIr::default(),
         };
         self.ir.constructions.push(construction);
     }
@@ -1410,6 +1411,7 @@ impl CallWalker<'_, '_, '_> {
             spread_args: Vec::new(),
             receiver_spans: super::discovery::receiver_spans(&call.callee),
             receiver_object: super::discovery::receiver_object(&call.callee),
+            instance: self.reader.instance_ir(Some(&call.callee), &[], self.scope),
         });
     }
 
