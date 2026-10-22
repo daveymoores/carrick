@@ -674,9 +674,11 @@ pub struct Decided {
 /// (carrick#2614): `await login(…)` where `login`'s own call writes the path.
 /// The call is not a second request; the site at `site_file:site_line` is.
 /// Recorded only where each hop from this call down to the site is the
-/// definition the compiler's `call` row names ([`RequestSummaryInputs::reach`],
-/// not the call graph's name join nor its unresolved-import fallback), so a
-/// call into another service or an unresolved one is never recorded.
+/// definition [`RequestSummaryInputs::reach`] reads off the compiler's `call`
+/// row (or, for a bare call of a function the same file declares, SWC's exact
+/// binding), never the unresolved-import fallback to the call graph's name
+/// join, so a call into another service or an unresolved one is never
+/// recorded.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Through {
     /// Repo-relative, `/`-separated.
