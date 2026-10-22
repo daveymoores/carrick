@@ -49,7 +49,8 @@
 //! [`FLAG_PUBLISHED`] and [`FLAG_MODULE_DEFAULT`] (carrick#2508) are flag
 //! bits, not a new version: a row written without them
 //! still reads, and reads as a declaration nothing says is published, which
-//! discovery's name match abstains on.
+//! discovery's name match abstains on. [`FLAG_RUNS_HANDED`] (carrick#2634)
+//! is one too: a call row without it reads as "not stated", which abstains.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader};
@@ -94,6 +95,13 @@ pub const FLAG_TOO_MANY: u8 = 16;
 pub const FLAG_PUBLISHED: u8 = 32;
 /// The declaration is what its module exports as `export =` or `default`.
 pub const FLAG_MODULE_DEFAULT: u8 = 64;
+/// A [`Kind::Call`] row only: the call's declared return is the result of
+/// the function it is handed (`ReturnType<F>`, a type parameter the handed
+/// function returns, or an awaitable of one), so the library runs it and
+/// hands its result back (carrick#2634). The last free bit of the `u8`: the
+/// next flag widens the field and bumps the format. Pinned to the sidecar's
+/// `FLAG_RUNS_HANDED` by `position-rows-runs-handed.test.ts`.
+pub const FLAG_RUNS_HANDED: u8 = 128;
 
 /// Line 1 of a rows file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
