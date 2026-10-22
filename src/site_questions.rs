@@ -282,11 +282,13 @@ pub struct ComparisonRead {
     pub steps: Vec<String>,
 }
 
-/// Where the chain from the request to a comparison stopped.
+/// Where the chain from the request to a comparison stopped. `text` is the
+/// expression it stopped at; `null` (always written) when the hole has none
+/// (a `handed_to` or a missing caller argument).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComparisonHole {
     pub reason: String,
-    pub text: String,
+    pub text: Option<String>,
 }
 
 /// One path or method comparison. `read` and `hole` are always written; at

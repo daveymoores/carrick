@@ -44,7 +44,7 @@ fn request() -> SiteQuestionsRequest {
 /// The same sha is pinned in carrick-cloud's
 /// `lambdas/site-questions/contract.test.js`. A change to the contract
 /// changes both repos' copies and both pins.
-const CONTRACT_SHA256: &str = "afe87a7c2998c1345d845bbccda2ce561ae746bb518d75bb484f7c5e2fdde09c";
+const CONTRACT_SHA256: &str = "9034f2c74b115e9e77866b6cf79a274a57a57cf2b656e46b1be71b1be77b47c5";
 
 #[test]
 fn the_contract_file_is_the_one_the_cloud_pins() {
@@ -454,6 +454,19 @@ fn the_handler_request_is_what_the_scanner_types_write() {
     // `read` and `hole` are always written, null when absent.
     let first = &serde_json::to_value(&typed).unwrap()["sites"][0]["handler"]["comparisons"][0];
     assert!(first.get("read").is_some() && first["read"].is_null());
+    // A hole with no text (a `handed_to` hole) writes `text: null`, never omits it.
+    let hole =
+        &serde_json::to_value(&typed).unwrap()["sites"][3]["handler"]["comparisons"][1]["hole"];
+    assert_eq!(hole["reason"], "handed_to");
+    assert!(hole.get("text").is_some() && hole["text"].is_null());
+    assert!(
+        typed.sites[3].handler.comparisons[1]
+            .hole
+            .as_ref()
+            .unwrap()
+            .text
+            .is_none()
+    );
     // A request holds one variant of site: a handler site has no `state`.
     assert!(handler_request()["sites"][0].get("state").is_none());
 }

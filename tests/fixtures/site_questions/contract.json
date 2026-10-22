@@ -1,6 +1,6 @@
 {
   "contract": "POST /site-questions (carrick#2437, carrick-cloud#2380), version 1",
-  "about": "The one example both repos test against: carrick tests/fixtures/site_questions/contract.json, vendored byte for byte as carrick-cloud lambdas/site-questions/fixtures/contract.json. `request` is what the scanner sends; `jev` is what a recorded Jev answers each request for the site at that point (a status alone is a failed request); `response` is what the cloud answers, with `{question_set}` standing for the cloud's current question-set id. Sites: s-0001 the slots the code decides are forced and only the name and arguments are asked; s-0002 every slot asked, the name's two orders disagree; s-0003 Jev fails and the site is retriable; s-0004 Jev's answer names no option and the site is not retriable. `handler` (R4b, carrick#2386): a request of handler records and the response the cloud gives, one comparison asked per id; h-0001 an entry handler with a forced method and one asked path hole, a route answer; h-0002 a shared helper, a loop guard answered none; h-0003 below band cant_tell; h-0004 Jev fails and the record is retriable.",
+  "about": "The one example both repos test against: carrick tests/fixtures/site_questions/contract.json, vendored byte for byte as carrick-cloud lambdas/site-questions/fixtures/contract.json. `request` is what the scanner sends; `jev` is what a recorded Jev answers each request for the site at that point (a status alone is a failed request); `response` is what the cloud answers, with `{question_set}` standing for the cloud's current question-set id. Sites: s-0001 the slots the code decides are forced and only the name and arguments are asked; s-0002 every slot asked, the name's two orders disagree; s-0003 Jev fails and the site is retriable; s-0004 Jev's answer names no option and the site is not retriable. `handler` (R4b, carrick#2386): a request of handler records and the response the cloud gives, one comparison asked per id; h-0001 an entry handler with a forced method and one asked path hole, a route answer; h-0002 a shared helper, a loop guard answered none; h-0003 below band cant_tell; h-0004 Jev fails and the record is retriable; its second comparison (not asked) is a hole with no text, written as null.",
   "request": {
     "repo": "example-org/shop",
     "service": "orders-api",
@@ -994,6 +994,18 @@
                 "hole": {
                   "reason": "unread_expression",
                   "text": "parse(req.url)"
+                }
+              },
+              {
+                "id": 1,
+                "at": "src/fake.ts:1",
+                "literal": "/v1/other",
+                "position": "equality",
+                "expression": "route",
+                "read": null,
+                "hole": {
+                  "reason": "handed_to",
+                  "text": null
                 }
               }
             ],
