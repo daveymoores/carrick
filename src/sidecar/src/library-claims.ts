@@ -193,8 +193,9 @@ const SERVER_RULES: RoleRules = { http: false, message: true, ops: new Set(['rec
 
 /**
  * The role table: the role alone picks the checks. A role this build does
- * not read yet (GraphQL executors, server mounts) answers `role_unsupported`,
- * and `none` has nothing on the wire to check.
+ * not read yet (GraphQL executors) answers `role_unsupported`, and `none`
+ * has nothing on the wire to check. A server's mounts are scope claims
+ * (`mounts`, #2474 R0).
  */
 const ROLE_TABLE: Readonly<Record<LibraryRole, RoleRules | undefined>> = {
   http_client: HTTP_RULES,
