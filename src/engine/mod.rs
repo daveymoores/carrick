@@ -22528,33 +22528,30 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 )
             })
             .collect();
+        // The files are not on disk, so each span is read as ASCII: the SWC
+        // span less its base (carrick#2604).
         assert_eq!(
             asked,
             vec![
                 (
                     "/repo/src/orders.ts",
                     InferKind::Expression,
-                    Some(112),
+                    Some(111),
                     None
                 ),
                 (
                     "/repo/src/jobs.ts",
                     InferKind::FunctionParam,
-                    Some(120),
+                    Some(119),
                     Some("message")
                 ),
                 (
                     "/repo/src/client.ts",
                     InferKind::Expression,
-                    Some(112),
+                    Some(111),
                     None
                 ),
-                (
-                    "/repo/src/client.ts",
-                    InferKind::CallResult,
-                    Some(100),
-                    None
-                ),
+                ("/repo/src/client.ts", InferKind::CallResult, Some(99), None),
             ]
         );
     }
