@@ -878,6 +878,8 @@ fn deno_lock_key(key: &str) -> Option<(&str, &str)> {
 pub struct LibraryAnswer {
     /// Every export of every `answered` package, element by element.
     pub exports: Vec<ExportClaims>,
+    /// Every package the store answered, with or without an export.
+    pub answered_packages: BTreeSet<String>,
     /// The packages the store has not finished (`pending`).
     pub pending: BTreeSet<String>,
     /// The part of `pending` a wait can end ([`WAITED_REASONS`]).
@@ -911,7 +913,12 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
         let status = entry.get("status").and_then(Value::as_str).unwrap_or("");
         let package = entry.get("package").and_then(Value::as_str);
         match status {
-            "answered" => answer.answered += 1,
+            "answered" => {
+                answer.answered += 1;
+                if let Some(package) = package {
+                    answer.answered_packages.insert(package.to_string());
+                }
+            }
             "pending" => {
                 if let Some(package) = package {
                     answer.pending.insert(package.to_string());

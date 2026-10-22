@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use super::row_calls::Reach;
 use super::*;
 use crate::library_claims::{ExportClaims, applies, runtime_package_of};
+use crate::library_store::LibraryAnswer;
 use crate::library_store::RUNTIME_TYPES;
 use crate::position_rows::{
     FLAG_DECLARATION_UNNAMED, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, Kind, Row,
@@ -133,8 +134,10 @@ pub struct Discovery {
 pub struct Labels<'a> {
     exports: &'a [ExportClaims],
     by_name: HashMap<(&'a str, &'a str), &'a ExportClaims>,
-    /// Every package the answer holds an export of, whatever its role.
-    answered: HashSet<&'a str>,
+    /// Every package the store answered, with or without an export; `None`
+    /// when only the exports are known ([`Labels::of`]), where no package
+    /// can be told unanswered.
+    answered: Option<HashSet<&'a str>>,
     /// The packages with an export of a network role.
     networked: HashSet<&'a str>,
     /// The exports the store labelled with no network role.
@@ -151,10 +154,7 @@ impl<'a> Labels<'a> {
         Labels {
             exports,
             by_name,
-            answered: exports
-                .iter()
-                .map(|export| export.package.as_str())
-                .collect(),
+            answered: None,
             networked: exports
                 .iter()
                 .filter(|export| export.role != LibraryRole::None)
@@ -165,6 +165,22 @@ impl<'a> Labels<'a> {
                 .filter(|export| export.role == LibraryRole::None)
                 .map(|export| (export.package.as_str(), export.export.as_str()))
                 .collect(),
+        }
+    }
+
+    /// [`Labels::of`], with the packages the store answered, so a call into
+    /// a package it did not answer (still building, skipped, not asked) is
+    /// told from one it answered with nothing to label.
+    pub fn of_answer(answer: &'a LibraryAnswer) -> Self {
+        Labels {
+            answered: Some(
+                answer
+                    .answered_packages
+                    .iter()
+                    .map(String::as_str)
+                    .collect(),
+            ),
+            ..Labels::of(&answer.exports)
         }
     }
 
@@ -180,17 +196,20 @@ impl<'a> Labels<'a> {
     /// call. It is unanswered only when no default-library key is answered.
 
     fn package_reason(&self, key: &str) -> Option<&'static str> {
-        if is_language_key(key) {
-            let answered = self.answered.iter().any(|known| is_language_key(known));
-            return (!answered).then_some(UNANSWERED_PACKAGE);
+        let unanswered = |answered: &HashSet<&str>| {
+            if is_language_key(key) {
+                !answered.iter().any(|known| is_language_key(known))
+            } else {
+                !answered.contains(key)
+            }
+        };
+        if !is_language_key(key) && self.networked.contains(key) {
+            return Some(PACKAGE_UNMATCHED);
         }
-        if self.networked.contains(key) {
-            Some(PACKAGE_UNMATCHED)
-        } else if self.answered.contains(key) {
-            None
-        } else {
-            Some(UNANSWERED_PACKAGE)
-        }
+        self.answered
+            .as_ref()
+            .is_some_and(unanswered)
+            .then_some(UNANSWERED_PACKAGE)
     }
 
     fn get(&self, package: &str, export: &str) -> Option<&'a ExportClaims> {
@@ -962,11 +981,15 @@ mod tests {
             .join(name)
     }
 
-    fn claims() -> Vec<ExportClaims> {
+    fn answer() -> LibraryAnswer {
         let text = std::fs::read_to_string(fixture("library-claims.json")).unwrap();
         let answer = crate::library_store::parse_answer(&text);
         assert_eq!(answer.dropped, 0, "every fixture claim parses");
-        answer.exports
+        answer
+    }
+
+    fn claims() -> Vec<ExportClaims> {
+        answer().exports
     }
 
     fn sites_of(discovery: &Discovery) -> serde_json::Value {
@@ -1028,8 +1051,8 @@ mod tests {
         let Some(on) = walked("discovery", "services/web", "web", &[], true) else {
             return;
         };
-        let exports = claims();
-        let discovery = discover(&on.inputs, &Labels::of(&exports), &on.repo);
+        let answer = answer();
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
         let expected: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(fixture("sites.expected.json")).unwrap())
                 .unwrap();
@@ -1066,6 +1089,15 @@ mod tests {
             discovery.counts.get("no_site").is_some_and(|n| *n > 0),
             "{:?}",
             discovery.counts
+        );
+        // Labels that know only the exports cannot tell a package the store
+        // did not answer from one it answered with nothing to label.
+        let blind = discover(&on.inputs, &Labels::of(&answer.exports), &on.repo);
+        assert!(
+            blind
+                .unfollowed
+                .iter()
+                .all(|site| site.stop.as_deref() != Some(UNANSWERED_PACKAGE))
         );
     }
 
@@ -1432,11 +1464,10 @@ mod tests {
             let [label, root, positions, answer] = parts.as_slice() else {
                 panic!("<label>=<repo>=<positions dir>=<store answer>: {entry}");
             };
-            let exports = crate::library_store::parse_answer(
+            let answer = crate::library_store::parse_answer(
                 &std::fs::read_to_string(answer).expect("the store answer reads"),
-            )
-            .exports;
-            let labels = Labels::of(&exports);
+            );
+            let labels = Labels::of_answer(&answer);
             let root = std::fs::canonicalize(root).expect("the repo exists");
             let config = root.join("carrick.json");
             let services = if config.exists() {
@@ -1454,6 +1485,7 @@ mod tests {
                 }
             }
             let mut sites: Vec<DiscoverySite> = Vec::new();
+            let mut unfollowed: Vec<DiscoverySite> = Vec::new();
             let mut counts: BTreeMap<String, usize> = BTreeMap::new();
             for service in &services {
                 let name = service
@@ -1473,6 +1505,7 @@ mod tests {
                     *counts.entry(key).or_default() += count;
                 }
                 sites.extend(discovery.sites);
+                unfollowed.extend(discovery.unfollowed);
             }
             crate::outln!("== {label}: {} record(s)", sites.len());
             for (key, count) in &counts {
@@ -1480,7 +1513,7 @@ mod tests {
             }
             all.insert(
                 label.to_string(),
-                serde_json::json!({ "counts": counts, "sites": sites }),
+                serde_json::json!({ "counts": counts, "sites": sites, "unfollowed": unfollowed }),
             );
         }
         if let Ok(out) = std::env::var("CARRICK_DISCOVERY_CENSUS_OUT") {
