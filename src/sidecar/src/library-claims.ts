@@ -40,6 +40,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
+import { PathNames, declaringFileName } from './position-rows.js';
 import type {
   ClaimSlot,
   KeyLabel,
@@ -50,6 +51,7 @@ import type {
   RunsSlot,
   SemanticsCheck,
   SemanticsModule,
+  SemanticsDeclaration,
   SemanticsResult,
   SurfaceExport,
   SurfaceKey,
@@ -218,8 +220,11 @@ function hasV2Field(claim: LibraryClaim): boolean {
 
 /** How one check came out, before it is stamped with its claim and receiver. */
 type Outcome =
-  | { verdict: 'verified' }
+  | { verdict: 'verified'; declarations?: DeclaredAt[] }
   | { verdict: 'failed' | 'unchecked'; reason: string };
+
+/** Where a member is declared, spelled as a position row's `decl_file` and `decl_line`. */
+type DeclaredAt = SemanticsDeclaration;
 
 const VERIFIED: Outcome = { verdict: 'verified' };
 const failed = (reason: string): Outcome => ({ verdict: 'failed', reason });
@@ -386,6 +391,13 @@ export function httpCheck(check: SemanticsCheck): LibraryCheck {
   }
 }
 
+/** Declarations in a fixed order, each once. */
+function sortedDeclarations(declarations: readonly DeclaredAt[]): DeclaredAt[] {
+  const seen = new Map<string, DeclaredAt>();
+  for (const each of declarations) seen.set(`${each.decl_file}:${each.decl_line}`, each);
+  return [...seen.values()].sort((a, b) => (a.decl_file < b.decl_file ? -1 : a.decl_file > b.decl_file ? 1 : a.decl_line - b.decl_line));
+}
+
 let probeSequence = 0;
 
 export class LibraryClaimsVerifier {
@@ -401,7 +413,12 @@ export class LibraryClaimsVerifier {
     const deadline = performance.now() + budgetMs;
     const stamp = (check: LibraryCheck, outcome: Outcome): SemanticsResult =>
       outcome.verdict === 'verified'
-        ? { claim_id: check.claim_id, receiver: check.receiver, verdict: 'verified' }
+        ? {
+            claim_id: check.claim_id,
+            receiver: check.receiver,
+            verdict: 'verified',
+            ...(outcome.declarations?.length ? { declarations: outcome.declarations } : {}),
+          }
         : {
             claim_id: check.claim_id,
             receiver: check.receiver,
@@ -659,12 +676,14 @@ export class LibraryClaimsVerifier {
         const built = builtReceiver(check);
         const builtAtDefaults = built === undefined ? undefined : atDefaults(check, built);
         const holding: ts.Signature[] = [];
+        const declarations: DeclaredAt[] = [];
         for (const receiver of receivers.value) {
           const result = reader.judgeMessage(receiver, check.claim, rules, builtAtDefaults);
           if (result.outcome.verdict !== 'verified') return result;
           holding.push(...(result.holding ?? []));
+          declarations.push(...(result.outcome.declarations ?? []));
         }
-        return { outcome: VERIFIED, holding };
+        return { outcome: declarations.length > 0 ? { verdict: 'verified', declarations: sortedDeclarations(declarations) } : VERIFIED, holding };
       };
 
       const semantics: SemanticsResult[] = [];
@@ -1036,6 +1055,8 @@ interface ClaimLayout {
  */
 class DeclarationReader {
   private readonly checker: ts.TypeChecker;
+  /** Names declaring files as position rows do. */
+  private readonly pathNames: PathNames;
   /** The service root, as a realpath. */
   private readonly root: string;
   private readonly packageDirectories = new Map<string, InstalledPackage | null>();
@@ -1056,6 +1077,7 @@ class DeclarationReader {
     serviceRoot: string
   ) {
     this.checker = program.getTypeChecker();
+    this.pathNames = new PathNames(serviceRoot);
     this.root = this.realpath(serviceRoot);
     this.printedRoots = [...new Set([this.root, serviceRoot])]
       .filter(root => root.length > 1)
@@ -1795,7 +1817,27 @@ class DeclarationReader {
     }
     if (!held) return best!.outcome;
     if (boundRuns) return this.boundRunsOutcome(receiver.makerHolding!, boundRuns);
-    return VERIFIED;
+    const declarations = this.declarationsOf(callee.signatures);
+    return declarations.length > 0 ? { verdict: 'verified', declarations } : VERIFIED;
+  }
+
+  /**
+   * Where the signatures a verified op resolved to are declared, as position
+   * rows spell it (`decl_file`, `decl_line`): the member on this receiver, so
+   * two members of one name on two types give two answers. A declaration no
+   * row could name is left out.
+   */
+  private declarationsOf(signatures: readonly ts.Signature[]): DeclaredAt[] {
+    const found: DeclaredAt[] = [];
+    for (const signature of signatures) {
+      const declaration = signature.getDeclaration();
+      if (!declaration) continue;
+      const file = declaration.getSourceFile();
+      const decl_file = declaringFileName(this.program, this.pathNames, file);
+      if (decl_file === null) continue;
+      found.push({ decl_file, decl_line: file.getLineAndCharacterOfPosition(declaration.getStart(file)).line + 1 });
+    }
+    return sortedDeclarations(found);
   }
 
   /**

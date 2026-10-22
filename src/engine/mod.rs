@@ -18951,6 +18951,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     crate::services::type_sidecar::SemanticsVerdict::Verified
                 },
                 reason: None,
+                declarations: Vec::new(),
                 claim_id: check.claim_id,
                 receiver: check.receiver,
             })

@@ -931,6 +931,12 @@ export interface RetypeCheckResponse extends BaseResponse {
   errors?: string[];
 }
 
+/** Where a verified op's member is declared on its receiver, as a position row's `decl_file` and `decl_line`. */
+export interface SemanticsDeclaration {
+  decl_file: string;
+  decl_line: number;
+}
+
 /**
  * The verdict on one `(claim_id, receiver)` pair.
  *
@@ -944,6 +950,8 @@ export interface SemanticsResult {
   verdict: 'verified' | 'failed' | 'unchecked';
   /** Absent exactly when verified. */
   reason?: string;
+  /** Verified op verdicts only: the declarations its member resolves to on the receiver. */
+  declarations?: SemanticsDeclaration[];
 }
 
 /** How one package of the request resolved, for logs. */

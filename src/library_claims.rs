@@ -934,6 +934,7 @@ mod tests {
                         SemanticsVerdict::Failed
                     },
                     reason: None,
+                    declarations: Vec::new(),
                 })
                 .collect())
         }
@@ -1123,6 +1124,7 @@ mod tests {
                     receiver: check.receiver.clone(),
                     verdict: SemanticsVerdict::Verified,
                     reason: None,
+                    declarations: Vec::new(),
                 })
                 .collect())
         });

@@ -732,6 +732,17 @@ pub struct SemanticsResult {
     /// Absent exactly when `verified`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// A verified op's member as declared on its receiver. Nothing reads it yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declarations: Vec<SemanticsDeclaration>,
+}
+
+/// Where a member is declared, spelled as a position row's `decl_file` and
+/// `decl_line`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticsDeclaration {
+    pub decl_file: String,
+    pub decl_line: u32,
 }
 
 /// The reason a semantics or library-claim check comes back `unchecked`
@@ -5351,6 +5362,30 @@ mod tests {
         assert_eq!(value["budget_ms"], 250);
     }
 
+    /// carrick#2474: a verified op verdict names where its member is declared.
+    #[test]
+    fn a_verified_op_verdict_parses_its_declarations() {
+        let json = r#"{"claim_id":"o","receiver":"instance:()","verdict":"verified",
+            "declarations":[{"decl_file":"pkg:x/index.d.ts","decl_line":7}]}"#;
+        let result: SemanticsResult = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            result.declarations,
+            vec![SemanticsDeclaration {
+                decl_file: "pkg:x/index.d.ts".into(),
+                decl_line: 7
+            }]
+        );
+        let bare: SemanticsResult =
+            serde_json::from_str(r#"{"claim_id":"o","receiver":"export","verdict":"verified"}"#)
+                .unwrap();
+        assert!(bare.declarations.is_empty());
+        assert!(
+            !serde_json::to_string(&bare)
+                .unwrap()
+                .contains("declarations")
+        );
+    }
+
     /// A response carries one verdict per check; `reason` is absent exactly
     /// when verified, and a response with no `semantics` key reads as empty.
     #[test]
@@ -5380,6 +5415,7 @@ mod tests {
                 receiver: "export".into(),
                 verdict: SemanticsVerdict::Verified,
                 reason: None,
+                declarations: Vec::new(),
             }
         );
         assert_eq!(semantics[1].verdict, SemanticsVerdict::Failed);

@@ -289,6 +289,11 @@ export function writePositionRows(options: PositionRowsOptions): PositionRowsCou
   return counts;
 }
 
+/** What a declaration's file is written as in a row's `decl_file`: `lib:<name>` for the default library, else `PathNames`'. */
+export function declaringFileName(program: ts.Program, paths: PathNames, file: ts.SourceFile): string | null {
+  return program.isSourceFileDefaultLibrary(file) ? `lib:${path.basename(file.fileName)}` : paths.declaringFile(file.fileName);
+}
+
 /** A file's line, with its keys in the pinned order. */
 function fileLine(line: FileLine): string {
   return JSON.stringify(line);
@@ -301,7 +306,7 @@ function fileLine(line: FileLine): string {
  * default library, `pkg:<name>/<path>` for an installed package outside the
  * root, and nothing otherwise.
  */
-class PathNames {
+export class PathNames {
   private readonly roots: string[];
   private readonly packageNames = new Map<string, string | null>();
   /**
@@ -532,9 +537,7 @@ class PositionWalker {
     declaringFile: ts.SourceFile,
     position: number
   ): { declFile: string | null; declLine: number; declPackage: string | null } {
-    const declFile = this.program.isSourceFileDefaultLibrary(declaringFile)
-      ? `lib:${path.basename(declaringFile.fileName)}`
-      : this.paths.declaringFile(declaringFile.fileName);
+    const declFile = declaringFileName(this.program, this.paths, declaringFile);
     const declLine = declaringFile.getLineAndCharacterOfPosition(position).line + 1;
     const declPackage = this.paths.declaringPackage(declaringFile.fileName, (file) => this.loader.packageOf(file));
     return { declFile, declLine, declPackage };
