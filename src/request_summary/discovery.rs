@@ -140,6 +140,9 @@ pub struct Discovery {
     /// by file and SWC span: the calls the fact layer reads as followed to
     /// the end (carrick#2613).
     pub finished: Vec<(String, u32, u32)>,
+    /// The calls whose walk found no site and passed a call it could not
+    /// follow on the way (`no_site` all the same): not followed to the end.
+    pub missed_inside: Vec<(String, u32, u32)>,
     pub counts: BTreeMap<String, usize>,
 }
 
@@ -666,6 +669,10 @@ struct Outcome {
     /// The shallowest definition still being read that the walk came back
     /// to: until it is done, this answer is not final.
     cycle_at: Option<usize>,
+    /// Somewhere in the code the walk read, a call could not be followed
+    /// (one of [`Discovery::unfollowed`]'s reasons): a walk that found no
+    /// site has not read everything the call runs (carrick#2613).
+    missed: bool,
 }
 
 impl Outcome {
@@ -703,6 +710,7 @@ impl Outcome {
         if self.stop.is_none() {
             self.stop = other.stop;
         }
+        self.missed |= other.missed;
         self.cycle_at = match (self.cycle_at, other.cycle_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1189,7 +1197,15 @@ impl Walker<'_> {
     fn body(&mut self, file: &Path, body: &FnIr) -> Outcome {
         let mut out = Outcome::default();
         for (call, construction) in body.read_calls() {
-            out.absorb(self.call(file, body, call, construction));
+            let mut inner = self.call(file, body, call, construction);
+            if inner.ends.is_empty()
+                && inner.stop.is_none()
+                && !inner.missed
+                && self.unfollowed(file, call, construction).is_some()
+            {
+                inner.missed = true;
+            }
+            out.absorb(inner);
         }
         if !out.ends.is_empty() {
             out.stop = None;
@@ -1234,11 +1250,12 @@ impl Walker<'_> {
                         }
                         None => {
                             *discovery.counts.entry("no_site".to_string()).or_default() += 1;
-                            discovery.finished.push((
-                                self.rel(file),
-                                call.site.span_start,
-                                call.site.span_end,
-                            ));
+                            let at = (self.rel(file), call.site.span_start, call.site.span_end);
+                            if outcome.missed {
+                                discovery.missed_inside.push(at);
+                            } else {
+                                discovery.finished.push(at);
+                            }
                         }
                     }
                     continue;
@@ -1332,6 +1349,8 @@ pub fn discover(inputs: &RequestSummaryInputs, labels: &Labels<'_>, root: &Path)
     discovery.unfollowed.dedup();
     discovery.finished.sort();
     discovery.finished.dedup();
+    discovery.missed_inside.sort();
+    discovery.missed_inside.dedup();
     discovery
 }
 

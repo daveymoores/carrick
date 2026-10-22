@@ -34,6 +34,11 @@ pub fn enabled() -> bool {
     std::env::var("CARRICK_FACT_FILES").is_ok_and(|value| value == "1")
 }
 
+/// The reason a call is not followed to the end when the walk found no site
+/// and passed a call it could not follow inside
+/// ([`Discovery::missed_inside`]).
+pub const MISSED_INSIDE: &str = "missed_inside";
+
 /// What discovery recorded for one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Followed {
@@ -127,6 +132,13 @@ impl FactFiles {
                 &site.file,
                 (site.span_start, site.span_end),
                 Followed::Unfollowed(reason),
+            );
+        }
+        for (file, start, end) in &discovery.missed_inside {
+            facts.record(
+                file,
+                (*start, *end),
+                Followed::Unfollowed(MISSED_INSIDE.to_string()),
             );
         }
         for (file, start, end) in &discovery.finished {

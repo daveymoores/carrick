@@ -19,7 +19,9 @@
 //! - `src/hook.ts`, an awaited call with a string argument (register signal
 //!   C2) on a function a factory returned, a call discovery cannot follow;
 //! - `src/twice.ts`, the same signal on a local helper whose walk finishes
-//!   with no network call.
+//!   with no network call;
+//! - `src/nested.ts`, the same signal on a local helper that calls a function
+//!   a factory returned: the walk finds no site, but did not read everything.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -94,6 +96,8 @@ const HOOK: &str = "function makeSender(): (path: string) => Promise<void> {\n  
 
 const TWICE: &str = "async function double(text: string): Promise<string> {\n  return text + text;\n}\n\nexport async function twice(): Promise<string> {\n  return await double(\"/twice\");\n}\n";
 
+const NESTED: &str = "function makeSender(): (path: string) => Promise<void> {\n  return async (path) => {\n    void path;\n  };\n}\n\nconst deliver = makeSender();\n\nasync function send(path: string): Promise<void> {\n  await deliver(path);\n}\n\nexport async function nested(): Promise<void> {\n  await send(\"/nested\");\n}\n";
+
 /// An answer the reader gives for one file, keyed by its stem.
 fn canned_answer(repo: &Path, stem: &str, answer: serde_json::Value) {
     let dir = repo.join("__llm__/analyze-file");
@@ -127,6 +131,7 @@ fn repo(tmp: &Path) -> PathBuf {
     fs::write(repo.join("src/serve.ts"), SERVE).unwrap();
     fs::write(repo.join("src/hook.ts"), HOOK).unwrap();
     fs::write(repo.join("src/twice.ts"), TWICE).unwrap();
+    fs::write(repo.join("src/nested.ts"), NESTED).unwrap();
     canned_answer(
         &repo,
         "notify",
@@ -482,6 +487,11 @@ fn a_register_candidate_stays_only_where_discovery_cannot_follow_its_call() {
         "dropped at a finished walk"
     );
     assert!(on.log_has(&["Skipped (no API patterns)", "src/twice.ts"]));
+    // A walk that found no site but passed a call it could not follow on the
+    // way has not read everything: the candidate stays.
+    let nested = span_id(NESTED, "send(\"/nested\")");
+    assert_eq!(off.listed("src/nested.ts"), vec![nested.clone()]);
+    assert_eq!(on.listed("src/nested.ts"), vec![nested]);
     let fallbacks = on.fallbacks();
     assert!(
         fallbacks["fallback_selection_C2"].as_u64().unwrap_or(0) >= 1,
