@@ -148,6 +148,8 @@ mod tests {
             end,
             chain: Vec::new(),
             stop: stop.map(str::to_string),
+            receiver: None,
+            reached: None,
         }
     }
 

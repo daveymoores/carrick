@@ -14,8 +14,14 @@
 //! census for it (carrick#2431, `{ "sites": [...] }`), and the store's
 //! `/library-claims` answer for its packages:
 //!
-//! `CARRICK_SITE_CENSUS='<label>=<repo>=<positions dir>=<sites.json>=<library-claims.json>[;…]'
+//! `CARRICK_SITE_CENSUS='<label>=<repo>=<positions dir>=<sites.json>=<library-claims.json>[=<blobs dir>][;…]'
 //! [CARRICK_SITE_CENSUS_OUT=<file>] cargo test --lib site_census -- --ignored --nocapture`
+//!
+//! With a scan's blobs dir, a `routes` section reads the route sites against
+//! that scan's endpoint rows (carrick#2474 R1): by what holds the receiver
+//! and how discovery reached them (a sites file from `discovery_census` with
+//! `CARRICK_RECEIVER_TRACE=1` names both), recall, extras, and the
+//! mount-shaped sites apart.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -49,6 +55,171 @@ struct RepoCensus {
     busiest_file: String,
     /// Records naming a line of a file, on average over files holding any.
     edit_reasks_mean: f64,
+    /// The route sites against the scan's endpoint rows (carrick#2474 R1),
+    /// when the census is handed the scan's blobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routes: Option<RoutesCensus>,
+}
+
+/// A repo's route sites (carrick#2474 R1): the records whose label states
+/// an HTTP route (kind `http`, role `handles`), read against the endpoint
+/// rows of the scan's blobs, each keyed `(method, path as written,
+/// file:line)`.
+#[derive(Debug, Default, Serialize)]
+struct RoutesCensus {
+    route_sites: usize,
+    /// By what holds the receiver (`none`: the site names none).
+    by_receiver: BTreeMap<String, usize>,
+    /// By how discovery reached the labelled call: `name`, `instance`,
+    /// `declaration` (`none`: discovery ran without the trace).
+    by_reached: BTreeMap<String, usize>,
+    /// Route sites whose record forces no method (the model is asked it).
+    method_unstated: usize,
+    endpoint_rows: usize,
+    /// Endpoint rows a route site states: the same `file:line`, the same
+    /// method where the site forces one, and the row's path ends with the
+    /// path the site writes (the row's carries its mount prefix).
+    recalled: usize,
+    /// Endpoint rows with such a route site at the same `file:line` whose
+    /// path the row's does not end with.
+    other_path: Vec<String>,
+    /// Endpoint rows no route site states.
+    missed: Vec<String>,
+    /// Route sites (mount-shaped ones aside) that state no endpoint row.
+    extras: Vec<String>,
+    /// Route sites whose label states no method at all (no method, no
+    /// method slot, no default): a member that registers under every verb
+    /// or none, the shape of a mount, that the store labels `receive`
+    /// (carrick-tools/carrick-cloud#2426). Counted apart.
+    mount_shaped: Vec<String>,
+    /// Every route site: `file:line METHOD path receiver-kind reached`.
+    sites: Vec<String>,
+}
+
+/// One endpoint row of the scan: method, path, `file:line`.
+fn endpoint_rows(blobs: &Path) -> Vec<(String, String, String)> {
+    let mut rows = Vec::new();
+    for entry in std::fs::read_dir(blobs).expect("the blobs dir reads") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Ok(blob) =
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&path).unwrap())
+        else {
+            continue;
+        };
+        for endpoint in blob["endpoints"].as_array().into_iter().flatten() {
+            let key = &endpoint["key"];
+            if key["protocol"] != "http" {
+                continue;
+            }
+            let (Some(method), Some(at), Some(file)) = (
+                key["method"].as_str(),
+                key["path"].as_str(),
+                endpoint["file_path"].as_str(),
+            ) else {
+                continue;
+            };
+            rows.push((method.to_uppercase(), at.to_string(), file.to_string()));
+        }
+    }
+    rows.sort();
+    rows.dedup();
+    rows
+}
+
+/// One record with what the census reads beside it: how discovery reached
+/// its labelled call, the path its decided site's code writes
+/// ([`super::decided_sites::DecidedSite::name_text`]), and whether its
+/// label states no method at all (the mount shape).
+struct Routed {
+    record: super::site_record::SiteRecord,
+    reached: Option<String>,
+    written: Option<String>,
+    no_method: bool,
+}
+
+/// The routes section: `records` against the scan's endpoint rows in
+/// `blobs`. A route's path is the one the record forces, else the one its
+/// decided site's code writes; its method the one the record forces, and a
+/// site that states none matches a row of any method (counted).
+fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
+    use crate::site_questions::Slot;
+    let mut census = RoutesCensus::default();
+    let mut stated: Vec<(String, String, String)> = Vec::new();
+    for routed in records {
+        let record = &routed.record;
+        let forced = |slot| record.state.forced.get(&slot).cloned();
+        if forced(Slot::Kind).as_deref() != Some("http")
+            || forced(Slot::Role).as_deref() != Some("handles")
+        {
+            continue;
+        }
+        census.route_sites += 1;
+        let kind = record.receiver.as_ref().map_or("none".to_string(), |at| {
+            serde_json::to_value(at.kind)
+                .ok()
+                .and_then(|kind| kind.as_str().map(str::to_string))
+                .unwrap_or_default()
+        });
+        *census.by_receiver.entry(kind.clone()).or_default() += 1;
+        let reached = routed.reached.clone().unwrap_or_else(|| "none".to_string());
+        *census.by_reached.entry(reached.clone()).or_default() += 1;
+        let at = format!("{}:{}", record.anchors.call.file, record.anchors.call.line);
+        let method = forced(Slot::Method).unwrap_or_default().to_uppercase();
+        if method.is_empty() {
+            census.method_unstated += 1;
+        }
+        let name = forced(Slot::Name)
+            .or_else(|| routed.written.clone())
+            .unwrap_or_default();
+        census
+            .sites
+            .push(format!("{at} {method} {name} {kind} {reached}"));
+        if routed.no_method {
+            census.mount_shaped.push(format!("{at} {method} {name}"));
+            continue;
+        }
+        stated.push((method, name, at));
+    }
+    let rows = endpoint_rows(blobs);
+    census.endpoint_rows = rows.len();
+    let same_place = |row: &(String, String, String), site: &(String, String, String)| {
+        (site.0.is_empty() || row.0 == site.0) && row.2 == site.2
+    };
+    for row in &rows {
+        if stated
+            .iter()
+            .any(|site| same_place(row, site) && !site.1.is_empty() && row.1.ends_with(&site.1))
+        {
+            census.recalled += 1;
+        } else if stated.iter().any(|site| same_place(row, site)) {
+            census
+                .other_path
+                .push(format!("{} {} {}", row.2, row.0, row.1));
+        } else {
+            census.missed.push(format!("{} {} {}", row.2, row.0, row.1));
+        }
+    }
+    for site in &stated {
+        if !rows.iter().any(|row| same_place(row, site)) {
+            census
+                .extras
+                .push(format!("{} {} {}", site.2, site.0, site.1));
+        }
+    }
+    for list in [
+        &mut census.other_path,
+        &mut census.missed,
+        &mut census.extras,
+        &mut census.mount_shaped,
+        &mut census.sites,
+    ] {
+        list.sort();
+        list.dedup();
+    }
+    census
 }
 
 fn percentile(sorted: &[usize], pct: usize) -> usize {
@@ -58,7 +229,13 @@ fn percentile(sorted: &[usize], pct: usize) -> usize {
     sorted[(sorted.len() - 1) * pct / 100]
 }
 
-fn census_repo(root: &Path, positions: &Path, sites: &Path, claims: &Path) -> RepoCensus {
+fn census_repo(
+    root: &Path,
+    positions: &Path,
+    sites: &Path,
+    claims: &Path,
+    blobs: Option<&Path>,
+) -> RepoCensus {
     let root = std::fs::canonicalize(root).expect("the repo exists");
     let config = root.join("carrick.json");
     let services = if config.exists() {
@@ -71,10 +248,13 @@ fn census_repo(root: &Path, positions: &Path, sites: &Path, claims: &Path) -> Re
     )
     .expect("the sites file parses")
     .sites;
-    let answer: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(claims).expect("the claims read"))
-            .expect("the claims parse");
-    let labels = SiteLabel::from_store_answer(&answer);
+    // Read as a scan reads the store's answer: the store writes a method
+    // as text, which the raw reader's label shape does not parse.
+    let exports = crate::library_store::parse_answer(
+        &std::fs::read_to_string(claims).expect("the claims read"),
+    )
+    .exports;
+    let labels = SiteLabel::from_exports(&exports);
     let mut by_service: BTreeMap<String, PathBuf> = BTreeMap::new();
     for entry in std::fs::read_dir(positions).expect("the positions dir reads") {
         let path = entry.expect("dir entry").path();
@@ -98,6 +278,7 @@ fn census_repo(root: &Path, positions: &Path, sites: &Path, claims: &Path) -> Re
     };
     let mut bytes: Vec<usize> = Vec::new();
     let mut per_file: HashMap<String, usize> = HashMap::new();
+    let mut routed: Vec<Routed> = Vec::new();
     for service in &services {
         let label = service
             .service_name
@@ -133,6 +314,33 @@ fn census_repo(root: &Path, positions: &Path, sites: &Path, claims: &Path) -> Re
             *census.leads.entry(reason).or_default() += 1;
         }
         let records = site_records(&inputs, &root, &decided, &labels);
+        // How discovery reached each record's labelled call, as the decided
+        // site at the record's call says.
+        for record in &records {
+            let call = &record.anchors.call;
+            let site = decided.sites.iter().find(|site| {
+                site.file == call.file
+                    && site.span_start == call.span_start
+                    && site.span_end == call.span_end
+            });
+            let reached = site
+                .and_then(|site| serde_json::to_value(site.reached?).ok())
+                .and_then(|by| by.as_str().map(str::to_string));
+            routed.push(Routed {
+                record: record.clone(),
+                reached,
+                written: site.and_then(|site| site.name_text()),
+                no_method: site
+                    .and_then(|site| SiteLabel::find(&labels, &site.end))
+                    .is_some_and(|label| {
+                        label.method.as_ref().is_none_or(|method| {
+                            method.literal.is_none()
+                                && method.from.is_none()
+                                && method.default.is_none()
+                        })
+                    }),
+            });
+        }
         for record in &records {
             let bucket = match record.bucket {
                 Bucket::Forced => "forced",
@@ -201,6 +409,7 @@ fn census_repo(root: &Path, positions: &Path, sites: &Path, claims: &Path) -> Re
     }
     census.summary_rows_off_site.sort();
     census.summary_rows_off_site.dedup();
+    census.routes = blobs.map(|blobs| census_routes(&routed, blobs));
     census
 }
 
@@ -214,8 +423,21 @@ fn site_census() {
     let mut out: BTreeMap<String, RepoCensus> = BTreeMap::new();
     for repo in spec.split(';').filter(|part| !part.is_empty()) {
         let parts: Vec<&str> = repo.split('=').collect();
-        let [label, root, positions, sites, claims] = parts.as_slice() else {
-            panic!("expected <label>=<repo>=<positions>=<sites>=<claims>, got {repo}");
+        let (label, root, positions, sites, claims, blobs) = match parts.as_slice() {
+            [label, root, positions, sites, claims] => {
+                (label, root, positions, sites, claims, None)
+            }
+            [label, root, positions, sites, claims, blobs] => (
+                label,
+                root,
+                positions,
+                sites,
+                claims,
+                Some(Path::new(*blobs)),
+            ),
+            _ => {
+                panic!("expected <label>=<repo>=<positions>=<sites>=<claims>[=<blobs>], got {repo}")
+            }
         };
         out.insert(
             label.to_string(),
@@ -224,6 +446,7 @@ fn site_census() {
                 Path::new(positions),
                 Path::new(sites),
                 Path::new(claims),
+                blobs,
             ),
         );
     }

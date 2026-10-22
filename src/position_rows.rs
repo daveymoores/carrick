@@ -461,6 +461,15 @@ impl PositionIndex {
         self.lookups.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Every `call` row of every file, in no fixed order: the members the
+    /// code calls, for the receiver trace's declaration ask (carrick#2474).
+    pub fn call_rows(&self) -> impl Iterator<Item = &Row> {
+        self.files
+            .values()
+            .flat_map(|file| file.rows.values())
+            .filter(|row| row.kind() == Kind::Call)
+    }
+
     /// How many files the rows name.
     pub fn file_count(&self) -> usize {
         self.files.len()

@@ -349,6 +349,11 @@ pub struct SiteRecord {
     pub bucket: Bucket,
     /// Why a lead is one.
     pub lead: Option<&'static str>,
+    /// The binding the labelled call is made on (carrick#2474 R1), with the
+    /// receiver trace on. Scanner-side only, off the wire like the anchors:
+    /// no site's sha moves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<super::discovery::ReceiverAt>,
 }
 
 impl SiteRecord {
@@ -1232,10 +1237,17 @@ fn kind_and_role(role: &str, op: Option<&str>) -> (Option<&'static str>, Option<
     (kind, side)
 }
 
-/// The service's labelled network roles by the files that use them.
+/// The service's labelled network roles by the files that use them. A site
+/// only the receiver trace finds (carrick#2474 R1, reached by its member's
+/// declaration) is left out while the trace is record-only, so no state
+/// found without it moves.
 fn roles_by_file(decided: &Decided) -> BTreeMap<String, BTreeSet<String>> {
     let mut roles: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for site in &decided.sites {
+    for site in decided
+        .sites
+        .iter()
+        .filter(|site| site.reached != Some(super::discovery::ReachedBy::Declaration))
+    {
         roles
             .entry(site.end.role.clone())
             .or_default()
@@ -1734,6 +1746,7 @@ fn record(
         basis,
         bucket,
         lead: (bucket == Bucket::Lead).then_some("name_unstated"),
+        receiver: site.receiver.clone(),
     })
 }
 

@@ -880,6 +880,10 @@ struct CallIr {
     /// `this.child.send()`): where a compiler row names the receiver's type
     /// (carrick#2431). Read by discovery alone.
     receiver_spans: Vec<(u32, u32, bool)>,
+    /// The object the callee's member is read on, whatever it is written
+    /// as: its span (discovery numbering) and form. `None` when the callee
+    /// is no member access. Read by the receiver trace alone (carrick#2474).
+    receiver_object: Option<(u32, u32, discovery::ObjectForm)>,
 }
 
 /// What a call's argument puts in place of the callee's spread of that
@@ -6305,6 +6309,10 @@ impl Visit for CallWalker<'_, '_, '_> {
                 Callee::Expr(callee) => discovery::receiver_spans(callee),
                 _ => Vec::new(),
             },
+            receiver_object: match &call.callee {
+                Callee::Expr(callee) => discovery::receiver_object(callee),
+                _ => None,
+            },
         });
     }
 
@@ -6369,6 +6377,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 names: Vec::new(),
                 spread_args: Vec::new(),
                 receiver_spans: Vec::new(),
+                receiver_object: None,
             });
         }
         element.visit_children_with(self);

@@ -388,14 +388,23 @@ impl SiteMaker {
     /// `instance:<member>`, `instance:()`, `instance:new` or
     /// `instance:new:<member>`.
     pub fn receiver_id(&self) -> String {
-        match (self.form, self.member.as_deref()) {
-            (MakerForm::Call, Some(member)) => format!("instance:{member}"),
-            (MakerForm::Call, None) => "instance:()".to_string(),
-            (MakerForm::New, None) => "instance:new".to_string(),
-            (MakerForm::New, Some(member)) => format!("instance:new:{member}"),
-        }
+        maker_receiver_id(self.form == MakerForm::New, self.member.as_deref())
     }
+}
 
+/// The contract's receiver id for instances a maker builds, by whether it
+/// is constructed (`new`) and its member: `instance:<member>`,
+/// `instance:()`, `instance:new` or `instance:new:<member>`.
+pub(crate) fn maker_receiver_id(new: bool, member: Option<&str>) -> String {
+    match (new, member) {
+        (false, Some(member)) => format!("instance:{member}"),
+        (false, None) => "instance:()".to_string(),
+        (true, None) => "instance:new".to_string(),
+        (true, Some(member)) => format!("instance:new:{member}"),
+    }
+}
+
+impl SiteMaker {
     /// The literal the maker was handed at argument `arg`, or at its key
     /// `key`: where a maker's `name`, `base` or `prefix` Slot reads
     /// (contract amendment 2, B2), so `new Queue("emails")` names `emails`.
