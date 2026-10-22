@@ -31,6 +31,8 @@
   {"file":"services/web/src/pages/b.ts","line":4,"span_start":86,"span_end":115,"callee":"api","end":{"package":"lib.dom","export":"fetch","member":null,"role":"http_client","op":"request","file":"services/web/src/api.ts","line":2,"span_start":85,"span_end":102},"chain":[{"function":"api","file":"services/web/src/api.ts","line":1}],"stop":null},
   {"file":"services/web/src/pages/c.ts","line":4,"span_start":86,"span_end":95,"callee":"api","end":{"package":"lib.dom","export":"fetch","member":null,"role":"http_client","op":"request","file":"services/web/src/api.ts","line":2,"span_start":85,"span_end":102},"chain":[{"function":"api","file":"services/web/src/api.ts","line":1}],"stop":null},
   {"file":"services/web/src/pages/things.ts","line":4,"span_start":90,"span_end":103,"callee":"v1","end":{"package":"lib.dom","export":"fetch","member":null,"role":"http_client","op":"request","file":"services/web/src/api.ts","line":2,"span_start":85,"span_end":102},"chain":[{"function":"v1","file":"services/web/src/api.ts","line":5},{"function":"api","file":"services/web/src/api.ts","line":1}],"stop":null},
+  {"file":"services/web/src/passed-in.ts","line":2,"span_start":104,"span_end":122,"callee":"send","end":null,"chain":[],"stop":"interface_member"},
+  {"file":"services/web/src/passed-in.ts","line":10,"span_start":257,"span_end":272,"callee":"deps.fetch","end":null,"chain":[],"stop":"interface_member"},
   {"file":"services/web/src/ports.ts","line":6,"span_start":144,"span_end":164,"callee":"port.send","end":null,"chain":[],"stop":"interface_member"},
   {"file":"services/web/src/ports.ts","line":10,"span_start":269,"span_end":285,"callee":"req","end":null,"chain":[],"stop":"injected_callee"},
   {"file":"services/web/src/presence.ts","line":4,"span_start":80,"span_end":113,"callee":"openSession","end":{"package":"fixture-socket","export":"Socket","member":null,"role":"socket","op":null,"file":"services/web/src/session.ts","line":12,"span_start":277,"span_end":292,"new":true},"chain":[{"function":"openSession","file":"services/web/src/session.ts","line":11}],"stop":null},
@@ -43,4 +45,11 @@
   {"file":"services/web/src/traced-load.ts","line":4,"span_start":117,"span_end":133,"callee":"fetch","end":{"package":"lib.dom","export":"fetch","member":null,"role":"http_client","op":"request","file":"services/web/src/traced-load.ts","line":4,"span_start":117,"span_end":133},"chain":[],"stop":null},
   {"file":"services/web/src/tracer.ts","line":3,"span_start":110,"span_end":115,"callee":"run","end":null,"chain":[],"stop":"injected_callee"},
   {"file":"services/web/src/use-books.ts","line":4,"span_start":100,"span_end":111,"callee":"listBooks","end":{"package":"lib.dom","export":"fetch","member":null,"role":"http_client","op":"request","file":"services/web/src/request.ts","line":2,"span_start":89,"span_end":106},"chain":[{"function":"listBooks","file":"services/web/src/books-api.ts","line":3},{"function":"request","file":"services/web/src/request.ts","line":1}],"stop":null}
+],
+"unfollowed": [
+  {"file":"services/web/src/passed-in.ts","line":20,"span_start":490,"span_end":503,"callee":"load","end":null,"chain":[],"stop":"value_callee"},
+  {"file":"services/web/src/passed-in.ts","line":27,"span_start":611,"span_end":631,"callee":"this.pull","end":null,"chain":[],"stop":"value_callee"},
+  {"file":"services/web/src/unfollowed.ts","line":6,"span_start":193,"span_end":205,"callee":"listShared","end":null,"chain":[],"stop":"outside_service"},
+  {"file":"services/web/src/unfollowed.ts","line":10,"span_start":271,"span_end":287,"callee":"describe","end":null,"chain":[],"stop":"package_unmatched"},
+  {"file":"services/web/src/unfollowed.ts","line":14,"span_start":331,"span_end":360,"callee":"ping","end":null,"chain":[],"stop":"unanswered_package"}
 ]}

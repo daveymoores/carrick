@@ -28,6 +28,17 @@
 //! a [`HoleReason`], `interface_member`, `injected_callee`, `cycle` or
 //! `no_body` (a definition whose body this pass did not read).
 //!
+//! A call that reached nothing and entered no code says why, on
+//! [`Discovery::unfollowed`], and never in `sites`: `value_callee` (an in-repo
+//! value that is not a definition: a parameter, a field, a returned
+//! function), `outside_service` (a function of this repo outside the
+//! service's files), `package_unmatched` (a call declared in a package the
+//! store answered with network-role exports, that matched none of them),
+//! `unanswered_package` (a call declared in a package the answer holds
+//! nothing for), or the hole the call's own row names. A call into an export
+//! the store labels with no network role, and a walk into in-repo code that
+//! finds no call to follow, stay `no_site`.
+//!
 //! Record-only: nothing in a scan calls this. Its tests and the offline
 //! census (`discovery_census`) do. Inside request summaries, as ruling D4
 //! has it: no second tracer.
@@ -49,6 +60,12 @@ use crate::services::type_sidecar::{LibraryClaim, LibraryOp, LibraryRole};
 /// The stop for a walk that reaches a definition the extractor keys and
 /// this pass read no body of.
 const NO_BODY: &str = "no_body";
+
+/// Why a call that entered no code was not followed ([`Discovery::unfollowed`]).
+const VALUE_CALLEE: &str = "value_callee";
+const OUTSIDE_SERVICE: &str = "outside_service";
+const PACKAGE_UNMATCHED: &str = "package_unmatched";
+const UNANSWERED_PACKAGE: &str = "unanswered_package";
 
 /// One discovered site, or one walk that entered code and stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +122,9 @@ pub struct ChainHop {
 #[derive(Debug, Default)]
 pub struct Discovery {
     pub sites: Vec<DiscoverySite>,
+    /// The calls the walk could not follow, each with its reason as `stop`
+    /// (`end` and `chain` empty). Not sites: nothing decided reads them.
+    pub unfollowed: Vec<DiscoverySite>,
     pub counts: BTreeMap<String, usize>,
 }
 
@@ -113,6 +133,12 @@ pub struct Discovery {
 pub struct Labels<'a> {
     exports: &'a [ExportClaims],
     by_name: HashMap<(&'a str, &'a str), &'a ExportClaims>,
+    /// Every package the answer holds an export of, whatever its role.
+    answered: HashSet<&'a str>,
+    /// The packages with an export of a network role.
+    networked: HashSet<&'a str>,
+    /// The exports the store labelled with no network role.
+    none: HashSet<(&'a str, &'a str)>,
 }
 
 impl<'a> Labels<'a> {
@@ -122,7 +148,49 @@ impl<'a> Labels<'a> {
             .filter(|export| export.role != LibraryRole::None)
             .map(|export| ((export.package.as_str(), export.export.as_str()), export))
             .collect();
-        Labels { exports, by_name }
+        Labels {
+            exports,
+            by_name,
+            answered: exports
+                .iter()
+                .map(|export| export.package.as_str())
+                .collect(),
+            networked: exports
+                .iter()
+                .filter(|export| export.role != LibraryRole::None)
+                .map(|export| export.package.as_str())
+                .collect(),
+            none: exports
+                .iter()
+                .filter(|export| export.role == LibraryRole::None)
+                .map(|export| (export.package.as_str(), export.export.as_str()))
+                .collect(),
+        }
+    }
+
+    /// Whether the store labelled `export` of `package` with no network role.
+    fn labelled_none(&self, package: &str, export: &str) -> bool {
+        self.none.contains(&(package, export))
+    }
+
+    /// Why a call declared in the package the store keys `key` and matching
+    /// no label was not followed, when the answer says nothing for it. The
+    /// default library is never `package_unmatched`: its calls are matched
+    /// by their global's name, and a call it does not label is no client
+    /// call. It is unanswered only when no default-library key is answered.
+
+    fn package_reason(&self, key: &str) -> Option<&'static str> {
+        if is_language_key(key) {
+            let answered = self.answered.iter().any(|known| is_language_key(known));
+            return (!answered).then_some(UNANSWERED_PACKAGE);
+        }
+        if self.networked.contains(key) {
+            Some(PACKAGE_UNMATCHED)
+        } else if self.answered.contains(key) {
+            None
+        } else {
+            Some(UNANSWERED_PACKAGE)
+        }
     }
 
     fn get(&self, package: &str, export: &str) -> Option<&'a ExportClaims> {
@@ -193,6 +261,17 @@ pub(crate) fn receiver_spans(callee: &Expr) -> Vec<(u32, u32, bool)> {
         }
     }
     out
+}
+
+/// The binding a call's callee is read through: the callee itself, or the
+/// name its member chain starts at.
+fn root_name(call: &CallIr) -> Option<&str> {
+    match call.receiver_spans.last() {
+        None => Some(call.callee_text.as_str()),
+        Some((_, _, false)) => call.callee_text.split(['.', '?']).next().map(str::trim),
+        Some(_) => None,
+    }
+    .filter(|root| super::row_calls::is_identifier(root))
 }
 
 /// The store's key for the package a row's declaration is in: the default
@@ -428,12 +507,7 @@ impl Walker<'_> {
         let ir = self.inputs.files.get(file)?;
         // The binding the callee is read through: the callee itself, or the
         // name its member chain starts at.
-        let root = match call.receiver_spans.last() {
-            None => Some(call.callee_text.as_str()),
-            Some((_, _, false)) => call.callee_text.split(['.', '?']).next().map(str::trim),
-            Some(_) => None,
-        }
-        .filter(|root| super::row_calls::is_identifier(root));
+        let root = root_name(call);
         let binding = root.and_then(|root| ir.bindings.get(root));
         if let Some(binding) = binding {
             let member = (!call.receiver_spans.is_empty()).then_some(symbol);
@@ -554,6 +628,51 @@ impl Walker<'_> {
                 .get(&positions.path_of(decl_file))
                 .and_then(|declared| declared.declaration_lines.signatures.get(&line))
                 .is_some_and(|name| name == symbol)
+    }
+
+    /// Why `call`, which reached no labelled export and entered no code, was
+    /// not followed: its callee is an in-repo value that is no definition, a
+    /// function outside the service, or a member of a package the answer does
+    /// not match or does not hold. `None` when nothing was missed.
+    fn unfollowed(&self, file: &Path, call: &CallIr, construction: bool) -> Option<&'static str> {
+        match self.inputs.reach(file, call.site.lo, call.site.hi) {
+            Reach::OutsideService(..) => Some(OUTSIDE_SERVICE),
+            Reach::NoFunction => {
+                let row = self.row(file, call)?;
+                if in_repo(row) {
+                    // A class built here has a constructor with no body to
+                    // read; a value that is no definition is the gap.
+                    return (!construction).then_some(VALUE_CALLEE);
+                }
+                let key = store_key(row, self.labels.exports)?;
+                if self.labelled_none_export(file, call, row, &key) {
+                    return None;
+                }
+                self.labels.package_reason(&key)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the store labelled the export `call` is made on with no
+    /// network role: by the name its package publishes the callee's
+    /// declaration as, or the name the file's binding imports it by.
+    fn labelled_none_export(&self, file: &Path, call: &CallIr, row: &Row, key: &str) -> bool {
+        if published_names(row)
+            .into_iter()
+            .any(|export| self.labels.labelled_none(key, export))
+        {
+            return true;
+        }
+        let binding =
+            root_name(call).and_then(|root| self.inputs.files.get(file)?.bindings.get(root));
+        binding.is_some_and(|binding| {
+            specifier_keys(&binding.specifier).iter().any(|package| {
+                [binding.export.as_str(), "default", "export ="]
+                    .into_iter()
+                    .any(|export| self.labels.labelled_none(package, export))
+            })
+        })
     }
 
     /// What `call`, written in `body` of `file`, reaches.
@@ -694,16 +813,32 @@ impl Walker<'_> {
                 };
             if outcome.ends.is_empty() {
                 let Some((chain, stop)) = outcome.stop else {
-                    *discovery.counts.entry("no_site".to_string()).or_default() += 1;
+                    match self.unfollowed(file, call, construction) {
+                        Some(reason) => {
+                            *discovery
+                                .counts
+                                .entry(format!("unfollowed/{reason}"))
+                                .or_default() += 1;
+                            discovery.unfollowed.push(record(
+                                None,
+                                Vec::new(),
+                                Some(reason.to_string()),
+                            ));
+                        }
+                        None => {
+                            *discovery.counts.entry("no_site".to_string()).or_default() += 1;
+                        }
+                    }
                     continue;
                 };
-                // A call whose own row says nothing is counted, not listed:
-                // the walk never entered code.
+                // A call whose own row says nothing: the walk never entered
+                // code. Listed with the hole the row names.
                 if chain.is_empty() && stop != "injected_callee" && stop != "interface_member" {
                     *discovery
                         .counts
                         .entry(format!("unread/{stop}"))
                         .or_default() += 1;
+                    discovery.unfollowed.push(record(None, chain, Some(stop)));
                     continue;
                 }
                 *discovery.counts.entry(format!("stop/{stop}")).or_default() += 1;
@@ -770,6 +905,10 @@ pub fn discover(inputs: &RequestSummaryInputs, labels: &Labels<'_>, root: &Path)
         .sites
         .sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
     discovery.sites.dedup();
+    discovery
+        .unfollowed
+        .sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+    discovery.unfollowed.dedup();
     discovery
 }
 
@@ -854,7 +993,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(fixture("sites.expected.json")).unwrap())
                 .unwrap();
         let got = sites_of(&discovery);
-        if got != expected {
+        if got["sites"] != expected["sites"] {
             let got: Vec<String> = discovery
                 .sites
                 .iter()
@@ -875,6 +1014,59 @@ mod tests {
             let missing: Vec<&String> = want.iter().filter(|s| !got.contains(s)).collect();
             panic!("extra: {extra:#?}\nmissing: {missing:#?}");
         }
+    }
+
+    /// carrick#2613 (T2): a call that reached nothing and entered no code says
+    /// why, on `unfollowed`: a function a factory returns, an in-repo
+    /// function outside the service, a member of a package the store answered
+    /// that none of its labels matched, and a call into a package the answer
+    /// holds nothing for. A body that calls only local helpers and the
+    /// language's own library is `no_site`, and no record of any kind. The
+    /// answer key is the fixture's `unfollowed` list.
+    #[test]
+    fn every_call_it_cannot_follow_says_why() {
+        let Some(on) = walked("discovery", "services/web", "web", &[], true) else {
+            return;
+        };
+        let exports = claims();
+        let discovery = discover(&on.inputs, &Labels::of(&exports), &on.repo);
+        let expected: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture("sites.expected.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&discovery.unfollowed).unwrap(),
+            expected["unfollowed"],
+            "{}",
+            serde_json::to_string(&discovery.unfollowed).unwrap()
+        );
+        for file in ["unfollowed.ts", "passed-in.ts"] {
+            let in_file = |records: &[DiscoverySite]| {
+                records
+                    .iter()
+                    .filter(|site| site.file.ends_with(file))
+                    .map(|site| format!("{} {}", site.line, site.callee))
+                    .collect::<Vec<_>>()
+            };
+            let sited = in_file(&discovery.sites);
+            let unlisted = in_file(&discovery.unfollowed);
+            assert!(
+                sited.iter().all(|record| !unlisted.contains(record)),
+                "no call is both a site and unfollowed: {sited:?} {unlisted:?}"
+            );
+        }
+        assert!(
+            !discovery
+                .unfollowed
+                .iter()
+                .chain(&discovery.sites)
+                .any(|site| site.file.ends_with("unfollowed.ts") && site.callee == "double"),
+            "a call to a local helper that finds nothing is no_site"
+        );
+        assert!(
+            discovery.counts.get("no_site").is_some_and(|n| *n > 0),
+            "{:?}",
+            discovery.counts
+        );
     }
 
     /// The seven-hop site has seven hops, and no site sits at the store
