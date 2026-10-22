@@ -3907,7 +3907,12 @@ async fn analyze_current_repo_incremental(
                 Path::new(repo_path),
                 ask_turns.clone(),
             );
-            let (analysis, (settled, placements), library_answer) = tokio::join!(
+            let (early_answer, first_answer) = tokio::sync::oneshot::channel();
+            let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
+            let file_orchestrator = file_orchestrator.with_fact_files(
+                crate::agents::file_orchestrator::FactFileSource::later(fact_files),
+            );
+            let (analysis, (settled, placements), library_answer, first_discovery) = tokio::join!(
                 file_orchestrator.analyze_files(
                     &files,
                     &cached_model_results,
@@ -3929,7 +3934,14 @@ async fn analyze_current_repo_incremental(
                     &semantics_root,
                     summaries_sender,
                 ),
-                settled_library_answer(library_ask.as_ref()),
+                settled_library_answer(library_ask.as_ref(), early_answer),
+                fact_files_of(
+                    library_ask.as_ref(),
+                    first_answer,
+                    &request_inputs,
+                    Path::new(repo_path),
+                    fact_sender,
+                ),
             );
             let analysis = analysis?;
             setup.detection.client_semantics = settled;
@@ -4003,6 +4015,7 @@ async fn analyze_current_repo_incremental(
                 SiteContext {
                     placements: Some(&placements),
                     library: library_ask.as_ref().map(|ask| &ask.sites),
+                    prior: first_discovery.as_ref(),
                 },
             )
             .await;
@@ -4014,6 +4027,7 @@ async fn analyze_current_repo_incremental(
                 SiteContext {
                     placements: Some(&placements),
                     library: library_ask.as_ref().map(|ask| &ask.sites),
+                    prior: first_discovery.as_ref(),
                 },
             );
             let withdrawn = withdraw_model_routes_at_definitions(
@@ -4845,18 +4859,85 @@ fn library_turn(
 /// to [`crate::library_store::WAIT_CAP`] from the first ask (carrick#2496).
 /// Run beside the analysis, so a scan whose analysis outlasts the builds
 /// waits nothing more.
-async fn settled_library_answer(ask: Option<&LibraryAsk>) -> crate::library_store::Settled {
+async fn settled_library_answer(
+    ask: Option<&LibraryAsk>,
+    early: tokio::sync::oneshot::Sender<crate::library_store::FirstAnswer>,
+) -> crate::library_store::Settled {
     match ask {
         Some(ask) => {
             crate::library_store::ask_until_settled(
                 &ask.asked,
                 |request| library_turn(&ask.turns)(request),
                 send_to_library_store,
+                Some(early),
             )
             .await
         }
         None => crate::library_store::Settled::default(),
     }
+}
+
+/// Run discovery on the store's first answer and tell the file reader's
+/// orchestrator which files the fact layer would send it (carrick#2613,
+/// record-only). Always sends: `None` when the scan records nothing here
+/// (site questions off, nothing asked, no compiler rows), so the orchestrator
+/// never waits on a sender that is gone. The walk is returned, so the site
+/// questions reuse it when the settled answer equals the first.
+async fn fact_files_of(
+    ask: Option<&LibraryAsk>,
+    first: tokio::sync::oneshot::Receiver<crate::library_store::FirstAnswer>,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    root: &Path,
+    sender: tokio::sync::oneshot::Sender<Option<crate::request_summary::fact_files::FactFiles>>,
+) -> Option<FirstDiscovery> {
+    let recorded = match ask {
+        Some(ask) if crate::site_questions::enabled() && inputs.positions.is_some() => {
+            first.await.ok().map(|answer| (ask, answer))
+        }
+        _ => None,
+    };
+    let Some((ask, answer)) = recorded else {
+        let _ = sender.send(None);
+        return None;
+    };
+    let (facts, first) = first_discovery(&ask.sites, answer, inputs, root);
+    let _ = sender.send(Some(facts));
+    Some(first)
+}
+
+/// Discovery run on the store's first `answer`, and the files the fact layer
+/// would send the reader from it ([`crate::request_summary::fact_files`]).
+fn first_discovery(
+    library: &crate::request_summary::LibrarySites,
+    answer: crate::library_store::FirstAnswer,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    root: &Path,
+) -> (
+    crate::request_summary::fact_files::FactFiles,
+    FirstDiscovery,
+) {
+    let labels = crate::request_summary::discovery::Labels::of(&answer.exports);
+    let discovery = crate::request_summary::discovery::discover(inputs, &labels, root);
+    let decided = crate::request_summary::decided_sites::decided_sites(
+        inputs,
+        root,
+        &discovered_sites(&discovery),
+        &crate::request_summary::decided_sites::SiteLabel::from_exports(&answer.exports),
+    );
+    let facts = crate::request_summary::fact_files::FactFiles::of(
+        &discovery,
+        &decided,
+        Some(library),
+        &answer,
+        root,
+    );
+    (
+        facts,
+        FirstDiscovery {
+            exports: answer.exports,
+            discovery,
+        },
+    )
 }
 
 /// The service's library rows: its library sites read through the claims
@@ -4983,6 +5064,18 @@ fn site_payloads_of(
 struct SiteContext<'a> {
     placements: Option<&'a crate::request_summary::decided_sites::SummaryPlacements>,
     library: Option<&'a crate::request_summary::LibrarySites>,
+    /// The walk made on the store's first answer, read again when the settled
+    /// answer is the same (carrick#2613).
+    prior: Option<&'a FirstDiscovery>,
+}
+
+/// Discovery run on the library store's first answer, before the file reader
+/// dispatched (carrick#2613), with the answer it read. The site questions read
+/// it instead of walking again when the settled answer equals it.
+#[derive(Debug)]
+struct FirstDiscovery {
+    exports: Vec<crate::library_claims::ExportClaims>,
+    discovery: crate::request_summary::discovery::Discovery,
 }
 
 /// What a service's site questions read before anything is asked
@@ -4998,6 +5091,21 @@ struct SiteRecordsOf {
     labels: Vec<crate::request_summary::decided_sites::SiteLabel>,
 }
 
+/// `discovery`'s sites as the decided-sites pass reads them.
+fn discovered_sites(
+    discovery: &crate::request_summary::discovery::Discovery,
+) -> Vec<crate::request_summary::decided_sites::DiscoverySite> {
+    discovery
+        .sites
+        .iter()
+        .filter_map(|site| {
+            serde_json::to_value(site)
+                .and_then(serde_json::from_value)
+                .ok()
+        })
+        .collect()
+}
+
 /// The site labels the settled `claims` give, of every role the store was
 /// asked for (carrick#2436), every call discovery finds that reaches one,
 /// where each one's name is decided, and each decided site's record. Files
@@ -5008,22 +5116,21 @@ fn site_records_of(
     claims: &[crate::library_claims::ExportClaims],
     context: SiteContext<'_>,
 ) -> SiteRecordsOf {
-    let labels = crate::request_summary::discovery::Labels::of(claims);
-    let discovery = crate::request_summary::discovery::discover(inputs, &labels, root);
+    let walked;
+    let discovery = match context.prior.filter(|prior| prior.exports == claims) {
+        Some(prior) => &prior.discovery,
+        None => {
+            let labels = crate::request_summary::discovery::Labels::of(claims);
+            walked = crate::request_summary::discovery::discover(inputs, &labels, root);
+            &walked
+        }
+    };
     let reached_label = discovery
         .sites
         .iter()
         .filter(|site| site.end.is_some())
         .count();
-    let discovered: Vec<crate::request_summary::decided_sites::DiscoverySite> = discovery
-        .sites
-        .iter()
-        .filter_map(|site| {
-            serde_json::to_value(site)
-                .and_then(serde_json::from_value)
-                .ok()
-        })
-        .collect();
+    let discovered = discovered_sites(discovery);
     let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
     let mut decided =
         crate::request_summary::decided_sites::decided_sites(inputs, root, &discovered, &labels);
@@ -10116,7 +10223,9 @@ async fn analyze_current_repo(
         Path::new(repo_path),
         ask_turns.clone(),
     );
-    let (analysis_result, (settled, placements), library_answer) = tokio::join!(
+    let (early_answer, first_answer) = tokio::sync::oneshot::channel();
+    let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
+    let (analysis_result, (settled, placements), library_answer, first_discovery) = tokio::join!(
         orchestrator.run_complete_analysis(
             files.clone(),
             packages,
@@ -10129,6 +10238,7 @@ async fn analyze_current_repo(
             &service_modules,
             sidecar,
             crate::agents::file_orchestrator::SummarySource::later(summaries),
+            crate::agents::file_orchestrator::FactFileSource::later(fact_files),
         ),
         compose_summaries(
             &request_inputs,
@@ -10137,7 +10247,14 @@ async fn analyze_current_repo(
             &service_root,
             summaries_sender,
         ),
-        settled_library_answer(library_ask.as_ref()),
+        settled_library_answer(library_ask.as_ref(), early_answer),
+        fact_files_of(
+            library_ask.as_ref(),
+            first_answer,
+            &request_inputs,
+            Path::new(repo_path),
+            fact_sender,
+        ),
     );
     let analysis_result = analysis_result?;
     setup.detection.client_semantics = settled;
@@ -10195,6 +10312,7 @@ async fn analyze_current_repo(
         SiteContext {
             placements: Some(&placements),
             library: library_ask.as_ref().map(|ask| &ask.sites),
+            prior: first_discovery.as_ref(),
         },
     )
     .await;
@@ -10206,6 +10324,7 @@ async fn analyze_current_repo(
         SiteContext {
             placements: Some(&placements),
             library: library_ask.as_ref().map(|ask| &ask.sites),
+            prior: first_discovery.as_ref(),
         },
     );
     let withdrawn = withdraw_model_routes_at_definitions(
@@ -10733,6 +10852,7 @@ mod tests {
                 &ask.asked,
                 |_| async {},
                 |_| async { Ok(body.to_string()) },
+                None,
             )
             .await;
             super::library_rows(Some(&ask), settled, None, std::path::Path::new("."));
@@ -21993,6 +22113,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 &asked,
                 |_| async {},
                 |request| async move { Ok(http_store(&request)) },
+                None,
             )
             .await;
             let of = super::site_records_of(
@@ -22145,6 +22266,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &ask.asked,
             |_| async {},
             |request| async move { Ok(lib_store(&request)) },
+            None,
         )
         .await;
         let of = super::site_records_of(
@@ -22174,6 +22296,79 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             })
             .count();
         assert_eq!(records, 1, "the site has its record");
+    }
+
+    /// carrick#2613: the store's first answer gives the fact layer's files
+    /// before the settle ends (the file holding a site is one), and the site
+    /// questions read that walk again, not a second one, only while the
+    /// settled answer equals the first.
+    #[tokio::test]
+    async fn the_first_answers_walk_is_read_again_only_for_an_equal_settled_answer() {
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &lib_fetch_edit(),
+            true,
+        ) else {
+            return;
+        };
+        let root = on.repo.join("services/web");
+        let ask = super::LibraryAsk::of(&on.inputs, &root, &on.repo, Default::default(), true)
+            .expect("the service asks the store");
+        let (early, first) = tokio::sync::oneshot::channel();
+        let settled = crate::library_store::ask_until_settled(
+            &ask.asked,
+            |_| async {},
+            |request| async move { Ok(lib_store(&request)) },
+            Some(early),
+        )
+        .await;
+        let first = first.await.expect("the first answer is sent");
+        assert_eq!(first.exports, settled.exports, "the settle added nothing");
+        let (facts, prior) = super::first_discovery(&ask.sites, first, &on.inputs, &on.repo);
+        let why = facts
+            .files
+            .get(LIB_FETCH_FILE)
+            .expect("the file with the site is a fact file");
+        assert!(why.site, "{why:?}");
+        assert!(
+            facts.calls.values().any(|followed| {
+                *followed == crate::request_summary::fact_files::Followed::Site
+            }),
+            "the call is recorded as a site"
+        );
+        // An equal settled answer reads the prior walk: an emptied one finds
+        // no site, so the walk was not made again.
+        let emptied = super::FirstDiscovery {
+            exports: prior.exports.clone(),
+            discovery: Default::default(),
+        };
+        let reused = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &settled.exports,
+            super::SiteContext {
+                prior: Some(&emptied),
+                ..Default::default()
+            },
+        );
+        assert_eq!(reused.discovered, 0, "the prior walk was read");
+        // A different settled answer walks again.
+        let stale = super::FirstDiscovery {
+            exports: Vec::new(),
+            discovery: Default::default(),
+        };
+        let walked = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &settled.exports,
+            super::SiteContext {
+                prior: Some(&stale),
+                ..Default::default()
+            },
+        );
+        assert!(walked.discovered > 0, "a settle that changed it walks");
     }
 
     /// carrick#2506: a factory typed in a DefinitelyTyped-style package

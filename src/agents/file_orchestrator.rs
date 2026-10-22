@@ -1467,6 +1467,128 @@ pub struct FileOrchestrator {
     /// What each call site's callee sends, composed over the call graph
     /// (carrick#1555). Empty unless the engine hands one over.
     request_summaries: SummarySource,
+    /// The files the fact layer would send the reader, logged beside the
+    /// ones the signals select (carrick#2613). Record-only.
+    fact_files: FactFileSource,
+}
+
+/// The fact layer's file set for one analysis (carrick#2613): not recorded,
+/// or sent by the engine once the library store's first answer is in.
+pub enum FactFileSource {
+    /// Nothing is recorded.
+    None,
+    /// Sent by the engine on every path, `None` when this scan records
+    /// nothing: a dropped sender is a bug, never an empty record.
+    Later(
+        std::sync::Mutex<
+            Option<
+                tokio::sync::oneshot::Receiver<
+                    Option<crate::request_summary::fact_files::FactFiles>,
+                >,
+            >,
+        >,
+    ),
+}
+
+/// The register signals that raised each call span of one file.
+type RegisterTags = std::collections::BTreeMap<
+    (u32, u32),
+    std::collections::BTreeSet<crate::swc_scanner::RegisterSignal>,
+>;
+
+/// Logs how the fact layer's files compare with the files the signals send
+/// the reader, and where each register signal's candidates sit against what
+/// discovery recorded (carrick#2613, record-only; nothing reads this but the
+/// run log). `read` is today's set: the files with a candidate or an
+/// exception, and the ones the wrapper rescue added.
+fn log_fact_files<'a>(
+    facts: &crate::request_summary::fact_files::FactFiles,
+    read: impl Iterator<Item = &'a str>,
+    tagged: &[(String, RegisterTags)],
+) {
+    use crate::request_summary::fact_files::Followed;
+    use crate::swc_scanner::RegisterSignal;
+    let read: std::collections::BTreeSet<&str> = read.collect();
+    let (sites, leads, unanswered) = facts.counts();
+    let fact_only = facts
+        .files
+        .keys()
+        .filter(|file| !read.contains(file.as_str()))
+        .count();
+    let read_only = read
+        .iter()
+        .filter(|file| !facts.files.contains_key(**file))
+        .count();
+    debug!(
+        "fact files: {} (sites {sites}, leads {leads}, unanswered-package {unanswered}); read today {}; fact-only {fact_only}; read-only {read_only}",
+        facts.files.len(),
+        read.len(),
+    );
+    for (file, why) in &facts.files {
+        if !read.contains(file.as_str()) {
+            debug!(
+                "fact files: fact-only {file} (site {}, lead {}, unanswered-package {})",
+                why.site, why.lead, why.unanswered_package
+            );
+        }
+    }
+    debug!(
+        "fact files: packages unanswered at dispatch {}{}",
+        facts.unanswered_packages,
+        if facts.ask_failed {
+            " (the ask failed)"
+        } else {
+            ""
+        }
+    );
+    for signal in RegisterSignal::ALL {
+        let (mut at_site, mut stopped, mut no_record) = (0usize, 0usize, 0usize);
+        for (file, calls) in tagged {
+            for (span, signals) in calls {
+                if !signals.contains(&signal) {
+                    continue;
+                }
+                match facts.followed(file, *span) {
+                    Some(Followed::Site) => at_site += 1,
+                    Some(Followed::Stopped) => stopped += 1,
+                    None => no_record += 1,
+                }
+            }
+        }
+        debug!(
+            "fact files: {} candidates: at a site {at_site}, at a stopped walk {stopped}, with no record {no_record}",
+            signal.label()
+        );
+    }
+}
+
+impl FactFileSource {
+    /// Fact files that arrive over `receiver`.
+    pub fn later(
+        receiver: tokio::sync::oneshot::Receiver<
+            Option<crate::request_summary::fact_files::FactFiles>,
+        >,
+    ) -> Self {
+        Self::Later(std::sync::Mutex::new(Some(receiver)))
+    }
+
+    /// The fact files, waiting for the store's first answer. Read once per
+    /// analysis.
+    async fn take(&self) -> Option<crate::request_summary::fact_files::FactFiles> {
+        match self {
+            Self::None => None,
+            Self::Later(receiver) => {
+                let receiver = receiver
+                    .lock()
+                    .expect("the fact-files lock is never poisoned")
+                    .take()
+                    .expect("an analysis reads its fact files once");
+                receiver
+                    .await
+                    .expect("the engine sends the fact files on every path")
+            }
+        }
+    }
 }
 
 /// The request summaries one analysis reads: in hand, or still being
@@ -1675,7 +1797,15 @@ impl FileOrchestrator {
             swc_scanner: SwcScanner::new(),
             model_deferred: false,
             request_summaries: RequestSummaryIndex::default().into(),
+            fact_files: FactFileSource::None,
         }
+    }
+
+    /// The fact layer's files for this service (carrick#2613), arriving
+    /// from the engine ([`FactFileSource::later`]).
+    pub fn with_fact_files(mut self, fact_files: FactFileSource) -> Self {
+        self.fact_files = fact_files;
+        self
     }
 
     /// The request summaries composed for this service (carrick#1555), read
@@ -2550,6 +2680,9 @@ impl FileOrchestrator {
         // work list of files that actually need an LLM call. Zero-cost skips are recorded here.
         let mut pending: Vec<PendingFile> = Vec::new();
         let mut deferred_zero_candidates: Vec<DeferredZeroCandidate> = Vec::new();
+        // The register signals (#2440) that raised each call, by file
+        // (carrick#2613): read by the fact-file log only.
+        let mut register_tagged: Vec<(String, RegisterTags)> = Vec::new();
         // carrick#1157: which files build a GraphQL schema in code, read only
         // when the service has schema fields a resolver could be linked to and
         // detection named packages to trace values to. Aliases resolve here:
@@ -2620,7 +2753,7 @@ impl FileOrchestrator {
             // STEP 1: Run SWC Scanner (Gatekeeper). Pass the LLM-detected
             // data-fetching packages so import-based recall uses detection's
             // decision rather than a hardcoded package list.
-            let scan_result = self.swc_scanner.scan_content(
+            let mut scan_result = self.swc_scanner.scan_content(
                 file_path,
                 &content,
                 &framework_detection.data_fetchers,
@@ -2680,6 +2813,12 @@ impl FileOrchestrator {
             // prompt (raw WebSocket/EventSource constructors today) are set
             // aside; a file with only those is skipped, not sent to a prompt
             // that has no instructions for them.
+            if !scan_result.register_signals.is_empty() {
+                register_tagged.push((
+                    crate::utils::repo_relative_source_path(&path_str, &repo_root_str).to_string(),
+                    std::mem::take(&mut scan_result.register_signals),
+                ));
+            }
             let (http_candidates, unrouted_candidates): (Vec<_>, Vec<_>) = scan_result
                 .candidates
                 .into_iter()
@@ -3317,6 +3456,12 @@ impl FileOrchestrator {
             }
         }
 
+        // The files the fact layer would send, from the store's first answer
+        // (carrick#2613). Awaited here, after the serial scan above has run
+        // beside the ask and before the rescue below, where a selection by
+        // the fact layer would act. Record-only: nothing reads it but the log.
+        let fact_files = self.fact_files.take().await;
+
         // Rescue or finalize the deferred zero-candidate skips: a file that
         // imports a wrapper module is force-analyzed with the wrapper's source
         // as context (its call sites are the repo's real outbound calls);
@@ -3441,6 +3586,14 @@ impl FileOrchestrator {
                 resolved: Vec::new(),
                 silent_sites: BTreeSet::new(),
             });
+        }
+
+        if let Some(facts) = &fact_files {
+            log_fact_files(
+                facts,
+                pending.iter().map(|pf| pf.prompt_path.as_str()),
+                &register_tagged,
+            );
         }
 
         // Where every request member the scan read is declared (carrick#656).
