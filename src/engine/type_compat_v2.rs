@@ -2420,6 +2420,67 @@ pub(crate) fn consumer_call_locators(infer: &[InferRequestItem]) -> HashMap<Stri
     calls
 }
 
+/// The manifest entries a consumer call locator belongs to: consumer
+/// response types inferred from a call's result.
+fn is_consumer_call_result(entry: &TypeManifestEntry) -> bool {
+    entry.role == ManifestRole::Consumer
+        && entry.type_kind == ManifestTypeKind::Response
+        && entry.evidence.infer_kind == InferKind::CallResult
+}
+
+/// Write each consumer response locator into its manifest entry's evidence,
+/// so a later `--changed-only` run that carries this service can retype the
+/// same call from the stored blob (carrick#2567). The locator is stored as
+/// the inference had it: a span, or the call's text and line.
+pub(crate) fn store_call_locators(
+    manifest: &mut [TypeManifestEntry],
+    calls: &HashMap<String, CallLocator>,
+) {
+    for entry in manifest.iter_mut().filter(|e| is_consumer_call_result(e)) {
+        let Some(call) = calls.get(&entry.type_alias) else {
+            continue;
+        };
+        entry.evidence.span_start = call.span_start;
+        entry.evidence.span_end = call.span_end;
+        entry.evidence.expression_text = call.expression_text.clone();
+        entry.evidence.expression_line = call.expression_line;
+    }
+}
+
+/// A carried service's consumer calls, read back from its stored manifest
+/// (carrick#2567). A carried service's files are byte-identical to its
+/// stored commit, so a stored locator names the call the run that stored it
+/// located. `repo_root` is the clone's root, which the stored paths are
+/// relative to. An entry stored without a span or a call text cannot be
+/// located, and is left out.
+pub(crate) fn stored_call_locators(
+    manifest: &[TypeManifestEntry],
+    repo_root: &Path,
+) -> HashMap<String, CallLocator> {
+    let mut calls = HashMap::new();
+    for entry in manifest.iter().filter(|e| is_consumer_call_result(e)) {
+        let evidence = &entry.evidence;
+        let has_span = evidence.span_start.is_some() && evidence.span_end.is_some();
+        if !has_span && evidence.expression_text.is_none() {
+            continue;
+        }
+        calls
+            .entry(entry.type_alias.clone())
+            .or_insert_with(|| CallLocator {
+                file_path: repo_root
+                    .join(&evidence.file_path)
+                    .to_string_lossy()
+                    .into_owned(),
+                line_number: evidence.line_number,
+                span_start: evidence.span_start,
+                span_end: evidence.span_end,
+                expression_text: evidence.expression_text.clone(),
+                expression_line: evidence.expression_line,
+            });
+    }
+    calls
+}
+
 /// Whether the CONSUMER's type is what left this verdict unresolved, in a way
 /// a retype of its call could settle. A consumer that states no contract at
 /// all (it reads no body, sends a form body, reads or sends bytes,
@@ -3134,6 +3195,8 @@ mod tests {
                 file_path: file_path.to_string(),
                 span_start: None,
                 span_end: None,
+                expression_text: None,
+                expression_line: None,
                 line_number,
                 infer_kind: InferKind::ResponseBody,
                 is_explicit: false,
@@ -4271,6 +4334,93 @@ mod tests {
         assert_eq!(calls.len(), 1, "only call results are retyped: {calls:?}");
         assert_eq!(calls["C"].line_number, 8);
         assert_eq!(calls["C"].span_start, Some(80));
+    }
+
+    /// carrick#2567: a consumer's call locators survive the stored blob, as
+    /// the inference had them (by text or by span), at the clone's root.
+    #[test]
+    fn stored_call_locators_read_back_what_the_capture_stored() {
+        let consumer = |alias: &str, line: u32| {
+            let mut e = entry(
+                OperationKey::http("GET", "/orders"),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                alias,
+                "web/src/client.ts",
+                line,
+                ManifestTypeState::Unknown,
+            );
+            e.evidence.infer_kind = InferKind::CallResult;
+            e
+        };
+        let mut producer = consumer("P", 3);
+        producer.role = ManifestRole::Producer;
+        let mut manifest = vec![
+            consumer("ByText", 8),
+            consumer("BySpan", 12),
+            consumer("Unlocated", 16),
+            producer,
+        ];
+        let at = |line: u32| CallLocator {
+            file_path: "/scan/web/src/client.ts".to_string(),
+            line_number: line,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+        };
+        let calls = HashMap::from([
+            (
+                "ByText".to_string(),
+                CallLocator {
+                    expression_text: Some("api.get(\"/orders\")".to_string()),
+                    expression_line: Some(8),
+                    ..at(8)
+                },
+            ),
+            (
+                "BySpan".to_string(),
+                CallLocator {
+                    span_start: Some(120),
+                    span_end: Some(140),
+                    ..at(12)
+                },
+            ),
+            (
+                "P".to_string(),
+                CallLocator {
+                    span_start: Some(1),
+                    span_end: Some(2),
+                    ..at(3)
+                },
+            ),
+        ]);
+        store_call_locators(&mut manifest, &calls);
+        assert_eq!(
+            manifest[3].evidence.span_start, None,
+            "a producer entry carries no consumer locator"
+        );
+
+        let read = stored_call_locators(&manifest, Path::new("/clone"));
+        assert_eq!(read.len(), 2, "an unlocated call is left out: {read:?}");
+        assert_eq!(
+            read["ByText"],
+            CallLocator {
+                file_path: "/clone/web/src/client.ts".to_string(),
+                expression_text: Some("api.get(\"/orders\")".to_string()),
+                expression_line: Some(8),
+                ..at(8)
+            }
+        );
+        assert_eq!(
+            read["BySpan"],
+            CallLocator {
+                file_path: "/clone/web/src/client.ts".to_string(),
+                span_start: Some(120),
+                span_end: Some(140),
+                ..at(12)
+            }
+        );
     }
 
     // ---- derive_capture_anchors -------------------------------------------

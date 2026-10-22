@@ -1152,6 +1152,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             let stored = previous_generation(previous_generations, &repo_name, service)
                 .cloned()
                 .expect("a carried service has a stored generation");
+            record_carried_consumer(repo_path, service, &stored);
             runs.push(ServiceRun::carried(service, stored));
             continue;
         };
@@ -2297,6 +2298,39 @@ const _: fn() = || {
     sendable::<ServiceRun>();
     shared::<ServiceScan>();
 };
+
+/// Register a carried service as a local consumer, as its capture would
+/// have, so the check retypes its calls as a full scan does (carrick#2567).
+/// Its files are the ones its stored generation was scanned from, at the
+/// same root, so the locators its stored manifest carries name the same
+/// calls.
+fn record_carried_consumer(repo_path: &str, service: &Config, stored: &CloudRepoData) {
+    let Some(manifest) = stored.type_manifest.as_deref() else {
+        return;
+    };
+    let absolute_repo = Path::new(repo_path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(repo_path));
+    let calls = type_compat_v2::stored_call_locators(manifest, &absolute_repo);
+    if calls.is_empty() {
+        return;
+    }
+    let service_id = stored
+        .service_name
+        .clone()
+        .unwrap_or_else(|| stored.repo_name.clone());
+    type_compat_v2::record_local_consumer(
+        &service_id,
+        type_compat_v2::LocalConsumer {
+            root: match &service.directory {
+                Some(dir) => absolute_repo.join(dir),
+                None => absolute_repo.clone(),
+            },
+            tsconfig: service.tsconfig.clone(),
+            calls,
+        },
+    );
+}
 
 /// One service's analysis to run: which, over what, and with what before it.
 struct ServiceJob {
@@ -6529,6 +6563,8 @@ fn add_graphql_request_entry(
             file_path,
             span_start: None,
             span_end: None,
+            expression_text: None,
+            expression_line: None,
             line_number: op.line,
             infer_kind: infer_kind_for_manifest(role, type_kind),
             is_explicit: true,
@@ -6741,6 +6777,8 @@ fn add_protocol_manifest_entry(
         file_path: file_path.to_string(),
         span_start: None,
         span_end: None,
+        expression_text: None,
+        expression_line: None,
         line_number,
         infer_kind,
         is_explicit: false,
@@ -7553,6 +7591,12 @@ fn run_capture_for_service(
         .service_name
         .clone()
         .unwrap_or_else(|| cloud_data.repo_name.clone());
+    let calls = type_compat_v2::consumer_call_locators(&infer);
+    // Stored with the blob, so a run that carries this service retypes the
+    // same calls (carrick#2567).
+    if let Some(manifest) = cloud_data.type_manifest.as_mut() {
+        type_compat_v2::store_call_locators(manifest, &calls);
+    }
     type_compat_v2::record_local_consumer(
         &service_id,
         type_compat_v2::LocalConsumer {
@@ -7561,7 +7605,7 @@ fn run_capture_for_service(
                 None => absolute_repo.clone(),
             },
             tsconfig: config.tsconfig.clone(),
-            calls: type_compat_v2::consumer_call_locators(&infer),
+            calls,
         },
     );
     // Every alias the check phase will import from this service's surface. The
@@ -9651,6 +9695,8 @@ fn add_manifest_pair(
             file_path: file_path.to_string(),
             span_start: None,
             span_end: None,
+            expression_text: None,
+            expression_line: None,
             line_number,
             infer_kind,
             is_explicit: false,
@@ -13133,6 +13179,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     file_path: abs("src/routes/orders.ts"),
                     span_start: None,
                     span_end: None,
+                    expression_text: None,
+                    expression_line: None,
                     line_number: 18,
                     infer_kind: InferKind::Expression,
                     is_explicit: true,
@@ -19019,6 +19067,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             file_path: "lib/api.ts".to_string(),
             span_start: None,
             span_end: None,
+            expression_text: None,
+            expression_line: None,
             line_number: 5,
             infer_kind: InferKind::CallResult,
             is_explicit: false,

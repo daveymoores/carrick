@@ -684,6 +684,8 @@ mod tests {
                 file_path: file_path.to_string(),
                 span_start: None,
                 span_end: None,
+                expression_text: None,
+                expression_line: None,
                 line_number,
                 infer_kind: match type_kind {
                     ManifestTypeKind::Request => InferKind::RequestBody,

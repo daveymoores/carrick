@@ -241,3 +241,186 @@ fn a_pool_of_three_processes_judges_every_call_as_one_process_does() {
         pool_line(&one_log)
     );
 }
+
+/// Run the binary over `repo` against the store at `store`, offline, with
+/// `flags`. Returns the scan's combined output.
+fn scan_stored(repo: &Path, store: &Path, flags: &[&str], env: &[(&str, &Path)]) -> String {
+    let home = store.with_file_name("home");
+    let _ = std::fs::remove_dir_all(&home);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    cmd.arg(repo)
+        .args(["--repo", "fixture/retype"])
+        .args(flags)
+        .env("HOME", &home)
+        .env("CARRICK_LOCAL_STORAGE_DIR", store)
+        .env("CARRICK_MOCK_ALL", "1")
+        .env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", repo.join("__llm__").display()),
+        )
+        .env("CARRICK_SKIP_INTENTS", "1")
+        .env("CARRICK_ALLOW_UNPREPARED", "1")
+        .env("CARRICK_NO_UPDATE_CHECK", "1");
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
+    for var in [
+        "GITHUB_REPOSITORY",
+        "GITHUB_REF",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "GITHUB_SHA",
+        "GITHUB_RUN_ID",
+        "GITHUB_ACTIONS",
+        "GITHUB_WORKSPACE",
+        "CI",
+        "CARRICK_OUTPUT_JSON",
+        "CARRICK_LOCAL_STORAGE_ISOLATE",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    ] {
+        cmd.env_remove(var);
+    }
+    let output = cmd.output().expect("failed to spawn carrick");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "scan {flags:?} failed:\n{log}");
+    log
+}
+
+fn git_in(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git failed to spawn");
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// carrick#2567: `--changed-only` carries a consumer whose files did not
+/// change, and its untyped calls are judged by retyping them, as a full scan
+/// judges them. Commit A has `api` answer `{ x }`, which `web` reads; both
+/// are stored at A. Commit B drops `x`. A `--pr` run of B with
+/// `--changed-only` analyses `api` alone and carries `web`, and it posts
+/// the findings and the checked-pair counts a full `--pr` run posts.
+#[test]
+fn a_carried_consumer_is_retyped_as_a_full_scan_retypes_it() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir
+        .path()
+        .canonicalize()
+        .expect("canonical temp dir")
+        .join("retype-http-client");
+    copy_tree(&fixture_dir(), &root);
+    // `--changed-only` analyses every service with an import it cannot
+    // resolve, and the fixture's libraries are ambient `declare module`
+    // blocks. Each becomes a module file beside its importer, imported by a
+    // relative path on the same line, so both services can be carried.
+    for (dir, module) in [("web", "http-client"), ("api", "http-server")] {
+        let ambient = root.join(format!("{dir}/src/{module}.d.ts"));
+        let text = std::fs::read_to_string(&ambient).expect("read the declarations");
+        let body: Vec<&str> = text.trim_end().lines().collect();
+        let body = body[1..body.len() - 1]
+            .iter()
+            .map(|line| line.strip_prefix("  ").unwrap_or(line))
+            .map(|line| line.replace("export function", "export declare function"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::remove_file(&ambient).expect("remove the ambient module");
+        std::fs::write(root.join(format!("{dir}/src/{module}.ts")), body + "\n")
+            .expect("write the module");
+        std::fs::write(
+            root.join(format!("__llm__/analyze-file/{module}.json")),
+            r#"{ "mounts": [], "endpoints": [], "data_calls": [] }"#,
+        )
+        .expect("write the cassette");
+        let importer = root.join(if dir == "web" {
+            "web/src/checkout.ts"
+        } else {
+            "api/src/routes.ts"
+        });
+        let source = std::fs::read_to_string(&importer).expect("read the importer");
+        let relative = source.replace(&format!("\"{module}\""), &format!("\"./{module}\""));
+        assert_ne!(source, relative, "{module} is imported by name");
+        std::fs::write(&importer, relative).expect("write the importer");
+    }
+    let routes = root.join("api/src/routes.ts");
+    let dropped = std::fs::read_to_string(&routes).expect("read routes");
+    let returned = dropped
+        .replace("y: number;", "x: number;")
+        .replace("{ y: 1 }", "{ x: 1 }");
+    assert_ne!(dropped, returned, "the fixture's producer shape moved");
+    std::fs::write(&routes, &returned).expect("write routes");
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-q", "-m", "A"]);
+    let a = git_in(&root, &["rev-parse", "HEAD"]);
+    let store = dir.path().join("store");
+    std::fs::create_dir_all(&store).expect("create the store");
+    scan_stored(&root, &store, &[], &[]);
+
+    std::fs::write(&routes, &dropped).expect("write routes");
+    git_in(&root, &["commit", "-q", "-am", "B: api drops x"]);
+    let b = git_in(&root, &["rev-parse", "HEAD"]);
+
+    let pr = |changed_only: bool| -> (serde_json::Value, String) {
+        let out = dir.path().join(format!("pr-{changed_only}.json"));
+        let mut flags = vec!["--pr", "7", "--pr-head", &b, "--pr-base", &a];
+        if changed_only {
+            flags.push("--changed-only");
+        }
+        let log = scan_stored(&root, &store, &flags, &[("CARRICK_PR_RESULT_OUT", &out)]);
+        let posted = std::fs::read_to_string(&out)
+            .unwrap_or_else(|error| panic!("the PR run posted no result ({error}):\n{log}"));
+        (
+            serde_json::from_str(&posted).expect("parse the PR result"),
+            log,
+        )
+    };
+    let (full, _) = pr(false);
+    let (scoped, scoped_log) = pr(true);
+
+    assert!(
+        scoped_log.contains("scope: web carried"),
+        "the scoped run carries web:\n{scoped_log}"
+    );
+    let mismatches = |payload: &serde_json::Value| -> Vec<String> {
+        let mut sites: Vec<String> = payload["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter(|f| f["kind"] == "type_mismatch")
+            .map(|f| f["call_sites"][0].as_str().unwrap_or_default().to_string())
+            .collect();
+        sites.sort();
+        sites
+    };
+    assert_eq!(
+        mismatches(&full),
+        ["web/src/checkout.ts:11", "web/src/checkout.ts:6"],
+        "the full run flags both reads by retyping them: {full:#}"
+    );
+    assert_eq!(
+        scoped["findings"], full["findings"],
+        "the scoped run posts the full run's findings"
+    );
+    assert_eq!(
+        scoped["checked"]["pairs"], full["checked"]["pairs"],
+        "the scoped run counts the pairs the full run counts"
+    );
+}

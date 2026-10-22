@@ -63,6 +63,15 @@ pub struct TypeEvidence {
     pub span_start: Option<u32>,
     /// End byte offset in the source file
     pub span_end: Option<u32>,
+    /// The call's text as the inference located it, when it was located by
+    /// text rather than by span. With `span_start`/`span_end` this is the
+    /// locator a later run retypes a carried consumer's call by
+    /// (carrick#2567), so it names the node the type came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_text: Option<String>,
+    /// The line `expression_text` starts on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_line: Option<u32>,
     /// Line number in the source file
     pub line_number: u32,
     /// Kind of inference performed for this type
@@ -2167,6 +2176,8 @@ mod tests {
                 file_path: "src/routes.ts".to_string(),
                 span_start: None,
                 span_end: None,
+                expression_text: None,
+                expression_line: None,
                 line_number: 12,
                 infer_kind: InferKind::ResponseBody,
                 is_explicit: false,
