@@ -390,6 +390,58 @@ pub fn changed_paths(
     Ok(changed)
 }
 
+/// The top-level-relative path of the scan root's `carrick.json` when the
+/// tree holds one that no commit does: untracked, and absent from HEAD. The
+/// runner writes the project config there before it scans, so it is the
+/// scaffold's own file (`SCAFFOLD_CONFIG`), not an edit the commit under scan
+/// made. `None` for a tracked or ignored file, or when git cannot say.
+pub fn untracked_root_config(repo_path: &str) -> Option<String> {
+    let listed = nul_paths(
+        run_git(
+            repo_path,
+            &[
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "--full-name",
+                "-z",
+                "--",
+                SCAFFOLD_CONFIG,
+            ],
+        )
+        .ok()?,
+    );
+    let path = listed.into_iter().next()?;
+    // Untracked says the index lacks it; HEAD must lack it too.
+    run_git(repo_path, &["cat-file", "-e", "HEAD:./carrick.json"])
+        .is_err()
+        .then_some(path)
+}
+
+/// The text of `path` (relative to the repository's top level) as `commit`
+/// holds it, or `None` when this clone does not hold the commit or the file.
+/// A blobless clone is not asked to fetch: `GIT_NO_LAZY_FETCH` makes a missing
+/// blob fail at once rather than reach for a remote (carrick#2316).
+pub fn file_at_commit(repo_path: &str, commit: &str, path: &str) -> Option<String> {
+    if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let output = Command::new("git")
+        .args(["show", &format!("{commit}:{path}")])
+        .current_dir(repo_path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).ok())
+        .flatten()
+}
+
 /// One file that differs between two trees, with the path it was renamed
 /// from when git pairs it with one.
 #[derive(Debug, Clone, PartialEq, Eq)]

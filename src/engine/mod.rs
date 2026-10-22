@@ -1031,6 +1031,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         crate::change_scope::plan(
             repo_path,
             &services,
+            &previous_generations
+                .iter()
+                .filter(|generation| generation.repo_name == repo_name)
+                .map(|generation| generation.service_name.clone())
+                .collect::<Vec<_>>(),
             |service| previous_generation(previous_generations, &repo_name, service),
             crate::change_scope::ThisRun {
                 scanner_version: env!("CARGO_PKG_VERSION"),
