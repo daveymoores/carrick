@@ -409,7 +409,7 @@ export class LibraryClaimsVerifier {
    * A check on an instance or a scope reads the maker or scope claims of the
    * same request first, whatever their place in it.
    */
-  run(fromDir: string, checks: LibraryCheck[], budgetMs: number): VerifyResult {
+  run(fromDir: string, checks: LibraryCheck[], budgetMs: number, scanRoot?: string): VerifyResult {
     const deadline = performance.now() + budgetMs;
     const stamp = (check: LibraryCheck, outcome: Outcome): SemanticsResult =>
       outcome.verdict === 'verified'
@@ -492,7 +492,7 @@ export class LibraryClaimsVerifier {
       const checker = program.getTypeChecker();
       const file = program.getSourceFile(probe.getFilePath());
       if (!file) throw new Error(`probe file ${probePath} is not in the program`);
-      const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir);
+      const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir, scanRoot);
       const localRanges = readLocalRanges(fromDir);
 
       const moduleReads = new Map<string, ModuleRead>();
@@ -1055,7 +1055,7 @@ interface ClaimLayout {
  */
 class DeclarationReader {
   private readonly checker: ts.TypeChecker;
-  /** Names declaring files as position rows do. */
+  /** Names declaring files as position rows do: from the scan root, else the service root. */
   private readonly pathNames: PathNames;
   /** The service root, as a realpath. */
   private readonly root: string;
@@ -1074,10 +1074,11 @@ class DeclarationReader {
     private readonly program: ts.Program,
     private readonly probe: ts.SourceFile,
     private readonly host: ts.ModuleResolutionHost,
-    serviceRoot: string
+    serviceRoot: string,
+    scanRoot?: string
   ) {
     this.checker = program.getTypeChecker();
-    this.pathNames = new PathNames(serviceRoot);
+    this.pathNames = new PathNames(scanRoot ?? serviceRoot);
     this.root = this.realpath(serviceRoot);
     this.printedRoots = [...new Set([this.root, serviceRoot])]
       .filter(root => root.length > 1)

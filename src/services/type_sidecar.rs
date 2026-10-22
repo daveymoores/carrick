@@ -1192,6 +1192,10 @@ enum SidecarRequest {
         checks: Vec<LibraryCheck>,
         #[serde(skip_serializing_if = "Option::is_none")]
         budget_ms: Option<u64>,
+        /// The scanned repo's root: a verdict's `declarations` are named
+        /// from it, as position rows are.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scan_root: Option<String>,
     },
     #[serde(rename = "list_program_files")]
     ListProgramFiles { request_id: String },
@@ -3159,6 +3163,7 @@ impl TypeSidecar {
             from_dir: from_dir.to_string_lossy().into_owned(),
             checks: checks.to_vec(),
             budget_ms: None,
+            scan_root: self.scan_root_arg(),
         };
         self.send_request(&request)?;
         let response = self.operation_response()?;
@@ -5074,6 +5079,7 @@ mod tests {
                     }),
                 ],
                 budget_ms: Some(500),
+                scan_root: Some("/repo".into()),
             },
             SidecarRequest::ListProgramFiles { request_id: id() },
             SidecarRequest::AddProgramFiles {
@@ -5624,10 +5630,12 @@ mod tests {
                 ),
             ],
             budget_ms: Some(500),
+            scan_root: Some("/repo".into()),
         };
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["action"], "verify_library_claims");
         assert_eq!(value["budget_ms"], 500);
+        assert_eq!(value["scan_root"], "/repo");
         let checks = value["checks"].as_array().unwrap();
         assert_eq!(
             checks[0],

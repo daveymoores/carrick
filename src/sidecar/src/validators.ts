@@ -533,6 +533,7 @@ const LibraryCheckSchema = z
 export const VerifyLibraryClaimsRequestSchema = BaseRequestSchema.extend({
   action: z.literal('verify_library_claims'),
   from_dir: z.string().min(1),
+  scan_root: z.string().min(1).optional(),
   checks: z.array(LibraryCheckSchema),
   // The contract's sample sends `null` for "no budget of the request's own".
   budget_ms: z.number().int().nonnegative().nullable().optional(),
