@@ -1,6 +1,6 @@
 {
   "counts": {
-    "path_guards": 24,
+    "path_guards": 25,
     "starts_with": 1,
     "table_keys": 2
   },
@@ -221,6 +221,42 @@
       "method": null,
       "method_from": "none",
       "path": "/both",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "end",
+          "file": "src/negatives.ts",
+          "kind": "call",
+          "line": 27,
+          "target": null
+        }
+      ],
+      "evidence": {
+        "at": "src/negatives.ts:8",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/negatives.ts",
+      "handler": {
+        "file": "src/negatives.ts",
+        "function": "createServer_handler",
+        "line": 8
+      },
+      "kind_slot": "forced",
+      "line": 26,
+      "method": null,
+      "method_from": "none",
+      "path": "/either",
       "position": "equality",
       "request": {
         "param": 0,

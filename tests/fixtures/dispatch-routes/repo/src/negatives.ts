@@ -23,6 +23,9 @@ createServer((req, res) => {
   if ((req.method === "GET" || req.method === "HEAD") && req.url === "/both") {
     res.end("both");
   }
+  if ((req.method === "POST" || req.headers["x-admin"] === "yes") && req.url === "/either") {
+    res.end("either");
+  }
 });
 
 export function settings(): boolean {

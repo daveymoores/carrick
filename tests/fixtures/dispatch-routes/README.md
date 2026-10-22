@@ -20,6 +20,7 @@ It was written from the source, file by file:
 - `middleware.ts`: the minimal fixture of carrick#2139. Two entry routes on
   their own lines.
 - `negatives.ts`: a negated path, a header compared, a name literal, a
-  method on another value, methods under `||`, a browser global, a handler
+  method on another value, methods under `||` (with each other, and with
+  another test), a browser global, a handler
   handed to an in-repo wrapper, a label with no `request`, and a handler in
   another slot than the label's.
