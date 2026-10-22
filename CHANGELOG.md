@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.125](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.124...carrick-v0.3.125) (2026-10-22)
+
+
+### Features
+
+* **site:** payload slots on the site record; capture reads them behind CARRICK_SITE_PAYLOADS ([#2602](https://github.com/carrick-tools/carrick/issues/2602)) ([e2f0c84](https://github.com/carrick-tools/carrick/commit/e2f0c84b77c18c74144b84c5325b8a7b4569fe33))
+
+
+### Bug Fixes
+
+* convert site-row type request spans to TypeScript positions ([#2607](https://github.com/carrick-tools/carrick/issues/2607)) ([c6613f0](https://github.com/carrick-tools/carrick/commit/c6613f0bad23a4db5739b93c18872ef75f9580ae))
+* **sidecar:** a service with no config at its root types each file under its nearest tsconfig/jsconfig ([#2585](https://github.com/carrick-tools/carrick/issues/2585)) ([76be644](https://github.com/carrick-tools/carrick/commit/76be64411398239cab6850f4fc39f847a686b8a2))
+* **sidecar:** read the type a value's own function states when the compiler types it any/unknown ([#2600](https://github.com/carrick-tools/carrick/issues/2600)) ([02d7e37](https://github.com/carrick-tools/carrick/commit/02d7e373e697b7293e2474d7db88bc5c3f42ad2d))
+* **sidecar:** serve a side with a declared any member as its shape, judge its closed members ([#2591](https://github.com/carrick-tools/carrick/issues/2591)) ([#2597](https://github.com/carrick-tools/carrick/issues/2597)) ([fd9b8c7](https://github.com/carrick-tools/carrick/commit/fd9b8c730feeb62e935a943371d6f560348137f5))
+
 ## [0.3.124](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.123...carrick-v0.3.124) (2026-10-22)
 
 
