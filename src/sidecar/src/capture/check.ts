@@ -45,6 +45,7 @@ import {
 } from './check-workspace.js';
 import { buildPoisonIndexes, type StubPoisonIndex } from './check-poison.js';
 import { openProbeProgram, probeDeepFindings } from './check-deep.js';
+import { onlyDeclaredOpenAny } from './deep-walk.js';
 import { pairFieldReports } from './check-fields.js';
 import { pairDispatchUnions } from './check-union.js';
 
@@ -602,7 +603,12 @@ function deepDecayOf(
     const record = aliasRecords.get(endpoint.service_name)?.get(endpoint.alias);
     // The capture emits every deep finding it made; the FIRST is the one the
     // pre-gate reads, exactly as when the walk stopped at the first hit.
-    const finding = record?.any_provenance?.[0];
+    const findings = record?.any_provenance ?? [];
+    // An `any` the source declares under a named member is an open member
+    // (carrick#2591): the pair is probed, and the compiler judges the closed
+    // members. Anything else on the record keeps the pair out of the probe.
+    if (onlyDeclaredOpenAny(findings)) continue;
+    const finding = findings[0];
     if (finding) {
       return { side, kind: finding.kind, path: finding.path };
     }

@@ -203,6 +203,7 @@ describe('check phase: capture-recorded deep decay is never read as compatible',
     checkRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-deep-any-check-'));
     const producer = captureLiterals(checkRoot, 'deep-producer', {
       P_MemberAny: '{ orderId: string; metadata: any }',
+      P_MemberAnyClosed: '{ orderId: number; metadata: any }',
       P_MemberUnknown: '{ orderId: string; metadata: unknown }',
       P_Clean: '{ orderId: string; metadata: { source: string } }',
     });
@@ -210,6 +211,7 @@ describe('check phase: capture-recorded deep decay is never read as compatible',
       C_Concrete: '{ orderId: string; metadata: { source: string } }',
       C_Concrete2: '{ orderId: string; metadata: { source: string } }',
       C_Concrete3: '{ orderId: string; metadata: { source: string } }',
+      C_Concrete4: '{ orderId: string; metadata: { source: string } }',
     });
     producerStub = producer.stub_dir;
     consumerStub = consumer.stub_dir;
@@ -219,7 +221,7 @@ describe('check phase: capture-recorded deep decay is never read as compatible',
     fs.rmSync(checkRoot, { recursive: true, force: true });
   });
 
-  it('deep any -> gate_caught_baked_any; deep unknown -> unverifiable; clean pair still probes', async () => {
+  it('a declared open any is probed on its closed members; deep unknown -> unverifiable; clean pair still probes', async () => {
     const result = await runCheck({
       stubs: [
         { service_name: 'deep-producer', stub_dir: producerStub },
@@ -232,6 +234,13 @@ describe('check phase: capture-recorded deep decay is never read as compatible',
           type_kind: 'response',
           producer: { service_name: 'deep-producer', alias: 'P_MemberAny' },
           consumer: { service_name: 'deep-consumer', alias: 'C_Concrete' },
+        },
+        {
+          pair_key: 'closed-pair',
+          protocol: 'http',
+          type_kind: 'response',
+          producer: { service_name: 'deep-producer', alias: 'P_MemberAnyClosed' },
+          consumer: { service_name: 'deep-consumer', alias: 'C_Concrete4' },
         },
         {
           pair_key: 'unknown-pair',
@@ -252,12 +261,16 @@ describe('check phase: capture-recorded deep decay is never read as compatible',
     assert.strictEqual(result.success, true, JSON.stringify(result.errors));
     const byKey = new Map(result.verdicts.map((v) => [v.pair_key, v]));
 
-    // Pre-fix this read 'compatible': member-level any sails through the
-    // whole-type IsAny gate and the assignment compiles clean.
+    // carrick#2591: an `any` the source declares under a named member is open.
+    // The pair is probed, an open member is never a mismatch, and the closed
+    // members are judged: `orderId` agrees here and disagrees below.
     const anyVerdict = byKey.get('any-pair')!;
-    assert.strictEqual(anyVerdict.bucket, 'gate_caught_baked_any', JSON.stringify(anyVerdict));
-    assert.strictEqual(anyVerdict.gate, 'capture:producer:any');
-    assert.match(anyVerdict.diagnostic ?? '', /metadata/);
+    assert.strictEqual(anyVerdict.bucket, 'compatible', JSON.stringify(anyVerdict));
+    assert.strictEqual(anyVerdict.resolved, true, JSON.stringify(anyVerdict));
+    const closedVerdict = byKey.get('closed-pair')!;
+    assert.strictEqual(closedVerdict.bucket, 'incompatible', JSON.stringify(closedVerdict));
+    assert.match(closedVerdict.diagnostic ?? '', /orderId/);
+    assert.doesNotMatch(closedVerdict.diagnostic ?? '', /metadata/);
 
     const unknownVerdict = byKey.get('unknown-pair')!;
     assert.strictEqual(unknownVerdict.bucket, 'unverifiable', JSON.stringify(unknownVerdict));
@@ -271,9 +284,8 @@ describe('check phase: capture-recorded deep decay is never read as compatible',
     // comparison, and now says so in its own field with the member path — the
     // half a bucket cannot carry. The clean pair, compared for real in the
     // assembled workspace, is a fact.
-    assert.strictEqual(anyVerdict.resolved, false);
-    assert.match(anyVerdict.unresolved_reason ?? '', /metadata/);
     assert.strictEqual(unknownVerdict.resolved, false);
+    assert.match(unknownVerdict.unresolved_reason ?? '', /metadata/);
     assert.strictEqual(
       cleanVerdict.resolved,
       true,
@@ -292,10 +304,10 @@ describe('check phase: capture-recorded deep decay is never read as compatible',
     ],
     pairs: [
       {
-        pair_key: 'any-pair',
+        pair_key: 'unknown-pair',
         protocol: 'http',
         type_kind: 'response',
-        producer: { service_name: 'deep-producer', alias: 'P_MemberAny' },
+        producer: { service_name: 'deep-producer', alias: 'P_MemberUnknown' },
         consumer: { service_name: 'deep-consumer', alias: 'C_Concrete' },
       },
       {
@@ -316,10 +328,10 @@ describe('check phase: capture-recorded deep decay is never read as compatible',
     assert.strictEqual(result.success, false);
     const byKey = new Map(result.verdicts.map((v) => [v.pair_key, v]));
 
-    const anyVerdict = byKey.get('any-pair')!;
-    assert.strictEqual(anyVerdict.bucket, 'gate_caught_baked_any', JSON.stringify(anyVerdict));
-    assert.strictEqual(anyVerdict.gate, 'capture:producer:any');
-    assert.doesNotMatch(anyVerdict.unresolved_reason ?? '', /install/);
+    const gated = byKey.get('unknown-pair')!;
+    assert.strictEqual(gated.bucket, 'unverifiable', JSON.stringify(gated));
+    assert.strictEqual(gated.gate, 'capture:producer:unknown');
+    assert.doesNotMatch(gated.unresolved_reason ?? '', /install/);
 
     const stopped = byKey.get('clean-pair')!;
     assert.strictEqual(stopped.bucket, 'unverifiable', JSON.stringify(stopped));
@@ -337,9 +349,9 @@ describe('check phase: capture-recorded deep decay is never read as compatible',
     assert.strictEqual(result.isolation, 'unavailable');
     const byKey = new Map(result.verdicts.map((v) => [v.pair_key, v]));
 
-    const anyVerdict = byKey.get('any-pair')!;
-    assert.strictEqual(anyVerdict.bucket, 'gate_caught_baked_any', JSON.stringify(anyVerdict));
-    assert.strictEqual(anyVerdict.gate, 'capture:producer:any');
+    const gated = byKey.get('unknown-pair')!;
+    assert.strictEqual(gated.bucket, 'unverifiable', JSON.stringify(gated));
+    assert.strictEqual(gated.gate, 'capture:producer:unknown');
 
     const stopped = byKey.get('clean-pair')!;
     assert.strictEqual(stopped.bucket, 'unverifiable', JSON.stringify(stopped));
@@ -431,7 +443,7 @@ describe('capture self-check: callable-return any and deep-past-old-bound any', 
   });
 });
 
-describe('check phase: callable-return any and deep-past-8 any are never compatible', () => {
+describe('check phase: a callable-return any is gated; a deep declared any is open', () => {
   let checkRoot: string;
   let producerStub: string;
   let consumerStub: string;
@@ -458,7 +470,7 @@ describe('check phase: callable-return any and deep-past-8 any are never compati
     fs.rmSync(checkRoot, { recursive: true, force: true });
   });
 
-  it('callable-return any -> gated; deep-past-8 any -> gated; clean counterparts still verify', async () => {
+  it('callable-return any -> gated; deep-past-8 declared any -> probed as open; clean counterparts still verify', async () => {
     const result = await runCheck({
       stubs: [
         { service_name: 'cb-producer', stub_dir: producerStub },
@@ -500,7 +512,10 @@ describe('check phase: callable-return any and deep-past-8 any are never compati
 
     // Pre-fix these read 'compatible' (walk skipped the callable / capped at 8).
     assert.strictEqual(byKey.get('ret-any')!.bucket, 'gate_caught_baked_any', JSON.stringify(byKey.get('ret-any')));
-    assert.strictEqual(byKey.get('deep11-any')!.bucket, 'gate_caught_baked_any', JSON.stringify(byKey.get('deep11-any')));
+    // A member eleven levels down, declared `any`, is an open member
+    // (carrick#2591): probed, and the closed members agree.
+    assert.strictEqual(byKey.get('deep11-any')!.bucket, 'compatible', JSON.stringify(byKey.get('deep11-any')));
+    assert.strictEqual(byKey.get('deep11-any')!.resolved, true, JSON.stringify(byKey.get('deep11-any')));
     // Clean counterparts must STILL verify — no over-demotion.
     assert.strictEqual(byKey.get('ret-clean')!.bucket, 'compatible', JSON.stringify(byKey.get('ret-clean')));
     assert.strictEqual(byKey.get('deep-clean')!.bucket, 'compatible', JSON.stringify(byKey.get('deep-clean')));

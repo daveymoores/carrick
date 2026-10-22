@@ -1,0 +1,34 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "target": "/checkout",
+      "method": "POST",
+      "call_kind": "internal_http",
+      "pattern_matched": "fetch(\"/checkout\"",
+      "call_expression_text": "fetch(\"/checkout\", { method: \"POST\" })",
+      "call_expression_line": 12,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "IdAsNumber",
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:17",
+      "line_number": 17,
+      "target": "/checkout",
+      "method": "POST",
+      "call_kind": "internal_http",
+      "pattern_matched": "fetch(\"/checkout\"",
+      "call_expression_text": "fetch(\"/checkout\", { method: \"POST\" })",
+      "call_expression_line": 17,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "MetaX",
+      "type_import_source": null
+    }
+  ]
+}

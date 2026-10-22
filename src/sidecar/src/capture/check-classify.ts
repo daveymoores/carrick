@@ -38,6 +38,7 @@ import {
 } from './check-probe.js';
 import { scrubDiagnostic, scrubPaths, type ScrubContext } from './check-scrub.js';
 import type { PairDeepFindings } from './check-deep.js';
+import { onlyDeclaredOpenAny } from './deep-walk.js';
 import type { DispatchUnion } from './check-union.js';
 import {
   describeFieldReport,
@@ -456,9 +457,10 @@ function onUnwidenedLines(plan: ProbePlan, diagnostic: RawDiagnostic): boolean {
  * - its own declarations typecheck (the alias is not poisoned);
  * - the member-level walk ran over it and found no `any`/`unknown`, which
  *   would assign to whatever the other side declares;
- * - the same walk found none on the two published sides either. A mismatch
- *   that is not a fact stays the mismatch it was: the reading would be
- *   clearing it against a member that accepts anything.
+ * - the same walk found none on the two published sides either, an open
+ *   member included (carrick#2591). A mismatch that is not a fact stays the
+ *   mismatch it was: the reading would be clearing it against a member that
+ *   accepts anything.
  */
 function unwidenedReadingFits(input: ClassifyInput): boolean {
   const { plan, probeDiags, poisonReason } = input;
@@ -467,7 +469,7 @@ function unwidenedReadingFits(input: ClassifyInput): boolean {
   const sent = plan.sentEndpoint;
   if (poisonReason(sent.service_name, unwidenedAliasOf(sent.alias))) return false;
   const walked = input.deepFindings?.sentUnwidened;
-  return walked !== undefined && walked.length === 0 && factness(input).resolved;
+  return walked !== undefined && walked.length === 0 && factness(input, true).resolved;
 }
 
 /**
@@ -522,7 +524,7 @@ function namedFields(input: ClassifyInput, scrubCtx: ScrubContext): string {
  * empty. A walk that could not run leaves the verdict not-a-fact: absence of
  * findings is not evidence.
  */
-function factness(input: ClassifyInput): {
+function factness(input: ClassifyInput, strict = false): {
   resolved: boolean;
   unresolved_reason?: string;
   unresolved_side?: Side;
@@ -536,6 +538,9 @@ function factness(input: ClassifyInput): {
     };
   }
   for (const side of ['sent', 'expected'] as const) {
+    // Open members only (carrick#2591): the closed members were judged and an
+    // open one is never a mismatch, so the verdict is a fact about the type.
+    if (!strict && onlyDeclaredOpenAny(findings[side])) continue;
     const first = findings[side][0];
     if (!first) continue;
     const label = side === 'sent' ? input.plan.direction.sent : input.plan.direction.expected;

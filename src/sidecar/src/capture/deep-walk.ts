@@ -31,7 +31,7 @@ export type DeepTopType = Pick<TypeProvenance, 'kind' | 'path'>;
  * The scanner mirrors it (`CAPTURE_FINDINGS_CAP` in
  * `src/engine/type_compat_v2.rs`): a record this long may have stopped
  * listing, so it cannot vouch for every position (carrick#1752). */
-const MAX_DEEP_FINDINGS = 32;
+export const MAX_DEEP_FINDINGS = 32;
 
 /**
  * Depth-bounded structural walk for a disqualifying top type at ANY depth:
@@ -312,6 +312,52 @@ function walkTopTypes(
   if (head === undefined) return [];
   rest.sort((a, b) => a.path.localeCompare(b.path));
   return [head, ...rest];
+}
+
+/**
+ * True when a deep-walk path passes through a named member (the same rule as
+ * `path_names_a_member` in `src/engine/type_compat_v2.rs`). The walk writes a
+ * member as its name, an element or type argument as `<n>`, an index signature
+ * as `[index]` and a callable return as `()`; a path made of the last three
+ * alone sits at the root of the type or inside a container, never in a field.
+ */
+export function pathNamesAMember(path: string): boolean {
+  const rest = path.replaceAll('[index]', '').replaceAll('()', '');
+  let inArgument = false;
+  for (const c of rest) {
+    if (c === '<') inArgument = true;
+    else if (c === '>') inArgument = false;
+    else if (c !== '.' && !inArgument) return true;
+  }
+  return false;
+}
+
+/**
+ * True when every finding is an `any` the SOURCE declares under a named
+ * member (carrick#2591): an OPEN member. The policy: an open member is never
+ * a mismatch, and the closed members are judged as for a fully typed pair.
+ * `any` accepts and supplies every shape in the assignment the probe makes, so
+ * the compiler already judges only the closed members.
+ *
+ * Nothing else qualifies. A callable's return (`getData()`) is no data
+ * member. An `unknown` member rejects a narrower counterparty
+ * under assignment, so it would read as a mismatch the policy forbids; a
+ * `budget_exhausted` sentinel, a root top type and an `any` an unresolved
+ * import left say nothing about the author's intent. A list as long as the
+ * walk's cap may have stopped listing, so it cannot vouch for every position.
+ */
+export function onlyDeclaredOpenAny(findings: readonly TypeProvenance[]): boolean {
+  return (
+    findings.length > 0 &&
+    findings.length < MAX_DEEP_FINDINGS &&
+    findings.every(
+      (f) =>
+        f.kind === 'any' &&
+        f.reason === 'declared' &&
+        pathNamesAMember(f.path) &&
+        !f.path.includes('()')
+    )
+  );
 }
 
 /** The disqualifier the self-check and the check phase gate on (see

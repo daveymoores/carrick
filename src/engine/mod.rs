@@ -20895,6 +20895,34 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
+    /// carrick#2591: a member the source declares `any` is an open member as
+    /// well. The entry keeps the state the source gave it, and the finding
+    /// still names the open field.
+    #[test]
+    fn an_any_member_the_source_declares_leaves_the_contract_v1_stated() {
+        let shape = "{ id: string; notes: any; }";
+        let mut manifest = enriched_explicit(shape);
+        let records = stamp_findings(
+            &mut manifest,
+            "OrderView",
+            vec![finding("notes", "any", "declared")],
+        );
+        apply_resolved_definitions(&mut manifest, vec![captured("OrderView", shape)], &records);
+
+        assert_eq!(manifest[0].expanded_definition.as_deref(), Some(shape));
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Explicit);
+        assert!(manifest[0].is_explicit, "the source cast the call to it");
+        assert_eq!(
+            manifest[0]
+                .any_provenance
+                .iter()
+                .map(|p| (p.path.as_str(), p.kind.as_str(), p.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("notes", "any", "declared")],
+            "the open field is still named"
+        );
+    }
+
     /// The same answer for an entry no v1 layer stated settles it as the
     /// capture's own reading, the way a clean answer does.
     #[test]
@@ -20914,9 +20942,11 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     }
 
     /// Everything else that puts a top type in the answer still leaves the
-    /// entry `Unknown`: a pipeline artefact, an `any`, a position that is not
-    /// a member of a typed shape, a list the walk may have cut short, or no
-    /// record to read at all. The answer is still published in every case.
+    /// entry `Unknown`: a pipeline artefact, an `any` no declared member
+    /// accounts for (a parameter, a callable return, one the text does not
+    /// print), a position that is not a member of a typed shape, a list the
+    /// walk may have cut short, or no record to read at all. The answer is
+    /// still published in every case.
     #[test]
     fn a_top_type_the_source_did_not_declare_on_a_member_still_leaves_the_entry_unknown() {
         let open = finding("notes", "unknown", "declared");
@@ -20938,9 +20968,14 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 vec![open.clone(), finding("row", "unknown", "unresolved_import")],
             ),
             (
-                "a member the source declares `any`",
-                "{ id: string; notes: any; }".to_string(),
+                "a declared `any` member beside an `any` in a parameter",
+                "{ notes: any; run: (input: any) => void; }".to_string(),
                 vec![finding("notes", "any", "declared")],
+            ),
+            (
+                "an `any` callable return the source declares",
+                "{ id: string; load: () => any; }".to_string(),
+                vec![finding("load()", "any", "declared")],
             ),
             (
                 "an `any` the walk does not read, in a parameter",

@@ -63,9 +63,17 @@ pub(crate) fn contains_disqualifying_top_type(text: &str) -> bool {
 /// [`contains_disqualifying_top_type`] for one of the two keywords, over text
 /// whose string literals are already emptied.
 fn scrubbed_text_uses_keyword_as_type(scrubbed: &str, keyword: &str) -> bool {
+    count_keyword_as_type(scrubbed, keyword) > 0
+}
+
+/// How many times `keyword` is written as a TYPE token in text whose string
+/// literals are already emptied (see [`contains_disqualifying_top_type`] for
+/// what counts).
+fn count_keyword_as_type(scrubbed: &str, keyword: &str) -> usize {
     let bytes = scrubbed.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
     let mut search_from = 0;
+    let mut count = 0;
     while let Some(pos) = scrubbed[search_from..].find(keyword) {
         let begin = search_from + pos;
         let end = begin + keyword.len();
@@ -88,9 +96,9 @@ fn scrubbed_text_uses_keyword_as_type(scrubbed: &str, keyword: &str) -> bool {
         if rest.first() == Some(&b':') {
             continue;
         }
-        return true;
+        count += 1;
     }
-    false
+    count
 }
 
 // ===========================================================================
@@ -387,7 +395,7 @@ pub(crate) fn text_is_bare_top_type(text: &str) -> bool {
 pub(crate) const CAPTURE_FINDINGS_CAP: usize = 32;
 
 /// True when every top type in a capture answer is a member the SOURCE
-/// declares `unknown` (carrick#1752): the answer is a typed contract with open
+/// declares `unknown` or `any` (carrick#1752, carrick#2591): the answer is a typed contract with open
 /// fields, not a type no layer could see.
 ///
 /// [`contains_disqualifying_top_type`] cannot ask this. It reads text, and in
@@ -397,39 +405,49 @@ pub(crate) const CAPTURE_FINDINGS_CAP: usize = 32;
 /// names every position a top type sits at, with a cause. So the answer
 /// qualifies only when all of these hold:
 ///
-///  - the text carries no `any`. `any` is bidirectionally assignable, and the
-///    walk does not read parameter positions, so the text is the one place a
-///    parameter `any` shows;
+///  - the text writes exactly as many `any` tokens as the findings name as
+///    `any` (carrick#2591). `any` is bidirectionally assignable and the walk
+///    does not read parameter positions, so the text is the one place a
+///    parameter `any` shows: it adds a token no finding accounts for. A
+///    finding that names an `any` the text does not print disagrees with the
+///    answer it describes, so it vouches for nothing;
 ///  - the record names at least one finding and fewer than the walk lists
 ///    before it stops ([`CAPTURE_FINDINGS_CAP`]), so every position the text
 ///    holds is accounted for. A root that is itself a top type has no members
 ///    to walk, so it names none;
 ///  - every finding, the record's and any other layer's on the entry, is an
-///    `unknown` the capture attributes to the declaration (`declared`), at a
+///    `unknown` or `any` the capture attributes to the declaration
+///    (`declared`), at a
 ///    position under a named member. `unknown[]` or `Record<string, unknown>`
 ///    at the root has no named member, and says nothing about the payload.
 ///
-/// This decides the entry's state only. What the compatibility check makes of
-/// an open member is the check phase's own walk, which reads the same record
-/// and is unchanged.
+/// This decides the entry's state only. The compatibility check reads the same
+/// record and judges an open `any` member as the sidecar's `onlyDeclaredOpenAny`
+/// states: never a mismatch, the closed members judged as for a typed pair.
 pub(crate) fn top_types_are_declared_open_members(
     expanded: &str,
     record: &CaptureAliasRecord,
     published: &[crate::services::type_sidecar::TypeProvenance],
 ) -> bool {
-    !scrubbed_text_uses_keyword_as_type(&strip_string_literal_contents(expanded), "any")
+    let findings = || record.any_provenance.iter().chain(published);
+    let named_any = record
+        .any_provenance
+        .iter()
+        .filter(|finding| finding.kind == "any")
+        .count();
+    count_keyword_as_type(&strip_string_literal_contents(expanded), "any") == named_any
         && !record.any_provenance.is_empty()
         && record.any_provenance.len() < CAPTURE_FINDINGS_CAP
-        && record
-            .any_provenance
-            .iter()
-            .chain(published)
-            .all(is_declared_open_member)
+        && findings().all(is_declared_open_member)
 }
 
-/// An `unknown` the declaration states, under a named member.
+/// An `unknown` or `any` the declaration states, under a named member.
 fn is_declared_open_member(finding: &crate::services::type_sidecar::TypeProvenance) -> bool {
-    finding.kind == "unknown" && finding.reason == "declared" && path_names_a_member(&finding.path)
+    // A callable's return is no data member: an `any` there stays refused
+    // (carrick#2591), as the sidecar's `onlyDeclaredOpenAny` has it.
+    let kind_is_open =
+        finding.kind == "unknown" || (finding.kind == "any" && !finding.path.contains("()"));
+    kind_is_open && finding.reason == "declared" && path_names_a_member(&finding.path)
 }
 
 /// True when a deep-walk path passes through a named member. The walk writes
@@ -7735,15 +7753,16 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
     /// carrick#1833: a failed install leaves standing every verdict the
     /// capture had already decided. The sidecar still answers one verdict per
     /// pair when its install fails; a pair whose consumer type carries a deep
-    /// `any` keeps `gate_caught_baked_any`, while the pair the check would
-    /// have probed says the install stopped it.
+    /// `any` the pre-gate still refuses (a callable's return, not a declared
+    /// open member: carrick#2591) keeps `gate_caught_baked_any`, while the
+    /// pair the check would have probed says the install stopped it.
     #[test]
     #[serial(v2_capture_sidecar)]
     fn a_failed_install_keeps_the_verdicts_the_capture_decided() {
         let Some((sidecar, _key, mut all_repo_data)) = corpus_pair_with(&[LiteralPair {
             key: OperationKey::http("GET", "/orders/summary"),
             producer_type: "{ id: string; total: number }",
-            consumer_type: "{ id: string; total: any }",
+            consumer_type: "{ id: string; total: () => any }",
         }]) else {
             return;
         };
