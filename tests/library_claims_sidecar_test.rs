@@ -157,6 +157,7 @@ fn send(member: &str, path: &[&str], place: Place, name: OpName, payload: u32) -
         base: None,
         runs: None,
         yields: None,
+        request: None,
     }
 }
 
@@ -223,6 +224,9 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
                 key_labels: BTreeMap::new(),
                 name_scope: None,
                 picker: None,
+                runs: None,
+                yields: None,
+                mounts: None,
             },
         ),
         check(
@@ -284,6 +288,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
                 base: None,
                 runs: None,
                 yields: None,
+                request: None,
             },
         ),
     ];
