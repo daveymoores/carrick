@@ -2273,8 +2273,14 @@ struct ServiceRun {
 
 impl ServiceRun {
     /// A service `--changed-only` carries: its stored generation stands in
-    /// for it, and it owes nothing.
+    /// for it, with the call-through facts it stored (carrick#2378), and it
+    /// owes nothing.
     fn carried(service: &Config, stored: CloudRepoData) -> Self {
+        let call_through = stored
+            .call_through
+            .as_ref()
+            .map(crate::call_through::StoredCallThrough::sites)
+            .unwrap_or_default();
         Self {
             label: service
                 .service_name
@@ -2285,7 +2291,7 @@ impl ServiceRun {
             owed: durability::OwedWork::default(),
             held_back: false,
             carried: true,
-            call_through: Default::default(),
+            call_through,
         }
     }
 }
@@ -2539,7 +2545,7 @@ impl ServiceScan {
         );
         drop(sidecar);
 
-        let data = analysis.data;
+        let mut data = analysis.data;
         if data.bundled_types.is_some() {
             debug!(
                 "Type resolution ({}): {} bundled types, {} manifest entries",
@@ -2557,6 +2563,9 @@ impl ServiceScan {
             losses: crate::scan_health::service_losses(service.service_name.as_deref()),
             retry_error: None,
         };
+        // Stored with the blob, for a later run that carries this service
+        // (carrick#2378).
+        data.call_through = crate::call_through::StoredCallThrough::of(&analysis.call_through);
         Ok(ServiceRun {
             label: label.to_string(),
             data,
@@ -7246,6 +7255,7 @@ fn build_cloud_data_from_mount_graph(
         dispatch_tables: None,
         possible_calls: None,
         possible_calls_omitted: None,
+        call_through: None,
     }
 }
 
@@ -12317,6 +12327,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }
     }
 
@@ -13287,6 +13298,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         relativize_cloud_paths(
@@ -13505,6 +13517,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -13559,6 +13572,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }];
 
         // Test Config merging
@@ -13658,6 +13672,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -14398,6 +14413,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         // Staging unavailable: the request body has to carry the payload, so
@@ -14457,6 +14473,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         let stripped = strip_ast_nodes(data, true);
@@ -14529,6 +14546,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 dispatch_tables: None,
                 possible_calls: None,
                 possible_calls_omitted: None,
+                call_through: None,
             }
         }
 
@@ -14610,6 +14628,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -14833,6 +14852,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -14983,6 +15003,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         attach_external_call_candidates(
@@ -15110,6 +15131,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         attach_external_call_candidates(
@@ -15231,6 +15253,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -25841,6 +25864,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }
     }
 

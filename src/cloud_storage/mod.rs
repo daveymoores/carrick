@@ -861,6 +861,19 @@ pub struct CloudRepoData {
     /// How many possible calls were left out past the cap. Absent when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub possible_calls_omitted: Option<u32>,
+    /// What the call-through pass reads of this service from another one
+    /// (carrick#2378): its model rows at calls through its own code, its
+    /// definitions that hand back a request's parsed body, and its calls
+    /// whose value is not handed back. Written for an analysed service and
+    /// read back when `--changed-only` carries it, so the rows of the
+    /// services analysed beside it settle as a full scan settles them.
+    ///
+    /// Scanner-only: the cloud stores it and hands it back. Absent on a
+    /// service with none, and on blobs written before the field existed,
+    /// which read as a service with none: what a carried service stated
+    /// before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_through: Option<crate::call_through::StoredCallThrough>,
 }
 
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
@@ -1056,6 +1069,7 @@ impl CloudRepoData {
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }
     }
 }
@@ -2625,6 +2639,7 @@ mod tests {
             dispatch_tables: None,
             possible_calls: None,
             possible_calls_omitted: None,
+            call_through: None,
         }
     }
 
