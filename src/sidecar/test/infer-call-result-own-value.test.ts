@@ -229,7 +229,7 @@ declare const api: {
 };
 declare function summarise(page: Page): string | null;
 declare function readRaw(): Promise<unknown>;
-declare function parseItem(value: unknown): Item;
+function parseItem(value: unknown): Item { return value as Item; }
 declare const url: string;
 
 export async function passedToACall(id: string) {
@@ -467,7 +467,7 @@ describe('carrick#2112: a later expression answers for a call only when it resta
     );
   });
 
-  it('still follows an untyped value into the call that first states its type', async () => {
+  it('still follows an untyped value into a function that returns it unchanged', async () => {
     assert.strictEqual(await callResult('Untyped', 'readRaw()', 'const raw = await readRaw()'), 'Item');
   });
 });
