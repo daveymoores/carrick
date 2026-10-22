@@ -258,6 +258,68 @@ impl<'a> Labels<'a> {
     }
 }
 
+/// The store's key for a global the runtime's types package declares
+/// (`node:web-globals/fetch` for `fetch`), the key the scanner asks
+/// ([`runtime_globals`]). None for any other row.
+fn runtime_global_key(row: &Row) -> Option<String> {
+    (row.decl_package() == Some(RUNTIME_TYPES))
+        .then(|| store_key(row, &[]))
+        .flatten()
+}
+
+/// Whether a call is made on a bare name the file holds no binding for
+/// (`fetch(…)`), so it is read as the language's or the runtime's global.
+fn is_free_name(ir: &FileIr, call: &CallIr) -> bool {
+    call.receiver_spans.is_empty()
+        && root_name(call).is_some_and(|root| !ir.bindings.contains_key(root))
+}
+
+/// The globals a service's calls use that the runtime's types package
+/// declares, by the store's key for the file they are declared in
+/// (carrick#2445): a Node program that loads no DOM library has its
+/// `fetch` from `web-globals/fetch.d.ts` under the runtime's types, not
+/// from a default-library file. Read with the same test discovery reads a
+/// global by ([`Walker::library_end`]).
+pub fn runtime_globals(inputs: &RequestSummaryInputs) -> BTreeMap<String, BTreeSet<String>> {
+    fn walk(
+        inputs: &RequestSummaryInputs,
+        file: &Path,
+        ir: &FileIr,
+        body: &FnIr,
+        out: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        let Some(positions) = inputs.positions.as_ref() else {
+            return;
+        };
+        for (call, _) in body.read_calls() {
+            if !is_free_name(ir, call) {
+                continue;
+            }
+            let Ok(row) = positions.lookup(
+                file,
+                ir.swc_start(call.site.lo),
+                ir.swc_start(call.site.hi),
+                Kind::Call,
+            ) else {
+                continue;
+            };
+            if let (Some(symbol), Some(key)) = (row.symbol(), runtime_global_key(row)) {
+                out.entry(key).or_default().insert(symbol.to_string());
+            }
+        }
+        for inner in body.nested.iter().chain(&body.detached) {
+            walk(inputs, file, ir, inner, out);
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (path, ir) in &inputs.files {
+        for body in ir.functions.values().chain([&ir.module_level]) {
+            walk(inputs, path, ir, body, &mut out);
+        }
+    }
+    out
+}
+
 /// Whether a store key names the language's own library.
 fn is_language_key(package: &str) -> bool {
     package.starts_with("lib.") || package.starts_with("lib:")
@@ -912,9 +974,7 @@ impl Walker<'_> {
         // `fetch(…)`, `new WebSocket(…)`: a name no binding of the file
         // holds, declared by the language's own library or the runtime's
         // types, is the language's global.
-        if binding.is_none()
-            && call.receiver_spans.is_empty()
-            && root.is_some()
+        if is_free_name(ir, call)
             && (row
                 .decl_file()
                 .is_some_and(|declared| declared.starts_with("lib:"))

@@ -350,6 +350,31 @@ pub fn default_library_packages(
         .collect()
 }
 
+/// The globals the runtime's own types declare, as the store is asked about
+/// them (carrick#2445): one package per declaring file, keyed as a runtime
+/// module is (`node:web-globals/fetch`), at the installed runtime types'
+/// version, narrowed to the globals the code uses from it. `globals` is by
+/// that key ([`crate::request_summary::discovery::runtime_globals`]). None
+/// when no runtime types are installed.
+pub fn runtime_global_packages(
+    globals: &BTreeMap<String, BTreeSet<String>>,
+    install: &Install<'_>,
+) -> Vec<RegistryPackage> {
+    let Some(runtime) = installed(RUNTIME_TYPES, install) else {
+        return Vec::new();
+    };
+    globals
+        .iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(key, names)| RegistryPackage {
+            package: key.clone(),
+            version: runtime.version.clone(),
+            specifiers: vec![key.clone()],
+            exports: names.iter().cloned().collect(),
+        })
+        .collect()
+}
+
 /// The entry one specifier is asked under.
 struct AskedAs {
     package: String,

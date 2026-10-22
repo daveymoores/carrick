@@ -4805,20 +4805,18 @@ impl LibraryAsk {
         let home = dirs::home_dir();
         let yarn_registry_env = std::env::var("YARN_NPM_REGISTRY_SERVER").ok();
         let npm_registry_env = std::env::var("NPM_CONFIG_REGISTRY").ok();
-        let asked = crate::library_store::request(
-            &specifiers,
-            &crate::library_store::Install {
-                service_root,
-                repo_root,
-                home: home.as_deref(),
-                yarn_registry_env: yarn_registry_env.as_deref(),
-                npm_registry_env: npm_registry_env.as_deref(),
-            },
-        );
+        let install = crate::library_store::Install {
+            service_root,
+            repo_root,
+            home: home.as_deref(),
+            yarn_registry_env: yarn_registry_env.as_deref(),
+            npm_registry_env: npm_registry_env.as_deref(),
+        };
+        let asked = crate::library_store::request(&specifiers, &install);
         // The language's own library (carrick#2504): the default-library
         // files the compiler read the code's globals from, asked only with
         // site questions on.
-        let library = match inputs
+        let mut library = match inputs
             .positions
             .as_ref()
             .map(|p| p.default_library_globals())
@@ -4828,6 +4826,14 @@ impl LibraryAsk {
             }
             _ => Vec::new(),
         };
+        // And the runtime's own (carrick#2445): the globals its types
+        // declare, for a program that loads no DOM library.
+        if site_questions {
+            library.extend(crate::library_store::runtime_global_packages(
+                &crate::request_summary::discovery::runtime_globals(inputs),
+                &install,
+            ));
+        }
         let asked = crate::library_store::Asked::with_default_library(asked, library)?
             .with_roles(crate::library_store::roles_for(site_questions));
         Some(Self {
@@ -22351,6 +22357,177 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 .unwrap()
                 .contains(&"WebSocket".into()),
             "on: a global the code does not use is not asked"
+        );
+    }
+
+    /// carrick#2445: a service whose program loads no DOM library, its
+    /// `fetch` declared by the runtime's types package.
+    fn runtime_fetch_edit() -> [(&'static str, &'static str); 4] {
+        [
+            (
+                "tsconfig.json",
+                "{\n  \"compilerOptions\": {\n    \"target\": \"es2022\",\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"strict\": true,\n    \"skipLibCheck\": true,\n    \"lib\": [\"es2022\"],\n    \"types\": [\"node\"]\n  },\n  \"include\": [\"src/**/*\"]\n}\n",
+            ),
+            (
+                "node_modules/@types/node/index.d.ts",
+                "/// <reference path=\"child_process.d.ts\" />\n/// <reference path=\"web-globals/fetch.d.ts\" />\n",
+            ),
+            (
+                "node_modules/@types/node/web-globals/fetch.d.ts",
+                "export {};\ndeclare global {\n  function fetch(input: string, init?: unknown): Promise<unknown>;\n}\n",
+            ),
+            (
+                "src/node-fetch.ts",
+                "export function sendNode(): Promise<unknown> {\n  return fetch(\"/node-global\");\n}\n",
+            ),
+        ]
+    }
+
+    /// carrick#2445: a service asks for a global the runtime's types
+    /// declare under the key the store gives the file (`node:web-globals/fetch`),
+    /// at the runtime types' installed version, narrowed to the name, only
+    /// with site questions on; and asks no `lib:` key for it. A program
+    /// that loads the DOM library asks only `lib:lib.dom.d.ts`.
+    #[test]
+    fn a_service_asks_for_the_runtime_s_globals_only_with_site_questions_on() {
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &runtime_fetch_edit(),
+            true,
+        ) else {
+            return;
+        };
+        let root = on.repo.join("services/web");
+        let body = |inputs: &crate::request_summary::RequestSummaryInputs, site_questions| {
+            super::LibraryAsk::of(inputs, &root, &on.repo, Default::default(), site_questions)
+                .map(|ask| serde_json::to_string(&ask.asked.request).unwrap())
+        };
+        let off = body(&on.inputs, false).expect("off: the service asks about its packages");
+        assert!(
+            !off.contains("web-globals") && !off.contains("exports"),
+            "off: the request names no runtime global: {off}"
+        );
+        let request =
+            serde_json::from_str::<serde_json::Value>(&body(&on.inputs, true).unwrap()).unwrap();
+        let packages = request["packages"].as_array().unwrap();
+        let runtime = packages
+            .iter()
+            .find(|package| package["package"] == "node:web-globals/fetch")
+            .expect("on: the runtime's fetch is asked about");
+        assert_eq!(runtime["version"], "22.0.0");
+        assert_eq!(
+            runtime["specifiers"],
+            serde_json::json!(["node:web-globals/fetch"])
+        );
+        assert_eq!(runtime["exports"], serde_json::json!(["fetch"]));
+        assert!(
+            packages
+                .iter()
+                .all(|package| package["package"] != "lib:lib.dom.d.ts"),
+            "on: the DOM library is not loaded, so not asked: {request}"
+        );
+
+        let Some(dom) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &lib_fetch_edit(),
+            true,
+        ) else {
+            return;
+        };
+        let asked =
+            serde_json::from_str::<serde_json::Value>(&body(&dom.inputs, true).unwrap()).unwrap();
+        assert!(
+            asked["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|package| !package["package"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("node:web-globals")),
+            "a DOM program asks only the DOM library: {asked}"
+        );
+    }
+
+    /// carrick#2445: the store's label for the runtime's `fetch`, under the
+    /// key the scanner asked, survives the per-service filter unrenamed and
+    /// makes the call a site keyed as the runtime keys it.
+    #[tokio::test]
+    async fn a_fetch_call_is_a_site_through_the_runtime_s_key() {
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &runtime_fetch_edit(),
+            true,
+        ) else {
+            return;
+        };
+        let root = on.repo.join("services/web");
+        let ask = super::LibraryAsk::of(&on.inputs, &root, &on.repo, Default::default(), true)
+            .expect("the service asks the store");
+        let store = |request: &crate::library_store::LibraryClaimsRequest| {
+            let answers: Vec<serde_json::Value> = request
+                .packages
+                .iter()
+                .filter(|package| package.package.starts_with("node:web-globals/"))
+                .map(|package| {
+                    serde_json::json!({
+                        "package": package.package, "version": package.version,
+                        "status": "answered",
+                        "exports": [{
+                            "specifier": package.package, "export": "fetch",
+                            "role": "http_client", "side": "client",
+                            "makes": [], "scopes": [],
+                            "ops": [{"op": "request", "member": null, "on": "export",
+                                     "name": {"arg": 0}}],
+                            "reserved": [], "calls": [], "patterns": []
+                        }]
+                    })
+                })
+                .collect();
+            serde_json::json!({ "library_claims": answers }).to_string()
+        };
+        let settled = crate::library_store::ask_until_settled(
+            &ask.asked,
+            |_| async {},
+            |request| async move { Ok(store(&request)) },
+            None,
+        )
+        .await;
+        assert_eq!(
+            settled
+                .exports
+                .iter()
+                .map(|export| (export.package.as_str(), export.specifier.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("node:web-globals/fetch", "node:web-globals/fetch")],
+            "the answer survives the filter unrenamed"
+        );
+        let of = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &settled.exports,
+            super::SiteContext::default(),
+        );
+        let sites: Vec<(u32, String, String)> = of
+            .decided
+            .sites
+            .iter()
+            .filter(|site| site.file == "services/web/src/node-fetch.ts")
+            .map(|site| (site.line, site.end.package.clone(), site.end.role.clone()))
+            .collect();
+        assert_eq!(
+            sites,
+            vec![(
+                2,
+                "node:web-globals/fetch".to_string(),
+                "http_client".to_string()
+            )]
         );
     }
 

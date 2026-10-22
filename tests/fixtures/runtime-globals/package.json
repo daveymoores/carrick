@@ -1,0 +1,8 @@
+{
+  "name": "runtime-globals-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  }
+}
