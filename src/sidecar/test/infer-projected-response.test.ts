@@ -41,7 +41,7 @@ interface TransportBody {
 
 declare function request(path: string): Promise<TransportBody>;
 declare function readRaw(path: string): Promise<unknown>;
-declare function parseEnvelope(value: unknown): PreferenceEnvelope;
+function parseEnvelope(value: unknown): PreferenceEnvelope { if (typeof value !== "object" || value === null) throw new Error("not an envelope"); return value as PreferenceEnvelope; }
 declare function store(value: unknown): void;
 
 export async function loadPreferences(): Promise<PreferenceEnvelope> {

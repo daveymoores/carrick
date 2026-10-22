@@ -12,12 +12,14 @@
  * The body read stays the floor it was built to be (carrick#1017): a cast
  * around it is still read off it, and a body read whose value goes nowhere
  * useful keeps its own answer. What changed is that a call which CONSUMES the
- * body read and whose own result the source binds states the payload more
- * precisely, so that call's result wins.
+ * body read, whose own result the source binds, and which states its
+ * argument (a schema, or a function that returns it unchanged) states the
+ * payload more precisely, so that call's result wins. A call that builds a
+ * new value from the body is a converter, and stays out (carrick#2595).
  *
  * Nothing here names a library or a validator: the shape is "the body read is
- * an argument of a call whose result is bound and whose type is an object",
- * which is a shape of the language.
+ * an argument of a call whose result is bound, whose type is an object, and
+ * that returns its argument unchanged", which is a shape of the language.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -38,7 +40,7 @@ interface TransportBody {
 }
 
 declare function request(path: string): Promise<TransportBody>;
-declare function parseEnvelope(value: unknown): PreferenceEnvelope;
+function parseEnvelope(value: unknown): PreferenceEnvelope { return value as PreferenceEnvelope; }
 declare function isEnvelope(value: unknown): boolean;
 declare function store(value: unknown): void;
 declare function enqueue(value: unknown): { jobId: string };

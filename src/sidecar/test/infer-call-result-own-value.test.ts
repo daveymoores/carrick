@@ -216,8 +216,9 @@ describe('carrick#2282: a return statement answers only for a call of its own fu
  *
  * Two readings are kept on purpose. An expression that holds a platform body
  * read that is not json or text (`await res.blob()`) holds the body. And where the call's own value is untyped
- * (`unknown`, `any`), a call that takes it whole is the first place the
- * source states a type for it, so the walk still follows it (carrick#1375).
+ * (`unknown`, `any`), a call that takes it whole and returns it unchanged is
+ * the first place the source states a type for it, so the walk still follows
+ * it (carrick#1375, carrick#2595).
  */
 const LATER_TS = `interface Page { items: { id: string; url: string }[]; nextCursor: string | null }
 interface Item { id: string; name: string }
@@ -229,7 +230,7 @@ declare const api: {
 };
 declare function summarise(page: Page): string | null;
 declare function readRaw(): Promise<unknown>;
-declare function parseItem(value: unknown): Item;
+function parseItem(value: unknown): Item { return value as Item; }
 declare const url: string;
 
 export async function passedToACall(id: string) {
@@ -467,7 +468,7 @@ describe('carrick#2112: a later expression answers for a call only when it resta
     );
   });
 
-  it('still follows an untyped value into the call that first states its type', async () => {
+  it('still follows an untyped value into a function that returns it unchanged', async () => {
     assert.strictEqual(await callResult('Untyped', 'readRaw()', 'const raw = await readRaw()'), 'Item');
   });
 });

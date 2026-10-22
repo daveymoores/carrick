@@ -3605,8 +3605,9 @@ export class TypeInferrer {
     // the response, so the walk below has nothing to follow, and the call
     // itself would stand as the terminal and publish the transport object.
     // The read is the terminal, as it is when the walk finds it on a binding,
-    // and a call that takes the read and states what it returns says more
-    // than the read does (carrick#1382).
+    // and a call that takes the read and states it (a schema, or a function
+    // that returns it unchanged) says more than the read does (carrick#1382,
+    // carrick#2595).
     const inPlaceRead = this.bodyReadOnCallValue(callExpr);
     if (inPlaceRead) {
       return {
@@ -3625,8 +3626,11 @@ export class TypeInferrer {
       /** The value itself was read: returned, passed, aliased, or body-read. */
       let sawWholeRead = false;
       // Where the call's own value states no type, a call that takes it whole
-      // is the first place the source states one, and the walk follows it
-      // (`parse(raw)` after `const raw = await readRaw()`, carrick#1375).
+      // and states it (a schema, or a function that returns it unchanged) is
+      // the first place the source states one, and the walk follows it
+      // (`parse(raw)` after `const raw = await readRaw()`, carrick#1375). A
+      // converter, or a declaration whose body cannot be read, states nothing
+      // about the value (carrick#2595).
       const callValue = this.unwrapPromiseType(callExpr.getType());
       const callValueIsUntyped = callValue.isAny() || callValue.isUnknown();
       // A transport response handed whole to a helper is a body read through
@@ -3739,7 +3743,7 @@ export class TypeInferrer {
           !this.usesNamesOnlyByProjection(expr, currentNames)
         ) {
           if (
-            callValueIsUntyped ||
+            (callValueIsUntyped && this.statesTrackedValue(expr, currentNames)) ||
             this.restatesTrackedValue(expr, currentNames) ||
             this.holdsBinaryBodyRead(expr, currentNames) ||
             (callValueIsTransport && this.handsTrackedValueToACall(expr, currentNames))
@@ -3791,14 +3795,39 @@ export class TypeInferrer {
    * tracked name whole (`const data: T = await parseJson(response, 'op')`).
    */
   private handsTrackedValueToACall(expr: Node, names: string[]): boolean {
-    if (!Node.isVariableDeclaration(expr)) return false;
-    const init = this.unwrapExpressionNode(expr.getInitializer());
-    return (
-      Node.isCallExpression(init) &&
-      init
-        .getArguments()
-        .some((argument) => this.isIdentifierUsage(this.unwrapExpressionNode(argument), names))
-    );
+    return Node.isVariableDeclaration(expr) && this.callTakingTrackedValue(expr, names) !== undefined;
+  }
+
+  /**
+   * The call whose result `expr` declares or assigns a name for, and the
+   * index of its argument that is a tracked name whole, or undefined.
+   */
+  private callTakingTrackedValue(
+    expr: Node,
+    names: string[]
+  ): { call: CallExpression; index: number } | undefined {
+    const value = Node.isVariableDeclaration(expr)
+      ? expr.getInitializer()
+      : Node.isBinaryExpression(expr) && expr.getOperatorToken().getKind() === SyntaxKind.EqualsToken
+        ? expr.getRight()
+        : undefined;
+    const init = this.unwrapExpressionNode(value);
+    if (!Node.isCallExpression(init)) return undefined;
+    const index = init
+      .getArguments()
+      .findIndex((argument) => this.isIdentifierUsage(this.unwrapExpressionNode(argument), names));
+    return index >= 0 ? { call: init, index } : undefined;
+  }
+
+  /**
+   * `expr` names the result of a call that states the tracked value it takes
+   * (`callStatesItsArgument`): a schema validates it, or the callee returns it
+   * unchanged. A converter's result describes what it built from the value,
+   * not the value (carrick#2595).
+   */
+  private statesTrackedValue(expr: Node, names: string[]): boolean {
+    const taking = this.callTakingTrackedValue(expr, names);
+    return !!taking && this.callStatesItsArgument(taking.call, taking.index);
   }
 
   /** `expr` holds a binary whole-body read taken on a tracked name. */
@@ -4440,7 +4469,10 @@ export class TypeInferrer {
    *    serialiser answering `string` describes what the caller did with the
    *    body, not what the body is, and publishing it would be a
    *    concrete-but-wrong contract where the honest `any` of the read is
-   *    merely unresolved.
+   *    merely unresolved;
+   *  - the call states its argument (`callStatesItsArgument`): a schema
+   *    validates it, or the callee returns it unchanged. A converter's
+   *    object result describes what it built, not the body (carrick#2595).
    */
   private statedPayloadAroundBodyRead(bodyRead: Node): Node | undefined {
     return this.receivingCallOf(
@@ -4448,7 +4480,13 @@ export class TypeInferrer {
       (candidate) =>
         Node.isCallExpression(candidate) &&
         this.callResultIsBound(candidate) &&
-        this.isObjectShape(this.unwrapPromiseType(candidate.getType()))
+        this.isObjectShape(this.unwrapPromiseType(candidate.getType())) &&
+        this.callStatesItsArgument(
+          candidate,
+          candidate
+            .getArguments()
+            .findIndex((argument) => argument.getStart() <= bodyRead.getStart() && bodyRead.getEnd() <= argument.getEnd())
+        )
     );
   }
 
@@ -8860,25 +8898,10 @@ export class TypeInferrer {
     found: Array<{ rank: number; text: string; provenance?: TypeProvenance[]; at: Node; how: string }>,
     stateNode: (rank: number, typeNode: Node | undefined, at: Node, how: string) => void
   ): void {
-    const schemaCandidates: Node[] = [];
-    const callee = call.getExpression();
-    if (Node.isPropertyAccessExpression(callee)) schemaCandidates.push(callee.getExpression());
-    call.getArguments().forEach((argument, at) => {
-      if (at !== index) schemaCandidates.push(this.unwrapExpressionNode(argument));
-    });
-    for (const candidate of schemaCandidates) {
-      const candidateType = candidate.getType();
-      if (
-        !this.schemaOutputType(candidateType, candidate) &&
-        !this.schemaInputType(candidateType, candidate)
-      ) {
-        continue;
-      }
-      const contract = this.schemaContract(candidate, 'input');
-      if (contract) {
-        found.push({ rank: 1, text: contract.text, provenance: contract.provenance, at: call, how: 'a schema it is handed to' });
-        return;
-      }
+    const contract = this.schemaHandedArgument(call, index);
+    if (contract) {
+      found.push({ rank: 1, text: contract.text, provenance: contract.provenance, at: call, how: 'a schema it is handed to' });
+      return;
     }
 
     const passThrough = this.passThroughFunction(call, index);
@@ -8904,6 +8927,45 @@ export class TypeInferrer {
     const text = this.structuralTextFromType(parameterType, call);
     if (!text || /\b(any|unknown)\b/.test(text)) return;
     found.push({ rank: 4, text, at: call, how: 'the parameter of a call it is handed to' });
+  }
+
+  /**
+   * The input contract of a schema `call` validates its argument at `index`
+   * with: its receiver (`Schema.safeParse(body)`) or one of its other
+   * arguments (`parse(Schema, body)`), or null. A candidate counts only when
+   * it declares schema types, so no method or library name is matched
+   * (carrick#1166).
+   */
+  private schemaHandedArgument(call: CallExpression, index: number): DeclaredContract | null {
+    const candidates: Node[] = [];
+    const callee = call.getExpression();
+    if (Node.isPropertyAccessExpression(callee)) candidates.push(callee.getExpression());
+    call.getArguments().forEach((argument, at) => {
+      if (at !== index) candidates.push(this.unwrapExpressionNode(argument));
+    });
+    for (const candidate of candidates) {
+      const candidateType = candidate.getType();
+      if (
+        !this.schemaOutputType(candidateType, candidate) &&
+        !this.schemaInputType(candidateType, candidate)
+      ) {
+        continue;
+      }
+      const contract = this.schemaContract(candidate, 'input');
+      if (contract) return contract;
+    }
+    return null;
+  }
+
+  /**
+   * `call`'s result describes the value it takes at argument `index`: it
+   * validates it with a schema, or its callee returns it unchanged
+   * (`passThroughFunction`). Any other call builds something new from the
+   * value, and its result describes what it built, never the value it was
+   * handed (carrick#2595).
+   */
+  private callStatesItsArgument(call: CallExpression, index: number): boolean {
+    return index >= 0 && (!!this.schemaHandedArgument(call, index) || !!this.passThroughFunction(call, index));
   }
 
   /**
