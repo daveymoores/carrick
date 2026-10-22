@@ -143,7 +143,10 @@ function projectComponents(key = ''): ProjectComponents {
         jsonWireDeclarations,
         findDisqualifyingTopTypes as unknown as TopTypeWalk
       ),
-      claimsVerifier: new LibraryClaimsVerifier(project),
+      claimsVerifier: new LibraryClaimsVerifier(project, {
+        packageDirectoryOf: (file) => loader.packageDirectoryOf(file),
+        resolveModule: (name, from, options) => loader.resolveThroughGraph(name, from, options),
+      }),
     };
     components.set(key, built);
   }

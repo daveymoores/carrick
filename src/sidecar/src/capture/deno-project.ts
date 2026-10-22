@@ -296,6 +296,14 @@ export class DenoProject {
     return specifier ? jsrPackageName(specifier) : undefined;
   }
 
+  /** The npm package directory a resolved file lies in, and the package's
+   * name: its cache directory, which carries no `node_modules` segment, so
+   * only the graph can say where the package starts (carrick#2599). */
+  packageDirectoryOf(file: string): { directory: string; name: string } | undefined {
+    const owner = this.npmOwner(path.resolve(file));
+    return owner?.localPath ? { directory: owner.localPath, name: owner.name } : undefined;
+  }
+
   private isNpmFile(file: string): boolean {
     return !!this.npmOwner(file) || file.split(path.sep).includes('node_modules');
   }
