@@ -194,7 +194,6 @@ impl<'a> Labels<'a> {
     /// default library is never `package_unmatched`: its calls are matched
     /// by their global's name, and a call it does not label is no client
     /// call. It is unanswered only when no default-library key is answered.
-
     fn package_reason(&self, key: &str) -> Option<&'static str> {
         let unanswered = |answered: &HashSet<&str>| {
             if is_language_key(key) {
