@@ -184,6 +184,11 @@ pub struct SiteLabel {
     /// label with no `op`): the slot and the form it is claimed for.
     #[serde(default)]
     pub runs: Option<RunsMake>,
+    /// A `receive` op's route fields (#2474 R0): where the handler's request
+    /// holds its path and method. Read by the dispatch routes (R4a); no
+    /// site's state carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<crate::services::type_sidecar::RequestAt>,
 }
 
 /// A maker that runs the function its call supplies at `slot`
@@ -213,6 +218,8 @@ impl SiteLabel {
             handler: Option<ArgSlot>,
             #[serde(default)]
             method: Option<MethodLabel>,
+            #[serde(default)]
+            request: Option<crate::services::type_sidecar::RequestAt>,
         }
         #[derive(Deserialize)]
         struct Export {
@@ -251,6 +258,7 @@ impl SiteLabel {
                         method: op.method,
                         reserved: Vec::new(),
                         runs: None,
+                        request: op.request,
                     });
                 }
             }
@@ -303,6 +311,7 @@ impl SiteLabel {
                             slot: slot(runs),
                             new: *form == MakeForm::New,
                         }),
+                        request: None,
                     });
                     continue;
                 }
@@ -318,6 +327,7 @@ impl SiteLabel {
                     method,
                     method_key,
                     method_default,
+                    request,
                     ..
                 } = claim
                 else {
@@ -345,6 +355,7 @@ impl SiteLabel {
                     method,
                     reserved: reserved_on(&export.claims, member.as_deref(), path, (*on, of)),
                     runs: None,
+                    request: request.as_deref().cloned(),
                 });
             }
         }
@@ -2089,6 +2100,7 @@ pub(crate) mod tests {
                     handler: None,
                     reserved: Vec::new(),
                     runs: None,
+                    request: None,
                     method: Some(MethodLabel {
                         from: None,
                         default: None,
@@ -2107,6 +2119,7 @@ pub(crate) mod tests {
                     handler: None,
                     reserved: Vec::new(),
                     runs: None,
+                    request: None,
                     method: Some(MethodLabel {
                         from: Some(ArgSlot {
                             arg: 1,
@@ -2810,6 +2823,7 @@ pub(crate) mod tests {
             handler: handler.map(|arg| ArgSlot { arg, key: None }),
             reserved: Vec::new(),
             runs: None,
+            request: None,
             method: None,
         }
     }
@@ -2828,6 +2842,7 @@ pub(crate) mod tests {
             handler: None,
             reserved: Vec::new(),
             runs: None,
+            request: None,
             method: Some(MethodLabel {
                 from: Some(ArgSlot {
                     arg: 1,
@@ -2854,6 +2869,7 @@ pub(crate) mod tests {
             handler: None,
             reserved: Vec::new(),
             runs: None,
+            request: None,
             method: None,
         }
     }
@@ -3356,6 +3372,7 @@ pub(crate) mod tests {
             handler: None,
             reserved: Vec::new(),
             runs: None,
+            request: None,
             method: Some(MethodLabel {
                 from: None,
                 default: None,

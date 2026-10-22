@@ -160,6 +160,7 @@ fn labels() -> Vec<SiteLabel> {
         reserved: Vec::new(),
         runs: None,
         method: None,
+        request: None,
     };
     vec![
         label("Server", Some("server")),

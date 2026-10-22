@@ -5207,6 +5207,9 @@ fn site_records_of(
         .count();
     let discovered = discovered_sites(discovery);
     let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
+    if context.declarations.is_some() {
+        log_dispatch_routes(inputs, &discovered, &labels, root);
+    }
     // With the receiver trace on, each site also names its instance
     // (carrick#2474 R2a): read by nothing.
     let mut decided = match context.declarations {
@@ -5243,6 +5246,37 @@ fn site_records_of(
         records,
         labels,
     }
+}
+
+/// The routes a hand-written dispatch states (carrick#2474 R4a), with the
+/// receiver trace on: one run-log line per route and one summary, then
+/// dropped. Nothing reaches the blob.
+fn log_dispatch_routes(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    discovered: &[crate::request_summary::decided_sites::DiscoverySite],
+    labels: &[crate::request_summary::decided_sites::SiteLabel],
+    root: &Path,
+) {
+    let started = std::time::Instant::now();
+    let dispatch =
+        crate::request_summary::dispatch::dispatch_routes(inputs, discovered, labels, root);
+    for route in &dispatch.routes {
+        debug!(
+            file = %route.file,
+            line = route.line,
+            method = %route.method.as_deref().unwrap_or("-"),
+            path = %route.path,
+            evidence = %route.evidence.kind(),
+            "receiver trace: dispatch route"
+        );
+    }
+    debug!(
+        routes = dispatch.routes.len(),
+        scopes = dispatch.scopes.len(),
+        not_routes = dispatch.not_routes.values().sum::<usize>(),
+        ms = started.elapsed().as_millis() as u64,
+        "receiver trace: dispatch routes"
+    );
 }
 
 /// `sites` read through `claims`, each verified by the sidecar against the
