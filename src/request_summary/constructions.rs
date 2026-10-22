@@ -130,16 +130,22 @@ fn states_text(value: &Value) -> bool {
         return false;
     };
     !pieces.is_empty()
-        && pieces.iter().all(|piece| match piece {
-            Piece::Lit(_) => true,
-            Piece::Opaque {
-                end: Root::Env { .. },
-                link: None,
-                ..
-            } => true,
-            _ => false,
+        && pieces.iter().all(|piece| {
+            matches!(
+                piece,
+                Piece::Lit(_)
+                    | Piece::Opaque {
+                        end: Root::Env { .. },
+                        link: None,
+                        ..
+                    }
+            )
         })
 }
+
+/// Each default a parameter, or a key of a destructured one, is given: its
+/// position, the keys down to it and what it may hold.
+pub(super) type ParamDefaults = Vec<(usize, Vec<String>, Vec<ValueAt>)>;
 
 impl TextOrigin {
     /// What the construction `call` passes for the field: `None` when it
@@ -191,10 +197,7 @@ impl Reader<'_> {
         &self,
         ctor: &Constructor,
         module: &ModuleScope,
-    ) -> (
-        HashMap<String, FieldOrigin>,
-        Vec<(usize, Vec<String>, Vec<ValueAt>)>,
-    ) {
+    ) -> (HashMap<String, FieldOrigin>, ParamDefaults) {
         let module_scope = Scope::module(module);
         let stated = |expr: &Expr| Some(self.eval(expr, &module_scope)).filter(states_text);
         let mut fields: HashMap<String, FieldOrigin> = HashMap::new();
