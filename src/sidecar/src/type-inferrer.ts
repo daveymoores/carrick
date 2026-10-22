@@ -3360,7 +3360,25 @@ export class TypeInferrer {
     // as the body publishes the wrong contract. Follow the call's signature to
     // the argument it sends as the body.
     let inCall = this.requestBodyInCall(unwrapped);
-    if (inCall.kind === 'none') inCall = this.bodyBuiltByCallee(unwrapped);
+    if (inCall.kind === 'none') {
+      // carrick#2628: the argument goes into a function that builds the body
+      // itself. An abstain here is a decision: capture's own re-read of the
+      // locator would publish the argument as the body.
+      const built = this.bodyBuiltByCallee(unwrapped);
+      if (built.kind === 'abstain') {
+        this.log(
+          `Request locator at ${request.file_path}:${request.line_number}: ${built.why}; ` +
+            'the argument is not the body'
+        );
+        return this.decidedAbstain(request, this.getNodeLocation(unwrapped), {
+          path: '',
+          kind: 'unknown',
+          reason: 'body_built_by_callee',
+          detail: `the located argument is not the request body: ${built.why}`,
+        });
+      }
+      inCall = built;
+    }
     if (inCall.kind === 'body') {
       this.log(
         `Request locator at ${request.file_path}:${request.line_number} names ${inCall.from}; ` +
@@ -8383,8 +8401,8 @@ export class TypeInferrer {
     }
     const at = types[0];
     const type = at.getType();
-    if (type.isAny() || type.isUnknown() || type.isTypeParameter()) {
-      return { kind: 'abstain', why: `the body the called function builds is not typed (${from})` };
+    if (type.isTypeParameter() || printedTypeHoldsTopType([...texts][0])) {
+      return { kind: 'abstain', why: `the body the called function builds is not fully typed (${from})` };
     }
     return { kind: 'body_type', type, at, from };
   }

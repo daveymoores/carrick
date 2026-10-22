@@ -106,7 +106,11 @@ export const tools = [
 interface Inferred {
   alias: string;
   type_string: string;
+  any_provenance?: Array<{ path: string; reason: string }>;
 }
+
+/** An answer of `unknown` the inferrer decided, so capture keeps it rather than re-reading the argument. */
+const DECIDED = 'unknown (body_built_by_callee)';
 
 const collapse = (text: string): string => text.replace(/\s+/g, ' ').trim();
 
@@ -172,7 +176,10 @@ describe('carrick#2628: a call into a client method that builds the request insi
       ],
     });
     const inferred = (res.inferred_types ?? []).find((t) => t.alias === alias);
-    return inferred ? collapse(inferred.type_string) : undefined;
+    if (!inferred) return undefined;
+    const root = (inferred.any_provenance ?? []).find((p) => p.path === '');
+    const text = collapse(inferred.type_string);
+    return text === 'unknown' && root ? `${text} (${root.reason})` : text;
   }
 
   it('reads the body the method wraps its argument into, never the argument', async () => {
@@ -186,16 +193,14 @@ describe('carrick#2628: a call into a client method that builds the request insi
     assert.strictEqual(body, '{ note: string; }');
   });
 
-  it('leaves the request unresolved when the method wraps the argument into something it does not send as a body', async () => {
+  it('decides no request when the method wraps the argument into something it does not send as a body', async () => {
     const body = await infer('input.labels', 'request_body');
-    assert.strictEqual(body, undefined);
+    assert.strictEqual(body, DECIDED);
   });
 
-  it('reads the body the method derives from its argument, without the cast that hides it', async () => {
+  it('decides no request when the body the method derives from its argument holds no type', async () => {
     const body = await infer('input.event', 'request_body');
-    assert.notStrictEqual(body, undefined);
-    assert.doesNotMatch(body!, /undefined/);
-    assert.strictEqual(body, '{ [x: string]: unknown; }');
+    assert.strictEqual(body, DECIDED);
   });
 
   it("reads the call's own result, not the handler's object built around it", async () => {

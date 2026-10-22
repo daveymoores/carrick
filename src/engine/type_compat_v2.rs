@@ -482,12 +482,16 @@ fn path_names_a_member(path: &str) -> bool {
 /// payload (carrick#1375). `serialised_body_unread`: a handler returns a status
 /// and a body string it serialised itself, and a return builds that string in a
 /// way the inferrer cannot read, so the envelope is never the contract
-/// (carrick#2200).
+/// (carrick#2200). `body_built_by_callee`: a request locator names an
+/// argument of a call into a function that builds the body from it, and the
+/// body it builds cannot be typed, so the argument is not the body
+/// (carrick#2628).
 const DECIDED_ABSTAIN_REASONS: &[&str] = &[
     "no_success_payload",
     "no_request_body",
     "projected_value_only",
     "serialised_body_unread",
+    "body_built_by_callee",
 ];
 
 /// True when an inference answered a bare top type because the inferrer read
@@ -5272,6 +5276,43 @@ mod tests {
                 assert_eq!(type_text, "unknown");
             }
             other => panic!("an unread serialised body must stay a literal unknown, got {other:?}"),
+        }
+    }
+
+    /// carrick#2628: a request locator on an argument of a call into a
+    /// function that builds the body from it in a way the inferrer cannot
+    /// type is answered `unknown` with `body_built_by_callee`. That is a
+    /// decision: the capture's raw locator re-run would publish the
+    /// argument (`string[]`) as the body the function wraps (`{ tags }`).
+    #[test]
+    fn derive_anchors_keeps_a_body_built_by_the_callee_decision() {
+        let mut decided = inferred("Endpoint_tags_Request", "unknown", None, None);
+        decided.infer_kind = InferKind::RequestBody;
+        decided.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "body_built_by_callee".to_string(),
+            detail: None,
+        }];
+        assert!(
+            inference_decided_no_contract(&decided),
+            "a body the callee builds is a decided abstain"
+        );
+
+        let mut request = response_body_infer("Endpoint_tags_Request");
+        request.infer_kind = InferKind::RequestBody;
+
+        let anchors = derive_capture_anchors(&[], &[request], &[], &[decided], &[], "/repo");
+
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        match &anchors[0] {
+            CaptureAnchor::Literal {
+                alias, type_text, ..
+            } => {
+                assert_eq!(alias, "Endpoint_tags_Request");
+                assert_eq!(type_text, "unknown");
+            }
+            other => panic!("a body the callee builds must stay a literal unknown, got {other:?}"),
         }
     }
 
