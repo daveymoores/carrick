@@ -1292,11 +1292,13 @@ async fn a_file_with_a_final_answer_is_not_asked_again_in_the_run() {
     assert_eq!(waited, std::time::Duration::ZERO);
 
     let losses = carrick::scan_health::service_losses(Some("beta"));
-    let lost = carrick::scan_health::unanalysed_files_for(Some("beta"));
+    let owed = carrick::scan_health::unanalysed_files_for(Some("beta"));
+    let lost = carrick::scan_health::final_losses_for(Some("beta"));
     // The run's losses are the process's: what this scan leaves on beta
     // would be owed by beta in every later scan of this binary.
     carrick::scan_health::forget_service_losses(Some("beta"));
     assert_eq!((losses.files, losses.final_files), (1, 1), "{losses:?}");
+    assert!(owed.is_empty(), "a final loss is not owed: {owed:?}");
     assert_eq!(lost.len(), 1, "{lost:?}");
     assert!(lost[0].path.ends_with("server.ts"), "{lost:?}");
     assert_eq!(

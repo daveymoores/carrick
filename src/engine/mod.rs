@@ -1412,7 +1412,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     if let Some(ref types_lost) = types_lost {
         headline.push_str(&format!("; {}", types_lost));
     }
-    let owing = runs.iter().filter(|run| !run.owed.is_empty()).count();
+    // A service whose only debt is files lost for good is complete
+    // (carrick#2488): the closing summary lists it as such.
+    let owing = runs
+        .iter()
+        .filter(|run| !run.owed.is_empty() && !run.owed.owes_only_final_files())
+        .count();
     if owing > 0 {
         headline.push_str(&format!("; {owing} service(s) pending model analysis"));
     }

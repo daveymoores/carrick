@@ -531,7 +531,11 @@ pub struct SdkUnresolved {
 /// Sent with the write actions so the cloud can apply its first-scan partial
 /// rule: a service with no hosted rows accepts the partial index and echoes
 /// this list back, and a service that already has rows refuses it. `reason` is
-/// [`crate::agent_service::AgentCallError::code`] verbatim.
+/// [`crate::agent_service::AgentCallError::code`] verbatim, or the scanner's
+/// own code for a file it never sent (`file_too_large`).
+///
+/// The same shape names a file lost for good (`final_losses`, carrick#2488),
+/// which the partial rule never counts.
 ///
 /// A file a budget refused is never in this list (carrick#555): nothing failed
 /// there, so there is nothing for the cloud to decide about.

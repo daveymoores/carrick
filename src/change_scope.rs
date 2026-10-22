@@ -402,10 +402,14 @@ fn owed_work(stored: &CloudRepoData, this_run: ThisRun<'_>) -> Option<String> {
         return Some("the stored index was written without its extraction config".to_string());
     }
     let boundary = stored.boundary.as_ref()?;
-    if boundary.files_lost.total > 0 {
+    // A file whose answer was final is lost the same way by every scan of
+    // its bytes, so it is not owed (carrick#2488): a changed file is
+    // analysed afresh through the changed-file path, not through this one.
+    let final_losses = boundary.final_losses.as_ref().map_or(0, |f| f.total);
+    let owed_files = boundary.files_lost.total.saturating_sub(final_losses);
+    if owed_files > 0 {
         return Some(format!(
-            "the stored index owes {} file(s) model analysis",
-            boundary.files_lost.total
+            "the stored index owes {owed_files} file(s) model analysis"
         ));
     }
     match boundary.candidates_awaiting_model {
@@ -1260,6 +1264,32 @@ mod tests {
         });
         assert_eq!(
             reason(&decide_with(Some(&lost), Ok(&changes), api_inputs())),
+            Some(Reason::StoredIncomplete)
+        );
+        // carrick#2488: a file lost for good is not owed, so a blob whose
+        // only losses are final is complete; one owed file beside them is not.
+        let mut lost_for_good = stored("abcdef1234");
+        lost_for_good.boundary = Some(crate::boundary::ServiceBoundary {
+            files_lost: crate::boundary::Counted::new(2, Vec::new()),
+            final_losses: Some(crate::boundary::Counted::new(2, Vec::new())),
+            ..Default::default()
+        });
+        assert_eq!(
+            reason(&decide_with(
+                Some(&lost_for_good),
+                Ok(&changes),
+                api_inputs()
+            )),
+            None
+        );
+        let mut one_owed = stored("abcdef1234");
+        one_owed.boundary = Some(crate::boundary::ServiceBoundary {
+            files_lost: crate::boundary::Counted::new(2, Vec::new()),
+            final_losses: Some(crate::boundary::Counted::new(1, Vec::new())),
+            ..Default::default()
+        });
+        assert_eq!(
+            reason(&decide_with(Some(&one_owed), Ok(&changes), api_inputs())),
             Some(Reason::StoredIncomplete)
         );
         let mut reconfigured = stored("abcdef1234");
