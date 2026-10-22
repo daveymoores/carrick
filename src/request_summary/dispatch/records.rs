@@ -354,6 +354,32 @@ pub fn handler_records(
     out
 }
 
+/// The line ranges of a function on lines `start..=end` that its code shows:
+/// the whole function up to [`WHOLE_LINES`] lines; a longer one as its first
+/// line and [`BEFORE`] lines before and [`AFTER`] after each line in
+/// `marks`, ranges that touch or overlap merged.
+fn windows(start: u32, end: u32, marks: &BTreeSet<u32>) -> Vec<(u32, u32)> {
+    if end - start < WHOLE_LINES {
+        return vec![(start, end)];
+    }
+    let mut ranges: Vec<(u32, u32)> = vec![(start, start)];
+    for line in marks.iter().filter(|line| **line >= start && **line <= end) {
+        ranges.push((
+            line.saturating_sub(BEFORE).max(start),
+            (line + AFTER).min(end),
+        ));
+    }
+    ranges.sort();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (lo, hi) in ranges {
+        match merged.last_mut() {
+            Some(last) if lo <= last.1 + 1 => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged
+}
+
 /// The literals in `list` that `keep` keeps: function, guard and text.
 fn stated_where<'g>(
     list: &[Stated<'g>],
@@ -582,25 +608,7 @@ impl Builder<'_, '_> {
     fn code(&self, node: usize, marks: &BTreeSet<u32>) -> String {
         let text = self.text(node);
         let (start, end) = self.lines(node, &text);
-        if end - start < WHOLE_LINES {
-            return numbered(&text, start, end);
-        }
-        let mut ranges: Vec<(u32, u32)> = vec![(start, start)];
-        for line in marks.iter().filter(|line| **line >= start && **line <= end) {
-            ranges.push((
-                line.saturating_sub(BEFORE).max(start),
-                (line + AFTER).min(end),
-            ));
-        }
-        ranges.sort();
-        let mut merged: Vec<(u32, u32)> = Vec::new();
-        for (lo, hi) in ranges {
-            match merged.last_mut() {
-                Some(last) if lo <= last.1 + 1 => last.1 = last.1.max(hi),
-                _ => merged.push((lo, hi)),
-            }
-        }
-        merged
+        windows(start, end, marks)
             .iter()
             .map(|(lo, hi)| numbered(&text, *lo, *hi))
             .collect::<Vec<_>>()
@@ -934,5 +942,25 @@ impl Builder<'_, '_> {
             .key
             .clone()
             .unwrap_or_else(|| "(anonymous)".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A function under 120 lines is shown whole; a longer one as its first
+    /// line and 4 lines before and 2 after each comparison, overlapping
+    /// windows merged and the last cut at the function's end.
+    #[test]
+    fn a_long_function_is_shown_in_windows_around_its_comparisons() {
+        let marks = BTreeSet::from([5, 50, 53, 199]);
+        assert_eq!(windows(10, 129, &marks), vec![(10, 129)]);
+        assert_eq!(windows(1, 200, &marks), vec![(1, 7), (46, 55), (195, 200)]);
+        // A mark outside the function shows nothing more.
+        assert_eq!(
+            windows(100, 300, &BTreeSet::from([5, 150])),
+            vec![(100, 100), (146, 152)]
+        );
     }
 }
