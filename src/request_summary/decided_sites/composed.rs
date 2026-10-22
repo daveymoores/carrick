@@ -20,7 +20,6 @@ use serde::Serialize;
 use super::super::RequestSummaryInputs;
 use super::instances::{
     InstanceAt, InstanceEnd, InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, WalkIndex,
-    prefix_of,
 };
 use super::{Calls, Placed, relative};
 
@@ -120,7 +119,7 @@ pub(super) fn mount_edges<'a>(
                     child: (file.clone(), *line),
                     at: format!("{}:{}", relative(root, placed.file), placed.call.site.line),
                     member: label.member.clone(),
-                    prefix: prefix_of(&placed, &label.name),
+                    prefix: walk().prefix_of(&placed, &label.name, None),
                     parents: parents.clone(),
                 });
             }

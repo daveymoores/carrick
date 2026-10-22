@@ -2596,6 +2596,10 @@ mod tests {
             "src/shared.ts:8 <- /b/ping",
             "src/users.ts:8 <- /v1/users",
             "src/users.ts:9 <- /v1/users/:id",
+            // A prefix the helper takes as a parameter: each call that
+            // fills it states a value (carrick#2635).
+            "src/versioned.ts:10 <- /v10/ping (entry_point)",
+            "src/versioned.ts:10 <- /v9/ping (entry_point)",
         ]);
         assert_eq!(got, want, "{got:#?}");
         // No scope claim verified: no scope or mount edge, every plugin's
@@ -2668,65 +2672,36 @@ mod tests {
             "src/errors.ts:10 <- /internal/status (entry_point) via src/status-index.ts:5 register /internal",
             "src/handler.ts:4 <- /me (entry_point) via ",
             "src/helper-local.ts:4 <- /api/v1/local (entry_point) via src/helper-local.ts:8 register /api/v1",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
-            "src/item-detail.ts:3 <- ? (entry_point) via src/documented.ts:5 register ?opts.prefix > src/documented.ts:7 register -",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
-            "src/item-detail.ts:3 <- ? (entry_point) via src/two-options.ts:5 register ?opts.prefix > src/two-options.ts:7 register -",
+            // A default (`opts.prefix ?? '/api/v1'`, `||`, a parameter
+            // default) and a conditional state each of their values, one
+            // route each (carrick#2635, carrick#2474 Q2). A parameter takes
+            // what each caller hands in (here the options `register` hands
+            // the plugin it runs, `/root` for `nullish.ts`) and the default.
+            // A parameter nothing fills and no default states is unread.
+            "src/item-detail.ts:3 <- /api/v1/items/:id (entry_point) via src/documented.ts:5 register /api/v1 > src/documented.ts:7 register -",
+            "src/item-detail.ts:3 <- /api/v1/items/:id (entry_point) via src/two-options.ts:5 register /api/v1 > src/two-options.ts:7 register -",
             "src/items.ts:3 <- /a/items (entry_point) via src/two-scopes.ts:6 register /a > src/two-scopes.ts:8 register -",
+            "src/items.ts:3 <- /api/v1/items (entry_point) via src/silent.ts:5 register /api/v1 > src/silent.ts:7 register -",
+            "src/items.ts:3 <- /api/v2/items (entry_point) via src/either.ts:5 register /api/v2 > src/either.ts:7 register -",
+            "src/items.ts:3 <- /api/v3/items (entry_point) via src/ternary.ts:5 register /api/v3|/legacy > src/ternary.ts:7 register -",
+            "src/items.ts:3 <- /api/v4/items (entry_point) via src/param-default.ts:5 register /api/v4 > src/param-default.ts:7 register -",
             "src/items.ts:3 <- /api/v5/items (entry_point) via src/const-prefix.ts:7 register /api/v5 > src/const-prefix.ts:9 register -",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
-            "src/items.ts:3 <- ? (entry_point) via src/either.ts:5 register ?opts.prefix > src/either.ts:7 register -",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
-            "src/items.ts:3 <- ? (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register ?opts.prefix > src/nullish.ts:7 register -",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
-            "src/items.ts:3 <- ? (entry_point) via src/param-default.ts:5 register ?prefix > src/param-default.ts:7 register -",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
-            "src/items.ts:3 <- ? (entry_point) via src/silent.ts:5 register ?opts.prefix > src/silent.ts:7 register -",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
-            "src/items.ts:3 <- ? (entry_point) via src/ternary.ts:5 register ?opts.legacy ? '/legacy' : '/api/v3' > src/ternary.ts:7 register -",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/items.ts:3 <- /legacy/items (entry_point) via src/ternary.ts:5 register /api/v3|/legacy > src/ternary.ts:7 register -",
+            "src/items.ts:3 <- /root/api/v1/items (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /api/v1|/root > src/nullish.ts:7 register -",
+            "src/items.ts:3 <- /root/root/items (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /api/v1|/root > src/nullish.ts:7 register -",
             "src/items.ts:3 <- ? (entry_point) via src/unread.ts:5 register ? > src/unread.ts:7 register -",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
-            "src/nullish.ts:8 <- ? (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register ?opts.prefix",
+            "src/nullish.ts:8 <- /root/api/v1/health (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /api/v1|/root",
+            "src/nullish.ts:8 <- /root/root/health (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /api/v1|/root",
             "src/orders.ts:3 <- /b/orders (entry_point) via src/two-scopes.ts:12 register /b > src/two-scopes.ts:14 register -",
             "src/orders.ts:3 <- /orders (entry_point) via src/no-options.ts:5 register - > src/no-options.ts:6 register -",
             "src/orders.ts:3 <- /v2/orders (entry_point) via src/group.ts:5 group /v2 > src/group.ts:5 register -",
             "src/pair.ts:4 <- /api/v1/left (entry_point) via src/helper-pair.ts:5 register /api/v1",
             "src/pair.ts:8 <- /api/v1/right (entry_point) via src/helper-pair.ts:5 register /api/v1",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
-            "src/reports.ts:11 <- ? (entry_point) via src/documented-modes.ts:5 register ?opts.prefix > src/documented-modes.ts:7 register -",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
-            "src/reports.ts:15 <- ? (entry_point) via src/documented-modes.ts:5 register ?opts.prefix > src/documented-modes.ts:7 register -",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
-            "src/reports.ts:5 <- ? (entry_point) via src/documented-modes.ts:5 register ?opts.prefix > src/documented-modes.ts:7 register -",
-            // A prefix read off a parameter, a default (`??`, `||`, a parameter
-            // default) or a conditional is recorded unread (`?`): the value
-            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
-            "src/reports.ts:9 <- ? (entry_point) via src/documented-modes.ts:5 register ?opts.prefix > src/documented-modes.ts:7 register -",
+            "src/reports.ts:11 <- /api/v1/feed (entry_point) via src/documented-modes.ts:5 register /api/v1 > src/documented-modes.ts:7 register -",
+            "src/reports.ts:15 <- /api/v1/reports (entry_point) via src/documented-modes.ts:5 register /api/v1 > src/documented-modes.ts:7 register -",
+            "src/reports.ts:5 <- /api/v1/reports/:id (entry_point) via src/documented-modes.ts:5 register /api/v1 > src/documented-modes.ts:7 register -",
+            "src/reports.ts:9 <- /api/v1/reports/:id/lines (entry_point) via src/documented-modes.ts:5 register /api/v1 > src/documented-modes.ts:7 register -",
+            "src/reports.ts:9 <- /api/v1/reports/:id/notes (entry_point) via src/documented-modes.ts:5 register /api/v1 > src/documented-modes.ts:7 register -",
             "src/request-hooks.ts:9 <- /hook-status (entry_point) via ",
             "src/team-items.ts:3 <- /a/teams/:id/items (entry_point) via src/helper-two-scopes-chain.ts:5 register /a",
             "src/team-items.ts:3 <- /a/teams/:id/items (entry_point) via src/helper-two-scopes.ts:5 register /a",
@@ -2781,7 +2756,7 @@ mod tests {
             "packages/routes/src/computed-routes.ts:3 <- /teams/:id/computed (entry_point) via ",
             "packages/routes/src/legacy.ts:3 <- /teams/:id/legacy (entry_point) via ",
             "packages/routes/src/notes.ts:7 <- /teams/:id/notes (entry_point) via ",
-            "packages/routes/src/orders.ts:3 <- ? (entry_point) via packages/routes/src/plugin.ts:13 register ?opts.prefix > packages/routes/src/plugin.ts:15 register -",
+            "packages/routes/src/orders.ts:3 <- /api/v1/orders (entry_point) via packages/routes/src/plugin.ts:13 register /api/v1 > packages/routes/src/plugin.ts:15 register -",
             "packages/routes/src/root-routes.ts:3 <- /teams/:id/root (entry_point) via ",
             "packages/routes/src/shared.ts:5 <- /admin/keys (entry_point) via ",
             "packages/routes/src/shared.ts:9 <- /public/keys (entry_point) via ",

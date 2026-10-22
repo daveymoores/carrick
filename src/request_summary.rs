@@ -935,6 +935,20 @@ struct ArgHeld {
     /// before it: where a compiler row names what a name there declares
     /// (carrick#2474 R2b).
     span: Option<(u32, u32)>,
+    /// Every way the value reads where the source states more than one
+    /// (carrick#2635).
+    alts: ArgAlts,
+}
+
+/// The values an argument may take, one list of pieces per way it reads,
+/// where it holds a default (`opts.prefix ?? '/api'`, `a || b`, a defaulted
+/// parameter) or a conditional (carrick#2635): the whole argument, and each
+/// plain key of an object literal written there. A value with one reading
+/// is not here. Read by the receiver trace alone.
+#[derive(Debug, Clone, Default)]
+struct ArgAlts {
+    whole: Vec<Vec<Piece>>,
+    keys: BTreeMap<String, Vec<Vec<Piece>>>,
 }
 
 /// What the receiver trace reads at one call (carrick#2474 R2a): the
@@ -3965,6 +3979,13 @@ struct Scope<'a> {
     /// nested pattern: each may hold something other than what the caller
     /// wrote under that key.
     keyed: HashMap<BindingKey, (usize, String)>,
+    /// Each parameter, or key of an object parameter, the function gives a
+    /// default (`prefix = '/api'`, `{ prefix = '/api' } = {}`): the
+    /// parameter's position, the key (`None`: the parameter itself) and the
+    /// default as written. Never a binding the body assigns again. Read by
+    /// the receiver trace alone (carrick#2635), which states both what a
+    /// caller hands in and the default.
+    defaults: HashMap<BindingKey, (usize, Option<String>, Expr)>,
     /// The rest element of a parameter the body unpacks (`const { path,
     /// ...rest } = config`, or `= init ?? {}`), with the parameter's
     /// position and every key the pattern takes out (carrick#2519): it holds
@@ -4029,6 +4050,7 @@ impl<'a> Scope<'a> {
         Self {
             params: Vec::new(),
             keyed: HashMap::new(),
+            defaults: HashMap::new(),
             rest_of: HashMap::new(),
             key_objects: HashSet::new(),
             outer_objects: HashMap::new(),
@@ -4105,11 +4127,37 @@ impl<'a> Scope<'a> {
             {
                 self.param_verbs.insert(index, verbs);
             }
+            // `prefix = '/api'`: the parameter, or one key of an object
+            // parameter, with a default (carrick#2635).
+            if let Pat::Assign(assign) = pat
+                && let Some(binding) = &key
+                && settled(binding)
+            {
+                self.defaults
+                    .insert(binding.clone(), (index, None, (*assign.right).clone()));
+            }
             self.params.push(key);
             if let Pat::Object(object) = pattern {
                 for (binding, key) in keyed_names(object) {
                     if settled(&binding) {
                         self.keyed.insert(binding, (index, key));
+                    }
+                }
+                for prop in &object.props {
+                    if let ObjectPatProp::Assign(assign) = prop
+                        && let Some(default) = &assign.value
+                    {
+                        let binding = ident_key(&assign.key.id);
+                        if settled(&binding) {
+                            self.defaults.insert(
+                                binding,
+                                (
+                                    index,
+                                    Some(assign.key.id.sym.to_string()),
+                                    (**default).clone(),
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -4207,6 +4255,63 @@ impl Reader<'_> {
         }
     }
 
+    /// Every way `expr` reads, one list of pieces each, where it holds a
+    /// default or a conditional (carrick#2635); empty where it reads one
+    /// way. `eval` reads the same expressions as one opaque value, which
+    /// the send side keys rows on, so this is a separate reading, for the
+    /// receiver trace alone.
+    fn stated_ways(&self, expr: &Expr, scope: &Scope<'_>) -> Vec<Vec<Piece>> {
+        // Most arguments state one value: read no further.
+        let branching = match unwrap_value(expr) {
+            Expr::Bin(bin) => matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr),
+            Expr::Cond(_) => true,
+            Expr::Ident(ident) => scope.defaults.contains_key(&ident_key(ident)),
+            _ => false,
+        };
+        if !branching {
+            return Vec::new();
+        }
+        let ways = self.ways(expr, scope);
+        if ways.len() > 1 { ways } else { Vec::new() }
+    }
+
+    fn ways(&self, expr: &Expr, scope: &Scope<'_>) -> Vec<Vec<Piece>> {
+        match unwrap_value(expr) {
+            // `opts.prefix ?? '/api'`: the left side, then the default.
+            Expr::Bin(bin) if bin.op == BinaryOp::NullishCoalescing => {
+                let mut ways = self.ways(&bin.left, scope);
+                ways.extend(self.ways(&bin.right, scope));
+                ways
+            }
+            // `opts.prefix || '/api'`.
+            Expr::Bin(bin) if bin.op == BinaryOp::LogicalOr => {
+                let mut ways = self.ways(&bin.left, scope);
+                ways.extend(self.ways(&bin.right, scope));
+                ways
+            }
+            // `opts.legacy ? '/legacy' : '/api'`: each branch.
+            Expr::Cond(cond) => {
+                let mut ways = self.ways(&cond.cons, scope);
+                ways.extend(self.ways(&cond.alt, scope));
+                ways
+            }
+            // A parameter with a default: what a caller hands in, then
+            // the default.
+            Expr::Ident(ident) if scope.defaults.contains_key(&ident_key(ident)) => {
+                let (index, key, default) = &scope.defaults[&ident_key(ident)];
+                let name = ident.sym.to_string();
+                let own = match key {
+                    Some(key) => Piece::ParamKey(*index, key.clone(), name),
+                    None => Piece::Param(*index, name),
+                };
+                let mut ways = vec![vec![own]];
+                ways.extend(self.ways(default, scope));
+                ways
+            }
+            other => vec![self.eval(other, scope).pieces()],
+        }
+    }
+
     /// What the receiver trace reads at a call whose callee is `callee`,
     /// handed `args` ([`InstanceIr`]). The receiver's value is read only
     /// for a name or a member read: a call's value is no parameter.
@@ -4262,10 +4367,47 @@ impl Reader<'_> {
                         .collect(),
                     _ => BTreeMap::new(),
                 };
+                let alts = match unwrap_value(&arg.expr) {
+                    Expr::Object(object) => ArgAlts {
+                        whole: Vec::new(),
+                        keys: object
+                            .props
+                            .iter()
+                            .filter_map(|prop| {
+                                let PropOrSpread::Prop(prop) = prop else {
+                                    return None;
+                                };
+                                let (name, value) = match &**prop {
+                                    Prop::Shorthand(ident) => {
+                                        (ident.sym.to_string(), Expr::Ident(ident.clone()))
+                                    }
+                                    Prop::KeyValue(entry) => (
+                                        match &entry.key {
+                                            PropName::Ident(name) => name.sym.to_string(),
+                                            PropName::Str(text) => {
+                                                text.value.to_string_lossy().into_owned()
+                                            }
+                                            _ => return None,
+                                        },
+                                        (*entry.value).clone(),
+                                    ),
+                                    _ => return None,
+                                };
+                                let ways = self.stated_ways(&value, scope);
+                                (!ways.is_empty()).then_some((name, ways))
+                            })
+                            .collect(),
+                    },
+                    expr => ArgAlts {
+                        whole: self.stated_ways(expr, scope),
+                        keys: BTreeMap::new(),
+                    },
+                };
                 ArgHeld {
                     whole: self.held(&arg.expr, scope),
                     keys,
                     span: Some((span.lo.0, span.hi.0)),
+                    alts,
                 }
             })
             .collect();
@@ -4714,6 +4856,7 @@ impl Reader<'_> {
         let mut scope = Scope {
             params: Vec::new(),
             keyed: HashMap::new(),
+            defaults: HashMap::new(),
             rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
             outer_objects: captured.objects.clone(),
@@ -4769,6 +4912,7 @@ impl Reader<'_> {
         let mut scope = Scope {
             params: Vec::new(),
             keyed: HashMap::new(),
+            defaults: HashMap::new(),
             rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
             outer_objects: captured.objects.clone(),

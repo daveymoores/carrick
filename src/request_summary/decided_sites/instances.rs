@@ -31,7 +31,7 @@
 //! into each site's composed path ([`super::composed`]).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -767,7 +767,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 file: relative(self.root, host.file),
                 line: host.call.site.line,
                 member: label.member.clone(),
-                prefix: prefix_of(host, &label.name),
+                prefix: self.prefix_of(host, &label.name, None),
                 package: label.package.clone(),
                 export: label.export.clone(),
                 receiver: receiver.to_string(),
@@ -786,19 +786,46 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             let Some((package, export, receiver)) = applies.first().and_then(identity) else {
                 continue;
             };
-            self.push(
-                at.clone(),
-                InstanceAt::Scope {
-                    file: relative(self.root, host.file),
-                    line: host.call.site.line,
-                    member: label.member.clone(),
-                    prefix: prefix_of(host, &label.name),
-                    package,
-                    export,
-                    receiver,
-                    parents: applies,
-                },
-            );
+            // A parameter in the prefix is filled by whatever hands this
+            // instance in. Where the parents name every call that hands it
+            // in (a caller of the function, or the member that runs it),
+            // each gets the values its own call fills; otherwise a parent
+            // may stand for several calls (the walk reads a definition
+            // once), so each reads every caller's and host's. Parents that
+            // read the same share one scope end (carrick#2635).
+            let origin_of = |parent: &InstanceEnd| match &parent.end {
+                InstanceAt::Scope { file, line, .. } => format!("{file}:{line}"),
+                InstanceAt::Root { .. } | InstanceAt::Hole { .. } => parent.at.clone(),
+            };
+            let handers = self.handers(host);
+            let paired = !handers.is_empty()
+                && handers
+                    .iter()
+                    .all(|hander| applies.iter().any(|parent| origin_of(parent) == *hander));
+            let mut groups: Vec<(Prefix, Vec<InstanceEnd>)> = Vec::new();
+            for parent in applies {
+                let origin = origin_of(&parent);
+                let prefix = self.prefix_of(host, &label.name, paired.then_some(origin.as_str()));
+                match groups.iter_mut().find(|(known, _)| *known == prefix) {
+                    Some((_, parents)) => parents.push(parent),
+                    None => groups.push((prefix, vec![parent])),
+                }
+            }
+            for (prefix, parents) in groups {
+                self.push(
+                    at.clone(),
+                    InstanceAt::Scope {
+                        file: relative(self.root, host.file),
+                        line: host.call.site.line,
+                        member: label.member.clone(),
+                        prefix,
+                        package: package.clone(),
+                        export: export.clone(),
+                        receiver: receiver.clone(),
+                        parents,
+                    },
+                );
+            }
             opened = true;
         }
         opened
@@ -1104,33 +1131,275 @@ pub(super) fn identity(end: &InstanceEnd) -> Option<(String, String, String)> {
     }
 }
 
-/// The prefix `placed`'s call states in the slot `name` (an argument, or a
-/// key of an object-literal one): text where every piece is literal.
-pub(super) fn prefix_of(placed: &Placed<'_>, name: &(usize, Option<String>)) -> Prefix {
-    let (arg, key) = name;
-    let value = match (placed.call.args.get(*arg), key) {
-        (None, _) => return Prefix::Unstated,
-        (Some(value), None) => value,
-        (Some(Value::Obj(object)), Some(key)) => match object.fields.get(key) {
-            Some(value) => value,
-            None if object.open => return Prefix::Unread { text: None },
-            None => return Prefix::Unstated,
-        },
-        (Some(_), Some(_)) => return Prefix::Unread { text: None },
-    };
-    let pieces = value.pieces();
-    let text: Option<String> = pieces
+/// The text of `pieces` where every piece is literal.
+fn literal(pieces: &[Piece]) -> Option<String> {
+    pieces
         .iter()
         .map(|piece| match piece {
             Piece::Lit(text) => Some(text.as_str()),
             _ => None,
         })
-        .collect();
-    match text {
-        Some(text) => Prefix::Stated { values: vec![text] },
-        None => Prefix::Unread {
-            text: opaque_text(&pieces),
+        .collect()
+}
+
+/// What a parameter reads as at one call that fills it (carrick#2635).
+enum Fill {
+    /// What the call hands in, in the terms of the caller's own body.
+    Pieces(Vec<Piece>),
+    /// The call hands nothing there: the parameter takes its default, or
+    /// holds nothing.
+    Absent,
+    /// The call hands something this pass does not read.
+    Unread,
+}
+
+/// `own` (a function's parameters by position, and keys of them) as a call
+/// fills it, where `arg_at` gives the argument the call writes at a
+/// position and `positional` says no spread moves them. A parameter that is
+/// all `own` holds can be absent; mixed with other pieces it cannot be read.
+fn fill<'v>(own: &[Piece], positional: bool, arg_at: impl Fn(usize) -> Option<&'v Value>) -> Fill {
+    let alone = positional && own.len() == 1;
+    let absent = || if alone { Fill::Absent } else { Fill::Unread };
+    let mut out: Vec<Piece> = Vec::new();
+    for piece in own {
+        match piece {
+            Piece::Param(index, _) => match arg_at(*index) {
+                Some(value) => out.extend(value.pieces()),
+                None => return absent(),
+            },
+            Piece::ParamKey(index, key, name) => match arg_at(*index) {
+                Some(Value::Obj(object)) => match object.fields.get(key) {
+                    Some(value) => out.extend(value.pieces()),
+                    None if !object.open
+                        && object.under_param.is_none()
+                        && object.under_rest.is_none() =>
+                    {
+                        return absent();
+                    }
+                    None => return Fill::Unread,
+                },
+                // The caller hands its own parameter on whole: its key
+                // waits on the caller's caller.
+                Some(Value::Str(pieces)) => match pieces.as_slice() {
+                    [Piece::Param(passed, _)] => {
+                        out.push(Piece::ParamKey(*passed, key.clone(), name.clone()));
+                    }
+                    _ => return Fill::Unread,
+                },
+                Some(Value::Callback(_)) => return Fill::Unread,
+                None => return absent(),
+            },
+            other => out.push(other.clone()),
+        }
+    }
+    Fill::Pieces(super::concat([out]))
+}
+
+/// The slot `name` of `placed`'s call, as the body that writes it reads it
+/// (an argument, or a key of an object-literal one).
+fn slot_pieces(placed: &Placed<'_>, name: &(usize, Option<String>)) -> Result<Vec<Piece>, Prefix> {
+    let (arg, key) = name;
+    let value = match (placed.call.args.get(*arg), key) {
+        (None, _) => return Err(Prefix::Unstated),
+        (Some(value), None) => value,
+        (Some(Value::Obj(object)), Some(key)) => match object.fields.get(key) {
+            Some(value) => value,
+            None if object.open => return Err(Prefix::Unread { text: None }),
+            None => return Err(Prefix::Unstated),
         },
+        (Some(_), Some(_)) => return Err(Prefix::Unread { text: None }),
+    };
+    Ok(value.pieces())
+}
+
+/// The ways the slot `name` of `placed`'s call reads, where the source
+/// states more than one (a default or a conditional, carrick#2635).
+fn slot_alternatives<'p>(
+    placed: &'p Placed<'_>,
+    name: &(usize, Option<String>),
+) -> Option<&'p Vec<Vec<Piece>>> {
+    let (arg, key) = name;
+    let held = placed.call.instance.args.get(*arg)?;
+    let ways = match key {
+        None => &held.alts.whole,
+        Some(key) => held.alts.keys.get(key)?,
+    };
+    (!ways.is_empty()).then_some(ways)
+}
+
+/// The most values one prefix slot states: beyond it the slot reads as
+/// unread.
+const MAX_PREFIX_VALUES: usize = 16;
+
+/// How many callers up a parameter is followed.
+const MAX_PREFIX_HOPS: usize = 6;
+
+impl<'w, 'a> InstanceWalk<'w, 'a> {
+    /// The prefix `placed`'s call states in the slot `name` (an argument, or
+    /// a key of an object-literal one): every value it states, each way a
+    /// default or a conditional reads, and a parameter as each caller (or
+    /// the member that runs the function) fills it (carrick#2635). Text
+    /// where every piece is literal. `origin` (`file:line` of the call that
+    /// hands the instance in) narrows the callers and hosts to that one.
+    pub(super) fn prefix_of(
+        &self,
+        placed: &Placed<'a>,
+        name: &(usize, Option<String>),
+        origin: Option<&str>,
+    ) -> Prefix {
+        let pieces = match slot_pieces(placed, name) {
+            Ok(pieces) => pieces,
+            Err(prefix) => return prefix,
+        };
+        if let Some(text) = literal(&pieces) {
+            return Prefix::Stated { values: vec![text] };
+        }
+        let ways = slot_alternatives(placed, name)
+            .cloned()
+            .unwrap_or_else(|| vec![pieces.clone()]);
+        let mut values = BTreeSet::new();
+        let mut walked = HashSet::new();
+        if self.settle(*placed, ways, origin, &mut walked, &mut values, 0)
+            && !values.is_empty()
+            && values.len() <= MAX_PREFIX_VALUES
+        {
+            return Prefix::Stated {
+                values: values.into_iter().collect(),
+            };
+        }
+        Prefix::Unread {
+            text: opaque_text(&pieces),
+        }
+    }
+
+    /// Add the text each of `ways` (read in `placed`'s body) states to
+    /// `values`. A parameter takes what each caller of its function hands
+    /// in, and what each member that runs the function hands it; one
+    /// nothing hands anything adds nothing (an entry point). False when a
+    /// value is not text this pass reads.
+    fn settle(
+        &self,
+        placed: Placed<'a>,
+        ways: Vec<Vec<Piece>>,
+        origin: Option<&str>,
+        walked: &mut HashSet<(PathBuf, String, Vec<Piece>)>,
+        values: &mut BTreeSet<String>,
+        hops: usize,
+    ) -> bool {
+        for way in ways {
+            if !holds_parameter(&way) {
+                match literal(&way) {
+                    Some(text) => {
+                        values.insert(text);
+                        continue;
+                    }
+                    None => return false,
+                }
+            }
+            let (Some(own), Some(key)) = (to_definition(&way, placed.depth), placed.key) else {
+                return false;
+            };
+            if hops >= MAX_PREFIX_HOPS {
+                return false;
+            }
+            if !walked.insert((placed.file.to_path_buf(), key.to_string(), own.clone())) {
+                continue;
+            }
+            let from_origin = |file: &Path, call: &CallIr| {
+                origin.is_none_or(|origin| origin == self.at_call(file, call))
+            };
+            for caller in self.calls.callers_of(placed.file, key) {
+                if !from_origin(caller.file, caller.call) {
+                    continue;
+                }
+                let step = fill(&own, caller.call.site_args.is_some(), |index| {
+                    caller.call.args.get(index)
+                });
+                if !self.settled(*caller, step, walked, values, hops) {
+                    return false;
+                }
+            }
+            let mut hosts = self.handed_to_library(placed.file, key);
+            hosts.extend(self.handed_by_declaration(placed.file, key));
+            for (host, arg) in hosts {
+                if !from_origin(host.file, host.call) {
+                    continue;
+                }
+                // The member hands the function its scoped instance at
+                // `param`; the parameters after it are the member's
+                // arguments after the function's (`register(plugin,
+                // options)` runs `plugin(instance, options)`).
+                let Some(param) = self.scopes.iter().find_map(|label| match &label.binds {
+                    ScopeBinds::Runs {
+                        arg: runs,
+                        key: None,
+                        param,
+                    } if label.member == host.call.callee && *runs == arg => Some(*param),
+                    _ => None,
+                }) else {
+                    return false;
+                };
+                if super::parameter_positions(&own)
+                    .iter()
+                    .any(|position| *position <= param)
+                {
+                    return false;
+                }
+                let step = fill(&own, host.call.site_args.is_some(), |index| {
+                    host.call.args.get(arg + index - param)
+                });
+                if !self.settled(host, step, walked, values, hops) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// One caller's or host's fill of a parameter: absent adds nothing, a
+    /// value adds what it states.
+    fn settled(
+        &self,
+        caller: Placed<'a>,
+        step: Fill,
+        walked: &mut HashSet<(PathBuf, String, Vec<Piece>)>,
+        values: &mut BTreeSet<String>,
+        hops: usize,
+    ) -> bool {
+        match step {
+            Fill::Absent => true,
+            Fill::Unread => false,
+            Fill::Pieces(pieces) => {
+                self.settle(caller, vec![pieces], None, walked, values, hops + 1)
+            }
+        }
+    }
+
+    /// Every call (`file:line`) that is a caller of the function `placed`
+    /// is written in, or a member that runs it.
+    fn handers(&self, placed: &Placed<'a>) -> Vec<String> {
+        let Some(key) = placed.key else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = self
+            .calls
+            .callers_of(placed.file, key)
+            .iter()
+            .map(|caller| self.at_call(caller.file, caller.call))
+            .collect();
+        out.extend(
+            self.handed_to_library(placed.file, key)
+                .into_iter()
+                .chain(self.handed_by_declaration(placed.file, key))
+                .map(|(host, _)| self.at_call(host.file, host.call)),
+        );
+        out
+    }
+
+    /// `file:line` of `call`, as an instance end names the call that hands
+    /// it in.
+    fn at_call(&self, file: &Path, call: &CallIr) -> String {
+        format!("{}:{}", relative(self.root, file), call.site.line)
     }
 }
 
