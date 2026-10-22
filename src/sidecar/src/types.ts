@@ -625,6 +625,8 @@ export interface LibraryCheck {
 export interface VerifyLibraryClaimsRequest extends BaseRequest {
   action: 'verify_library_claims';
   from_dir: string;
+  /** The scanned repo's root, as on `init`: a verdict's `declarations` are named from it, as position rows are. */
+  scan_root?: string;
   checks: LibraryCheck[];
   /** Checks not reached in time come back `unchecked` with reason `budget`; null or absent is the default. */
   budget_ms?: number | null;

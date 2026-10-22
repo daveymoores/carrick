@@ -59,9 +59,9 @@ describe('verify_library_claims: declarations of a verified op (carrick#2474)', 
   });
   const maker = (member: string | null, form: 'call' | 'new' = 'call') => ({ kind: 'make', form, member });
 
-  const send = async (checks: unknown[]): Promise<Verdict[]> => {
+  const send = async (checks: unknown[], extra: Record<string, unknown> = {}): Promise<Verdict[]> => {
     const response = await client.send<{ status: string; verdicts?: Verdict[]; errors?: string[] }>(
-      { request_id: `decl-${requestId++}`, action: 'verify_library_claims', from_dir: root, checks },
+      { request_id: `decl-${requestId++}`, action: 'verify_library_claims', from_dir: root, checks, ...extra },
       60_000
     );
     assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
@@ -124,6 +124,14 @@ describe('verify_library_claims: declarations of a verified op (carrick#2474)', 
     assert.deepStrictEqual(classGet.declarations, [{ decl_file: file, decl_line: classLine }]);
     assert.notDeepStrictEqual(appGet.declarations, reqGet.declarations);
     assert.notDeepStrictEqual(appGet.declarations, classGet.declarations);
+  });
+
+  it('a service at the scan root names them the same with the scan root sent', async () => {
+    const checks = [check('a0', 'default', 'export', maker(null)), check('a1', 'default', 'instance:()', route('get', 'instance:()'))];
+    const [, without] = await send(checks);
+    const [, withRoot] = await send(checks, { scan_root: root });
+    assert.deepStrictEqual(withRoot.declarations, [{ decl_file: file, decl_line: lineOf('get(path: string, handler: Handler): this;') }]);
+    assert.deepStrictEqual(withRoot, without);
   });
 
   it('a failed op carries none', async () => {
