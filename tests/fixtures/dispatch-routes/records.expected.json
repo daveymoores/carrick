@@ -213,11 +213,7 @@
           }
         }
       ],
-      "forced": {
-        "0": {
-          "path": "/stats"
-        }
-      },
+      "forced": {},
       "methods": [],
       "scopes": [],
       "subject": {
@@ -498,20 +494,7 @@
           }
         }
       ],
-      "forced": {
-        "0": {
-          "method": "GET",
-          "path": "/orders"
-        },
-        "1": {
-          "method": "POST",
-          "path": "/orders"
-        },
-        "2": {
-          "method": "GET",
-          "path": "/status"
-        }
-      },
+      "forced": {},
       "methods": [
         {
           "at": "src/server.ts:11",
@@ -657,24 +640,8 @@
         }
       ],
       "forced": {
-        "0": {
-          "method": "GET",
-          "path": "/api/items"
-        },
-        "1": {
-          "method": "PUT",
-          "path": "/api/items"
-        },
-        "2": {
-          "method": "POST",
-          "path": "/orders/export"
-        },
         "3": {
           "path": "/profile"
-        },
-        "4": {
-          "method": "DELETE",
-          "path": "/cache"
         },
         "5": {
           "path": "/feed"
@@ -936,5 +903,54 @@
         ]
       }
     }
+  ],
+  "settled": [
+    {},
+    {},
+    {},
+    {},
+    {
+      "0": {
+        "path": "/stats"
+      }
+    },
+    {},
+    {},
+    {},
+    {},
+    {
+      "0": {
+        "method": "GET",
+        "path": "/orders"
+      },
+      "1": {
+        "method": "POST",
+        "path": "/orders"
+      },
+      "2": {
+        "method": "GET",
+        "path": "/status"
+      }
+    },
+    {
+      "0": {
+        "method": "GET",
+        "path": "/api/items"
+      },
+      "1": {
+        "method": "PUT",
+        "path": "/api/items"
+      },
+      "2": {
+        "method": "POST",
+        "path": "/orders/export"
+      },
+      "4": {
+        "method": "DELETE",
+        "path": "/cache"
+      }
+    },
+    {},
+    {}
   ]
 }

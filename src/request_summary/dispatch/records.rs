@@ -70,6 +70,11 @@ pub enum HoleReach {
 #[derive(Debug, Default, Serialize)]
 pub struct HandlerRecords {
     pub records: Vec<HandlerRecord>,
+    /// Per record, in the same order, the values the code settles for the
+    /// comparisons nothing is asked of (path and method forced, or a path
+    /// forced with no method stated): the fact rows and `no_method` leads
+    /// of T3b. The wire's `forced` names asked comparisons only.
+    pub settled: Vec<BTreeMap<String, ForcedRoute>>,
     /// Chains (per guard for `unresolved_constant`) of path comparisons
     /// that attach to no handler, by reason: R4a's closed list, plus
     /// `hole_outside_handler`.
@@ -335,7 +340,17 @@ pub fn handler_records(
     }
     records.sort_by(|(a, _), (b, _)| a.cmp(b));
     count_records(&mut out.counts, &records);
-    out.records = records.into_iter().map(|(_, record)| record).collect();
+    // The wire's `forced` names asked comparisons only; the values of one
+    // nothing is asked of stay beside the record.
+    for (_, mut record) in records {
+        let (forced, settled): (BTreeMap<_, _>, BTreeMap<_, _>) =
+            std::mem::take(&mut record.forced)
+                .into_iter()
+                .partition(|(id, _)| record.asked.iter().any(|asked| asked.to_string() == *id));
+        record.forced = forced;
+        out.records.push(record);
+        out.settled.push(settled);
+    }
     out
 }
 

@@ -956,6 +956,15 @@ mod tests {
                     .iter()
                     .all(|id| typed.comparisons.iter().any(|c| c.id == *id))
             );
+            // `forced` names asked comparisons only, as the cloud checks.
+            assert!(
+                typed
+                    .forced
+                    .keys()
+                    .all(|id| typed.asked.iter().any(|asked| asked.to_string() == *id)),
+                "{}",
+                typed.subject.at
+            );
         }
     }
 
@@ -976,18 +985,22 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find_map(|record| {
+                .enumerate()
+                .find_map(|(index, record)| {
                     let comparison = record["comparisons"]
                         .as_array()
                         .unwrap()
                         .iter()
                         .find(|c| c["at"] == at.as_str() && c["literal"] == path)?;
-                    Some((record, comparison["id"].to_string()))
+                    Some((index, record, comparison["id"].to_string()))
                 });
-            let Some((record, id)) = found else {
+            let Some((index, record, id)) = found else {
                 panic!("{at} {path} is in no record");
             };
-            let forced_path = record["forced"][&id]["path"].as_str();
+            // Asked: on the wire's `forced`; asked nothing: settled beside it.
+            let forced_path = record["forced"][&id]["path"]
+                .as_str()
+                .or(records["settled"][index][&id]["path"].as_str());
             match route["evidence"]["kind"].as_str().unwrap() {
                 "label" => assert_eq!(forced_path, Some(path), "{at} {path}"),
                 _ => assert_eq!(forced_path, None, "{at} {path}"),
