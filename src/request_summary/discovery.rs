@@ -2600,6 +2600,10 @@ mod tests {
             // fills it states a value (carrick#2635).
             "src/versioned.ts:10 <- /v10/ping (entry_point)",
             "src/versioned.ts:10 <- /v9/ping (entry_point)",
+            // A default stands for the caller that omits the value only.
+            "src/versioned.ts:22 <- /given/pong (entry_point)",
+            "src/versioned.ts:22 <- /omit-default/pong (entry_point)",
+            "src/versioned.ts:28 <- /only/pang (entry_point)",
         ]);
         assert_eq!(got, want, "{got:#?}");
         // No scope claim verified: no scope or mount edge, every plugin's
@@ -2676,8 +2680,10 @@ mod tests {
             // default) and a conditional state each of their values, one
             // route each (carrick#2635, carrick#2474 Q2). A parameter takes
             // what each caller hands in (here the options `register` hands
-            // the plugin it runs, `/root` for `nullish.ts`) and the default.
-            // A parameter nothing fills and no default states is unread.
+            // the plugin it runs: `nullish.ts` states `/root`, so its default
+            // does not apply); the default stands where a caller omits the
+            // value or none is known. A parameter nothing fills and no
+            // default states is unread.
             "src/item-detail.ts:3 <- /api/v1/items/:id (entry_point) via src/documented.ts:5 register /api/v1 > src/documented.ts:7 register -",
             "src/item-detail.ts:3 <- /api/v1/items/:id (entry_point) via src/two-options.ts:5 register /api/v1 > src/two-options.ts:7 register -",
             "src/items.ts:3 <- /a/items (entry_point) via src/two-scopes.ts:6 register /a > src/two-scopes.ts:8 register -",
@@ -2687,11 +2693,9 @@ mod tests {
             "src/items.ts:3 <- /api/v4/items (entry_point) via src/param-default.ts:5 register /api/v4 > src/param-default.ts:7 register -",
             "src/items.ts:3 <- /api/v5/items (entry_point) via src/const-prefix.ts:7 register /api/v5 > src/const-prefix.ts:9 register -",
             "src/items.ts:3 <- /legacy/items (entry_point) via src/ternary.ts:5 register /api/v3|/legacy > src/ternary.ts:7 register -",
-            "src/items.ts:3 <- /root/api/v1/items (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /api/v1|/root > src/nullish.ts:7 register -",
-            "src/items.ts:3 <- /root/root/items (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /api/v1|/root > src/nullish.ts:7 register -",
+            "src/items.ts:3 <- /root/root/items (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /root > src/nullish.ts:7 register -",
             "src/items.ts:3 <- ? (entry_point) via src/unread.ts:5 register ? > src/unread.ts:7 register -",
-            "src/nullish.ts:8 <- /root/api/v1/health (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /api/v1|/root",
-            "src/nullish.ts:8 <- /root/root/health (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /api/v1|/root",
+            "src/nullish.ts:8 <- /root/root/health (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /root",
             "src/orders.ts:3 <- /b/orders (entry_point) via src/two-scopes.ts:12 register /b > src/two-scopes.ts:14 register -",
             "src/orders.ts:3 <- /orders (entry_point) via src/no-options.ts:5 register - > src/no-options.ts:6 register -",
             "src/orders.ts:3 <- /v2/orders (entry_point) via src/group.ts:5 group /v2 > src/group.ts:5 register -",

@@ -947,8 +947,34 @@ struct ArgHeld {
 /// is not here. Read by the receiver trace alone.
 #[derive(Debug, Clone, Default)]
 struct ArgAlts {
-    whole: Vec<Vec<Piece>>,
-    keys: BTreeMap<String, Vec<Vec<Piece>>>,
+    whole: Vec<Way>,
+    keys: BTreeMap<String, Vec<Way>>,
+}
+
+/// One way a value reads (carrick#2635).
+#[derive(Debug, Clone)]
+struct Way {
+    pieces: Vec<Piece>,
+    /// A default: it applies only where the value written before it is
+    /// missing (a caller omits it, or none is known), so it is stated only
+    /// then.
+    fallback: bool,
+}
+
+impl Way {
+    fn stated(pieces: Vec<Piece>) -> Self {
+        Way {
+            pieces,
+            fallback: false,
+        }
+    }
+
+    fn defaulted(ways: Vec<Way>) -> impl Iterator<Item = Way> {
+        ways.into_iter().map(|way| Way {
+            fallback: true,
+            ..way
+        })
+    }
 }
 
 /// What the receiver trace reads at one call (carrick#2474 R2a): the
@@ -4260,7 +4286,7 @@ impl Reader<'_> {
     /// way. `eval` reads the same expressions as one opaque value, which
     /// the send side keys rows on, so this is a separate reading, for the
     /// receiver trace alone.
-    fn stated_ways(&self, expr: &Expr, scope: &Scope<'_>) -> Vec<Vec<Piece>> {
+    fn stated_ways(&self, expr: &Expr, scope: &Scope<'_>) -> Vec<Way> {
         // Most arguments state one value: read no further.
         let branching = match unwrap_value(expr) {
             Expr::Bin(bin) => matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr),
@@ -4275,18 +4301,18 @@ impl Reader<'_> {
         if ways.len() > 1 { ways } else { Vec::new() }
     }
 
-    fn ways(&self, expr: &Expr, scope: &Scope<'_>) -> Vec<Vec<Piece>> {
+    fn ways(&self, expr: &Expr, scope: &Scope<'_>) -> Vec<Way> {
         match unwrap_value(expr) {
             // `opts.prefix ?? '/api'`: the left side, then the default.
             Expr::Bin(bin) if bin.op == BinaryOp::NullishCoalescing => {
                 let mut ways = self.ways(&bin.left, scope);
-                ways.extend(self.ways(&bin.right, scope));
+                ways.extend(Way::defaulted(self.ways(&bin.right, scope)));
                 ways
             }
             // `opts.prefix || '/api'`.
             Expr::Bin(bin) if bin.op == BinaryOp::LogicalOr => {
                 let mut ways = self.ways(&bin.left, scope);
-                ways.extend(self.ways(&bin.right, scope));
+                ways.extend(Way::defaulted(self.ways(&bin.right, scope)));
                 ways
             }
             // `opts.legacy ? '/legacy' : '/api'`: each branch.
@@ -4304,11 +4330,11 @@ impl Reader<'_> {
                     Some(key) => Piece::ParamKey(*index, key.clone(), name),
                     None => Piece::Param(*index, name),
                 };
-                let mut ways = vec![vec![own]];
-                ways.extend(self.ways(default, scope));
+                let mut ways = vec![Way::stated(vec![own])];
+                ways.extend(Way::defaulted(self.ways(default, scope)));
                 ways
             }
-            other => vec![self.eval(other, scope).pieces()],
+            other => vec![Way::stated(self.eval(other, scope).pieces())],
         }
     }
 

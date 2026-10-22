@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::super::{
-    CallIr, ClientRef, HeldInstance, MadeBy, MakerForm, Piece, RequestSummaryInputs, Value,
+    CallIr, ClientRef, HeldInstance, MadeBy, MakerForm, Piece, RequestSummaryInputs, Value, Way,
 };
 use super::{Calls, Placed, filled, holds_parameter, relative, to_definition};
 use crate::position_rows::{FLAG_ANY, FLAG_DECLARATION_UNNAMED, Kind};
@@ -1217,7 +1217,7 @@ fn slot_pieces(placed: &Placed<'_>, name: &(usize, Option<String>)) -> Result<Ve
 fn slot_alternatives<'p>(
     placed: &'p Placed<'_>,
     name: &(usize, Option<String>),
-) -> Option<&'p Vec<Vec<Piece>>> {
+) -> Option<&'p Vec<Way>> {
     let (arg, key) = name;
     let held = placed.call.instance.args.get(*arg)?;
     let ways = match key {
@@ -1233,6 +1233,18 @@ const MAX_PREFIX_VALUES: usize = 16;
 
 /// How many callers up a parameter is followed.
 const MAX_PREFIX_HOPS: usize = 6;
+
+/// What reading one prefix slot has found so far (carrick#2635).
+#[derive(Default)]
+struct Reading {
+    /// The definitions walked, with the parameter as their body reads it.
+    walked: HashSet<(PathBuf, String, Vec<Piece>)>,
+    /// The text stated.
+    values: BTreeSet<String>,
+    /// A value a default stands for is missing: a caller omits it, or none
+    /// is known.
+    missing: bool,
+}
 
 impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// The prefix `placed`'s call states in the slot `name` (an argument, or
@@ -1256,15 +1268,14 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         }
         let ways = slot_alternatives(placed, name)
             .cloned()
-            .unwrap_or_else(|| vec![pieces.clone()]);
-        let mut values = BTreeSet::new();
-        let mut walked = HashSet::new();
-        if self.settle(*placed, ways, origin, &mut walked, &mut values, 0)
-            && !values.is_empty()
-            && values.len() <= MAX_PREFIX_VALUES
+            .unwrap_or_else(|| vec![Way::stated(pieces.clone())]);
+        let mut reading = Reading::default();
+        if self.settle(*placed, ways, origin, &mut reading, 0)
+            && !reading.values.is_empty()
+            && reading.values.len() <= MAX_PREFIX_VALUES
         {
             return Prefix::Stated {
-                values: values.into_iter().collect(),
+                values: reading.values.into_iter().collect(),
             };
         }
         Prefix::Unread {
@@ -1277,45 +1288,74 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// in, and what each member that runs the function hands it; one
     /// nothing hands anything adds nothing (an entry point). False when a
     /// value is not text this pass reads.
+    ///
+    /// A default (`fallback`) is stated only where the value written before
+    /// it is missing: a caller omits it, or no caller is known (`missing`).
     fn settle(
         &self,
         placed: Placed<'a>,
-        ways: Vec<Vec<Piece>>,
+        ways: Vec<Way>,
         origin: Option<&str>,
-        walked: &mut HashSet<(PathBuf, String, Vec<Piece>)>,
-        values: &mut BTreeSet<String>,
+        reading: &mut Reading,
         hops: usize,
     ) -> bool {
-        for way in ways {
-            if !holds_parameter(&way) {
-                match literal(&way) {
-                    Some(text) => {
-                        values.insert(text);
-                        continue;
-                    }
-                    None => return false,
+        for defaults in [false, true] {
+            if defaults && !reading.missing {
+                break;
+            }
+            for way in ways.iter().filter(|way| way.fallback == defaults) {
+                if !self.settle_way(placed, &way.pieces, origin, reading, hops) {
+                    return false;
                 }
             }
-            let (Some(own), Some(key)) = (to_definition(&way, placed.depth), placed.key) else {
+        }
+        true
+    }
+
+    /// [`Self::settle`] for one way.
+    fn settle_way(
+        &self,
+        placed: Placed<'a>,
+        way: &[Piece],
+        origin: Option<&str>,
+        reading: &mut Reading,
+        hops: usize,
+    ) -> bool {
+        {
+            if !holds_parameter(way) {
+                return match literal(way) {
+                    Some(text) => {
+                        reading.values.insert(text);
+                        true
+                    }
+                    None => false,
+                };
+            }
+            let (Some(own), Some(key)) = (to_definition(way, placed.depth), placed.key) else {
                 return false;
             };
             if hops >= MAX_PREFIX_HOPS {
                 return false;
             }
-            if !walked.insert((placed.file.to_path_buf(), key.to_string(), own.clone())) {
-                continue;
+            if !reading
+                .walked
+                .insert((placed.file.to_path_buf(), key.to_string(), own.clone()))
+            {
+                return true;
             }
             let from_origin = |file: &Path, call: &CallIr| {
                 origin.is_none_or(|origin| origin == self.at_call(file, call))
             };
+            let mut handed = false;
             for caller in self.calls.callers_of(placed.file, key) {
                 if !from_origin(caller.file, caller.call) {
                     continue;
                 }
+                handed = true;
                 let step = fill(&own, caller.call.site_args.is_some(), |index| {
                     caller.call.args.get(index)
                 });
-                if !self.settled(*caller, step, walked, values, hops) {
+                if !self.settled(*caller, step, reading, hops) {
                     return false;
                 }
             }
@@ -1325,6 +1365,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 if !from_origin(host.file, host.call) {
                     continue;
                 }
+                handed = true;
                 // The member hands the function its scoped instance at
                 // `param`; the parameters after it are the member's
                 // arguments after the function's (`register(plugin,
@@ -1348,29 +1389,29 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 let step = fill(&own, host.call.site_args.is_some(), |index| {
                     host.call.args.get(arg + index - param)
                 });
-                if !self.settled(host, step, walked, values, hops) {
+                if !self.settled(host, step, reading, hops) {
                     return false;
                 }
             }
+            // Nothing is known to fill it: a default stands.
+            if !handed {
+                reading.missing = true;
+            }
+            true
         }
-        true
     }
 
-    /// One caller's or host's fill of a parameter: absent adds nothing, a
-    /// value adds what it states.
-    fn settled(
-        &self,
-        caller: Placed<'a>,
-        step: Fill,
-        walked: &mut HashSet<(PathBuf, String, Vec<Piece>)>,
-        values: &mut BTreeSet<String>,
-        hops: usize,
-    ) -> bool {
+    /// One caller's or host's fill of a parameter: absent adds nothing and
+    /// leaves the default to stand, a value adds what it states.
+    fn settled(&self, caller: Placed<'a>, step: Fill, reading: &mut Reading, hops: usize) -> bool {
         match step {
-            Fill::Absent => true,
+            Fill::Absent => {
+                reading.missing = true;
+                true
+            }
             Fill::Unread => false,
             Fill::Pieces(pieces) => {
-                self.settle(caller, vec![pieces], None, walked, values, hops + 1)
+                self.settle(caller, vec![Way::stated(pieces)], None, reading, hops + 1)
             }
         }
     }
