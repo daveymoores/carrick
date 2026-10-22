@@ -557,11 +557,7 @@ impl RequestSummaryInputs {
         let Some(declared) = self.files.get(&declaring) else {
             return Reach::OutsideService(declaring, symbol.to_string());
         };
-        let joined = join(declared, row.decl_line(), symbol);
-        match joined {
-            Join::One(key) => Reach::Function(declaring, key),
-            Join::Several => Reach::Unknown(HoleReason::RowsMissing),
-            Join::Unfollowed => Reach::Unknown(HoleReason::UnreadExpression),
+        match join(declared, row.decl_line(), symbol) {
             // A call whose result did not resolve, at a declaration that is
             // no definition: an import of nothing, as the import line is.
             Join::None if unresolved => Reach::Unknown(if declaring == file {
@@ -569,8 +565,30 @@ impl RequestSummaryInputs {
             } else {
                 HoleReason::UnresolvedName
             }),
-            Join::None => Reach::NoFunction,
+            joined => reach_of_join(declaring, joined),
         }
+    }
+
+    /// The definition of `file` the declaration of `symbol` at `line` is,
+    /// when the service holds `file`: what [`Self::row_names`] reads of a
+    /// declaration in one of its files, for a call another service of the
+    /// run makes (carrick#2618). `NoFunction` when the service holds no such
+    /// file or the declaration is no definition.
+    pub(crate) fn definition_at(&self, file: &Path, line: Option<u32>, symbol: &str) -> Reach {
+        match self.files.get(file) {
+            Some(declared) => reach_of_join(file.to_path_buf(), join(declared, line, symbol)),
+            None => Reach::NoFunction,
+        }
+    }
+}
+
+/// What a declaration in `declaring` that [`join`] read is.
+fn reach_of_join(declaring: PathBuf, joined: Join) -> Reach {
+    match joined {
+        Join::One(key) => Reach::Function(declaring, key),
+        Join::Several => Reach::Unknown(HoleReason::RowsMissing),
+        Join::Unfollowed => Reach::Unknown(HoleReason::UnreadExpression),
+        Join::None => Reach::NoFunction,
     }
 }
 
