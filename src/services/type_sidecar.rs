@@ -1423,6 +1423,16 @@ pub struct InferredType {
     /// when the two are the same or the reading was dropped as unsound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unwidened_type_string: Option<String>,
+    /// carrick#2100, response inferences only: the inference was owed an
+    /// unwidened reading and the sidecar's time budget for it ran out first,
+    /// so `unwidened_type_string` is absent for want of time, not because the
+    /// handler sends what `type_string` says. The definitions pass carries it
+    /// onto the producer's manifest entry, and the check does not publish a
+    /// mismatch judged on the widened type. The key is pinned on both sides
+    /// (`inferred_type_wire_key_for_a_spent_unwidened_budget` here and
+    /// `infer-unwidened-response.test.ts`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unwidened_out_of_budget: bool,
     /// carrick#1749, `call_result` only: present when `type_string` is the
     /// source's own statement of the body it reads, made AT the read (a cast
     /// of it, or the annotated declaration it initializes). Read by
@@ -4484,6 +4494,40 @@ fn answered_in_order(
 mod tests {
     use super::*;
 
+    /// carrick#2100: the key the sidecar sets when the unwidened reading ran
+    /// out of time. `infer-unwidened-response.test.ts` pins the same key on
+    /// the sidecar's wire answer; a rename on either side fails one of them.
+    #[test]
+    fn inferred_type_wire_key_for_a_spent_unwidened_budget() {
+        let read = |extra: serde_json::Value| -> InferredType {
+            let mut wire = serde_json::json!({
+                "alias": "Status",
+                "type_string": "{ status: string; }",
+                "is_explicit": false,
+                "source_location": { "file_path": "src/routes.ts", "start_line": 4, "end_line": 4 },
+                "infer_kind": "response_body",
+            });
+            wire.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(wire).unwrap()
+        };
+        let spent = read(serde_json::json!({ "unwidened_out_of_budget": true }));
+        assert!(spent.unwidened_out_of_budget);
+        assert_eq!(
+            serde_json::to_value(&spent).unwrap()["unwidened_out_of_budget"],
+            serde_json::json!(true)
+        );
+        let read_in_time = read(serde_json::json!({}));
+        assert!(!read_in_time.unwidened_out_of_budget);
+        assert!(
+            serde_json::to_value(&read_in_time)
+                .unwrap()
+                .get("unwidened_out_of_budget")
+                .is_none()
+        );
+    }
+
     /// The check's answer carries how its compiler ended, and only an abort
     /// with V8's heap line is a memory death (carrick#2209).
     #[test]
@@ -6173,6 +6217,7 @@ mod tests {
             member_return_type: None,
             any_provenance: Vec::new(),
             unwidened_type_string: None,
+            unwidened_out_of_budget: false,
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,

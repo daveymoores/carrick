@@ -320,8 +320,49 @@ describe('carrick#1516: the unwidened reading of a response inference', () => {
     assert.ok(spent, 'the inference itself is not the reading and must answer');
     assert.match(collapse(spent.type_string)!, /scope: string/);
     assert.strictEqual(spent.unwidened_type_string, undefined);
-    // Control: the same inference with the default budget reads.
-    assert.ok(read()?.unwidened_type_string);
+    // carrick#2100: the answer says the budget, not the handler, is why it
+    // carries no reading, so the check does not judge the widened type.
+    assert.strictEqual(spent.unwidened_out_of_budget, true);
+    // Control: the same inference with the default budget reads, and says
+    // nothing ran out.
+    const full = read();
+    assert.ok(full?.unwidened_type_string);
+    assert.strictEqual(full?.unwidened_out_of_budget, undefined);
+  });
+
+  // carrick#2100: the wire spelling the scanner reads (`InferredType` in
+  // `src/services/type_sidecar.rs` pins the same key), and the switch the
+  // scanner's own tests force the budget with.
+  it('says on the wire when the budget, set from the environment, ran out', async () => {
+    const spent = new SidecarClient();
+    await spent.start({ CARRICK_UNWIDENED_BUDGET_MS: '0' });
+    try {
+      await spent.send({ action: 'init', request_id: 'init', repo_root: repoDir });
+      const res = await spent.send<{ status: string; inferred_types?: Array<Record<string, unknown>> }>({
+        action: 'infer',
+        request_id: 'spent',
+        requests: [
+          {
+            file_path: controllerPath,
+            line_number: lineOf(CONTROLLER, "@Get('holidays')"),
+            infer_kind: 'response_body',
+            alias: 'holidays',
+          },
+        ],
+      });
+      const t = res.inferred_types?.[0];
+      assert.ok(t, JSON.stringify(res));
+      assert.strictEqual(t['unwidened_type_string'], undefined);
+      assert.strictEqual(t['unwidened_out_of_budget'], true);
+    } finally {
+      await spent.stop();
+    }
+    // The scan's own process, on the default budget, read it and says nothing.
+    assert.ok(inferred.get('holidays')?.unwidened_type_string);
+    assert.strictEqual(
+      (inferred.get('holidays') as Record<string, unknown> | undefined)?.['unwidened_out_of_budget'],
+      undefined
+    );
   });
 
   it('restores every file it rewrote', async () => {

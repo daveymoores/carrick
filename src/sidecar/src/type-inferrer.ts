@@ -946,16 +946,23 @@ export class TypeInferrer {
    * read is the project the scan loaded.
    *
    * Nothing is read past `deadline`: a batch that runs out keeps the readings
-   * it made and publishes none for the rest.
+   * it made and publishes none for the rest, and marks each of the rest
+   * `unwidened_out_of_budget` (carrick#2100). A request that never needed a
+   * reading (a declared return, nothing to mark) or lost it for a reason of
+   * its own (a marking that added a diagnostic) is never marked.
    */
   private addUnwidenedReadings(
     responses: Array<{ request: InferRequestItem; result: InferredType }>,
     extractionConfig: ExtractionConfig | undefined,
     deadline: number
   ): void {
-    const outOfTime = (stage: string): boolean => {
+    const outOfTime = (stage: string, unread: ReadonlyArray<{ result: InferredType }>): boolean => {
       if (performance.now() <= deadline) return false;
-      this.log(`Unwidened reading stopped ${stage}: it ran out of its budget`);
+      this.log(
+        `Unwidened reading stopped ${stage}: it ran out of its budget, ` +
+          `${unread.length} reading(s) not made`
+      );
+      for (const plan of unread) plan.result.unwidened_out_of_budget = true;
       return true;
     };
     interface Plan {
@@ -1016,7 +1023,7 @@ export class TypeInferrer {
     for (const [file, list] of insertionsByFile) insertions.set(file, normalise(list));
     const before = new Map<SourceFile, ReturnType<typeof fileDiagnostics>>();
     for (const file of checkedFiles) {
-      if (outOfTime('before the rewrite')) return;
+      if (outOfTime('before the rewrite', plans)) return;
       before.set(file, fileDiagnostics(file));
     }
     const originals = new Map<SourceFile, string>();
@@ -1032,7 +1039,7 @@ export class TypeInferrer {
       // holds it loses its reading.
       const tainted = new Set<Plan>();
       for (const file of checkedFiles) {
-        if (outOfTime('while checking the rewrite')) return;
+        if (outOfTime('while checking the rewrite', plans)) return;
         const list = insertions.get(file) ?? [];
         for (const at of addedDiagnostics(before.get(file)!, fileDiagnostics(file), list)) {
           const holders = plans.flatMap((plan) => plan.path).filter(
@@ -1047,8 +1054,10 @@ export class TypeInferrer {
         }
       }
 
-      for (const plan of plans) {
-        if (outOfTime('while re-reading')) return;
+      for (const [at, plan] of plans.entries()) {
+        if (outOfTime('while re-reading', plans.slice(at).filter((rest) => !tainted.has(rest)))) {
+          return;
+        }
         if (tainted.has(plan)) {
           this.log(
             `Unwidened reading for ${plan.request.file_path}:${plan.request.line_number} ` +

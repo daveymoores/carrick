@@ -1264,6 +1264,14 @@ export interface InferredType {
    */
   unwidened_type_string?: string;
   /**
+   * carrick#2100, response inferences only: `true` when this inference was
+   * owed an unwidened reading (its handler's path has literals to mark) and
+   * the batch's time budget ran out before it was read. The reading's absence
+   * then says nothing about the handler, so the check must not judge the
+   * widened `type_string` as what the handler sends. Absent otherwise.
+   */
+  unwidened_out_of_budget?: true;
+  /**
    * carrick#1749, `call_result` only: present when the source itself states
    * the type of the body it reads, AT the read: a cast of the read
    * (`res.json() as Promise<T>`, a callback's `value as T`) or the annotated

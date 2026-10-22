@@ -23,11 +23,7 @@
 //! | Retype | the scan's one retype ceiling, `RETYPE_SCAN_CEILING` in `engine/type_compat_v2.rs`, and a request's `RETYPE_BUDGET_MS` in the sidecar's `index.ts` | an abstain saying "the retype check ran out of its N ms budget" (the ceiling's adds "for the whole scan"), on the pair's unresolved reason | [`from_check_outcomes`] |
 //! | Library checks | `SEMANTICS_BUDGET_MS` in the sidecar's `index.ts` | a verdict `unchecked` with reason `budget` | the two places a service's library checks are answered |
 //! | Sidecar deadline | `OPERATION_TIMEOUT` in `services/type_sidecar.rs` | the operation fails with a timeout and the process is replaced | the sidecar client while a service is analysed; [`from_check_outcomes`] in the cross-service check |
-//!
-//! The fourth limit, the unwidened reading's `UNWIDENED_BUDGET_MS` in the
-//! sidecar's `type-inferrer.ts`, is not counted: the sidecar only logs that
-//! it ran out, and an inference without an unwidened reading looks the same
-//! to the scanner whether the limit ran out or the reading was never owed.
+//! | Unwidened reading | `UNWIDENED_BUDGET_MS` in the sidecar's `type-inferrer.ts` | the inference is marked `unwidened_out_of_budget`, and a pair judged incompatible on its widened type is `unverifiable` (carrick#2100) | the definitions pass, per producer response marked |
 
 use std::collections::BTreeMap;
 
@@ -47,6 +43,9 @@ pub enum TimeLimit {
     /// The sidecar went silent for the whole operation deadline: the items
     /// the requests it never answered carried.
     SidecarDeadline,
+    /// The unwidened reading's time limit: producer responses it was owed
+    /// and did not make (carrick#2100).
+    UnwidenedReading,
 }
 
 /// What the time limits that ran out cost one service, by kind (carrick#2021).
@@ -71,6 +70,13 @@ pub struct TimeLimitsRunOut {
     /// log only: [`TimeLimitsRunOut::lines`] states no line for it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub sidecar_deadline: usize,
+    /// Producer responses whose unwidened reading (the handler's literals
+    /// kept, carrick#1516) the sidecar ran out of time to make. A pair the
+    /// check finds incompatible on such a response's widened type is
+    /// `unverifiable` (carrick#2100). On the index and in the run log only,
+    /// like `sidecar_deadline`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unwidened_reading: usize,
 }
 
 fn is_zero(count: &usize) -> bool {
@@ -84,6 +90,7 @@ impl TimeLimitsRunOut {
             TimeLimit::Retype => &mut self.retype,
             TimeLimit::LibraryChecks => &mut self.library_checks,
             TimeLimit::SidecarDeadline => &mut self.sidecar_deadline,
+            TimeLimit::UnwidenedReading => &mut self.unwidened_reading,
         };
         *count += cost;
     }
@@ -93,6 +100,7 @@ impl TimeLimitsRunOut {
         self.add(TimeLimit::Retype, other.retype);
         self.add(TimeLimit::LibraryChecks, other.library_checks);
         self.add(TimeLimit::SidecarDeadline, other.sidecar_deadline);
+        self.add(TimeLimit::UnwidenedReading, other.unwidened_reading);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -102,7 +110,8 @@ impl TimeLimitsRunOut {
     /// One line per stated limit that ran out, naming what it skipped and
     /// why, and nothing for a limit that did not. The scan summary prints the
     /// run's total; each service's boundary prints its own. The sidecar
-    /// deadline has no line (see the module header).
+    /// deadline and the unwidened reading have no line (see the module
+    /// header).
     pub fn lines(&self) -> Vec<String> {
         [
             (
@@ -203,6 +212,23 @@ pub fn fold_check_outcomes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// carrick#2100: a reading the unwidened budget did not make is counted
+    /// under `unwidened_reading`, merged like every kind, and states no line
+    /// for a person to read.
+    #[test]
+    fn the_unwidened_reading_is_counted_on_the_wire_and_states_no_line() {
+        let mut cost = TimeLimitsRunOut::default();
+        cost.add(TimeLimit::UnwidenedReading, 2);
+        let mut total = TimeLimitsRunOut::default();
+        total.merge(&cost);
+        total.merge(&cost);
+        assert_eq!(
+            serde_json::to_string(&total).unwrap(),
+            r#"{"unwidened_reading":4}"#
+        );
+        assert!(total.lines().is_empty());
+    }
     use crate::cloud_storage::ManifestTypeKind;
     use crate::services::type_sidecar::VerdictBucket;
 

@@ -189,12 +189,13 @@ export class SidecarClient {
   }> = [];
 
   /**
-   * Start the sidecar process
+   * Start the sidecar process, with `env` added to this process's environment
    */
-  async start(): Promise<void> {
+  async start(env?: NodeJS.ProcessEnv): Promise<void> {
     return new Promise((resolve, reject) => {
       this.process = spawn('node', [SIDECAR_PATH], {
         stdio: ['pipe', 'pipe', 'pipe'],
+        ...(env === undefined ? {} : { env: { ...process.env, ...env } }),
       });
 
       // Handle stdout (JSON responses)
