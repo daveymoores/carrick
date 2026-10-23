@@ -246,6 +246,13 @@ const RESPONSE_INIT_MEMBER_NAMES = new Set<string>([
 const RESPONSE_HELPER_MAX_DEPTH = 4;
 
 /**
+ * How many wrapper calls a handler bound to one is followed through
+ * (carrick#2472 P3-2b): `wrap(trace(async (req, res) => …))` needs two. A
+ * backstop against a pathologically nested initializer.
+ */
+const WRAPPER_CALL_MAX_DEPTH = 3;
+
+/**
  * Members an options object uses to state an HTTP status. A >= 400 status marks
  * the branch an error path, whose shape is not the endpoint's contract.
  */
@@ -7565,16 +7572,19 @@ export class TypeInferrer {
   }
 
   /**
-   * The handler function referenced by a route-registration call: the first
+   * The handler function referenced by a route-registration call: the LAST
    * argument that is an inline function, or an identifier bound to a function
-   * (typically the 2nd+ arg — the path literal is not function-valued, so it is
-   * skipped naturally). No callee-name check: a call whose argument resolves to
-   * a function is structurally a registration regardless of the framework.
+   * (carrick#2472 P3-2b). The functions before it are middleware
+   * (`route(path).post(auth, audit, handler)`), which runs first and hands on;
+   * reading the first function read a middleware as the route. The path
+   * literal is not function-valued, so it is skipped naturally. No callee-name
+   * check: a call whose argument resolves to a function is structurally a
+   * registration regardless of the framework.
    */
   private handlerFromRegistrationCall(
     call: CallExpression
   ): FunctionLike | undefined {
-    for (const arg of call.getArguments()) {
+    for (const arg of [...call.getArguments()].reverse()) {
       const handler = this.asHandlerFunction(arg);
       if (handler) {
         return handler;
@@ -7617,8 +7627,10 @@ export class TypeInferrer {
    * declaration (via the compiler's definition nodes) and returned when that
    * declaration is — or initializes to — a function. Anything else (a path
    * literal, an object, a non-function binding) yields undefined.
+   * `followWrapperCalls` false reads a binding to a wrapper call as no
+   * function, so a name the wrapper walk meets is never walked again.
    */
-  private asHandlerFunction(node: Node): FunctionLike | undefined {
+  private asHandlerFunction(node: Node, followWrapperCalls = true): FunctionLike | undefined {
     const expr = this.unwrapExpressionNode(node);
 
     if (Node.isArrowFunction(expr) || Node.isFunctionExpression(expr)) {
@@ -7627,7 +7639,7 @@ export class TypeInferrer {
 
     if (Node.isIdentifier(expr)) {
       for (const def of expr.getDefinitionNodes()) {
-        const func = this.functionFromDeclaration(def);
+        const func = this.functionFromDeclaration(def, followWrapperCalls);
         if (func) {
           return func;
         }
@@ -7641,10 +7653,16 @@ export class TypeInferrer {
    * Extract a `FunctionLike` from a declaration node the compiler resolved an
    * identifier to: a function declaration is itself the function; a variable
    * declaration / binding whose initializer is an inline function yields that
-   * function (`const h = async () => { … }`). Import/re-export shims are walked
-   * by ts-morph's `getDefinitionNodes`, so no manual import chasing is needed.
+   * function (`const h = async () => { … }`), and one whose initializer is a
+   * wrapper call yields the function the call wraps
+   * (`const h = wrap<Contract>(async (req, res) => { … })`, carrick#2472
+   * P3-2b; `functionWrappedBy`). Import/re-export shims are walked by
+   * ts-morph's `getDefinitionNodes`, so no manual import chasing is needed.
    */
-  private functionFromDeclaration(decl: Node): FunctionLike | undefined {
+  private functionFromDeclaration(
+    decl: Node,
+    followWrapperCalls = true
+  ): FunctionLike | undefined {
     if (Node.isFunctionDeclaration(decl)) {
       return decl;
     }
@@ -7671,10 +7689,42 @@ export class TypeInferrer {
         if (Node.isArrowFunction(inner) || Node.isFunctionExpression(inner)) {
           return inner;
         }
+        if (followWrapperCalls && Node.isCallExpression(inner)) {
+          return this.functionWrappedBy(inner, 0);
+        }
       }
     }
 
     return undefined;
+  }
+
+  /**
+   * The function a call wraps, for a name bound to that call and used as a
+   * handler (carrick#2472 P3-2b): the call's one argument that is a function
+   * literal, a name bound to one, or another such call, a few calls deep.
+   *
+   * Two conditions keep this to wrappers. The call's own value has to be
+   * callable, because the name is used as a function: `rows.map((row) => …)`
+   * is handed a function and yields a list. And exactly one argument may be a
+   * function: with two there is no saying which of them is wrapped.
+   */
+  private functionWrappedBy(call: CallExpression, depth: number): FunctionLike | undefined {
+    if (depth >= WRAPPER_CALL_MAX_DEPTH) return undefined;
+    if (!this.isCallableType(call.getType())) return undefined;
+    const wrapped: FunctionLike[] = [];
+    for (const arg of call.getArguments()) {
+      const value = this.unwrapExpressionNode(arg);
+      const func =
+        Node.isArrowFunction(value) || Node.isFunctionExpression(value)
+          ? value
+          : Node.isCallExpression(value)
+            ? this.functionWrappedBy(value, depth + 1)
+            : Node.isIdentifier(value)
+              ? this.asHandlerFunction(value, false)
+              : undefined;
+      if (func) wrapped.push(func);
+    }
+    return wrapped.length === 1 ? wrapped[0] : undefined;
   }
 
   /**
