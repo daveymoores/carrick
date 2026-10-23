@@ -1994,6 +1994,7 @@ mod tests {
                 }],
                 hands_back_body: order.iter().map(|&i| bodies[i].clone()).collect(),
                 side_calls: order.iter().map(|&i| side_calls[i].clone()).collect(),
+                leaves: Vec::new(),
             }
         };
         let sites = facts(&[0, 1]);
