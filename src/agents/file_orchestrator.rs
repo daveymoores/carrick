@@ -427,6 +427,21 @@ impl PartedFile<'_> {
     }
 }
 
+/// Which of the modules a part's candidates name through an import its
+/// prompt carries (carrick#2486).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartModules {
+    /// Every one: what a part under the line is asked with.
+    Named,
+    /// Only those also named on a line the part shows. A candidate's call can
+    /// run far past the part's window (a registration whose inline callback
+    /// holds the rest of the file names every module registered inside it),
+    /// and a module named only on lines the part does not show is nothing the
+    /// prompt can be read against. A part over the line sheds those before it
+    /// is halved, since halving cannot shed them.
+    Shown,
+}
+
 /// How a file is asked, decided before its first request (carrick#2309).
 enum Asking {
     /// In one request: its whole prompt is at or under the line.
@@ -1935,7 +1950,10 @@ impl FileOrchestrator {
     ///   about, and is not sent. The exception is a file whose prompt carries
     ///   a GraphQL section, where a type can be the thing located.
     /// - A part whose prompt is at or under the line is one request.
-    /// - A part over it is halved by its bytes
+    /// - A part over it first sheds the attached modules its candidates name
+    ///   only on lines it does not show ([`PartModules::Shown`]), and is one
+    ///   request when that brings it under the line (carrick#2486).
+    /// - A part still over it is halved by its bytes
     ///   ([`SourceCut::halves_by_size`]) and each half fitted in turn.
     /// - A part over it that cannot be halved, one item with no list to cut,
     ///   is not sent when it holds no candidate: it states nothing the model
@@ -1958,13 +1976,34 @@ impl FileOrchestrator {
             {
                 continue;
             }
-            let Some(prompt) =
-                self.part_prompt(file, guidance, &plan.cut, &part, plan.named.as_deref())
-            else {
+            let prompt_with = |modules| {
+                self.part_prompt(
+                    file,
+                    guidance,
+                    &plan.cut,
+                    &part,
+                    plan.named.as_deref(),
+                    modules,
+                )
+            };
+            let Some(prompt) = prompt_with(PartModules::Named) else {
                 continue;
             };
             if prompt.text.len() <= plan.line {
                 fitted.push((part, prompt));
+                continue;
+            }
+            if let Some(shed) = prompt_with(PartModules::Shown)
+                && shed.text.len() <= plan.line
+            {
+                debug!(
+                    "{}: part {} is {} bytes with every module its candidates name and {} with only those named on its lines; asked with those",
+                    file.prompt_path,
+                    part.label(),
+                    prompt.text.len(),
+                    shed.text.len()
+                );
+                fitted.push((part, shed));
                 continue;
             }
             match plan.cut.halves_by_size(&part, &plan.limits) {
@@ -2161,8 +2200,9 @@ impl FileOrchestrator {
     /// The prompt of one part of a file (carrick#1898, carrick#2308): the
     /// file's own prompt, showing the part's window and what the window uses
     /// in place of the file, listing only the part's candidates and only the
-    /// imports its shown lines name, and carrying only the modules its
-    /// candidates name through an import.
+    /// imports its shown lines name, and carrying the modules its candidates
+    /// name through an import: all of them, or with [`PartModules::Shown`]
+    /// only those also named on a line the part shows.
     ///
     /// A part that lists no candidate carries the modules its window names
     /// through an import, and every part of a file with no candidate at all
@@ -2175,6 +2215,7 @@ impl FileOrchestrator {
         cut: &SourceCut,
         part: &SourcePart,
         named: Option<&[BTreeSet<usize>]>,
+        attached: PartModules,
     ) -> Option<AnalysisPrompt> {
         let positions = &part.candidates;
         let hints: Vec<String> = positions
@@ -2206,10 +2247,17 @@ impl FileOrchestrator {
                     .collect(),
             )
         } else {
+            let shown_modules: BTreeSet<usize> = file
+                .wrapper_imports
+                .iter()
+                .filter(|(name, _)| shown_names.contains(name.as_str()))
+                .flat_map(|(_, modules)| modules.iter().copied())
+                .collect();
             named.map(|named| {
                 positions
                     .iter()
                     .flat_map(|position| named[*position].iter().copied())
+                    .filter(|place| attached == PartModules::Named || shown_modules.contains(place))
                     .collect()
             })
         };
