@@ -65,7 +65,7 @@ const CALLS_TS = `import { callApi, post, Api, request, put, wrapped } from './a
 
 export async function run(api: Api, email: string, code: string, id: string) {
   await callApi('POST', '/v1/verify', { email, code });
-  await post<{ ok: boolean }>('/v1/paid', { paid: true });
+  await post<{ ok: boolean }>('/v1/settled', { settled: true });
   await api.send<{ ok: boolean }>('PATCH', '/v1/items/1', { purchased: true });
   await request('POST', '/v1/items/query', { filter: { email }, limit: 1 });
   await put('/v1/items/2', { name: id });
@@ -150,8 +150,8 @@ describe('carrick#2668: a helper that sends its argument as the body when one is
   });
 
   it('reads the argument a generic helper sends as `JSON.stringify(body)`', async () => {
-    const body = await request('{ paid: true }');
-    assert.strictEqual(body, '{ paid: boolean; }');
+    const body = await request('{ settled: true }');
+    assert.strictEqual(body, '{ settled: boolean; }');
   });
 
   it('reads the argument a generic helper sends as `body ? JSON.stringify(body) : null` and logs as `body || null`', async () => {
