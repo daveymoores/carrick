@@ -10,12 +10,14 @@
  * argument (`{ Querystring: ... }`). A compare then reported the request's
  * fields as fields the producer sends.
  *
- * A bare parameter whose type an installed library declares is an object the
- * framework handed the handler (its request, its reply, its context), never a
- * body: a call that forwards one sends through it, and states no body by its
- * own arguments. The row abstains. A parameter typed by the repo is still a
- * payload (`.then((item) => reply.send(item))`), and a direct send keeps the
- * type of what it sends.
+ * A bare parameter of the handler the route registration hands in is an
+ * object the framework passed it (its request, its reply, its context), never
+ * a body: a call that forwards one sends through it, and states no body by its
+ * own arguments. The row abstains. A parameter of any other function is still
+ * a payload, wherever its type is declared: a callback's
+ * (`.then((account) => reply.send(account))`) or a helper's
+ * (`sendAccount(reply, account: Account)`), typed by the repo or by an
+ * installed package. A direct send keeps the type of what it sends.
  *
  * No library, framework or member name is matched.
  */
@@ -51,7 +53,17 @@ export interface Server {
 }
 `;
 
-const SERVICE_TS = `import type { Server } from "server-kit";
+/** A data library whose model types live in an installed package, as an ORM
+ * or a generated client's do. */
+const DATA_KIT_DTS = `export interface Account {
+  id: string;
+  email: string;
+}
+export declare function loadAccount(): Promise<Account>;
+`;
+
+const SERVICE_TS = `import type { Server, Reply } from "server-kit";
+import { loadAccount, type Account } from "data-kit";
 
 declare const app: Server;
 
@@ -79,6 +91,18 @@ app.get<{ Querystring: { code?: string } }>("/direct", async (request, reply) =>
 
 app.get("/then", async (request, reply) => {
   return loadItem().then((item) => reply.send(item));
+});
+
+app.get("/account", async (request, reply) => {
+  return loadAccount().then((account) => reply.send(account));
+});
+
+function sendAccount(reply: Reply, account: Account) {
+  return reply.send(account);
+}
+
+app.get("/account-helper", async (request, reply) => {
+  return sendAccount(reply, await loadAccount());
 });
 
 app.get<{ Querystring: { code?: string } }>("/returns-reply", async (request, reply) => {
@@ -115,10 +139,12 @@ describe('carrick-cloud#2576: a call that forwards the handler\'s framework obje
         include: ['src'],
       })
     );
-    const dir = path.join(repoDir, 'node_modules', 'server-kit');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'server-kit', version: '1.0.0', types: 'index.d.ts' }));
-    fs.writeFileSync(path.join(dir, 'index.d.ts'), SERVER_KIT_DTS);
+    for (const [name, dts] of [['server-kit', SERVER_KIT_DTS], ['data-kit', DATA_KIT_DTS]]) {
+      const dir = path.join(repoDir, 'node_modules', name);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name, version: '1.0.0', types: 'index.d.ts' }));
+      fs.writeFileSync(path.join(dir, 'index.d.ts'), dts);
+    }
     servicePath = path.join(repoDir, 'src', 'service.ts');
     fs.writeFileSync(servicePath, SERVICE_TS);
     client = new SidecarClient();
@@ -190,5 +216,30 @@ describe('carrick-cloud#2576: a call that forwards the handler\'s framework obje
   it('keeps a repo-typed parameter handed to the send as the payload', async () => {
     const text = await infer('Then', '"/then", async', 'reply.send(item)', 'return loadItem().then((item) => reply.send(item));');
     assert.ok(text !== undefined && /\bid: string\b/.test(text) && /\btitle: string\b/.test(text), `expected the item, got: ${text}`);
+  });
+
+  it('keeps a callback parameter typed by an installed package as the payload', async () => {
+    const text = await infer(
+      'Account',
+      '"/account", async',
+      'reply.send(account)',
+      'return loadAccount().then((account) => reply.send(account));'
+    );
+    assert.strictEqual(text, 'Account');
+  });
+
+  it('keeps a helper parameter typed by an installed package as the payload', async () => {
+    const text = await infer('AccountHelper', 'function sendAccount', 'reply.send(account)', 'return reply.send(account);\n}');
+    assert.strictEqual(text, 'Account');
+  });
+
+  it('does not publish the reply a handler returns at a line-only read', async () => {
+    const response = await client.send<InferShape>({
+      action: 'infer',
+      request_id: 'infer-ReturnsReplyLine',
+      requests: [{ file_path: servicePath, line_number: lineOf('"/returns-reply", async'), infer_kind: 'response_body', alias: 'ReturnsReplyLine' }],
+    });
+    const text = response.inferred_types?.find((t) => t.alias === 'ReturnsReplyLine')?.type_string;
+    assert.ok(!/Querystring|Reply/.test(text ?? ''), `reply type leaked into the response: ${text}`);
   });
 });

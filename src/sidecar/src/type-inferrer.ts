@@ -1272,14 +1272,14 @@ export class TypeInferrer {
     if (this.serialisedBodyEnvelopeEngages(awaitedType, func)) {
       return this.inferSerialisedBodyEnvelope(request, func);
     }
-    // A handler that returns the reply it was handed (`return reply`) states
-    // no body by that return; the reply's type is built from the route's
-    // request type argument (carrick-cloud#2576).
+    // A route handler that returns the reply it was handed (`return reply`)
+    // states no body by that return; the reply's type is built from the
+    // route's request type argument (carrick-cloud#2576).
     const returned = this.returnedExpressions(func);
     if (
       returned.length > 0 &&
       returned.every((expression) =>
-        this.isLibraryTypedParameter(this.unwrapExpressionNode(expression))
+        this.isRouteHandlerParameter(this.unwrapExpressionNode(expression), request)
       )
     ) {
       this.log(
@@ -1814,12 +1814,12 @@ export class TypeInferrer {
         payloadNode = args[0];
       }
     }
-    // An object the framework handed the handler is never its body: not the
-    // reply a handler returns (`return reply`), and not the request the drill
-    // reaches in a call that forwards it (`return finish(request, reply)`),
-    // whose type the framework built from the route's request type argument
-    // (carrick-cloud#2576).
-    if (this.isLibraryTypedParameter(payloadNode)) {
+    // A parameter the route registration hands its handler is never the
+    // route's body: not the reply a handler returns (`return reply`), and not
+    // the request the drill reaches in a call that forwards it
+    // (`return finish(request, reply)`), whose type the framework built from
+    // the route's request type argument (carrick-cloud#2576).
+    if (this.isRouteHandlerParameter(payloadNode, request)) {
       this.log(
         `Response payload at ${request.file_path}:${request.line_number} is an object ` +
           'the framework handed the handler; it states no body'
@@ -2056,26 +2056,25 @@ export class TypeInferrer {
   }
 
   /**
-   * True when `node` is a bare reference to a function parameter whose type an
-   * installed library declares: an object a framework hands its handler (the
-   * request, the reply, a context), never a body the route sends
-   * (carrick-cloud#2576). A parameter typed by the repo is data
-   * (`.then((item) => reply.send(item))`), and so is one typed by a default
-   * TypeScript library (`Date`, `Map`).
+   * True when `node` is a bare reference to a parameter of the handler the
+   * route registration on the request's line hands in (found as
+   * `registrationAtLine` finds it, wrappers included): the request, the reply
+   * or the context the framework passes, never a body the route sends
+   * (carrick-cloud#2576). Where the parameter's type is declared is not read:
+   * a parameter of any other function is data, whether the repo or an
+   * installed package types it (`.then((account) => reply.send(account))`, a
+   * helper's `account: Account`).
    */
-  private isLibraryTypedParameter(node: Node): boolean {
+  private isRouteHandlerParameter(node: Node, request: InferRequestItem): boolean {
     if (!Node.isIdentifier(node)) return false;
-    const symbol = node.getSymbol();
-    if (!symbol?.getDeclarations().some((decl) => Node.isParameterDeclaration(decl))) {
-      return false;
-    }
-    const type = node.getType();
-    const typeSymbol = type.getAliasSymbol() ?? type.getSymbol();
-    if (!typeSymbol || !this.symbolIsLibOrExternalOrigin(typeSymbol)) return false;
-    const program = this.project.getProgram().compilerObject;
-    return !typeSymbol
-      .getDeclarations()
-      .some((decl) => program.isSourceFileDefaultLibrary(decl.getSourceFile().compilerNode));
+    const owners = (node.getSymbol()?.getDeclarations() ?? [])
+      .filter((decl) => Node.isParameterDeclaration(decl))
+      .map((decl) => decl.getParent().compilerNode);
+    if (owners.length === 0) return false;
+    const sourceFile = this.project.getSourceFile(request.file_path);
+    if (!sourceFile) return false;
+    const handler = this.registrationAtLine(sourceFile, request.line_number)?.handler;
+    return handler !== undefined && owners.includes(handler.compilerNode);
   }
 
   /**
