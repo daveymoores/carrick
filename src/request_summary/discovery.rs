@@ -21,6 +21,11 @@
 //! until the store says which exports run what they are handed, none is
 //! taken to.
 //!
+//! A call into a function declared in a file of another service of the run
+//! (carrick#2618, [`discover_with`]) is followed in that file with that
+//! service's own IR and rows: the chain names the sibling's files, and the
+//! record is this service's, at its own call.
+//!
 //! There is no hop limit. A cycle ends the walk, and each definition's
 //! answer is kept once it does not depend on a definition still being read.
 //!
@@ -45,8 +50,8 @@
 //! A call that reached nothing and entered no code says why, on
 //! [`Discovery::unfollowed`], and never in `sites`: `value_callee` (an in-repo
 //! value that is not a definition: a parameter, a field, a returned
-//! function), `outside_service` (a function of this repo outside the
-//! service's files), `package_unmatched` (a call declared in a package the
+//! function), `outside_service` (a function of this repo in no file of any
+//! service of the run), `package_unmatched` (a call declared in a package the
 //! store answered with network-role exports, that matched none of them),
 //! `unanswered_package` (a call declared in a package the answer holds
 //! nothing for), or the hole the call's own row names. A call into an export
@@ -955,6 +960,9 @@ impl<'a> Outcome<'a> {
 
 struct Walker<'a> {
     inputs: &'a RequestSummaryInputs,
+    /// The run's other services, in declared order (carrick#2618): the walk
+    /// reads a file of one of them with that service's own inputs.
+    siblings: &'a [&'a RequestSummaryInputs],
     labels: &'a Labels<'a>,
     root: &'a Path,
     /// Each call the library-site reader reads as made through an instance
@@ -975,6 +983,57 @@ struct Walker<'a> {
 }
 
 impl<'a> Walker<'a> {
+    /// The inputs that hold `file`: this service's, else the first sibling's
+    /// that does. Every read keyed by a file goes through this, so a body the
+    /// walk enters in a sibling is read with the sibling's own IR and rows.
+    fn inputs_for(&self, file: &Path) -> &'a RequestSummaryInputs {
+        if self.inputs.files.contains_key(file) {
+            return self.inputs;
+        }
+        self.siblings
+            .iter()
+            .copied()
+            .find(|sibling| sibling.files.contains_key(file))
+            .unwrap_or(self.inputs)
+    }
+
+    /// What the call `call` in `file` reaches, [`RequestSummaryInputs::reach`]
+    /// of the service that holds `file`. A function of another service of
+    /// the run is read in that service's files, from the declaration the
+    /// call's row names (or, when the rows say nothing, the key the call
+    /// graph names); with no such service the call stays outside the run.
+    fn reach(&self, file: &Path, call: &CallIr) -> Reach {
+        let reach = self
+            .inputs_for(file)
+            .reach(file, call.site.lo, call.site.hi);
+        let Reach::OutsideService(declaring, name) = &reach else {
+            return reach;
+        };
+        let owner = self.inputs_for(declaring);
+        if !owner.files.contains_key(declaring.as_path()) {
+            return reach;
+        }
+        let named = self.row(file, call).and_then(|row| {
+            let positions = self.inputs_for(file).positions.as_ref()?;
+            (positions.path_of(row.decl_file()?) == *declaring
+                && row.symbol() == Some(name.as_str()))
+            .then(|| owner.definition_at(declaring, row.decl_line(), name))
+        });
+        match named {
+            Some(Reach::NoFunction) | None => {
+                let keyed = owner.files[declaring.as_path()]
+                    .functions
+                    .contains_key(name);
+                if keyed {
+                    Reach::Function(declaring.clone(), name.clone())
+                } else {
+                    Reach::NoFunction
+                }
+            }
+            Some(read) => read,
+        }
+    }
+
     fn rel(&self, file: &Path) -> String {
         let relative = file.strip_prefix(self.root).unwrap_or(file);
         relative
@@ -986,7 +1045,7 @@ impl<'a> Walker<'a> {
 
     fn hop(&self, file: &Path, key: &str) -> ChainHop {
         let line = self
-            .inputs
+            .inputs_for(file)
             .files
             .get(file)
             .and_then(|ir| {
@@ -1042,8 +1101,9 @@ impl<'a> Walker<'a> {
 
     /// The call row at `call`, when there are rows to read.
     fn row(&self, file: &Path, call: &CallIr) -> Option<&Row> {
-        let positions = self.inputs.positions.as_ref()?;
-        let ir = self.inputs.files.get(file)?;
+        let inputs = self.inputs_for(file);
+        let positions = inputs.positions.as_ref()?;
+        let ir = inputs.files.get(file)?;
         positions
             .lookup(
                 file,
@@ -1145,7 +1205,8 @@ impl<'a> Walker<'a> {
                 }
             }
         }
-        let ir = self.inputs.files.get(file)?;
+        let inputs = self.inputs_for(file);
+        let ir = inputs.files.get(file)?;
         // The binding the callee is read through: the callee itself, or the
         // name its member chain starts at.
         let root = root_name(call);
@@ -1230,7 +1291,7 @@ impl<'a> Walker<'a> {
             }
         }
         if let Some(package) = &package
-            && let Some(positions) = self.inputs.positions.as_ref()
+            && let Some(positions) = inputs.positions.as_ref()
         {
             for (lo, hi, member) in &call.receiver_spans {
                 let kind = if *member { Kind::Member } else { Kind::Ident };
@@ -1293,14 +1354,15 @@ impl<'a> Walker<'a> {
         else {
             return false;
         };
-        let Some(positions) = self.inputs.positions.as_ref() else {
+        let Some(positions) = self.inputs_for(file).positions.as_ref() else {
             return false;
         };
+        let declared_in = positions.path_of(decl_file);
         in_repo(row)
             && self
-                .inputs
+                .inputs_for(&declared_in)
                 .files
-                .get(&positions.path_of(decl_file))
+                .get(&declared_in)
                 .and_then(|declared| declared.declaration_lines.signatures.get(&line))
                 .is_some_and(|name| name == symbol)
     }
@@ -1310,7 +1372,7 @@ impl<'a> Walker<'a> {
     /// function outside the service, or a member of a package the answer does
     /// not match or does not hold. `None` when nothing was missed.
     fn unfollowed(&self, file: &Path, call: &CallIr, construction: bool) -> Option<&'static str> {
-        match self.inputs.reach(file, call.site.lo, call.site.hi) {
+        match self.reach(file, call) {
             Reach::OutsideService(..) => Some(OUTSIDE_SERVICE),
             Reach::NoFunction => {
                 let row = self.row(file, call)?;
@@ -1339,8 +1401,8 @@ impl<'a> Walker<'a> {
         {
             return true;
         }
-        let binding =
-            root_name(call).and_then(|root| self.inputs.files.get(file)?.bindings.get(root));
+        let binding = root_name(call)
+            .and_then(|root| self.inputs_for(file).files.get(file)?.bindings.get(root));
         binding.is_some_and(|binding| {
             specifier_keys(&binding.specifier).iter().any(|package| {
                 [binding.export.as_str(), "default", "export ="]
@@ -1391,7 +1453,7 @@ impl<'a> Walker<'a> {
         if call.invokes_param.is_some() {
             return Outcome::stopped(INJECTED_CALLEE);
         }
-        match self.inputs.reach(file, call.site.lo, call.site.hi) {
+        match self.reach(file, call) {
             Reach::Function(target, key) => {
                 let hop = self.hop(&target, &key);
                 let id = (target, key);
@@ -1629,7 +1691,7 @@ impl<'a> Walker<'a> {
 
     /// The definition `key` of `file`, the file as `inputs` keys it.
     fn function(&self, file: &Path, key: &str) -> Option<(&'a Path, &'a FnIr)> {
-        let (path, ir) = self.inputs.files.get_key_value(file)?;
+        let (path, ir) = self.inputs_for(file).files.get_key_value(file)?;
         Some((path.as_path(), ir.functions.get(key)?))
     }
 
@@ -1645,7 +1707,7 @@ impl<'a> Walker<'a> {
                 .chain(&ir.detached)
                 .find_map(|inner| find(inner, start))
         }
-        let ir = self.inputs.files.get(file)?;
+        let ir = self.inputs_for(file).files.get(file)?;
         let mut keys: Vec<&String> = ir.functions.keys().collect();
         keys.sort();
         keys.into_iter()
@@ -1686,7 +1748,7 @@ impl<'a> Walker<'a> {
                         ..Outcome::default()
                     })];
                 }
-                match self.inputs.row_names(file, *lo, *hi, kind) {
+                match self.inputs_for(file).row_names(file, *lo, *hi, kind) {
                     Reach::Function(target, key) => {
                         vec![Held::Reached(self.enter_value(target, key, invoke))]
                     }
@@ -1694,7 +1756,8 @@ impl<'a> Walker<'a> {
                 }
             }
             ValueAt::Returned { lo, hi } => {
-                let Reach::Function(target, key) = self.inputs.reach(file, *lo, *hi) else {
+                let Reach::Function(target, key) = self.inputs_for(file).reach(file, *lo, *hi)
+                else {
                     return nothing();
                 };
                 let Some((factory_file, factory)) = self.function(&target, &key) else {
@@ -1747,8 +1810,9 @@ impl<'a> Walker<'a> {
         kind: Kind,
         invoke: Invoke<'_>,
     ) -> Option<SiteEnd> {
-        let positions = self.inputs.positions.as_ref()?;
-        let ir = self.inputs.files.get(file)?;
+        let inputs = self.inputs_for(file);
+        let positions = inputs.positions.as_ref()?;
+        let ir = inputs.files.get(file)?;
         let row = positions
             .lookup(file, ir.swc_start(lo), ir.swc_start(hi), kind)
             .ok()?;
@@ -2071,6 +2135,19 @@ fn role_key(role: LibraryRole) -> String {
 /// Every site of the service `inputs` reads, with the store's answer
 /// `labels`, paths relative to `root`. Nothing without rows.
 pub fn discover(inputs: &RequestSummaryInputs, labels: &Labels<'_>, root: &Path) -> Discovery {
+    discover_with(inputs, &[], labels, root)
+}
+
+/// [`discover`], with the run's other services `siblings` in declared order
+/// (carrick#2618): a call into a function declared in a file of one of them
+/// is followed in that file, read with the sibling's own IR and rows. Records
+/// are written for this service's own files only.
+pub fn discover_with(
+    inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
+    labels: &Labels<'_>,
+    root: &Path,
+) -> Discovery {
     let mut discovery = Discovery::default();
     if inputs.positions.is_none() {
         return discovery;
@@ -2084,6 +2161,7 @@ pub fn discover(inputs: &RequestSummaryInputs, labels: &Labels<'_>, root: &Path)
         .collect();
     let mut walker = Walker {
         inputs,
+        siblings,
         labels,
         root,
         instances,
@@ -2629,6 +2707,113 @@ mod tests {
         assert_eq!(
             records_in(&discovery, "services/web/src/maybe.ts"),
             texts(&["4 socket?.send -> fixture-socket Socket send"])
+        );
+    }
+
+    /// carrick#2618: a call into a function declared in a file of another
+    /// service of the run is followed in that file, read with that service's
+    /// own IR and rows. The record is the calling service's, at its own call,
+    /// and the chain names the sibling's files. A file of no service stays
+    /// `outside_service`, and the sibling's own files are never recorded.
+    /// Without siblings the same calls are `outside_service`. The answer key
+    /// is `tests/fixtures/discovery-siblings/README.md`.
+    #[test]
+    fn a_call_into_a_sibling_service_is_a_site_through_its_code() {
+        let Some(on) = super::super::fixture_walk::walked_services(
+            "discovery-siblings",
+            &[("services/app", "app"), ("packages/client", "client")],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/discovery-siblings/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let labels = Labels::of_answer(&answer);
+        let [app, client] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let file = "services/app/src/main.ts";
+        let chain_of = |discovery: &Discovery, line: u32| -> Vec<String> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file == file && site.line == line)
+                .flat_map(|site| {
+                    let end = site.end.as_ref().expect("a site reaches fetch");
+                    let mut parts: Vec<String> = site
+                        .chain
+                        .iter()
+                        .map(|hop| format!("{} {}", hop.function, hop.file))
+                        .collect();
+                    parts.push(format!("{} {} {}", end.package, end.export, end.file));
+                    parts
+                })
+                .collect()
+        };
+        let with = discover_with(app, &[client], &labels, &on.repo);
+        let http = "packages/client/src/http.ts";
+        assert_eq!(
+            chain_of(&with, 5),
+            texts(&[
+                &format!("getItem {http}"),
+                &format!("send {http}"),
+                &format!("lib.dom fetch {http}")
+            ])
+        );
+        assert_eq!(
+            chain_of(&with, 9),
+            texts(&[
+                &format!("postTo {http}"),
+                &format!("send {http}"),
+                &format!("lib.dom fetch {http}")
+            ])
+        );
+        assert_eq!(
+            chain_of(&with, 14),
+            texts(&[
+                &format!("ItemsClient.remove {http}"),
+                &format!("send {http}"),
+                &format!("lib.dom fetch {http}")
+            ])
+        );
+        assert!(
+            with.sites.iter().all(|site| site.line != 13),
+            "no record at the construction"
+        );
+        assert!(
+            with.sites.iter().all(|site| site.line != 18),
+            "format() reaches no labelled call"
+        );
+        let unfollowed: Vec<(u32, Option<&str>)> = with
+            .unfollowed
+            .iter()
+            .map(|site| (site.line, site.stop.as_deref()))
+            .collect();
+        assert_eq!(unfollowed, vec![(22, Some("outside_service"))]);
+        for record in with.sites.iter().chain(&with.unfollowed) {
+            assert!(
+                !record.file.starts_with("packages/"),
+                "no record in a sibling's file: {}",
+                record.file
+            );
+        }
+        // The same walk with no siblings: every call into a package file is
+        // outside the service.
+        let alone = discover_with(app, &[], &labels, &on.repo);
+        assert!(alone.sites.is_empty());
+        let alone: Vec<u32> = alone.unfollowed.iter().map(|site| site.line).collect();
+        assert_eq!(alone, vec![5, 9, 13, 14, 18, 22]);
+        // The sibling's own walk records its own call.
+        let own = discover_with(client, &[app], &labels, &on.repo);
+        assert!(
+            records_in(&own, http).contains(&"4 fetch -> lib.dom fetch -".to_string()),
+            "{:?}",
+            records_in(&own, http)
         );
     }
 
@@ -3608,25 +3793,39 @@ mod tests {
             let mut sites: Vec<DiscoverySite> = Vec::new();
             let mut unfollowed: Vec<DiscoverySite> = Vec::new();
             let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-            for service in &services {
-                let name = service
-                    .service_name
-                    .clone()
-                    .unwrap_or_else(|| "(root)".to_string());
-                let index = match by_service.get(&name) {
-                    Some(path) => crate::position_rows::PositionIndex::of(
-                        &root,
-                        crate::position_rows::read_rows_file(path).expect("rows read"),
-                    ),
-                    None => crate::position_rows::PositionIndex::missing(&root),
-                };
-                let inputs = crate::engine::discover_service_inputs(&root, service, Some(index));
+            // Every service's inputs are kept: each walk reads the others'
+            // files with their own IR and rows (carrick#2618).
+            let service_inputs: Vec<RequestSummaryInputs> = services
+                .iter()
+                .map(|service| {
+                    let name = service
+                        .service_name
+                        .clone()
+                        .unwrap_or_else(|| "(root)".to_string());
+                    let index = match by_service.get(&name) {
+                        Some(path) => crate::position_rows::PositionIndex::of(
+                            &root,
+                            crate::position_rows::read_rows_file(path).expect("rows read"),
+                        ),
+                        None => crate::position_rows::PositionIndex::missing(&root),
+                    };
+                    crate::engine::discover_service_inputs(&root, service, Some(index))
+                })
+                .collect();
+            for (at, inputs) in service_inputs.iter().enumerate() {
+                let siblings: Vec<&RequestSummaryInputs> = service_inputs
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != at)
+                    .map(|(_, other)| other)
+                    .collect();
+                let service = &services[at];
                 let declarations = script.as_ref().map(|script| {
                     super::super::fixture_walk::census_declarations(
                         script,
                         &root,
                         service,
-                        &inputs,
+                        inputs,
                         &answer.exports,
                     )
                 });
@@ -3641,7 +3840,7 @@ mod tests {
                     }
                     None => &labels,
                 };
-                let discovery = discover(&inputs, labels, &root);
+                let discovery = discover_with(inputs, &siblings, labels, &root);
                 for (key, count) in discovery.counts {
                     *counts.entry(key).or_default() += count;
                 }
