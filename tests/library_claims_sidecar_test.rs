@@ -217,7 +217,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
             "export",
             LibraryClaim::Scope {
                 member: "channel".into(),
-                name: slot(0),
+                name: Some(slot(0)),
                 path: vec![],
                 on: Some(ClaimOn::Export),
                 of: None,
@@ -227,6 +227,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
                 runs: None,
                 yields: None,
                 mounts: None,
+                collects: None,
             },
         ),
         check(

@@ -845,6 +845,21 @@ pub enum BoundName {
     Maker,
     /// The scope member bound it to the receiver.
     Scope,
+    /// The key path the op's value sits under in a `collects` object
+    /// (#2474 R6a, contract amendment 3 on carrick#2434).
+    Key,
+}
+
+/// Where a router member takes its procedures (#2474 R6a, contract
+/// amendment 3 on carrick#2434): an object at argument `arg` (or its
+/// property `key`) whose property values are procedures or nested
+/// collections, each named by its key; nested keys join with `join`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Collects {
+    pub arg: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    pub join: String,
 }
 
 /// Where an op's name comes from: a slot of the call, or a bound name.
@@ -996,9 +1011,13 @@ pub enum LibraryClaim {
         picker: Option<String>,
     },
     /// `member(name)` (after `path`) returns a receiver bound to that name.
+    /// A procedure router's member (`collects`, #2474 R6a) has no name: a
+    /// scope carries exactly one of `name` and `collects`, and the store
+    /// reader drops one with neither.
     Scope {
         member: String,
-        name: ClaimSlot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<ClaimSlot>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         path: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1021,6 +1040,10 @@ pub enum LibraryClaim {
         /// `name`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mounts: Option<ClaimSlot>,
+        /// Procedure routers (#2474 R6a): the member collects procedures by
+        /// key and returns the collection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collects: Option<Collects>,
     },
     /// A member that acts on the wire; `member: None` is the object `path`
     /// reaches (the receiver itself when `path` is empty).
@@ -5168,7 +5191,7 @@ mod tests {
                     }),
                     library(LibraryClaim::Scope {
                         member: "channel".into(),
-                        name: slot(),
+                        name: Some(slot()),
                         path: vec!["tasks".into()],
                         on: Some(ClaimOn::Both),
                         of: Some("instance:connect".into()),
@@ -5182,6 +5205,51 @@ mod tests {
                             side: "server".into(),
                         })),
                         mounts: Some(slot()),
+                        collects: None,
+                    }),
+                    // Procedure routers (#2474 R6a): a router member with no
+                    // name, and an op named by its key.
+                    library(LibraryClaim::Scope {
+                        member: "router".into(),
+                        name: None,
+                        path: vec![],
+                        on: Some(ClaimOn::Instance),
+                        of: None,
+                        key_labels: BTreeMap::new(),
+                        name_scope: None,
+                        picker: None,
+                        runs: None,
+                        yields: None,
+                        mounts: None,
+                        collects: Some(Collects {
+                            arg: 0,
+                            key: Some("routes".into()),
+                            join: ".".into(),
+                        }),
+                    }),
+                    library(LibraryClaim::Op {
+                        op: LibraryOp::Receive,
+                        member: Some("query".into()),
+                        path: vec!["procedure".into()],
+                        on: Some(ClaimOn::Instance),
+                        of: None,
+                        name: Some(OpName::Bound {
+                            bound: BoundName::Key,
+                        }),
+                        payload: None,
+                        handler: Some(slot()),
+                        ack: None,
+                        key_labels: BTreeMap::new(),
+                        name_scope: None,
+                        picker: None,
+                        options: None,
+                        method: Some("GET".into()),
+                        method_key: None,
+                        method_default: None,
+                        base: None,
+                        runs: None,
+                        yields: None,
+                        request: None,
                     }),
                     library(LibraryClaim::Op {
                         op: LibraryOp::Send,
@@ -5790,7 +5858,7 @@ mod tests {
                     "instance:connect",
                     LibraryClaim::Scope {
                         member: "channel".into(),
-                        name: slot(0, None),
+                        name: Some(slot(0, None)),
                         path: vec![],
                         on: None,
                         of: Some("instance:connect".into()),
@@ -5800,6 +5868,7 @@ mod tests {
                         runs: None,
                         yields: None,
                         mounts: None,
+                        collects: None,
                     },
                 ),
                 check(

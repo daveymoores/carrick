@@ -126,9 +126,11 @@ impl ScopeLabel {
         let mut labels = Vec::new();
         for export in exports {
             for (claim_id, claim) in export.claims_with_scopes_by_id() {
+                // A procedure router's member has no name (#2474 R6a): it binds
+                // no prefix, and R6c reads its collection.
                 let LibraryClaim::Scope {
                     member,
-                    name,
+                    name: Some(name),
                     path,
                     runs,
                     yields,

@@ -1053,7 +1053,20 @@ fn parse_export(
             let tagged = element.as_object_mut().map(|fields| {
                 fields.insert("kind".to_string(), Value::String(kind.to_string()));
             });
-            let parsed = tagged.and_then(|()| serde_json::from_value::<LibraryClaim>(element).ok());
+            let parsed = tagged
+                .and_then(|()| serde_json::from_value::<LibraryClaim>(element).ok())
+                // A scope names a prefix or collects procedures (#2474 R6a);
+                // one that does neither is out of shape.
+                .filter(|claim| {
+                    !matches!(
+                        claim,
+                        LibraryClaim::Scope {
+                            name: None,
+                            collects: None,
+                            ..
+                        }
+                    )
+                });
             match parsed {
                 Some(claim) => claims.push(claim),
                 None => *dropped += 1,
@@ -2366,6 +2379,69 @@ mod tests {
         );
         assert_eq!(answer.exports[0].claims.len(), 1);
         assert_eq!(answer.dropped, 4);
+    }
+
+    /// carrick#2474 R6a: a router member's `collects`, with no name, an op
+    /// named by its key, and an adapter's `runs` and `prefix` read off the
+    /// store's answer and go to the verifier as written (contract amendment
+    /// 3 of 2026-10-23 on #2434).
+    #[test]
+    fn the_procedure_fields_read_and_are_sent_as_written() {
+        let answer = parse_answer(
+            r#"{"library_claims":[{"package":"fixture-procs","version":"1.0.0","status":"answered","exports":[
+                {"specifier":"fixture-procs","export":"init","role":"server_framework",
+                 "makes":[{"form":"call","member":"create"}],
+                 "scopes":[
+                    {"member":"router","of":"instance:create","collects":{"arg":0,"join":"."}}
+                 ],
+                 "ops":[
+                    {"op":"receive","member":"query","path":["procedure"],"of":"instance:create",
+                     "name":{"bound":"key"},"handler":{"arg":0},"method":"GET"}
+                 ]},
+                {"specifier":"fixture-procs","export":"serveRpc","role":"server_framework",
+                 "makes":[{"form":"call","member":null,"runs":{"arg":0,"key":"router"},
+                           "prefix":{"arg":0,"key":"endpoint"}}]}]}]}"#,
+        );
+        assert_eq!((answer.answered, answer.dropped), (1, 0));
+        let sent = serde_json::to_value(&answer.exports[0].claims).unwrap();
+        assert_eq!(
+            sent[1],
+            serde_json::json!({ "kind": "scope", "member": "router", "of": "instance:create",
+                                "collects": { "arg": 0, "join": "." } })
+        );
+        assert_eq!(sent[2]["name"], serde_json::json!({ "bound": "key" }));
+        assert_eq!(sent[2]["method"], serde_json::json!("GET"));
+        let adapter = serde_json::to_value(&answer.exports[1].claims).unwrap();
+        assert_eq!(
+            adapter[0],
+            serde_json::json!({ "kind": "make", "form": "call", "member": null,
+                                "prefix": { "arg": 0, "key": "endpoint" },
+                                "runs": { "arg": 0, "key": "router" } })
+        );
+    }
+
+    /// A procedure field in a shape this build cannot read drops its element
+    /// and counts it, as every other field does; so does a scope with neither
+    /// a name nor a collection, as one without a name did before.
+    #[test]
+    fn a_procedure_field_out_of_shape_is_dropped_and_counted() {
+        let answer = parse_answer(
+            r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"answered","exports":[
+                {"specifier":"lib","export":"init","role":"server_framework",
+                 "scopes":[
+                    {"member":"router","on":"instance","collects":{"arg":0,"join":"."}},
+                    {"member":"router","on":"instance","collects":{"arg":0}},
+                    {"member":"router","on":"instance","collects":{"arg":-1,"join":"."}},
+                    {"member":"router","on":"instance","collects":"record"},
+                    {"member":"router","on":"instance"}
+                 ],
+                 "ops":[
+                    {"op":"receive","member":"query","on":"instance","name":{"bound":"keys"},
+                     "handler":{"arg":0},"method":"GET"}
+                 ]}]}]}"#,
+        );
+        assert_eq!(answer.exports[0].claims.len(), 1);
+        assert_eq!(answer.dropped, 5);
     }
 
     /// An answer in the shape before label v2 reads as it did, and its

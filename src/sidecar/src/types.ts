@@ -476,10 +476,22 @@ export interface ClaimSlot {
 
 /**
  * A name the call does not carry: the one the maker's `name` slot bound to
- * the instance (`maker`), or the one the scope member bound (`scope`).
+ * the instance (`maker`), the one the scope member bound (`scope`), or the
+ * key path the op's value sits under in a `collects` object (`key`, #2474
+ * R6a).
  */
 export interface BoundName {
-  bound: 'maker' | 'scope';
+  bound: 'maker' | 'scope' | 'key';
+}
+
+/**
+ * Where a router member takes its procedures (#2474 R6a, contract amendment
+ * 3 on carrick#2434): an object at argument `arg` (or its property `key`)
+ * whose property values are procedures or nested collections, each named by
+ * its key; nested keys join with `join`.
+ */
+export interface Collects extends ClaimSlot {
+  join: string;
 }
 
 /**
@@ -580,7 +592,8 @@ export type LibraryClaim =
       /** A member that returns a receiver bound to a name (a channel, room or queue). */
       kind: 'scope';
       member: string;
-      name: ClaimSlot;
+      /** Exactly one of `name` and `collects` (#2474 R6a). */
+      name?: ClaimSlot;
       path?: string[];
       on?: ClaimOn;
       of?: string;
@@ -596,6 +609,8 @@ export type LibraryClaim =
       yields?: Yields;
       /** Route fields (#2474 R0): the instance handed here is served under `name`. */
       mounts?: ClaimSlot;
+      /** Procedure routers (#2474 R6a): the member collects procedures by key and returns the collection. */
+      collects?: Collects;
     }
   | {
       kind: 'op';

@@ -420,7 +420,16 @@ const ClaimSlotSchema = z
   })
   .strict();
 
-const BoundNameSchema = z.object({ bound: z.enum(['maker', 'scope']) }).strict();
+const BoundNameSchema = z.object({ bound: z.enum(['maker', 'scope', 'key']) }).strict();
+
+/** Procedure routers (#2474 R6a): where a router member takes its procedures, and how nested keys join. */
+const CollectsSchema = z
+  .object({
+    arg: z.number().int().nonnegative(),
+    key: z.string().min(1).optional(),
+    join: z.string().min(1),
+  })
+  .strict();
 
 /**
  * Label structure v2 (carrick#2434). The schema takes the shape only: which
@@ -486,7 +495,8 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
     .object({
       kind: z.literal('scope'),
       member: z.string().min(1),
-      name: ClaimSlotSchema,
+      // Exactly one of `name` and `collects`: the verifier's verdict (#2474 R6a).
+      name: ClaimSlotSchema.optional(),
       path: MemberPathSchema.optional(),
       on: ClaimOnSchema.optional(),
       of: z.string().min(1).optional(),
@@ -496,6 +506,7 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       runs: ClaimSlotSchema.optional(),
       yields: YieldsSchema.optional(),
       mounts: ClaimSlotSchema.optional(),
+      collects: CollectsSchema.optional(),
     })
     .strict(),
   z
