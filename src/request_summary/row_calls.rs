@@ -517,6 +517,55 @@ impl RequestSummaryInputs {
         self.reach(file, lo, hi).target()
     }
 
+    /// Every call of the service's files whose callee [`Self::reach`] names
+    /// as a function another file of the service declares
+    /// ([`crate::call_through`]'s leaf calls). A construction (`new
+    /// Client()`) is left out: it builds a value and sends nothing itself.
+    /// Sorted by file and span, each call once.
+    pub(crate) fn calls_into_other_files(&self) -> Vec<CallIntoFile> {
+        let mut out: Vec<CallIntoFile> = every_call(&self.files)
+            .into_iter()
+            .filter(|(_, _, construction)| !construction)
+            .filter_map(
+                |(file, call, _)| match self.reach(file, call.site.lo, call.site.hi) {
+                    Reach::Function(target, key) if target != file => Some(CallIntoFile {
+                        file: file.to_path_buf(),
+                        span_start: call.site.span_start,
+                        span_end: call.site.span_end,
+                        line: call.site.line,
+                        target,
+                        key,
+                    }),
+                    _ => None,
+                },
+            )
+            .collect();
+        out.sort_by(|a, b| {
+            (&a.file, a.span_start, a.span_end).cmp(&(&b.file, b.span_start, b.span_end))
+        });
+        out.dedup_by(|a, b| {
+            (&a.file, a.span_start, a.span_end) == (&b.file, b.span_start, b.span_end)
+        });
+        out
+    }
+}
+
+/// One call [`RequestSummaryInputs::calls_into_other_files`] lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallIntoFile {
+    /// The file as walked.
+    pub(crate) file: PathBuf,
+    /// The call's span in SWC's own numbering ([`SWC_SPAN_BASE`]), and the
+    /// line it opens on.
+    pub(crate) span_start: u32,
+    pub(crate) span_end: u32,
+    pub(crate) line: u32,
+    /// The definition the callee resolves to: the file as walked and its key.
+    pub(crate) target: PathBuf,
+    pub(crate) key: String,
+}
+
+impl RequestSummaryInputs {
     /// What the call row at `lo..hi` in `file` names.
     fn row_reach(&self, file: &Path, lo: u32, hi: u32) -> Reach {
         self.row_names(file, lo, hi, Kind::Call)

@@ -106,12 +106,36 @@ pub struct CallThroughSites {
     /// call's argument ([`crate::return_flow`]), by file, line and the
     /// definition called. A call not listed hands its value back.
     pub side_calls: HashMap<SideKey, SideCall>,
+    /// The service's calls into a function another of its files declares,
+    /// whether or not a row sits at them ([`LeafCall`]). Read only in the run
+    /// that analyses the service, so never stored: a carried service's blob
+    /// already holds the rows they stated.
+    pub leaves: Vec<LeafCall>,
 }
 
 impl CallThroughSites {
+    /// Whether there is nothing to store. The leaf calls are never stored.
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty() && self.hands_back_body.is_empty() && self.side_calls.is_empty()
     }
+}
+
+/// A call in one file of a service whose callee, as the compiler resolves it
+/// ([`RequestSummaryInputs::reach`]), is a function another file of the same
+/// service declares: `client.save(id)` in a command module, `save` a method
+/// of the service's own client class. Where that function itself calls into
+/// another service and the walk from it reaches exactly one request there,
+/// the call states that request at its own line ([`settle`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LeafCall {
+    /// Repository-relative file, and the lines the call opens and closes on.
+    pub file: String,
+    pub line: u32,
+    pub last_line: u32,
+    /// The name the call is made through, as a row names its client.
+    pub client: String,
+    /// The definition the callee resolves to.
+    pub callee: DefinitionSite,
 }
 
 /// A service's [`CallThroughSites`] as its blob stores them (carrick#2378):
@@ -168,6 +192,7 @@ impl StoredCallThrough {
 
     pub fn sites(&self) -> CallThroughSites {
         CallThroughSites {
+            leaves: Vec::new(),
             rows: self.rows.clone(),
             hands_back_body: self.hands_back_body.iter().cloned().collect(),
             side_calls: self
@@ -234,6 +259,7 @@ pub fn read_sites(
     let root = repo_path.trim_end_matches('/');
     let hands_back_body = hands_back_body(definitions, root, passes_body);
     let side_calls = read_side_calls(file_results, inputs, root);
+    let leaves = read_leaves(inputs, root, definitions);
     let mut keys: Vec<&String> = file_results
         .iter()
         .filter(|(_, result)| result.data_calls.iter().any(is_model_row))
@@ -245,6 +271,7 @@ pub fn read_sites(
             rows: Vec::new(),
             hands_back_body,
             side_calls,
+            leaves,
         };
     }
 
@@ -307,7 +334,86 @@ pub fn read_sites(
         rows,
         hands_back_body,
         side_calls,
+        leaves,
     }
+}
+
+/// Every call of the service into a function another of its files declares
+/// ([`LeafCall`]), with the line that function opens on as every service
+/// names a definition. A callee whose file and name more than one
+/// definition share names no one definition, and its calls are left out.
+fn read_leaves(
+    inputs: &RequestSummaryInputs,
+    root: &str,
+    definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
+) -> Vec<LeafCall> {
+    let mut lines: HashMap<(String, &str), Vec<u32>> = HashMap::new();
+    for definition in definitions
+        .values()
+        .filter(|definition| definition.name != crate::visitor::MODULE_SCOPE_KEY)
+    {
+        let file = crate::engine::repo_relative(&definition.file_path.to_string_lossy(), root);
+        lines
+            .entry((file, definition.name.as_str()))
+            .or_default()
+            .push(definition.line_number);
+    }
+    for at in lines.values_mut() {
+        at.sort_unstable();
+        at.dedup();
+    }
+
+    let mut by_file: BTreeMap<PathBuf, Vec<crate::request_summary::CallIntoFile>> = BTreeMap::new();
+    for call in inputs.calls_into_other_files() {
+        by_file.entry(call.file.clone()).or_default().push(call);
+    }
+    let mut leaves = Vec::new();
+    for (path, calls) in by_file {
+        // Where each call closes, read off the file as a row's span is.
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+        let extents: HashMap<(u32, u32), CallExtent> = match parse_file(&path, &cm, &handler) {
+            Some(module) => {
+                let positions = Positions { cm: &cm };
+                let mut every = EveryCall {
+                    positions: &positions,
+                    calls: Vec::new(),
+                    callees: HashMap::new(),
+                };
+                module.visit_with(&mut every);
+                every
+                    .calls
+                    .into_iter()
+                    .map(|extent| (extent.span(), extent))
+                    .collect()
+            }
+            None => HashMap::new(),
+        };
+        let file = crate::engine::repo_relative(&path.to_string_lossy(), root);
+        for call in calls {
+            let name = call.key.split('@').next().unwrap_or(&call.key);
+            let target = crate::engine::repo_relative(&call.target.to_string_lossy(), root);
+            let Some([line]) = lines.get(&(target.clone(), name)).map(Vec::as_slice) else {
+                continue;
+            };
+            let last_line = extents
+                .get(&(call.span_start, call.span_end))
+                .map_or(call.line, |extent| extent.last_line);
+            leaves.push(LeafCall {
+                file: file.clone(),
+                line: call.line,
+                last_line,
+                client: name.rsplit('.').next().unwrap_or(name).to_string(),
+                callee: DefinitionSite {
+                    file: target,
+                    line: *line,
+                },
+            });
+        }
+    }
+    leaves.sort();
+    leaves.dedup();
+    leaves
 }
 
 /// Every resolved call of the service whose value is not handed back by the
@@ -899,6 +1005,8 @@ pub struct Settled {
     /// Corrected rows that kept their response entry and lost their request
     /// entry: the call's arguments are the called function's parameters.
     pub requests_not_carried: usize,
+    /// Rows stated at a leaf call no row sat at ([`LeafCall`]).
+    pub leaf_rows: usize,
 }
 
 /// Settle every model call row whose call reaches exactly one request
@@ -933,9 +1041,14 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         .iter()
         .flat_map(|sites| &sites.hands_back_body)
         .collect();
+    let owners = file_owners(services.iter().map(|service| &*service.data));
     let mut decider = Decider::new(&graph, &sites);
     let mut settled = Settled::default();
-    for service in services.iter_mut().filter(|service| service.writable) {
+    for (index, service) in services
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, service)| service.writable)
+    {
         let mut corrected = 0;
         for row in &service.sites.rows {
             match decider.decide(row) {
@@ -975,7 +1088,9 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
             }
         }
         settled.corrected += corrected;
-        if corrected > 0
+        let stated = state_leaves(service, index, &owners, &graph, &mut decider);
+        settled.leaf_rows += stated;
+        if (corrected > 0 || stated > 0)
             && let Some(mut boundary) = service.data.boundary.take()
         {
             boundary.fold_settled_calls(service.data, corrected);
@@ -992,7 +1107,166 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         settled.reaches_several,
         settled.reaches_unstated
     );
+    debug!(
+        "Call-through leaf rows stated: {} at calls into a function of the caller's own service that calls into another service and reaches exactly one request there (carrick#1146)",
+        settled.leaf_rows
+    );
     settled
+}
+
+/// Each file a service's definitions or rows name, with the index of the
+/// first service that names it.
+fn file_owners<'d>(services: impl Iterator<Item = &'d CloudRepoData>) -> HashMap<String, usize> {
+    let mut owners: HashMap<String, usize> = HashMap::new();
+    for (index, data) in services.enumerate() {
+        let definitions = data
+            .function_definitions
+            .values()
+            .map(|definition| definition.file_path.to_string_lossy().into_owned());
+        let rows = data
+            .mount_graph
+            .iter()
+            .flat_map(|graph| &graph.data_calls)
+            .filter_map(|call| site_of(call).map(|(file, _)| file.to_string()));
+        for file in definitions.chain(rows) {
+            owners.entry(file).or_insert(index);
+        }
+    }
+    owners
+}
+
+/// State a row at each of `service`'s leaf calls ([`LeafCall`]) that holds no
+/// row on its lines, when all of these hold:
+///
+/// - the walk from the callee reaches exactly ONE request operation
+///   ([`Decider::decide`], the callee's own step only);
+/// - that request is written in another service's file: a request the
+///   service writes itself is stated by its own request summaries, at its
+///   line and at the calls other modules make into its module;
+/// - the callee itself calls into that service: it is the function that
+///   crosses the boundary, so a call one hop further up (a command calling a
+///   helper that calls the client) states nothing, as the summaries state a
+///   request once per module that calls into it and not once per hop.
+///
+/// The row is the reached request's operation (method, target, base,
+/// dispatch) as a call through, `wrapper_call` with `reaches_request`, from
+/// `request_summary`. It carries no type entry: no capture anchored one at
+/// the call. Returns how many rows it stated.
+fn state_leaves<'g>(
+    service: &mut ServiceRows<'_>,
+    index: usize,
+    owners: &HashMap<String, usize>,
+    graph: &'g ReachGraph,
+    decider: &mut Decider<'g>,
+) -> usize {
+    let mut reached: HashMap<&DefinitionSite, Option<&'g Reached>> = HashMap::new();
+    let mut stated = 0;
+    for leaf in &service.sites.leaves {
+        if holds_a_row(service.data, leaf) {
+            continue;
+        }
+        let request = *reached.entry(&leaf.callee).or_insert_with(|| {
+            let row = SiteRow {
+                file: leaf.file.clone(),
+                line: leaf.line,
+                method: String::new(),
+                target: String::new(),
+                steps: vec![vec![leaf.callee.clone()]],
+            };
+            match decider.decide(&row) {
+                Reach::One { request, .. } => Some(request),
+                _ => None,
+            }
+        });
+        let Some(request) = request else {
+            continue;
+        };
+        let Some(&request_owner) = request
+            .site
+            .rsplit_once(':')
+            .and_then(|(file, _)| owners.get(file))
+        else {
+            continue;
+        };
+        if request_owner == index {
+            continue;
+        }
+        let crosses = graph.calls.get(&leaf.callee).is_some_and(|edges| {
+            edges
+                .iter()
+                .any(|edge| owners.get(&edge.to.file) == Some(&request_owner))
+        });
+        if !crosses {
+            continue;
+        }
+        if state_leaf(service.data, leaf, request) {
+            stated += 1;
+        }
+    }
+    stated
+}
+
+/// Whether a row of any source sits on the lines `leaf` spans.
+fn holds_a_row(data: &CloudRepoData, leaf: &LeafCall) -> bool {
+    let on_lines =
+        |file: &str, line: u32| file == leaf.file && leaf.line <= line && line <= leaf.last_line;
+    let in_graph = data
+        .mount_graph
+        .iter()
+        .flat_map(|graph| &graph.data_calls)
+        .filter_map(site_of)
+        .any(|(file, line)| on_lines(file, line));
+    in_graph
+        || data.calls.iter().any(|call| {
+            call.file_path
+                .to_string_lossy()
+                .rsplit_once(':')
+                .and_then(|(file, line)| Some((file.to_string(), line.parse().ok()?)))
+                .is_some_and(|(file, line)| on_lines(&file, line))
+        })
+}
+
+/// Write the row `leaf` states for `reached` into the graph and the calls.
+fn state_leaf(data: &mut CloudRepoData, leaf: &LeafCall, reached: &Reached) -> bool {
+    let Some(graph) = data.mount_graph.as_mut() else {
+        return false;
+    };
+    let own_route = graph
+        .find_matching_endpoints(&reached.canonical_path, &reached.method)
+        .iter()
+        .any(|endpoint| {
+            endpoint.evidence == carrick_match::MatchEvidence::RouteDefinition
+                && carrick_match::match_agreement(&endpoint.full_path, &reached.canonical_path)
+                    .unwrap_or(0)
+                    > 0
+        });
+    let call = DataFetchingCall {
+        method: reached.method.clone(),
+        target_url: reached.target_url.clone(),
+        canonical_path: reached.canonical_path.clone(),
+        client: leaf.client.clone(),
+        file_location: format!("{}:{}", leaf.file, leaf.line),
+        call_kind: None,
+        repo_name: None,
+        service_name: None,
+        host: reached.host.clone(),
+        line: Some(leaf.line),
+        base: reached.base.clone(),
+        consumers_not_resolved: None,
+        resolution_source: Some(ResolutionSource::RequestSummary),
+        dispatch: reached.dispatch.clone(),
+        role: Some(ConsumerRole::WrapperCall),
+        reaches_request: Some(reached.site.clone()),
+        library_semantics: Vec::new(),
+        own_route,
+    };
+    debug!(
+        "  - {}: states {} {}, the request written at {}",
+        call.file_location, call.method, call.target_url, reached.site
+    );
+    data.calls.push(crate::cloud_storage::call_details(&call));
+    graph.data_calls.push(call);
+    true
 }
 
 /// A deterministic request row, as much of it as a corrected row takes.
