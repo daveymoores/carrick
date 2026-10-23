@@ -41,8 +41,8 @@ use crate::request_summary::{
     SiteReceiver,
 };
 use crate::services::type_sidecar::{
-    BoundName, ClaimOn, ClaimSlot, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole, MakeForm,
-    NameScope, NameScopeKind, OpName, SemanticsResult, SemanticsVerdict,
+    BoundName, ClaimOn, ClaimSlot, Collects, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole,
+    MakeForm, NameScope, NameScopeKind, OpName, SemanticsResult, SemanticsVerdict,
 };
 
 /// Which end of a socket an export makes. A classification the types
@@ -184,7 +184,9 @@ impl ExportClaims {
     /// [`Self::claims_by_id`] with the scope claims in too
     /// (`<prefix>:scope:<path.member>:name@<slot>:<binds>[:on/of…]`, where
     /// `<binds>` is `runs@<slot>><param>`, `mounts@<slot>` or `returns` and
-    /// a slot is `<arg>` or `<arg>.<key>`): what the receiver trace sends in
+    /// a slot is `<arg>` or `<arg>.<key>`; a procedure router's member spells
+    /// `collects@<slot>/<join>` in the name's place, #2474 R6a): what the
+    /// receiver trace sends in
     /// its own request (carrick#2474 R2b, carrick#1678), never the library
     /// check's.
     pub fn claims_with_scopes_by_id(&self) -> Vec<(String, &LibraryClaim)> {
@@ -376,6 +378,7 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
             runs,
             yields,
             mounts,
+            collects,
             ..
         } => {
             // What it binds (carrick#2474 R0's fields): two scope claims of
@@ -397,10 +400,25 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
                     mounts.as_ref().map(slot).unwrap_or_default()
                 ),
             };
+            // A procedure router's member has no name (#2474 R6a, contract
+            // amendment 3): its id spells the collection in the name's
+            // place, so a named scope's id stays byte for byte as it was. A
+            // claim with both reaches the verifier, which refuses it.
+            let collected = |collects: &Collects| match &collects.key {
+                Some(key) => format!("collects@{}.{key}/{}", collects.arg, collects.join),
+                None => format!("collects@{}/{}", collects.arg, collects.join),
+            };
+            let named = match (name, collects) {
+                (Some(name), None) => format!("name@{}:{binds}", slot(name)),
+                (None, Some(collects)) => collected(collects),
+                (Some(name), Some(collects)) => {
+                    format!("name@{}:{binds}:{}", slot(name), collected(collects))
+                }
+                (None, None) => return None,
+            };
             Some(format!(
-                "{prefix}:scope:{}:name@{}:{binds}{}",
+                "{prefix}:scope:{}:{named}{}",
                 hops(path, Some(member)),
-                slot(name),
                 selector(on, of)
             ))
         }
@@ -849,9 +867,10 @@ impl Reading<'_> {
                         name_scope.clone(),
                     )
                 }
-                // A name a scope member binds is carrick#1678's.
+                // A name a scope member binds is carrick#1678's; one a
+                // router key binds is #2474 R6c's.
                 OpName::Bound {
-                    bound: BoundName::Scope,
+                    bound: BoundName::Scope | BoundName::Key,
                 } => return None,
             };
             if !self.name_ok(text, Some(&receiver)) {
@@ -1182,6 +1201,47 @@ mod tests {
                 "fixture-server@2:Server:scope:use:name@0:mounts@1:of:instance:new",
                 "fixture-server@2:Server:scope:register:name@1.prefix:runs@0>0:of:instance:new",
                 "fixture-server@2:Server:scope:basePath:name@0:returns:of:instance:new",
+            ]
+        );
+    }
+
+    /// #2474 R6a (contract amendment 3 on #2434): a router member has no
+    /// name, so its id spells its collection in the name's place. The named
+    /// scopes beside it keep their ids byte for byte, and a claim with both
+    /// a name and a collection still gets an id, so the verifier refuses it
+    /// rather than the reader losing it.
+    #[test]
+    fn a_router_member_s_id_spells_its_collection() {
+        let kit = export(json!({
+            "package": "fixture-procs", "version": "3.0.0", "specifier": "fixture-procs",
+            "export": "init", "role": "server_framework",
+            "claims": [
+                { "kind": "scope", "member": "router", "of": "instance:create",
+                  "collects": { "arg": 0, "join": "." } },
+                { "kind": "scope", "member": "router", "of": "instance:create",
+                  "collects": { "arg": 0, "key": "routes", "join": "/" } },
+                { "kind": "scope", "member": "basePath", "of": "instance:create",
+                  "name": { "arg": 0 } },
+                { "kind": "scope", "member": "both", "of": "instance:create",
+                  "name": { "arg": 0 }, "collects": { "arg": 1, "join": "." } },
+                { "kind": "op", "op": "receive", "member": "query", "path": ["procedure"],
+                  "of": "instance:create", "name": { "bound": "key" },
+                  "handler": { "arg": 0 }, "method": "GET" }
+            ]
+        }));
+        let ids: Vec<String> = kit
+            .claims_with_scopes_by_id()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "fixture-procs@3:init:scope:router:collects@0/.:of:instance:create",
+                "fixture-procs@3:init:scope:router:collects@0.routes//:of:instance:create",
+                "fixture-procs@3:init:scope:basePath:name@0:returns:of:instance:create",
+                "fixture-procs@3:init:scope:both:name@0:returns:collects@1/.:of:instance:create",
+                "fixture-procs@3:init:op:receive:procedure.query:of:instance:create",
             ]
         );
     }

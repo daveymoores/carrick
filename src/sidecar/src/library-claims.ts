@@ -274,6 +274,8 @@ interface NamedMember {
 }
 
 /** `named` is unset when the callee is the receiver itself. */
+/** What a `runs` slot must hold: undefined when it holds. */
+type RunsPredicate = (declared: Slot | undefined) => Outcome | undefined;
 type Callable = { signatures: readonly ts.Signature[]; holder: ts.Type; named?: NamedMember } | { failure: Outcome };
 
 interface ModuleRead {
@@ -314,6 +316,12 @@ interface MessageReceiver extends Holder {
   scoped: boolean;
   /** The maker overloads this instance is read through: what `runs: { bound: 'maker' }` reads. */
   makerHolding?: readonly ts.Signature[];
+  /**
+   * The request holds a verified `collects` scope of this package
+   * (`{ bound: 'key' }` reads it, #2474 R6a). Read only for an op that names
+   * its key.
+   */
+  keyBound?: boolean;
   /**
    * The export whose own call or construction made this instance
    * (`instance:()`, `instance:new`, with no scope step): a `yields` naming it
@@ -654,6 +662,11 @@ export class LibraryClaimsVerifier {
         if (types.some(type => reader.returnSaysNothing(type))) {
           return { reason: receiverPath.maker ? 'maker_unresolved' : 'export_untyped' };
         }
+        const claim = check.claim;
+        const keyBound =
+          claim.kind === 'op' && claim.name !== undefined && 'bound' in claim.name && claim.name.bound === 'key'
+            ? verifiedCollects(check.package).length > 0
+            : undefined;
         return {
           value: types.map(type => ({
             type,
@@ -662,6 +675,7 @@ export class LibraryClaimsVerifier {
             makerBindsName,
             scoped: receiverPath.scope !== undefined,
             makerHolding,
+            ...(keyBound === undefined ? {} : { keyBound }),
             madeBy: receiverPath.maker?.member === null && receiverPath.scope === undefined ? check.export : undefined,
           })),
         };
@@ -683,6 +697,37 @@ export class LibraryClaimsVerifier {
         const returns = [...new Set((holding ?? []).map(sig => reader.returnOf(sig, built)))];
         if (returns.length === 0) return { reason: 'unresolved' };
         return { value: returns };
+      };
+
+      /**
+       * The `collects` scope checks of the request (#2474 R6a) that verify,
+       * of one package or of any: judged only when a claim reads them, so a
+       * request with none judges exactly what it judged before.
+       */
+      const verifiedCollects = (pkg?: string): number[] =>
+        checks
+          .map((other, i) => ({ other, i }))
+          .filter(
+            ({ other }) =>
+              other.claim.kind === 'scope' && other.claim.collects !== undefined && (pkg === undefined || other.package === pkg)
+          )
+          .filter(({ i }) => judge(i).outcome.verdict === 'verified')
+          .map(({ i }) => i);
+
+      /**
+       * What the request's verified `collects` scopes return, read at their
+       * defaults: the collections an adapter's `runs` slot can take, matched
+       * across packages (an HTTP framework's adapter serves another
+       * package's router). Undefined when there are none.
+       */
+      const collections = (): ts.Type[] | undefined => {
+        const types = new Set<ts.Type>();
+        for (const i of verifiedCollects()) {
+          const built = builtReceiver(checks[i]);
+          const read = holdingReturns([judge(i)], built === undefined ? undefined : atDefaults(checks[i], built));
+          if ('value' in read) read.value.forEach(type => types.add(type));
+        }
+        return types.size > 0 ? [...types] : undefined;
       };
 
       const judge = (index: number): Judged => {
@@ -738,10 +783,13 @@ export class LibraryClaimsVerifier {
         if ('reason' in receivers) return { outcome: unchecked(receivers.reason) };
         const built = builtReceiver(check);
         const builtAtDefaults = built === undefined ? undefined : atDefaults(check, built);
+        // An adapter's `runs` is read against the request's collections only
+        // when today's reading refuses it (#2474 R6a): `judgeMake` asks.
+        const collectionsOf = check.claim.kind === 'make' && check.claim.runs !== undefined ? collections : undefined;
         const holding: ts.Signature[] = [];
         const declarations: DeclaredAt[] = [];
         for (const receiver of receivers.value) {
-          const result = reader.judgeMessage(receiver, check.claim, rules, builtAtDefaults);
+          const result = reader.judgeMessage(receiver, check.claim, rules, builtAtDefaults, collectionsOf);
           if (result.outcome.verdict !== 'verified') return result;
           holding.push(...(result.holding ?? []));
           declarations.push(...(result.outcome.declarations ?? []));
@@ -1794,10 +1842,16 @@ class DeclarationReader {
    * overloads it holds on. `built` is the probe's no-argument build of the
    * receiver a maker or scope claim makes (see `returnOf`).
    */
-  judgeMessage(receiver: MessageReceiver, claim: LibraryClaim, rules: RoleRules, built?: ts.Signature): Judged {
+  judgeMessage(
+    receiver: MessageReceiver,
+    claim: LibraryClaim,
+    rules: RoleRules,
+    built?: ts.Signature,
+    collections?: () => readonly ts.Type[] | undefined
+  ): Judged {
     switch (claim.kind) {
       case 'make':
-        return this.judgeMake(receiver, claim, built);
+        return this.judgeMake(receiver, claim, built, collections);
       case 'scope':
         return this.judgeScope(receiver, claim, built);
       case 'op':
@@ -1816,8 +1870,20 @@ class DeclarationReader {
    * defaults (`returnOf`). Those overloads are the ones an instance is read
    * through. A definition (`task({ id, run })`) is a maker with a `name` and a
    * `handler` slot; a queue (`new Queue("emails")`) one with a positional name.
+   *
+   * An adapter (#2474 R6a, contract amendment 3 on carrick#2434) is a maker
+   * whose `runs` slot takes a collection rather than a function. Today's
+   * reading runs first, unchanged; only an overload it refuses on `runs` is
+   * read again, when the request holds verified `collects` scopes
+   * (`collections`), with `runs` taking what one of them returns
+   * (`runsCollectionOutcome`). With no such scope this arm never runs.
    */
-  private judgeMake(receiver: MessageReceiver, claim: MakeClaim, built?: ts.Signature): Judged {
+  private judgeMake(
+    receiver: MessageReceiver,
+    claim: MakeClaim,
+    built?: ts.Signature,
+    collections?: () => readonly ts.Type[] | undefined
+  ): Judged {
     const layout = this.layout({
       base: claim.base,
       prefix: claim.prefix,
@@ -1833,6 +1899,14 @@ class DeclarationReader {
     let best: RankedFailure | undefined;
     for (const signature of callee.signatures) {
       let result = this.messageSignatureOutcome(signature, layout.value, labels);
+      if (result.outcome.verdict !== 'verified' && result.outcome.reason.startsWith('runs_') && collections !== undefined) {
+        const collected = collections();
+        if (collected !== undefined) {
+          result = this.messageSignatureOutcome(signature, layout.value, labels, declared =>
+            this.runsCollectionOutcome(signature, declared, collected)
+          );
+        }
+      }
       if (result.rank === Infinity && this.returnSaysNothing(this.returnOf(signature, built))) {
         result = { rank: 6, outcome: unchecked('maker_unresolved') };
       }
@@ -1859,10 +1933,20 @@ class DeclarationReader {
    * overloads: a `>scope:` receiver read through it is not resolved.
    * `runs` without `yields` (or the reverse), or `mounts` beside either, is
    * `claim_invalid`.
+   *
+   * Procedure routers (#2474 R6a, contract amendment 3 on carrick#2434): a
+   * scope carries exactly one of `name` and `collects`, and `collects` never
+   * beside `runs`, `yields` or `mounts` (`claim_invalid`). With `collects`
+   * the member takes an object of procedures there (`collectsOutcome`), and
+   * its return, the collection, is read as a plain scope's is.
    */
   private judgeScope(receiver: MessageReceiver, claim: ScopeClaim, built?: ts.Signature): Judged {
     if ((claim.runs === undefined) !== (claim.yields === undefined)) return { outcome: unchecked('claim_invalid') };
     if (claim.mounts !== undefined && claim.runs !== undefined) return { outcome: unchecked('claim_invalid') };
+    if ((claim.name === undefined) === (claim.collects === undefined)) return { outcome: unchecked('claim_invalid') };
+    if (claim.collects !== undefined && (claim.runs !== undefined || claim.mounts !== undefined)) {
+      return { outcome: unchecked('claim_invalid') };
+    }
     const binds = claim.runs !== undefined || claim.mounts !== undefined;
     const layout = this.layout({ name: claim.name, runs: claim.runs, mounts: claim.mounts });
     if ('failure' in layout) return { outcome: layout.failure };
@@ -1880,6 +1964,10 @@ class DeclarationReader {
       if (result.rank === Infinity && claim.mounts !== undefined) {
         const mounted = this.mountsOutcome(signature, claim.mounts, receiver);
         if (mounted) result = { rank: 5, outcome: mounted };
+      }
+      if (result.rank === Infinity && claim.collects !== undefined) {
+        const collected = this.collectsOutcome(signature, claim.collects);
+        if (collected) result = { rank: 5, outcome: collected };
       }
       if (result.rank === Infinity && !binds && this.returnSaysNothing(this.returnOf(signature, built))) {
         result = { rank: 6, outcome: unchecked('scope_unresolved') };
@@ -1923,6 +2011,61 @@ class DeclarationReader {
     const erased = this.fitsErased(receiver.type, slot, signature.typeParameters ?? []);
     if (erased !== undefined) return erased ? undefined : failed('mounts_not_instance');
     return this.checker.isTypeAssignableTo(receiver.type, slot) ? undefined : failed('mounts_not_instance');
+  }
+
+  /**
+   * `collects: { arg, key?, join }` on a scope (#2474 R6a): the parameter
+   * there is an object type that is not a function, whose keys name the
+   * procedures. A parameter typed `any`, `unknown`, `{}` or by an
+   * unconstrained type parameter says nothing (`collects_untyped`).
+   * Undefined when it holds.
+   */
+  private collectsOutcome(signature: ts.Signature, collects: ClaimSlot): Outcome | undefined {
+    let declared = this.keyParameterAt(signature, collects.arg);
+    if (declared !== undefined && collects.key !== undefined) {
+      const property = this.declaredProperty(declared, collects.key);
+      declared = property ? this.throughConstraint(this.checker.getTypeOfSymbol(property)) : undefined;
+    }
+    if (declared === undefined) return failed('param_missing');
+    if (declared === VARIADIC) return unchecked('collects_untyped');
+    const parts = this.parts(declared);
+    if (parts.length === 0) return failed('collects_not_object');
+    if (parts.some(part => this.isOpenTop(part) || this.isUnconstrained(part) || this.isEmptyObject(part))) {
+      return unchecked('collects_untyped');
+    }
+    if (parts.some(part => !this.isObjectLike(part) || part.getCallSignatures().length > 0)) {
+      return failed('collects_not_object');
+    }
+    return undefined;
+  }
+
+  /**
+   * An adapter's `runs` slot (#2474 R6a) takes one of `collections`, the
+   * types the request's verified `collects` scopes return, read as a mounted
+   * instance is (`fitsErased`, then assignability). A slot typed `any`,
+   * `unknown`, `{}` or by an unconstrained type parameter says nothing
+   * (`runs_untyped`). Undefined when it holds.
+   */
+  private runsCollectionOutcome(
+    signature: ts.Signature,
+    declared: Slot | undefined,
+    collections: readonly ts.Type[]
+  ): Outcome | undefined {
+    if (declared === undefined) return failed('param_missing');
+    const slot = this.throughConstraint(declared);
+    if (slot === VARIADIC) return unchecked('runs_untyped');
+    const parts = this.parts(slot);
+    if (parts.length === 0) return failed('runs_not_collection');
+    if (parts.some(part => this.isOpenTop(part) || this.isUnconstrained(part) || this.isEmptyObject(part))) {
+      return unchecked('runs_untyped');
+    }
+    const own = signature.typeParameters ?? [];
+    for (const collection of collections) {
+      const erased = this.fitsErased(collection, slot, own);
+      if (erased === true) return undefined;
+      if (erased === undefined && this.checker.isTypeAssignableTo(collection, slot)) return undefined;
+    }
+    return failed('runs_not_collection');
   }
 
   /**
@@ -2052,7 +2195,9 @@ class DeclarationReader {
     if (name === undefined) {
       nameSlot = undefined;
     } else if ('bound' in name) {
-      if (name.bound === 'maker' ? !receiver.makerBindsName : !receiver.scoped) return failed('name_unbound');
+      const bound =
+        name.bound === 'maker' ? receiver.makerBindsName : name.bound === 'scope' ? receiver.scoped : receiver.keyBound === true;
+      if (!bound) return failed('name_unbound');
     } else {
       nameSlot = name;
     }
@@ -2140,6 +2285,18 @@ class DeclarationReader {
    */
   private methodOutcome(claim: OpClaim, rules: RoleRules): Outcome | undefined {
     const words = rules.methods;
+    // A procedure named by its key (#2474 R6a): a receive op with a handler
+    // whose label states its method, a route word. The member names the
+    // procedure kind (`query`), not a verb, so it need not equal the method.
+    if (claim.name !== undefined && 'bound' in claim.name && claim.name.bound === 'key') {
+      if (!words || claim.op !== 'receive' || claim.handler === undefined || claim.method === undefined) {
+        return unchecked('claim_invalid');
+      }
+      if (claim.method_key !== undefined || claim.method_default !== undefined || claim.options !== undefined) {
+        return unchecked('claim_invalid');
+      }
+      return words.has(claim.method) ? undefined : failed('method_not_word');
+    }
     if (!words) {
       const any =
         claim.method !== undefined ||
@@ -2370,8 +2527,17 @@ class DeclarationReader {
    *    prefix key accepting a string and a handler key a declared function.
    * 4. Every string slot of the call besides the name is accounted for
    *    (design D2, `nameSiblings`).
+   *
+   * `runsAs` replaces the `runs` predicate (an adapter's collection, #2474
+   * R6a); absent, a `runs` slot is a declared function.
    */
-  private messageSignatureOutcome(signature: ts.Signature, layout: ClaimLayout, labels: KeyLabels): RankedFailure {
+  private messageSignatureOutcome(
+    signature: ts.Signature,
+    layout: ClaimLayout,
+    labels: KeyLabels,
+    runsAs?: RunsPredicate
+  ): RankedFailure {
+    const runsFailure = runsAs ?? ((declared: Slot | undefined) => this.runsFailure(declared));
     for (const [arg, part] of layout.positional) {
       if (part === 'method') {
         const declared = this.keyParameterAt(signature, arg);
@@ -2401,14 +2567,14 @@ class DeclarationReader {
     for (const [arg, part] of layout.positional) {
       if (part !== 'handler' && part !== 'ack' && part !== 'runs') continue;
       const declared = this.keyParameterAt(signature, arg);
-      const failure = part === 'runs' ? this.runsFailure(declared) : this.handlerFailure(declared);
+      const failure = part === 'runs' ? runsFailure(declared) : this.handlerFailure(declared);
       if (failure) return { rank: 3, outcome: failure };
     }
     const views = new Map<number, ts.Type>();
     for (const [arg, keys] of layout.keyed) {
       const slot = this.keyParameterAt(signature, arg);
       if (slot === undefined) return { rank: 1, outcome: failed('param_missing') };
-      const view = this.viewFor(slot, keys);
+      const view = this.viewFor(slot, keys, runsFailure);
       if ('rank' in view) return view;
       views.set(arg, view.view);
     }
@@ -2422,7 +2588,7 @@ class DeclarationReader {
    * union member that is an object type and not a function type, declaring
    * every claimed key with the type its part needs.
    */
-  private viewFor(slot: Slot, keys: ReadonlyMap<string, PartName>): { view: ts.Type } | RankedFailure {
+  private viewFor(slot: Slot, keys: ReadonlyMap<string, PartName>, runsFailure: RunsPredicate): { view: ts.Type } | RankedFailure {
     if (slot === VARIADIC || !this.isObjectType(slot)) {
       return { rank: 1, outcome: this.slotFailure(slot, 'param_missing') };
     }
@@ -2451,7 +2617,7 @@ class DeclarationReader {
           break;
         }
         if (part === 'runs') {
-          const bad = this.runsFailure(type);
+          const bad = runsFailure(type);
           if (bad) {
             failure = { rank: 3, outcome: bad };
             break;
