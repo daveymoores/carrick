@@ -96,6 +96,10 @@ const SERVE: &str = "import { answer } from \"@fixture/serve\";\n\nfunction pong
 
 const HOOK: &str = "function makeSender(): (path: string) => Promise<void> {\n  return async (path) => {\n    void path;\n  };\n}\n\nconst post = makeSender();\n\nexport async function hook(): Promise<void> {\n  await post(\"/hooks\");\n}\n";
 
+const MEMBERS: &str = "export class Pusher {\n  constructor(private readonly base: string) {}\n\n  push(item: string): Promise<Response> {\n    return fetch(`${this.base}/api/v2/items/${item}`, { method: \"PUT\" });\n  }\n}\n";
+
+const MEMBER_CALLER: &str = "import { Pusher } from \"./members\";\n\ninterface Sender {\n  push(item: string): Promise<Response>;\n}\n\nconst client: Sender = new Pusher(\"http://items.internal\");\n\nexport async function run(): Promise<void> {\n  await client.push(\"a\");\n}\n";
+
 const TWICE: &str = "async function double(text: string): Promise<string> {\n  return text + text;\n}\n\nexport async function twice(): Promise<string> {\n  return await double(\"/twice\");\n}\n";
 
 const NESTED: &str = "function makeSender(): (path: string) => Promise<void> {\n  return async (path) => {\n    void path;\n  };\n}\n\nconst deliver = makeSender();\n\nasync function send(path: string): Promise<void> {\n  await deliver(path);\n}\n\nexport async function nested(): Promise<void> {\n  await send(\"/nested\");\n}\n";
@@ -134,6 +138,8 @@ fn repo(tmp: &Path) -> PathBuf {
     .unwrap();
     fs::write(repo.join("src/serve.ts"), SERVE).unwrap();
     fs::write(repo.join("src/hook.ts"), HOOK).unwrap();
+    fs::write(repo.join("src/members.ts"), MEMBERS).unwrap();
+    fs::write(repo.join("src/member_caller.ts"), MEMBER_CALLER).unwrap();
     fs::write(repo.join("src/twice.ts"), TWICE).unwrap();
     fs::write(repo.join("src/nested.ts"), NESTED).unwrap();
     add_package(
@@ -220,6 +226,8 @@ struct Scan {
     log: String,
     stderr: String,
     prompts: BTreeMap<String, String>,
+    /// The scan's consumer rows (`CARRICK_OUTPUT_JSON`).
+    calls: Vec<serde_json::Value>,
 }
 
 impl Scan {
@@ -287,6 +295,7 @@ fn run_scan(site_questions: bool, fact_files: bool) -> Scan {
             "CARRICK_SIDECAR_DIR",
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
         )
+        .env("CARRICK_OUTPUT_JSON", "1")
         .env("CARRICK_POSITION_ROWS", "1");
     if site_questions {
         cmd.env("CARRICK_SITE_QUESTIONS", "1");
@@ -332,10 +341,14 @@ fn run_scan(site_questions: bool, fact_files: bool) -> Scan {
             Some((path, message))
         })
         .collect();
+    let projection: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the scan prints its projection");
+    let calls = projection["calls"].as_array().cloned().unwrap_or_default();
     Scan {
         log,
         stderr,
         prompts,
+        calls,
     }
 }
 
@@ -546,4 +559,28 @@ fn a_register_candidate_stays_only_where_discovery_cannot_follow_its_call() {
         off.fallbacks().get("fallback_selection_C2").is_none(),
         "without the switch the line is as it was"
     );
+}
+
+/// F0 (carrick#2440): a candidate kept at a call discovery cannot follow
+/// feeds the imported-member join as it does with the switch off. The call
+/// `client.push("a")` goes through an interface, so discovery cannot follow
+/// it and the register candidate is kept; the member another module declares
+/// states the verb and the path.
+#[test]
+fn a_kept_candidate_reaches_the_imported_member_join() {
+    let (off, on) = (recording(), choosing());
+    for (scan, name) in [(off, "off"), (on, "on")] {
+        let row = scan
+            .calls
+            .iter()
+            .find(|call| {
+                call["file"]
+                    .as_str()
+                    .is_some_and(|f| f.ends_with("member_caller.ts"))
+                    && call["line"].as_i64() == Some(10)
+            })
+            .unwrap_or_else(|| panic!("{name}: no row at the call: {:#?}", scan.calls));
+        assert_eq!(row["method"], "PUT", "{name}: {row}");
+        assert_eq!(row["path"], "/api/v2/items/:item", "{name}: {row}");
+    }
 }

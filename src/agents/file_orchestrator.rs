@@ -1514,24 +1514,6 @@ enum WhenEmpty {
     Unrouted,
 }
 
-/// `candidates` less the ones listed for the reader alone (`reader_only`,
-/// carrick#2613): what the passes over a file's candidates read.
-fn signal_candidates<'a>(
-    candidates: &'a HashMap<String, CandidateTarget>,
-    reader_only: &HashSet<String>,
-) -> std::borrow::Cow<'a, HashMap<String, CandidateTarget>> {
-    if reader_only.is_empty() {
-        return std::borrow::Cow::Borrowed(candidates);
-    }
-    std::borrow::Cow::Owned(
-        candidates
-            .iter()
-            .filter(|(id, _)| !reader_only.contains(*id))
-            .map(|(id, candidate)| (id.clone(), candidate.clone()))
-            .collect(),
-    )
-}
-
 /// The register signals that raised each call span of one file.
 type RegisterTags = std::collections::BTreeMap<
     (u32, u32),
@@ -2514,19 +2496,9 @@ impl FileOrchestrator {
             /// with those signals. Filled only when the fact layer chooses
             /// the reader's files (carrick#2613, D4).
             held: BTreeMap<(u32, u32), BTreeSet<crate::swc_scanner::RegisterSignal>>,
-            /// Candidates listed for the reader alone: register-signal
-            /// candidates kept at a call discovery could not follow (D4). No
-            /// wrapper pass and no receiver role reads them.
-            reader_only: HashSet<String>,
         }
 
         impl PendingFile {
-            /// The candidates the passes over candidates read: every one
-            /// but the ones listed for the reader alone.
-            fn signal_candidates(&self) -> std::borrow::Cow<'_, HashMap<String, CandidateTarget>> {
-                signal_candidates(&self.candidate_map, &self.reader_only)
-            }
-
             /// Drop the listed candidates at `spans`, keeping the prompt's
             /// lines in step with `listed`.
             fn unlist(&mut self, spans: &BTreeSet<(u32, u32)>) {
@@ -3334,7 +3306,6 @@ impl FileOrchestrator {
                 when_empty,
                 unrouted: unrouted_candidates.len(),
                 held,
-                reader_only: HashSet::new(),
             });
         }
 
@@ -3347,7 +3318,8 @@ impl FileOrchestrator {
             use crate::request_summary::fact_files::Followed;
             // D4: a candidate only the register signals raised is kept where
             // discovery could not follow its call, listed for the reader
-            // alone, and dropped where the walk finished. At a site it stays:
+            // and read by every pass as any candidate, and dropped where the
+            // walk finished. At a site it stays:
             // that is the fact layer's own call, under the same id.
             let mut chosen: Vec<PendingFile> = Vec::with_capacity(pending.len());
             for mut pf in pending.drain(..) {
@@ -3363,13 +3335,6 @@ impl FileOrchestrator {
                             dropped.insert(span);
                         }
                         Some(Followed::Stopped(_) | Followed::Unfollowed(_)) | None => {
-                            if let Some(listed) = pf
-                                .listed
-                                .iter()
-                                .find(|listed| (listed.span_start, listed.span_end) == span)
-                            {
-                                pf.reader_only.insert(listed.candidate_id.clone());
-                            }
                             for signal in signals {
                                 *stats.fallback_selection.entry(signal.label()).or_default() += 1;
                             }
@@ -3505,7 +3470,6 @@ impl FileOrchestrator {
                     when_empty: WhenEmpty::Deferred,
                     unrouted: 0,
                     held: BTreeMap::new(),
-                    reader_only: HashSet::new(),
                 };
                 pf.list(sites.candidates);
                 pending.push(pf);
@@ -3534,10 +3498,8 @@ impl FileOrchestrator {
         let mut wrapper_map: HashMap<PathBuf, WrapperModule> = HashMap::new();
         for pf in &pending {
             // Rescued files (graphql/messaging fall-throughs) carry no HTTP
-            // candidates and are not wrapper material. Nor is a file whose
-            // only candidates are listed for the reader alone (carrick#2613).
-            let candidates = pf.signal_candidates();
-            if candidates.is_empty() {
+            // candidates and are not wrapper material.
+            if pf.candidate_map.is_empty() {
                 continue;
             }
             let path = Path::new(&pf.path_str);
@@ -3567,8 +3529,9 @@ impl FileOrchestrator {
             // (carrick-cloud#386). `None` whenever the module parameterizes its
             // method or its requests disagree, in which case the delegating
             // site keeps whatever extraction gave it.
-            let request_shape =
-                wrapper_request_shape::fold_module(candidates.values().map(|c| &c.request_shape));
+            let request_shape = wrapper_request_shape::fold_module(
+                pf.candidate_map.values().map(|c| &c.request_shape),
+            );
             wrapper_map.insert(
                 canonical,
                 WrapperModule {
@@ -3708,9 +3671,8 @@ impl FileOrchestrator {
                 // client is two hops away and the nearer ring declares no
                 // member for the site. Only a file with candidates can have a
                 // site to resolve, so a rescued or candidate-less file
-                // triggers no parse. A candidate listed for the reader alone
-                // is no site of this join's (carrick#2613).
-                let joinable = signal_candidates(&pf.candidate_map, &pf.reader_only);
+                // triggers no parse.
+                let joinable = &pf.candidate_map;
                 if !joinable.is_empty() {
                     let nearest: BTreeSet<PathBuf> =
                         seen.iter().chain(matched.iter()).cloned().collect();
@@ -3754,7 +3716,7 @@ impl FileOrchestrator {
                     // the module a declined site named is only known there.
                     (pf.resolved_members, pf.unresolved_member_sites) =
                         Self::resolve_imported_members(
-                            &joinable,
+                            joinable,
                             rings,
                             &import_owners,
                             &receiver_imports,
@@ -3763,7 +3725,7 @@ impl FileOrchestrator {
                     // (carrick#1733) names its module and its object, so it
                     // answers ahead of the name join at the same site.
                     for (span, member) in
-                        Self::resolve_object_members(&joinable, &object_receivers, &member_cache)
+                        Self::resolve_object_members(joinable, &object_receivers, &member_cache)
                     {
                         pf.unresolved_member_sites.retain(|(site, _)| *site != span);
                         pf.resolved_members.insert(span, member);
@@ -3823,7 +3785,7 @@ impl FileOrchestrator {
                                 .insert(specifier.clone(), fold_indexes_with_conflicts(indexes));
                         }
                         let through_packages = Self::resolve_package_surface_members(
-                            &joinable,
+                            joinable,
                             &surfaces,
                             &pf.receiver_origins,
                         );
@@ -3962,7 +3924,6 @@ impl FileOrchestrator {
                 when_empty: WhenEmpty::Deferred,
                 unrouted: 0,
                 held: BTreeMap::new(),
-                reader_only: HashSet::new(),
             });
         }
 
@@ -4050,26 +4011,14 @@ impl FileOrchestrator {
         // role is a property of the RECEIVER's type (carrick#695). One batched
         // sidecar request for the whole service, resolved into a per-file
         // span -> role map that the arm below reads like any other input.
-        // A candidate listed for the reader alone has no receiver asked
-        // about (carrick#2613).
-        let asked_candidates: Vec<std::borrow::Cow<'_, HashMap<String, CandidateTarget>>> =
-            pending.iter().map(PendingFile::signal_candidates).collect();
         let receiver_roles = Self::resolve_receiver_roles(
             sidecar,
             pending
                 .iter()
-                .zip(&asked_candidates)
-                .map(|(pf, candidates)| {
-                    (
-                        pf.path_str.as_str(),
-                        pf.content.as_str(),
-                        candidates.as_ref(),
-                    )
-                }),
+                .map(|pf| (pf.path_str.as_str(), pf.content.as_str(), &pf.candidate_map)),
             framework_detection,
             &mut stats,
         );
-        drop(asked_candidates);
         //
         // The rest of this layer reads the request summaries, which may still
         // be waiting on library semantics the scan is asking about again
