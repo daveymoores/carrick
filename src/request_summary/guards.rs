@@ -275,6 +275,26 @@ impl Subject {
         self.steps.iter().map(Step::render).collect()
     }
 
+    /// The parameter the value is, as how many functions out (0: the
+    /// reader's own), its position and the keys read down from it, when it
+    /// is one read through keys alone (carrick#2432).
+    pub(super) fn parameter(&self) -> Option<(u8, usize, Vec<String>)> {
+        let (depth, index) = match &self.root {
+            Root::Param(index, _) => (0, *index),
+            Root::Outer(depth, index, _) => (*depth, *index),
+            _ => return None,
+        };
+        let keys = self
+            .steps
+            .iter()
+            .map(|step| match step {
+                Step::Key(key) => Some(key.clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some((depth, index, keys))
+    }
+
     /// The root the value comes from, as one opaque piece ends at it
     /// (carrick#2406). A literal with an access after it is no literal the
     /// piece holds, so it ends where reading stopped.
@@ -1381,6 +1401,8 @@ impl CallWalker<'_, '_, '_> {
             arg_subjects: self.reader.arg_subjects(args, self.scope, bound),
             callee_subject: Some(self.reader.subject(&new.callee, self.scope, bound)),
             callee_text,
+            callee_values: Vec::new(),
+            arg_values: Vec::new(),
             tested: None,
             handed: self.reader.handed(args, self.scope, bound),
             names: self.reader.arg_names(args, self.scope),
@@ -1425,6 +1447,12 @@ impl CallWalker<'_, '_, '_> {
             arg_subjects: Vec::new(),
             callee_subject: None,
             callee_text: self.reader.text(call.callee.span()),
+            callee_values: self
+                .reader
+                .callee_values(&call.callee, self.scope, &self.guard.bound),
+            arg_values: self
+                .reader
+                .arg_values(&call.args, self.scope, &self.guard.bound),
             tested: None,
             handed: Vec::new(),
             names: Vec::new(),

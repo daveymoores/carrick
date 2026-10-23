@@ -65,6 +65,10 @@ pub use instances::{
     InstanceAt, InstanceEnd, InstanceHole, MakerLabel, Prefix, ScopeBinds, ScopeLabel,
 };
 
+/// The hop discovery records where a walk enters a function through a value
+/// the call runs (carrick#2432, [`super::discovery`]).
+pub(super) const VALUE_HOP: &str = "<value>";
+
 /// The labelled call a discovery site reaches: the store key of the package
 /// (`lib:lib.dom.d.ts` for the language's own library), the export and member, the
 /// store role and op, and where the call is.
@@ -663,6 +667,9 @@ pub enum Undecided {
     /// no op (carrick#2515): the store says nothing about what its members
     /// do, so no slot can be read. The call is listed, not named.
     NoOpClaim,
+    /// The callee is a value whose values reach different labelled exports,
+    /// or one of them none (carrick#2432): which one runs is the caller's.
+    SeveralValues,
 }
 
 /// A discovered call whose name no call of this code decides.
@@ -752,11 +759,11 @@ fn through(
 /// function whose body holds it (`None` at module level), how many functions
 /// deep inside that one it is, and the body that writes it.
 #[derive(Clone, Copy)]
-struct Placed<'a> {
-    file: &'a Path,
-    key: Option<&'a str>,
-    depth: u8,
-    call: &'a CallIr,
+pub(super) struct Placed<'a> {
+    pub(super) file: &'a Path,
+    pub(super) key: Option<&'a str>,
+    pub(super) depth: u8,
+    pub(super) call: &'a CallIr,
     /// For a call inside a function written as a call's argument, that
     /// call: what runs the innermost function the call is written in
     /// (carrick#2474 R2a). `None` at depth 0, and for a function written
@@ -768,10 +775,14 @@ struct Placed<'a> {
     written_in: Option<&'a super::guards::WrittenIn>,
 }
 
+/// The definition a call reaches, as a callers index reads it: its file and
+/// key.
+type Target = Option<(PathBuf, String)>;
+
 /// Every call of the service, by file and span, by the function whose body
 /// holds it, and by the function of the service the call graph resolves it
 /// to.
-struct Calls<'a> {
+pub(super) struct Calls<'a> {
     sites: &'a crate::call_graph::CallSiteTargets,
     by_span: HashMap<(&'a Path, u32, u32), Placed<'a>>,
     by_owner: HashMap<(&'a Path, &'a str), Vec<Placed<'a>>>,
@@ -780,6 +791,27 @@ struct Calls<'a> {
 
 impl<'a> Calls<'a> {
     fn index(inputs: &'a RequestSummaryInputs) -> Self {
+        Self::build(inputs, |file, call| {
+            inputs
+                .sites
+                .target_at(file, call.site.lo, call.site.hi)
+                .cloned()
+        })
+    }
+
+    /// The same index, each call's callers edge read from what the rows say
+    /// it reaches ([`RequestSummaryInputs::reach`], rows first): the callers
+    /// discovery's value walk reads (carrick#2432).
+    pub(super) fn through_reach(inputs: &'a RequestSummaryInputs) -> Self {
+        Self::build(inputs, |file, call| {
+            match inputs.reach(file, call.site.lo, call.site.hi) {
+                super::row_calls::Reach::Function(target, key) => Some((target, key)),
+                _ => None,
+            }
+        })
+    }
+
+    fn build(inputs: &'a RequestSummaryInputs, target: impl Fn(&Path, &CallIr) -> Target) -> Self {
         fn walk<'a>(
             file: &'a Path,
             key: Option<&'a str>,
@@ -787,6 +819,7 @@ impl<'a> Calls<'a> {
             ir: &'a FnIr,
             host: Option<&'a CallIr>,
             out: &mut Calls<'a>,
+            target: &dyn Fn(&Path, &CallIr) -> Target,
         ) {
             let written_in = if depth == 0 {
                 None
@@ -808,8 +841,8 @@ impl<'a> Calls<'a> {
                 if let Some(key) = key {
                     out.by_owner.entry((file, key)).or_default().push(placed);
                 }
-                if let Some(target) = out.sites.target_at(file, call.site.lo, call.site.hi) {
-                    out.callers.entry(target.clone()).or_default().push(placed);
+                if let Some(target) = target(file, call) {
+                    out.callers.entry(target).or_default().push(placed);
                 }
             }
             for (index, inner) in ir.nested.iter().enumerate() {
@@ -818,10 +851,10 @@ impl<'a> Calls<'a> {
                         .iter()
                         .any(|arg| matches!(arg, Value::Callback(at) if *at == index))
                 });
-                walk(file, key, depth.saturating_add(1), inner, host, out);
+                walk(file, key, depth.saturating_add(1), inner, host, out, target);
             }
             for inner in &ir.detached {
-                walk(file, key, depth.saturating_add(1), inner, None, out);
+                walk(file, key, depth.saturating_add(1), inner, None, out, target);
             }
         }
         let mut calls = Calls {
@@ -844,9 +877,10 @@ impl<'a> Calls<'a> {
                     &file.functions[key],
                     None,
                     &mut calls,
+                    &target,
                 );
             }
-            walk(path, None, 0, &file.module_level, None, &mut calls);
+            walk(path, None, 0, &file.module_level, None, &mut calls, &target);
         }
         calls
     }
@@ -860,7 +894,7 @@ impl<'a> Calls<'a> {
             .target_at(placed.file, placed.call.site.lo, placed.call.site.hi)
     }
 
-    fn callers_of(&self, file: &Path, key: &str) -> &[Placed<'a>] {
+    pub(super) fn callers_of(&self, file: &Path, key: &str) -> &[Placed<'a>] {
         self.callers
             .get(&(file.to_path_buf(), key.to_string()))
             .map_or(&[], Vec::as_slice)
@@ -1590,6 +1624,17 @@ fn decide(
         };
         walk.receiver = site.receiver.clone();
         walk.reached = site.reached;
+        // An end discovery keeps with a stop is one of the labelled exports
+        // a callee's disagreeing values reach (carrick#2432): the call is a
+        // lead, named by none of them.
+        if site.stop.is_some() {
+            if let Some(placed) =
+                calls.at_span(&root.join(&site.file), site.span_start, site.span_end)
+            {
+                walk.lead(&placed, end, Undecided::SeveralValues);
+            }
+            continue;
+        }
         let Some(label) = SiteLabel::find(labels, end) else {
             // A call that hands a maker the function it runs
             // (carrick#2426): the function holds the request, found at its
@@ -1642,6 +1687,25 @@ fn decide(
         if walk.settles(&last, &at_end, end) {
             walk.site(&[last], end, at_end, BTreeSet::from([slot.arg]));
             through_to_last(&mut walk);
+            continue;
+        }
+        // The site's call runs, as a value, the function that makes the
+        // labelled call (carrick#2432): its arguments fill that function's
+        // own parameters, which no call-graph caller does.
+        if let [hop] = site.chain.as_slice()
+            && hop.function == VALUE_HOP
+            && !at_end.iter().any(|piece| matches!(piece, Piece::Outer(..)))
+            && let Some(first) =
+                calls.at_span(&root.join(&site.file), site.span_start, site.span_end)
+        {
+            let value = filled(&at_end, first.call);
+            let down = [first, last];
+            if walk.settles(&first, &value, end) {
+                walk.site(&down, end, value, parameter_positions(&at_end));
+            } else {
+                walked.push(format!("{}:{}", site.file, site.line));
+                walk.up(&down, &value, end, &mut Vec::new());
+            }
             continue;
         }
         let Some(chain) = place_chain(&calls, root, site, &last) else {
@@ -2580,7 +2644,13 @@ pub(crate) mod tests {
                     lead.reason
                 ))
                 .collect::<Vec<_>>(),
-            vec![("api.ts".to_string(), 10, Undecided::NameNeverBound)]
+            vec![
+                ("api.ts".to_string(), 10, Undecided::NameNeverBound),
+                // A callee whose values reach two labelled exports
+                // (carrick#2432): one lead per export, at the call.
+                ("values.ts".to_string(), 32, Undecided::SeveralValues),
+                ("values.ts".to_string(), 32, Undecided::SeveralValues),
+            ]
         );
     }
 
@@ -2590,6 +2660,17 @@ pub(crate) mod tests {
     fn a_name_nothing_binds_is_a_possible_call() {
         let decided = decided();
         let found = crate::possible_calls::from_sites(&decided, &[]);
+        // The others are a callee whose values disagree (carrick#2432).
+        let (found, values): (Vec<_>, Vec<_>) = found
+            .into_iter()
+            .partition(|call| !call.file_path.ends_with("values.ts"));
+        assert!(
+            values
+                .iter()
+                .all(|call| call.unread.reason
+                    == crate::possible_calls::UnreadReason::InjectedCallee),
+            "{values:?}"
+        );
         assert_eq!(found.len(), 1, "{found:?}");
         let call = &found[0];
         assert_eq!(call.file_path.trim_start_matches(WEB), "api.ts");
@@ -2629,9 +2710,17 @@ pub(crate) mod tests {
             ("pages/b.ts:4", Some("/b")),
             ("pages/c.ts:4", Some("/c")),
             ("pages/things.ts:4", Some("/v1/things")),
+            // A callee that is a value, followed to the labelled export it
+            // holds (carrick#2432): at the call that runs it, and at each
+            // caller that hands a different one.
+            ("passed-in.ts:2", Some("/defaulted")),
             ("presence.ts:4", Some("user.joined")),
             ("store.ts:3", Some("/settings")),
             ("traced-load.ts:4", Some("/traced")),
+            ("values.ts:6", Some("/api/events")),
+            ("values.ts:19", Some("/api/sync")),
+            ("values.ts:36", Some("/api/a")),
+            ("values.ts:40", Some("/api/b")),
         ];
         let mut got: Vec<(String, Option<String>)> = sites;
         got.sort();
@@ -2665,7 +2754,11 @@ pub(crate) mod tests {
             names.sort();
             names
         };
-        let only_chain = |name: &(String, u32, Option<String>)| name.0.ends_with("presence.ts");
+        // Discovery's chain alone reaches a member of a call's result, and
+        // a caller that hands a callee its value (carrick#2432).
+        let only_chain = |name: &(String, u32, Option<String>)| {
+            name.0.ends_with("presence.ts") || (name.0.ends_with("values.ts") && name.1 >= 36)
+        };
         let mut expected = names(&full);
         expected.retain(|name| !only_chain(name));
         assert_eq!(names(&walked), expected);
@@ -2677,7 +2770,12 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             leads,
-            vec![("api.ts".to_string(), 10), ("session.ts".to_string(), 7)]
+            vec![
+                ("api.ts".to_string(), 10),
+                ("session.ts".to_string(), 7),
+                ("values.ts".to_string(), 32),
+                ("values.ts".to_string(), 32),
+            ]
         );
         assert!(!walked.walked.is_empty());
     }
