@@ -208,6 +208,7 @@ fn the_scope_trace_writes_nothing_of_its_own() {
     let mounted = [
         "src/admin.ts:8 get",
         "src/extra.ts:9 post",
+        "src/index.ts:46 get",
         "src/reports.ts:9 get",
         "src/shared.ts:8 get",
         "src/users.ts:8 get",
