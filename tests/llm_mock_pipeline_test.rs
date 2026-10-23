@@ -208,9 +208,10 @@ async fn mock_llm_output_flows_through_validation_and_mount_graph() {
     );
 
     // reports.ts: emission_style routes type inference. The return-value
-    // endpoint asks for the handler's return type (line-anchored
-    // FunctionReturn); the no-payload endpoint asks for nothing at all,
-    // leaving its manifest entry honestly unknown.
+    // endpoint asks for the handler's return type (text-located
+    // FunctionReturn); the no-payload endpoint is asked by its registration
+    // line only (carrick#2719), where the type layer answers nothing for its
+    // void handler.
     let reports_result = result
         .file_results
         .iter()
@@ -244,11 +245,26 @@ async fn mock_llm_output_flows_through_validation_and_mount_graph() {
         .collect();
     assert_eq!(
         reports_items.len(),
-        1,
-        "only the return-value endpoint may request inference, got: {:?}",
+        2,
+        "one request per endpoint, got: {:?}",
         reports_items
     );
-    let summary_item = reports_items[0];
+    let export_item = reports_items
+        .iter()
+        .find(|item| item.line_number == export.line_number as u32)
+        .expect("the no-payload endpoint is asked by its line");
+    assert_eq!(export_item.infer_kind, InferKind::ResponseBody);
+    assert!(
+        export_item.span_start.is_none()
+            && export_item.span_end.is_none()
+            && export_item.expression_text.is_none(),
+        "a no-payload endpoint is asked by its registration line only: {:?}",
+        export_item
+    );
+    let summary_item = reports_items
+        .iter()
+        .find(|item| item.line_number == summary.line_number as u32)
+        .expect("the return-value endpoint requests inference");
     assert_eq!(summary_item.line_number, summary.line_number as u32);
     assert_eq!(summary_item.infer_kind, InferKind::FunctionReturn);
     assert_eq!(

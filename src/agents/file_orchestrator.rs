@@ -5491,11 +5491,26 @@ impl FileOrchestrator {
                             InferLocator::Line,
                         );
                     }
-                    // No recoverable payload expression (zero-arg sends,
-                    // streams, helper-written payloads): skip inference. The
-                    // manifest entry keeps `unknown` with its evidence —
-                    // honest, instead of inferring from the wrong node.
-                    Some(EmissionStyle::NoPayload) => {}
+                    // The model located no payload (carrick#2719). On a
+                    // registration that names a handler declared elsewhere
+                    // (`router.route(p).get(mw, importedHandler)`) that is a
+                    // claim about a body it never read, so it decides
+                    // nothing: the compiler is asked at the registration
+                    // line, where the type layer follows the handler the
+                    // registration names and answers nothing for a handler
+                    // that returns void and sends no typed body, so a true
+                    // no-payload route keeps `unknown`. Never by span: the
+                    // registration call contains the handler, and a span
+                    // request would read the call expression as the payload.
+                    Some(EmissionStyle::NoPayload) => {
+                        push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::ResponseBody,
+                            response_alias.clone(),
+                            InferLocator::Line,
+                        );
+                    }
                     Some(EmissionStyle::ImperativeSend) | None => {
                         let response_inferred = push_infer(
                             &file_path_absolute,
@@ -16930,24 +16945,33 @@ export * from "./aFetch.js";"#,
     }
 
     #[test]
-    fn test_collect_type_requests_no_payload_skips_response_inference() {
-        // Zero-arg sends / helper-written payloads: no recoverable payload
-        // expression exists, so no inference is requested at all — the
-        // manifest entry stays honestly `unknown` with its evidence. The
-        // spans on the endpoint are the landmine: without the emission_style
-        // gate the span fallback would infer from the whole `app.get(...)`
-        // call expression.
+    fn test_collect_type_requests_no_payload_asks_by_registration_line() {
+        // The model located no payload (carrick#2719). On a registration
+        // naming a handler declared elsewhere that claim is about a body it
+        // never read, so the compiler is asked at the registration line,
+        // where the type layer follows the handler and answers nothing for a
+        // void one. The spans on the endpoint are the landmine: the
+        // registration call contains the handler, so a span request would
+        // read the whole `app.get(...)` call expression as the payload.
         let mut endpoint =
             endpoint_with_emission_style("GET", "/export", Some(EmissionStyle::NoPayload));
         // Pairing invariant: no-payload ⇒ response expression is null.
         endpoint.response_expression_text = None;
         endpoint.response_expression_line = None;
+        assert!(endpoint.call_expression_span_start.is_some());
 
         let infer = infer_for_endpoint(endpoint);
+        assert_eq!(infer.len(), 1, "got: {:?}", infer);
+        let item = &infer[0];
+        assert_eq!(item.infer_kind, InferKind::ResponseBody);
+        assert_eq!(item.line_number, 12);
         assert!(
-            infer.is_empty(),
-            "no-payload endpoints must not request response inference: {:?}",
-            infer
+            item.span_start.is_none()
+                && item.span_end.is_none()
+                && item.expression_text.is_none()
+                && item.expression_line.is_none(),
+            "a no-payload row is asked by its registration line only: {:?}",
+            item
         );
     }
 
@@ -16971,7 +16995,10 @@ export * from "./aFetch.js";"#,
             "no-payload endpoints must not bundle explicit response symbols: {:?}",
             explicit
         );
-        assert!(infer.is_empty(), "got: {:?}", infer);
+        // The registration-line question is still asked (carrick#2719): the
+        // type layer reads the handler, not the model's hint.
+        assert_eq!(infer.len(), 1, "got: {:?}", infer);
+        assert!(infer[0].span_start.is_none() && infer[0].expression_text.is_none());
         assert!(inline.is_empty(), "got: {:?}", inline);
     }
 
@@ -16987,9 +17014,12 @@ export * from "./aFetch.js";"#,
         endpoint.payload_expression_line = Some(13);
 
         let infer = infer_for_endpoint(endpoint);
-        assert_eq!(infer.len(), 1, "got: {:?}", infer);
-        assert_eq!(infer[0].infer_kind, InferKind::RequestBody);
-        assert_eq!(infer[0].expression_text.as_deref(), Some("req.body"));
+        let request: Vec<_> = infer
+            .iter()
+            .filter(|item| item.infer_kind == InferKind::RequestBody)
+            .collect();
+        assert_eq!(request.len(), 1, "got: {:?}", infer);
+        assert_eq!(request[0].expression_text.as_deref(), Some("req.body"));
     }
 
     #[test]
