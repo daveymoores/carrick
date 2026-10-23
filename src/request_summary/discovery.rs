@@ -3825,7 +3825,7 @@ mod tests {
                         script,
                         &root,
                         service,
-                        &inputs,
+                        inputs,
                         &answer.exports,
                     )
                 });
