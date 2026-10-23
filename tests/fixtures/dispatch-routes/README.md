@@ -77,4 +77,5 @@ The file added for carrick#2693:
   `act`), on a hole in an entry handler (`clean(request.url)`) and on a
   hole in a label handler (`clean(req.url)`). Each is asked and answered `route` in band
   (`handler-answers.json`, written for this file, not a live repeat), and
-  each ends `no_method`: the literal chooses no method.
+  each ends `no_method`: the literal chooses no method, and the record
+  lists no method to the model (nor `other.method` in `negatives.ts`).

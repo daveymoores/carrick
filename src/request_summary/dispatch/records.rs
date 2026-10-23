@@ -254,7 +254,6 @@ pub fn handler_records(
     nodes.sort();
     for node in nodes {
         for candidate in &methods[node] {
-            let mut reached = BTreeSet::new();
             let mut decides = BTreeSet::new();
             for (chain, facts) in &candidate.chains {
                 if chain.negated {
@@ -263,7 +262,6 @@ pub fn handler_records(
                 let reads_method = reader.reads_method(chain, facts);
                 for (handler, kind) in attacher.attach_method(*node, chain, facts) {
                     handlers.entry(handler).or_insert(kind);
-                    reached.insert(handler);
                     if reads_method {
                         decides.insert(handler);
                     }
@@ -277,15 +275,17 @@ pub fn handler_records(
             }) {
                 count(&mut out.counts, "methods_in_branch");
             }
-            method_handlers.insert(address(candidate.guard), decides);
-            if !reached.is_empty() {
+            // A record shows the model only the methods the code states: a
+            // literal compared with another value is no method (carrick#2693).
+            if !decides.is_empty() {
                 stated_methods.push(Stated {
                     node: *node,
                     guard: candidate.guard,
                     literal: candidate.method.clone(),
-                    handlers: reached,
+                    handlers: decides.clone(),
                 });
             }
+            method_handlers.insert(address(candidate.guard), decides);
         }
     }
     let mut compared: Vec<Compared<'_>> = Vec::new();

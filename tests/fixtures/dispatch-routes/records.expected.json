@@ -722,16 +722,7 @@
         }
       ],
       "forced": {},
-      "methods": [
-        {
-          "at": "src/action.ts:10",
-          "literal": "PUT"
-        },
-        {
-          "at": "src/action.ts:13",
-          "literal": "DELETE"
-        }
-      ],
+      "methods": [],
       "scopes": [],
       "subject": {
         "at": "src/action.ts:7",
@@ -765,12 +756,7 @@
         }
       ],
       "forced": {},
-      "methods": [
-        {
-          "at": "src/action.ts:20",
-          "literal": "PATCH"
-        }
-      ],
+      "methods": [],
       "scopes": [],
       "subject": {
         "at": "src/action.ts:19",
@@ -802,12 +788,7 @@
         }
       ],
       "forced": {},
-      "methods": [
-        {
-          "at": "src/action.ts:27",
-          "literal": "DELETE"
-        }
-      ],
+      "methods": [],
       "scopes": [],
       "subject": {
         "at": "src/action.ts:26",
@@ -1125,10 +1106,6 @@
       ],
       "forced": {},
       "methods": [
-        {
-          "at": "src/negatives.ts:20",
-          "literal": "GET"
-        },
         {
           "at": "src/negatives.ts:23",
           "literal": "GET"
