@@ -28,6 +28,11 @@
 //!   `inference.alternative`. With no row at the site an answer in the band
 //!   stands, and one below it is a possible call
 //!   ([`crate::possible_calls`], reason `below_band`).
+//! - **Callers** (carrick#2614). A call whose request is decided lower on
+//!   its chain (`await login(…)`, where `login` writes the path) is no
+//!   second request ([`crate::request_summary::decided_sites::Through`]): a
+//!   reader row there folds onto the site when a row standing at the site
+//!   after the fold agrees on its key ([`agrees`]).
 //! - **The band** (amended by David, 2026-10-17). An answer is in band only
 //!   when every slot the model answered that the row depends on (kind, role,
 //!   name, method, namespace: the slots that feed the key and the side) is at
@@ -59,7 +64,7 @@ use crate::analyzer::ApiEndpointDetails;
 use crate::cloud_storage::CloudRepoData;
 use crate::operation::{OperationKey, SocketDirection};
 use crate::possible_calls::{PossibleCall, UnreadReason};
-use crate::request_summary::decided_sites::{Decided, DecidedSite, SiteLabel};
+use crate::request_summary::decided_sites::{Decided, DecidedSite, SiteLabel, Through};
 use crate::request_summary::site_record::{Basis, Bucket, SiteRecord, TypeAnchors};
 use crate::site_questions::{Answered, SiteAnswers, SiteQuestion, Slot, SlotAnswer, SlotValue};
 
@@ -163,6 +168,9 @@ pub struct SiteRows {
     /// only where no row stands at its line: elsewhere the index already
     /// holds the route, and the site is counted, not listed.
     pub routes: Vec<PossibleCall>,
+    /// Calls above a decided site on its chain (carrick#2614), whose reader
+    /// rows fold onto the row the site holds.
+    pub through: Vec<Through>,
 }
 
 /// The id a site is asked under: its file and call span, unique in a run.
@@ -402,6 +410,7 @@ pub fn of(
         rows: Vec::new(),
         leads: crate::possible_calls::from_sites(decided, records),
         routes: Vec::new(),
+        through: decided.through.clone(),
     };
     for record in records {
         if record.bucket == Bucket::Lead {
@@ -522,6 +531,9 @@ pub struct SiteFold {
     /// Leads dropped because the blob already holds a row at their line
     /// (carrick#2539): the index states that site, so it is no possible call.
     pub lead_on_row_line: usize,
+    /// Reader rows at a call above a decided site folded onto the row the
+    /// site holds (carrick#2614). Each is in `withdrawn` as well.
+    pub through_folded: usize,
 }
 
 /// `file` relative to `root`, `/`-separated, whichever form it is held in
@@ -607,12 +619,8 @@ pub fn fold_rows(
             })
             .map(|(index, _)| index)
             .collect();
-        let reader = |existing: &ApiEndpointDetails| {
-            existing.resolution_source == Some(ResolutionSource::Model)
-                && existing.inference.is_none()
-        };
         // A fact the scan states keeps the site.
-        if here.iter().any(|&index| !reader(&rows[index])) {
+        if here.iter().any(|&index| !is_reader(&rows[index])) {
             continue;
         }
         let readers: Vec<usize> = here;
@@ -669,7 +677,43 @@ pub fn fold_rows(
         rows.push(stated);
         out.stated.push(row.clone());
     }
+    // A reader row at a call above a decided site, for an operation a row at
+    // the site states, is that request read again at its caller
+    // (carrick#2614). The site's row is whichever stands there after the
+    // fold above: the scan's, the site's, or the reader's. No row there, or
+    // none that agrees, and the caller's row stands.
+    for through in &site.through {
+        let at = |row: &ApiEndpointDetails, file: &str, line: u32| {
+            place(root, row).is_some_and(|(f, l)| f == file && l == line)
+        };
+        let stated: Vec<OperationKey> = calls
+            .iter()
+            .filter(|row| at(row, &through.site_file, through.site_line))
+            .map(|row| row.key.clone())
+            .collect();
+        let folds = |row: &ApiEndpointDetails| {
+            is_reader(row)
+                && at(row, &through.file, through.line)
+                && stated.iter().any(|key| agrees(&row.key, key))
+        };
+        let mut index = 0;
+        while index < calls.len() {
+            if folds(&calls[index]) {
+                let gone = calls.remove(index);
+                out.withdrawn
+                    .push((through.file.clone(), through.line, gone.key, RowSide::Call));
+                out.through_folded += 1;
+            } else {
+                index += 1;
+            }
+        }
+    }
     out
+}
+
+/// A row the file reader stated, which no site answer has touched.
+fn is_reader(row: &ApiEndpointDetails) -> bool {
+    row.resolution_source == Some(ResolutionSource::Model) && row.inference.is_none()
 }
 
 #[cfg(test)]

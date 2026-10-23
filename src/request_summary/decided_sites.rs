@@ -55,6 +55,7 @@ use swc_common::{SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use super::row_calls::Reach;
 use super::{CallIr, FnIr, Piece, RequestSummaryInputs, Value, concat, render_target};
 
 /// The labelled call a discovery site reaches: the store key of the package
@@ -665,6 +666,55 @@ pub struct Decided {
     /// Sites that state no row because their name is one the library emits
     /// itself (carrick#2426), by `file:line`.
     pub reserved: Vec<String>,
+    /// Calls above a decided site on its chain (carrick#2614).
+    pub through: Vec<Through>,
+}
+
+/// A discovered call whose request is decided lower down its chain
+/// (carrick#2614): `await login(…)` where `login`'s own call writes the path.
+/// The call is not a second request; the site at `site_file:site_line` is.
+/// Recorded only where each hop from this call down to the site is the
+/// definition [`RequestSummaryInputs::reach`] reads off the compiler's `call`
+/// row (or, for a bare call of a function the same file declares, SWC's exact
+/// binding), never the unresolved-import fallback to the call graph's name
+/// join, so a call into another service or an unresolved one is never
+/// recorded.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Through {
+    /// Repo-relative, `/`-separated.
+    pub file: String,
+    pub line: u32,
+    pub site_file: String,
+    pub site_line: u32,
+}
+
+/// The [`Through`] from `chain[0]` to the site at `chain[to]`, when `to` is
+/// below it and every hop between is one the compiler's rows resolve.
+fn through(
+    inputs: &RequestSummaryInputs,
+    root: &Path,
+    chain: &[Placed<'_>],
+    to: usize,
+) -> Option<Through> {
+    if to == 0 || to >= chain.len() || inputs.row_calls.is_none() {
+        return None;
+    }
+    let resolved = chain[..=to].windows(2).all(|pair| {
+        let (call, into) = (&pair[0], &pair[1]);
+        let (file, lo, hi) = (call.file, call.call.site.lo, call.call.site.hi);
+        !inputs.fell_back(file, lo, hi)
+            && matches!(
+                inputs.reach(file, lo, hi),
+                Reach::Function(target, key)
+                    if target == into.file && into.key == Some(key.as_str())
+            )
+    });
+    resolved.then(|| Through {
+        file: relative(root, chain[0].file),
+        line: chain[0].call.site.line,
+        site_file: relative(root, chain[to].file),
+        site_line: chain[to].call.site.line,
+    })
 }
 
 /// One call, where it is written: its file, the definition key of the
@@ -1441,9 +1491,18 @@ pub fn decided_sites(
             unplaced.push(format!("{}:{}", site.file, site.line));
             continue;
         };
+        // A call above the labelled call, when that call is the site.
+        let through_to_last = |walk: &mut Walk<'_, '_>| {
+            if let Some(chain) = place_chain(&calls, root, site, &last)
+                && let Some(through) = through(inputs, root, &chain, chain.len() - 1)
+            {
+                walk.out.through.push(through);
+            }
+        };
         let Some(slot) = &label.name else {
             // The label names no slot: the labelled call is the site.
             walk.site(&[last], end, Vec::new(), BTreeSet::new());
+            through_to_last(&mut walk);
             continue;
         };
         let table = tables
@@ -1457,6 +1516,7 @@ pub fn decided_sites(
         let at_end = slot_value(last.call, slot);
         if walk.settles(&last, &at_end, end) {
             walk.site(&[last], end, at_end, BTreeSet::from([slot.arg]));
+            through_to_last(&mut walk);
             continue;
         }
         let Some(chain) = place_chain(&calls, root, site, &last) else {
@@ -1492,6 +1552,19 @@ pub fn decided_sites(
                     .is_none_or(|pieces| !walk.settles(&chain[1], pieces, end));
             if below_open {
                 walk.site(&chain, end, top, args[0].clone());
+            } else {
+                // The site is the lowest call whose value still settles.
+                let to = (1..n)
+                    .take_while(|&k| {
+                        values[k]
+                            .as_ref()
+                            .is_some_and(|pieces| walk.settles(&chain[k], pieces, end))
+                    })
+                    .last()
+                    .unwrap_or(0);
+                if let Some(through) = through(inputs, root, &chain, to) {
+                    walk.out.through.push(through);
+                }
             }
             continue;
         }
@@ -1510,6 +1583,8 @@ pub fn decided_sites(
     out.unplaced = unplaced;
     out.ran.sort();
     out.reserved.sort();
+    out.through.sort();
+    out.through.dedup();
     out.sites.sort_by(|a, b| {
         (&a.file, a.line, &a.key, &a.end.file, a.end.line).cmp(&(
             &b.file,

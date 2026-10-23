@@ -535,6 +535,7 @@ fn fold_one(
             .collect(),
         leads: Vec::new(),
         routes: Vec::new(),
+        through: Vec::new(),
     };
     fold_rows(calls, endpoints, &one, Path::new("."), make)
 }
@@ -728,6 +729,7 @@ fn a_lead_on_a_line_with_a_row_is_dropped() {
             lead_at("src/b.ts", 5, Some("producer")),
         ],
         routes: Vec::new(),
+        through: Vec::new(),
     };
     let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), make);
     let kept: Vec<(&str, u32, Option<&str>)> = fold
@@ -1097,4 +1099,135 @@ fn agreement_reads_written_values_as_parameters() {
         &OperationKey::pubsub("order.settled"),
         &OperationKey::pubsub("order.placed")
     ));
+}
+
+/// carrick#2614: a reader row at a call above a decided site folds onto the
+/// row standing at the site when the two agree, and stands otherwise.
+#[test]
+fn a_reader_row_above_a_decided_site_folds_onto_the_sites_row() {
+    let through = |file: &str, line: u32, site_line: u32| Through {
+        file: file.to_string(),
+        line,
+        site_file: "src/client.ts".to_string(),
+        site_line,
+    };
+    let model = Some(ResolutionSource::Model);
+    let mut calls = vec![
+        // The site rows: one the scan states, one only the reader states.
+        blob_row(
+            OperationKey::http("POST", "/api/login"),
+            "src/client.ts",
+            12,
+            Some(ResolutionSource::RequestSummary),
+        ),
+        blob_row(
+            OperationKey::http("GET", "/api/me"),
+            "src/client.ts",
+            20,
+            model,
+        ),
+        // Folds: the same operation as the scan's site row.
+        blob_row(
+            OperationKey::http("POST", "/api/login"),
+            "src/page.ts",
+            4,
+            model,
+        ),
+        // Folds: the same operation as the reader's site row.
+        blob_row(
+            OperationKey::http("GET", "/api/me"),
+            "src/page.ts",
+            6,
+            model,
+        ),
+        // Stands: another operation than the site states.
+        blob_row(
+            OperationKey::http("DELETE", "/api/session"),
+            "src/page.ts",
+            9,
+            model,
+        ),
+        // Stands: no row at its site.
+        blob_row(
+            OperationKey::http("POST", "/api/audit"),
+            "src/page.ts",
+            11,
+            model,
+        ),
+        // Stands: the scan states it, not the reader.
+        blob_row(
+            OperationKey::http("POST", "/api/login"),
+            "src/page.ts",
+            13,
+            Some(ResolutionSource::RequestSummary),
+        ),
+        // Stands: no call above a site is recorded at its line.
+        blob_row(
+            OperationKey::http("POST", "/api/login"),
+            "src/page.ts",
+            15,
+            model,
+        ),
+    ];
+    let site = SiteRows {
+        enabled: true,
+        through: vec![
+            through("src/page.ts", 4, 12),
+            through("src/page.ts", 6, 20),
+            through("src/page.ts", 9, 12),
+            through("src/page.ts", 11, 30),
+            through("src/page.ts", 13, 12),
+        ],
+        ..SiteRows::default()
+    };
+    let fold = fold_rows(&mut calls, &mut Vec::new(), &site, Path::new("."), make);
+    let left: Vec<String> = calls
+        .iter()
+        .map(|row| row.file_path.to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        left,
+        [
+            "src/client.ts:12",
+            "src/client.ts:20",
+            "src/page.ts:9",
+            "src/page.ts:11",
+            "src/page.ts:13",
+            "src/page.ts:15",
+        ]
+    );
+    assert_eq!(fold.through_folded, 2);
+    assert_eq!(
+        fold.withdrawn,
+        [
+            (
+                "src/page.ts".to_string(),
+                4,
+                OperationKey::http("POST", "/api/login"),
+                RowSide::Call
+            ),
+            (
+                "src/page.ts".to_string(),
+                6,
+                OperationKey::http("GET", "/api/me"),
+                RowSide::Call
+            ),
+        ]
+    );
+
+    // Off, nothing folds.
+    let mut before = calls.clone();
+    before.push(blob_row(
+        OperationKey::http("POST", "/api/login"),
+        "src/page.ts",
+        4,
+        model,
+    ));
+    let mut after = before.clone();
+    let off = SiteRows {
+        enabled: false,
+        ..site
+    };
+    fold_rows(&mut after, &mut Vec::new(), &off, Path::new("."), make);
+    assert_eq!(after.len(), before.len());
 }
