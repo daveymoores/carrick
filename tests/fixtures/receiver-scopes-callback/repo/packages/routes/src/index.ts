@@ -1,0 +1,14 @@
+export { routesPlugin } from './plugin';
+export type { RoutesOptions } from './plugin';
+export { registerNoteRoutes } from './notes';
+export { registerTagRoutes } from './tags';
+export { registerAdminRoutes, registerPublicRoutes } from './shared';
+export { registerRootRoutes } from './root-routes';
+export { twicePlugin, computedPlugin, builtPlugin, spreadPlugin } from './hosts';
+export { registerTwiceRoutes } from './twice-routes';
+export { registerComputedRoutes } from './computed-routes';
+export { registerBuiltRoutes } from './built-routes';
+export { registerSpreadRoutes } from './spread-routes';
+export { documentedRoutes } from './docs';
+export { registerLegacyRoutes } from './legacy';
+export { legacyPlugin } from './older';

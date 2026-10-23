@@ -1,0 +1,32 @@
+[
+  {
+    "claim_id": "fixture-twin-server@2:default:scope:register:name@1.prefix:runs@0>0:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-twin-server/index.d.ts",
+        "decl_line": 18
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-twin-server@2:Admin:scope:register:name@1.prefix:runs@0>0:on:instance",
+    "receiver": "instance:new",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-twin-server/index.d.ts",
+        "decl_line": 25
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-split-server@1:default:scope:register:name@1.prefix:runs@0>0:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-split-types/index.d.ts",
+        "decl_line": 6
+      }
+    ]
+  }
+]

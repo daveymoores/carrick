@@ -79,6 +79,8 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
         receiver: None,
         reached: None,
         instances: Vec::new(),
+        composed: Vec::new(),
+        composed_trimmed: false,
     }
 }
 

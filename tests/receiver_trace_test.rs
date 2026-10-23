@@ -13,8 +13,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/receiver-trace")
+fn fixture_dir(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
 }
 
 fn run_git(dir: &Path, args: &[&str]) {
@@ -53,16 +55,21 @@ type Blobs = BTreeMap<String, String>;
 /// One offline scan of a committed copy of the fixture: the fact layer on or
 /// off, and the trace switch set to `trace` or unset.
 fn scan(fact_layer: bool, trace: Option<&str>) -> Blobs {
+    scan_fixture("receiver-trace", fact_layer, trace)
+}
+
+/// [`scan`] of the fixture `name`.
+fn scan_fixture(name: &str, fact_layer: bool, trace: Option<&str>) -> Blobs {
     let tmp = tempfile::tempdir().expect("temp dir");
     let repo = tmp.path().join("workspace");
-    copy_dir(&fixture_dir().join("repo"), &repo);
+    copy_dir(&fixture_dir(name).join("repo"), &repo);
     run_git(&repo, &["init", "-q"]);
     run_git(&repo, &["add", "-A"]);
     run_git(&repo, &["commit", "-q", "-m", "init"]);
     let cassettes = tmp.path().join("cassettes");
     std::fs::create_dir_all(cassettes.join("library-claims")).unwrap();
     std::fs::copy(
-        fixture_dir().join("library-claims.json"),
+        fixture_dir(name).join("library-claims.json"),
         cassettes.join("library-claims/default.json"),
     )
     .unwrap();
@@ -188,4 +195,37 @@ fn the_receiver_trace_switch_moves_only_what_it_finds() {
     assert_eq!(scan(true, Some("true")), off);
     // With the fact layer off the switch changes no byte.
     assert_eq!(scan(false, Some("1")), scan(false, None));
+}
+
+/// carrick#2474 R2b: the scope and mount edges and the composed paths are
+/// record-only. On a fixture of mounts and plugin scopes the switch moves
+/// only the route sites R1's declaration arm finds (a plugin's scoped app,
+/// a scope a member returns, an option's callback), and with the fact layer
+/// off it changes no byte.
+#[test]
+fn the_scope_trace_writes_nothing_of_its_own() {
+    let off = scan_fixture("receiver-scopes", true, None);
+    let mounted = [
+        "src/admin.ts:8 get",
+        "src/extra.ts:9 post",
+        "src/reports.ts:9 get",
+        "src/shared.ts:8 get",
+        "src/users.ts:8 get",
+        "src/users.ts:9 post",
+    ];
+    assert_eq!(possible_calls(&off), mounted.to_vec());
+    let on = scan_fixture("receiver-scopes", true, Some("1"));
+    let mut traced: Vec<&str> = mounted.to_vec();
+    traced.extend([
+        "src/index.ts:26 get",
+        "src/index.ts:37 get",
+        "src/index.ts:38 get",
+        "src/options.ts:16 get",
+    ]);
+    traced.sort();
+    assert_eq!(possible_calls(&on), traced);
+    assert_eq!(
+        scan_fixture("receiver-scopes", false, Some("1")),
+        scan_fixture("receiver-scopes", false, None)
+    );
 }

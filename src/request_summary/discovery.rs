@@ -57,7 +57,8 @@ use crate::position_rows::{
     FLAG_DECLARATION_UNNAMED, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, Kind, Row,
 };
 use crate::services::type_sidecar::{
-    LibraryCheck, LibraryClaim, LibraryOp, LibraryRole, MakeForm, SemanticsResult, SemanticsVerdict,
+    ClaimOn, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole, MakeForm, SemanticsResult,
+    SemanticsVerdict,
 };
 
 /// The stop for a walk that reaches a definition the extractor keys and
@@ -495,11 +496,27 @@ pub struct DeclaredOp {
 /// member a `call` row of that package names, on every receiver the claim
 /// applies to, with the export's maker claims the verifier judges an
 /// instance op with. `ops` lines up with `checks`: the op each op check
-/// stands for, `None` for a maker.
+/// stands for, `None` for a maker. Each labelled scope claim whose member a
+/// `call` row names is asked too (carrick#2474 R2b, carrick#1678), on the
+/// same receivers, after every op check (the verifier judges in request
+/// order under a time limit, so near it a scope goes unchecked, never an
+/// op): `scopes` lines up with `checks` the same way.
 #[derive(Debug, Default, Clone)]
 pub struct DeclarationAsk {
     pub checks: Vec<LibraryCheck>,
     pub ops: Vec<Option<DeclaredOp>>,
+    pub scopes: Vec<Option<AskedScope>>,
+}
+
+/// One scope claim the trace asks, by its claim id, on one receiver id
+/// (carrick#2474 R2b).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AskedScope {
+    /// The store's key for the package.
+    pub package: String,
+    pub export: String,
+    pub claim_id: String,
+    pub receiver: String,
 }
 
 /// The receiver id the instances a maker claim builds are read through, as
@@ -520,18 +537,23 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
         .filter(|row| !in_repo(row))
         .filter_map(|row| Some((store_key(row, exports)?, row.symbol()?.to_string())))
         .collect();
+    // The scope checks, asked once every export's op checks are in.
+    let mut scope_checks: Vec<(LibraryCheck, AskedScope)> = Vec::new();
     for export in exports
         .iter()
         .filter(|export| export.role != LibraryRole::None)
     {
-        let claims = export.claims_by_id();
+        let claims = export.claims_with_scopes_by_id();
         let wanted: Vec<&(String, &LibraryClaim)> = claims
             .iter()
             .filter(|(_, claim)| match claim {
                 LibraryClaim::Op {
                     member: Some(member),
                     ..
-                } => called.contains(&(export.package.clone(), member.clone())),
+                }
+                | LibraryClaim::Scope { member, .. } => {
+                    called.contains(&(export.package.clone(), member.clone()))
+                }
                 _ => false,
             })
             .collect();
@@ -552,36 +574,59 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
                 receivers.push(make_receiver(*form, member.as_deref()));
                 ask.checks.push(check(id, "export", claim));
                 ask.ops.push(None);
+                ask.scopes.push(None);
             }
         }
+        // Every receiver a claim's `on` or `of` applies to.
+        let on_receivers = |on: Option<ClaimOn>, of: Option<&str>| -> Vec<String> {
+            let mut all = receivers.clone();
+            all.extend(of.map(str::to_string));
+            all.sort();
+            all.dedup();
+            all.retain(|receiver| applies(on, of, receiver));
+            all
+        };
         for (id, claim) in wanted {
-            let LibraryClaim::Op {
-                op,
-                member: Some(member),
-                on,
-                of,
-                ..
-            } = claim
-            else {
-                continue;
-            };
-            let mut on_receivers = receivers.clone();
-            on_receivers.extend(of.iter().cloned());
-            on_receivers.sort();
-            on_receivers.dedup();
-            for receiver in on_receivers
-                .iter()
-                .filter(|receiver| applies(*on, of.as_deref(), receiver))
-            {
-                ask.checks.push(check(id, receiver, claim));
-                ask.ops.push(Some(DeclaredOp {
-                    package: export.package.clone(),
-                    export: export.export.clone(),
-                    member: member.clone(),
-                    op: *op,
-                }));
+            match claim {
+                LibraryClaim::Op {
+                    op,
+                    member: Some(member),
+                    on,
+                    of,
+                    ..
+                } => {
+                    for receiver in on_receivers(*on, of.as_deref()) {
+                        ask.checks.push(check(id, &receiver, claim));
+                        ask.ops.push(Some(DeclaredOp {
+                            package: export.package.clone(),
+                            export: export.export.clone(),
+                            member: member.clone(),
+                            op: *op,
+                        }));
+                        ask.scopes.push(None);
+                    }
+                }
+                LibraryClaim::Scope { on, of, .. } => {
+                    for receiver in on_receivers(*on, of.as_deref()) {
+                        scope_checks.push((
+                            check(id, &receiver, claim),
+                            AskedScope {
+                                package: export.package.clone(),
+                                export: export.export.clone(),
+                                claim_id: id.clone(),
+                                receiver,
+                            },
+                        ));
+                    }
+                }
+                _ => {}
             }
         }
+    }
+    for (check, scope) in scope_checks {
+        ask.checks.push(check);
+        ask.ops.push(None);
+        ask.scopes.push(Some(scope));
     }
     ask
 }
@@ -591,6 +636,12 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
 #[derive(Debug, Default, Clone)]
 pub struct MemberDeclarations {
     by_declaration: HashMap<(String, u32), Vec<DeclaredOp>>,
+    /// The scope claims verified, each by claim id on the receiver id it
+    /// was asked on, with the member declarations (`decl_file`,
+    /// `decl_line`) the verdict names (carrick#2474 R2b, carrick#2636):
+    /// a call whose row resolves to one of them is a call of that scope
+    /// member, whatever holds its receiver.
+    pub verified_scopes: HashMap<AskedScope, Vec<(String, u32)>>,
     /// The checks asked.
     pub checks: usize,
     /// Of those, the ones the verifier did not reach in its time limit.
@@ -609,16 +660,32 @@ impl MemberDeclarations {
         if verdicts.len() != ask.checks.len() {
             return out;
         }
-        for ((check, op), verdict) in ask.checks.iter().zip(&ask.ops).zip(verdicts) {
-            let Some(op) = op else {
-                continue;
-            };
+        for (((check, op), scope), verdict) in ask
+            .checks
+            .iter()
+            .zip(&ask.ops)
+            .zip(&ask.scopes)
+            .zip(verdicts)
+        {
             if verdict.verdict != SemanticsVerdict::Verified
                 || verdict.claim_id != check.claim_id
                 || verdict.receiver != check.receiver
             {
                 continue;
             }
+            if let Some(scope) = scope {
+                let mut declarations: Vec<(String, u32)> = verdict
+                    .declarations
+                    .iter()
+                    .map(|declared| (declared.decl_file.clone(), declared.decl_line))
+                    .collect();
+                declarations.sort();
+                declarations.dedup();
+                out.verified_scopes.insert(scope.clone(), declarations);
+            }
+            let Some(op) = op else {
+                continue;
+            };
             for declared in &verdict.declarations {
                 let ops = out
                     .by_declaration
@@ -1965,10 +2032,36 @@ mod tests {
         Vec<ExportClaims>,
         MemberDeclarations,
     )> {
-        let on = walked("receiver-trace", ".", "web", &[], true)?;
+        traced_fixture_named("receiver-trace")
+    }
+
+    /// The fixture `name`'s service `web` walked with rows, its store
+    /// answer, and the declarations and scopes the trace's own verify
+    /// request returns for it.
+    fn traced_fixture_named(
+        name: &str,
+    ) -> Option<(
+        super::super::fixture_walk::Walked,
+        Vec<ExportClaims>,
+        MemberDeclarations,
+    )> {
+        traced_fixture_in(name, ".", "web")
+    }
+
+    /// [`traced_fixture_named`] for the service `service` in `dir`.
+    fn traced_fixture_in(
+        name: &str,
+        dir: &str,
+        service: &str,
+    ) -> Option<(
+        super::super::fixture_walk::Walked,
+        Vec<ExportClaims>,
+        MemberDeclarations,
+    )> {
+        let on = walked(name, dir, service, &[], true)?;
         let text = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/receiver-trace/library-claims.json"),
+                .join(format!("tests/fixtures/{name}/library-claims.json")),
         )
         .unwrap();
         let answer = crate::library_store::parse_answer(&text);
@@ -1985,8 +2078,77 @@ mod tests {
             .verify_library_claims(&on.repo, &ask.checks)
             .expect("the verifier answers")
             .verdicts;
+        let verdicts = with_scope_declarations(name, &ask, verdicts);
         let declarations = MemberDeclarations::of(&ask, &verdicts);
         Some((on, exports, declarations))
+    }
+
+    /// One verified scope verdict's declarations, as a cassette holds them.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct ScopeDeclarations {
+        claim_id: String,
+        receiver: String,
+        declarations: Vec<crate::services::type_sidecar::SemanticsDeclaration>,
+    }
+
+    /// `verdicts` with each verified scope verdict's declarations
+    /// (carrick#2636): the live verifier's where it names them, else the
+    /// fixture's cassette `scope-declarations.json`, recorded from a
+    /// verifier that does. Where both name them they must agree. With
+    /// `CARRICK_RECORD_SCOPE_DECLARATIONS=1` the live ones are written to the
+    /// cassette.
+    fn with_scope_declarations(
+        name: &str,
+        ask: &DeclarationAsk,
+        mut verdicts: Vec<SemanticsResult>,
+    ) -> Vec<SemanticsResult> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("tests/fixtures/{name}/scope-declarations.json"));
+        let live: Vec<ScopeDeclarations> = ask
+            .scopes
+            .iter()
+            .zip(&verdicts)
+            .filter(|(scope, verdict)| {
+                scope.is_some()
+                    && verdict.verdict == SemanticsVerdict::Verified
+                    && !verdict.declarations.is_empty()
+            })
+            .map(|(_, verdict)| ScopeDeclarations {
+                claim_id: verdict.claim_id.clone(),
+                receiver: verdict.receiver.clone(),
+                declarations: verdict.declarations.clone(),
+            })
+            .collect();
+        if std::env::var("CARRICK_RECORD_SCOPE_DECLARATIONS").as_deref() == Ok("1") {
+            assert!(!live.is_empty(), "the verifier names no scope declarations");
+            std::fs::write(&path, serde_json::to_string_pretty(&live).unwrap() + "\n").unwrap();
+            return verdicts;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return verdicts;
+        };
+        let cassette: Vec<ScopeDeclarations> = serde_json::from_str(&text).unwrap();
+        for known in &live {
+            assert!(
+                cassette.contains(known),
+                "the cassette disagrees with the verifier: {known:?}"
+            );
+        }
+        for (scope, verdict) in ask.scopes.iter().zip(&mut verdicts) {
+            if scope.is_none()
+                || verdict.verdict != SemanticsVerdict::Verified
+                || !verdict.declarations.is_empty()
+            {
+                continue;
+            }
+            if let Some(held) = cassette
+                .iter()
+                .find(|held| held.claim_id == verdict.claim_id && held.receiver == verdict.receiver)
+            {
+                verdict.declarations = held.declarations.clone();
+            }
+        }
+        verdicts
     }
 
     /// Each site as `file:line callee -> export member op reached receiver`.
@@ -2259,6 +2421,7 @@ mod tests {
             for end in &site.instances {
                 let what = match &end.end {
                     InstanceAt::Root { file, line, .. } => format!("root {file}:{line}"),
+                    InstanceAt::Scope { file, line, .. } => format!("scope {file}:{line}"),
                     InstanceAt::Hole { reason, .. } => serde_json::to_value(reason)
                         .unwrap()
                         .as_str()
@@ -2289,25 +2452,8 @@ mod tests {
         let Some((on, exports, declarations)) = traced_fixture() else {
             return;
         };
-        let discovery = discover(
-            &on.inputs,
-            &Labels::traced(&exports, &declarations),
-            &on.repo,
-        );
-        use super::super::decided_sites::{MakerLabel, SiteLabel, decided_sites_traced};
-        let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
-            .sites
-            .iter()
-            .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
-            .collect();
-        let labels = SiteLabel::from_exports(&exports);
-        let decided = decided_sites_traced(
-            &on.inputs,
-            &on.repo,
-            &discovered,
-            &labels,
-            &MakerLabel::from_exports(&exports),
-        );
+        let (discovery, decided) = decided_traced(&on, &exports, &declarations, &[]);
+        let labels = super::super::decided_sites::SiteLabel::from_exports(&exports);
         let got = instance_ends(&decided);
         let want = texts(&[
             "src/app.ts:13 <- src/app.ts:13 root src/app.ts:12",
@@ -2353,6 +2499,407 @@ mod tests {
         );
     }
 
+    /// Each route site of `decided` as `file:line <- path`, one line per
+    /// composed path, with `(end)` after a path relative to a hole, and `?`
+    /// for a path that is not text; with `edges`, each path's scope and
+    /// mount edges from the top down (`… via file:line member prefix > …`).
+    fn composed_lines(decided: &super::super::decided_sites::Decided, edges: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        for site in decided
+            .sites
+            .iter()
+            .filter(|site| site.end.op.as_deref() == Some("receive"))
+        {
+            for composed in &site.composed {
+                let path = composed.path.as_deref().unwrap_or("?");
+                let what = match composed.end.as_str() {
+                    "top" => path.to_string(),
+                    end => format!("{path} ({end})"),
+                };
+                let mut line = format!("{}:{} <- {what}", site.file, site.line);
+                if edges {
+                    line = format!("{line} via {}", composed.edges.join(" > "));
+                }
+                out.push(line);
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The fixture service `on`'s sites, discovered with the receiver trace
+    /// and decided with it, under the scope labels `scopes`.
+    fn decided_traced(
+        on: &super::super::fixture_walk::Walked,
+        exports: &[ExportClaims],
+        declarations: &MemberDeclarations,
+        scopes: &[super::super::decided_sites::ScopeLabel],
+    ) -> (Discovery, super::super::decided_sites::Decided) {
+        use super::super::decided_sites::{MakerLabel, SiteLabel, decided_sites_traced};
+        let discovery = discover(&on.inputs, &Labels::traced(exports, declarations), &on.repo);
+        let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
+            .collect();
+        let decided = decided_sites_traced(
+            &on.inputs,
+            &on.repo,
+            &discovered,
+            &SiteLabel::from_exports(exports),
+            &MakerLabel::from_exports(exports),
+            scopes,
+        );
+        (discovery, decided)
+    }
+
+    /// carrick#2474 R2b: with the receiver trace on, each route site names
+    /// the full path it is served at, per instance end: the prefixes of the
+    /// scopes a labelled member opens (a plugin it runs, handed by name,
+    /// written in place, or inside another plugin) and of the mounts an
+    /// instance is handed to (a router another module builds, one mounted
+    /// twice, one an own factory returns, a mount made on a helper's
+    /// parameter, and a scope a member returns), joined from the top down
+    /// with the route's own path. A member run with no options binds no
+    /// prefix. A function written under an option key is a hole
+    /// (`callback_option`) until carrick#2432 lands. Only the scope claims
+    /// the trace's own request verified count.
+    #[test]
+    fn each_route_is_composed_under_its_scopes_and_mounts() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-scopes") else {
+            return;
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let mut verified: Vec<&str> = scopes.iter().map(|scope| scope.member.as_str()).collect();
+        verified.sort();
+        assert_eq!(verified, vec!["basePath", "register", "route"]);
+        let (discovery, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = composed_lines(&decided, false);
+        let want = texts(&[
+            "src/admin.ts:8 <- /admin/stats",
+            "src/extra.ts:9 <- /a/pong",
+            "src/extra.ts:9 <- /b/pong",
+            "src/index.ts:14 <- /bare",
+            "src/index.ts:19 <- /health",
+            "src/index.ts:26 <- /in/inline",
+            "src/index.ts:37 <- /v2/x",
+            "src/index.ts:38 <- /v3/y",
+            "src/items.ts:12 <- /api/items",
+            "src/items.ts:8 <- /api/deep/leaf",
+            // Waits on carrick#2432's injected-callee step.
+            "src/options.ts:16 <- /extra (callback_option)",
+            "src/reports.ts:9 <- /r/daily",
+            "src/shared.ts:8 <- /a/ping",
+            "src/shared.ts:8 <- /b/ping",
+            "src/users.ts:8 <- /v1/users",
+            "src/users.ts:9 <- /v1/users/:id",
+        ]);
+        assert_eq!(got, want, "{got:#?}");
+        // No scope claim verified: no scope or mount edge, every plugin's
+        // route a hole and every router's at its own path.
+        let (_, unverified) = decided_traced(
+            &on,
+            &exports,
+            &declarations,
+            &ScopeLabel::from_exports(&exports, &HashMap::new()),
+        );
+        let bare = composed_lines(&unverified, false);
+        for kept in [
+            "src/users.ts:8 <- /",
+            "src/index.ts:14 <- /bare (runs_by_library)",
+            "src/index.ts:37 <- /x (unread)",
+        ] {
+            assert!(bare.contains(&kept.to_string()), "{bare:#?}");
+        }
+        // Records keep their state byte for byte, so no site's sha moves.
+        let (_, records) = records_of(&on, &exports, &discovery);
+        let traced =
+            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+        assert_eq!(
+            serde_json::to_string(
+                &traced
+                    .iter()
+                    .map(|record| &record.state)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
+            serde_json::to_string(
+                &records
+                    .iter()
+                    .map(|record| &record.state)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+        );
+    }
+
+    /// The composed paths of the route sites of the fixture `name`, with the
+    /// receiver trace on and the scope claims its own request verified.
+    fn composed_fixture(name: &str, dir: &str, service: &str) -> Option<Vec<String>> {
+        let (on, exports, declarations) = traced_fixture_in(name, dir, service)?;
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        Some(composed_lines(&decided, true))
+    }
+
+    /// carrick#2474 R2b on carrick#2325's tree (`d565a091`, its instances
+    /// typed against a made-up plugin-server package): each route takes
+    /// the prefix of every plugin scope above it, with an empty model
+    /// answer. Nothing calls the top plugins, so each path is relative to
+    /// the app they are handed (`entry_point`), as the closed PR's answer
+    /// key reads them.
+    #[test]
+    fn the_inline_plugin_tree_composes_its_prefixes() {
+        let Some(got) = composed_fixture("receiver-scopes-inline", ".", "web") else {
+            return;
+        };
+        let want = texts(&[
+            "src/admin-routes.ts:3 <- /admin/users (entry_point) via ",
+            "src/admin-routes.ts:3 <- /admin/users (unread) via ",
+            "src/callbacks.ts:6 <- /ids (entry_point) via ",
+            "src/chain.ts:3 <- /api/v1/leaf (entry_point) via src/helper-depth-3.ts:5 register /api/v1",
+            "src/chain.ts:3 <- /api/v1/leaf (entry_point) via src/helper-depth-4.ts:5 register /api/v1",
+            "src/errors.ts:10 <- /internal/status (entry_point) via src/status-index.ts:5 register /internal",
+            "src/handler.ts:4 <- /me (entry_point) via ",
+            "src/helper-local.ts:4 <- /api/v1/local (entry_point) via src/helper-local.ts:8 register /api/v1",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/item-detail.ts:3 <- ? (entry_point) via src/documented.ts:5 register ?opts.prefix > src/documented.ts:7 register -",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/item-detail.ts:3 <- ? (entry_point) via src/two-options.ts:5 register ?opts.prefix > src/two-options.ts:7 register -",
+            "src/items.ts:3 <- /a/items (entry_point) via src/two-scopes.ts:6 register /a > src/two-scopes.ts:8 register -",
+            "src/items.ts:3 <- /api/v5/items (entry_point) via src/const-prefix.ts:7 register /api/v5 > src/const-prefix.ts:9 register -",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/items.ts:3 <- ? (entry_point) via src/either.ts:5 register ?opts.prefix > src/either.ts:7 register -",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/items.ts:3 <- ? (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register ?opts.prefix > src/nullish.ts:7 register -",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/items.ts:3 <- ? (entry_point) via src/param-default.ts:5 register ?prefix > src/param-default.ts:7 register -",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/items.ts:3 <- ? (entry_point) via src/silent.ts:5 register ?opts.prefix > src/silent.ts:7 register -",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/items.ts:3 <- ? (entry_point) via src/ternary.ts:5 register ?opts.legacy ? '/legacy' : '/api/v3' > src/ternary.ts:7 register -",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/items.ts:3 <- ? (entry_point) via src/unread.ts:5 register ? > src/unread.ts:7 register -",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/nullish.ts:8 <- ? (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register ?opts.prefix",
+            "src/orders.ts:3 <- /b/orders (entry_point) via src/two-scopes.ts:12 register /b > src/two-scopes.ts:14 register -",
+            "src/orders.ts:3 <- /orders (entry_point) via src/no-options.ts:5 register - > src/no-options.ts:6 register -",
+            "src/orders.ts:3 <- /v2/orders (entry_point) via src/group.ts:5 group /v2 > src/group.ts:5 register -",
+            "src/pair.ts:4 <- /api/v1/left (entry_point) via src/helper-pair.ts:5 register /api/v1",
+            "src/pair.ts:8 <- /api/v1/right (entry_point) via src/helper-pair.ts:5 register /api/v1",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/reports.ts:11 <- ? (entry_point) via src/documented-modes.ts:5 register ?opts.prefix > src/documented-modes.ts:7 register -",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/reports.ts:15 <- ? (entry_point) via src/documented-modes.ts:5 register ?opts.prefix > src/documented-modes.ts:7 register -",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/reports.ts:5 <- ? (entry_point) via src/documented-modes.ts:5 register ?opts.prefix > src/documented-modes.ts:7 register -",
+            // A prefix read off a parameter, a default (`??`, `||`, a parameter
+            // default) or a conditional is recorded unread (`?`): the value
+            // layer reads no alternatives yet (follow-up to carrick#2474 R2b).
+            "src/reports.ts:9 <- ? (entry_point) via src/documented-modes.ts:5 register ?opts.prefix > src/documented-modes.ts:7 register -",
+            "src/request-hooks.ts:9 <- /hook-status (entry_point) via ",
+            "src/team-items.ts:3 <- /a/teams/:id/items (entry_point) via src/helper-two-scopes-chain.ts:5 register /a",
+            "src/team-items.ts:3 <- /a/teams/:id/items (entry_point) via src/helper-two-scopes.ts:5 register /a",
+            "src/team-items.ts:3 <- /a/teams/:id/items (entry_point) via src/relay-same-name-a.ts:10 register /a",
+            "src/team-items.ts:3 <- /api/v1/teams/:id/items (entry_point) via src/helper-both.ts:5 register /api/v1",
+            "src/team-items.ts:3 <- /api/v1/teams/:id/items (entry_point) via src/helper-chain.ts:5 register /api/v1",
+            "src/team-items.ts:3 <- /api/v1/teams/:id/items (entry_point) via src/helper-first.ts:5 register /api/v1",
+            "src/team-items.ts:3 <- /api/v1/teams/:id/items (entry_point) via src/helper-other-instance.ts:6 register /api/v1",
+            "src/team-items.ts:3 <- /api/v1/teams/:id/items (entry_point) via src/helper-plugin.ts:5 register /api/v1 > src/helper-plugin.ts:8 register -",
+            "src/team-items.ts:3 <- /b/teams/:id/items (entry_point) via src/helper-two-scopes-chain.ts:11 register /b",
+            "src/team-items.ts:3 <- /b/teams/:id/items (entry_point) via src/helper-two-scopes.ts:11 register /b",
+            "src/team-items.ts:3 <- /root/api/v1/teams/:id/items (entry_point) via src/relay-index.ts:5 register /root > src/relay-local.ts:11 register /api/v1",
+            "src/team-items.ts:3 <- /teams/:id/items (runs_by_library) via ",
+            "src/team-items.ts:3 <- /teams/:id/items (unread) via ",
+            "src/team-notes.ts:4 <- /api/v1/teams/:id/notes (entry_point) via src/helper-both.ts:5 register /api/v1",
+            "src/team-notes.ts:4 <- /api/v1/teams/:id/notes (entry_point) via src/helper-second.ts:5 register /api/v1",
+            "src/team-notes.ts:4 <- /b/teams/:id/notes (entry_point) via src/relay-same-name-b.ts:10 register /b",
+            "src/team-notes.ts:4 <- /teams/:id/notes (unread) via ",
+            "src/twin.ts:4 <- /api/v1/items/:id (entry_point) via ",
+        ]);
+        assert_eq!(got, want, "{got:#?}");
+    }
+
+    /// carrick#2474 R2b on carrick#2353's tree (`93cf47ec`, typed the same
+    /// way): a function written under an option key that the plugin calls
+    /// with its scope (`opts.registerExtra(api)`) is a hole,
+    /// `callback_option`, in each service, until carrick#2432's
+    /// injected-callee step reads the key out of the object literal; the
+    /// path below it composes. Waits on carrick#2432.
+    #[test]
+    fn the_callback_option_tree_records_its_holes() {
+        let Some(server) =
+            composed_fixture("receiver-scopes-callback", "packages/server", "server")
+        else {
+            return;
+        };
+        // A route a function under an option key registers: relative to
+        // the option's hole. Waits on carrick#2432.
+        let want =
+            texts(&["packages/server/src/extra.ts:7 <- /teams/:id/audit (callback_option) via "]);
+        assert_eq!(server, want, "{server:#?}");
+        let Some(routes) =
+            composed_fixture("receiver-scopes-callback", "packages/routes", "routes")
+        else {
+            return;
+        };
+        // Each function another service hands its scope is an entry point
+        // here; the package's own plugin reads its prefix off its options
+        // (`opts.prefix ?? '/api/v1'`), recorded unread.
+        let want = texts(&[
+            "packages/routes/src/built-routes.ts:3 <- /teams/:id/built (entry_point) via ",
+            "packages/routes/src/computed-routes.ts:3 <- /teams/:id/computed (entry_point) via ",
+            "packages/routes/src/legacy.ts:3 <- /teams/:id/legacy (entry_point) via ",
+            "packages/routes/src/notes.ts:7 <- /teams/:id/notes (entry_point) via ",
+            "packages/routes/src/orders.ts:3 <- ? (entry_point) via packages/routes/src/plugin.ts:13 register ?opts.prefix > packages/routes/src/plugin.ts:15 register -",
+            "packages/routes/src/root-routes.ts:3 <- /teams/:id/root (entry_point) via ",
+            "packages/routes/src/shared.ts:5 <- /admin/keys (entry_point) via ",
+            "packages/routes/src/shared.ts:9 <- /public/keys (entry_point) via ",
+            "packages/routes/src/spread-routes.ts:3 <- /teams/:id/spread (entry_point) via ",
+            "packages/routes/src/tags.ts:3 <- /teams/:id/tags (entry_point) via ",
+            "packages/routes/src/twice-routes.ts:3 <- /teams/:id/twice (entry_point) via ",
+        ]);
+        assert_eq!(routes, want, "{routes:#?}");
+    }
+
+    /// Each route site's instance ends, in the order the walk gives them:
+    /// `file:line <- at root|scope [call] package export receiver [prefix]` or
+    /// `<- at <hole>`.
+    fn ends_in_order(decided: &super::super::decided_sites::Decided) -> Vec<String> {
+        use super::super::decided_sites::{InstanceAt, Prefix};
+        let mut out = Vec::new();
+        for site in decided
+            .sites
+            .iter()
+            .filter(|site| site.end.op.as_deref() == Some("receive"))
+        {
+            for end in &site.instances {
+                let what = match &end.end {
+                    InstanceAt::Root {
+                        package,
+                        export,
+                        receiver,
+                        ..
+                    } => format!("root {package} {export} {receiver}"),
+                    InstanceAt::Scope {
+                        file,
+                        line,
+                        package,
+                        export,
+                        receiver,
+                        prefix,
+                        ..
+                    } => format!(
+                        "scope {file}:{line} {package} {export} {receiver} {}",
+                        match prefix {
+                            Prefix::Stated { values } => values.join("|"),
+                            Prefix::Unstated => "-".to_string(),
+                            Prefix::Unread { .. } => "?".to_string(),
+                        }
+                    ),
+                    InstanceAt::Hole { .. } => format!("{:?}", end.hole()),
+                };
+                out.push(format!("{}:{} <- {} {what}", site.file, site.line, end.at));
+            }
+        }
+        out
+    }
+
+    /// carrick#2474 R2b, carrick#2636: a scope call on a server handed in
+    /// by whatever runs the plugin (every end above it a hole) opens the
+    /// scope of the one label the trace verified whose verdict names the
+    /// member declaration the call resolves to, on the receiver it was
+    /// verified on. Two exports of one package with a `register` each give
+    /// one scope, the right export's, with the receiver its instances are
+    /// read through (`instance:new` for a constructed one); a server whose
+    /// types a package of their own declares (`type_packages`) opens its
+    /// scope too. Declarations the verifier of this branch does not name
+    /// yet come from the fixture's cassette (carrick#2636).
+    #[test]
+    fn a_scope_under_unknown_parents_opens_by_the_declaration_its_call_resolves_to() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-scopes-hosts")
+        else {
+            return;
+        };
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let mut got: Vec<String> = ends_in_order(&decided)
+            .into_iter()
+            .filter(|end| end.contains("src/plugins.ts"))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            texts(&[
+                "src/items.ts:4 <- src/items.ts:4 scope src/plugins.ts:11 fixture-twin-server default instance:() /app",
+                "src/list.ts:4 <- src/list.ts:4 scope src/plugins.ts:16 fixture-twin-server Admin instance:new /admin",
+                "src/things.ts:4 <- src/things.ts:4 scope src/plugins.ts:21 fixture-split-server default instance:() /hub",
+            ]),
+            "{:#?}",
+            ends_in_order(&decided)
+        );
+    }
+
+    /// carrick#2474 R2b: the library calls that run a function are walked
+    /// in file and source order, whatever order the service's calls are
+    /// indexed in: a chained call starts where the call it is made on
+    /// does, so two decided runs give their ends in one order.
+    #[test]
+    fn chained_scope_calls_give_their_ends_in_one_order() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-scopes-hosts")
+        else {
+            return;
+        };
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let first = ends_in_order(&decided_traced(&on, &exports, &declarations, &scopes).1);
+        assert!(
+            first
+                .iter()
+                .any(|end| end.starts_with("src/chained.ts") && end.contains("/two")),
+            "{first:#?}"
+        );
+        for _ in 0..16 {
+            let again = ends_in_order(&decided_traced(&on, &exports, &declarations, &scopes).1);
+            assert_eq!(again, first);
+        }
+    }
+
     /// carrick#2474 R1: the ask holds each export's maker on `export` and
     /// each op whose member a call row names, on every receiver its `of`
     /// or `on` applies to, whether or not a library site uses it.
@@ -2385,6 +2932,31 @@ mod tests {
             "{got:#?}"
         );
         assert_eq!(ask.ops.iter().filter(|op| op.is_some()).count(), 3);
+    }
+
+    /// carrick#2474 R2b: the verifier judges in request order under a time
+    /// limit, so the scope checks the trace adds come after every op check
+    /// R1 asks: near the limit, the scopes go unchecked, never an op.
+    #[test]
+    fn the_declaration_ask_puts_every_scope_check_after_the_op_checks() {
+        let Some(on) = walked("receiver-scopes", ".", "web", &[], true) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/receiver-scopes/library-claims.json"),
+        )
+        .unwrap();
+        let exports = crate::library_store::parse_answer(&text).exports;
+        let ask = declaration_ask(&on.inputs, &exports);
+        let last_op = ask.ops.iter().rposition(Option::is_some);
+        let first_scope = ask.scopes.iter().position(Option::is_some);
+        assert!(
+            last_op.is_some() && first_scope.is_some(),
+            "{:#?}",
+            ask.checks
+        );
+        assert!(last_op < first_scope, "{:#?}", ask.checks);
     }
 
     /// The offline census over flag-on rows: every site per repo, by role,
@@ -2449,27 +3021,13 @@ mod tests {
                 };
                 let inputs = crate::engine::discover_service_inputs(&root, service, Some(index));
                 let declarations = script.as_ref().map(|script| {
-                    let service_root = root.join(service.directory.as_deref().unwrap_or("."));
-                    let sidecar =
-                        crate::services::TypeSidecar::spawn(script).expect("spawn the sidecar");
-                    sidecar.set_scan_root(&root);
-                    sidecar.start_init(&service_root, None);
-                    sidecar
-                        .wait_ready(std::time::Duration::from_secs(900))
-                        .expect("the sidecar is ready");
-                    let ask = declaration_ask(&inputs, &answer.exports);
-                    let verdicts = sidecar
-                        .verify_library_claims(&service_root, &ask.checks)
-                        .map(|answer| answer.verdicts)
-                        .unwrap_or_default();
-                    let declarations = MemberDeclarations::of(&ask, &verdicts);
-                    crate::outln!(
-                        "  {name}: {} check(s), {} not reached, {} declaration(s)",
-                        declarations.checks,
-                        declarations.not_reached,
-                        declarations.len()
-                    );
-                    declarations
+                    super::super::fixture_walk::census_declarations(
+                        script,
+                        &root,
+                        service,
+                        &inputs,
+                        &answer.exports,
+                    )
                 });
                 let traced;
                 let labels = match &declarations {

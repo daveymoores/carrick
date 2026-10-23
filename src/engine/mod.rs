@@ -5217,14 +5217,19 @@ fn site_records_of(
         log_dispatch_routes(inputs, &discovered, &labels, root);
     }
     // With the receiver trace on, each site also names its instance
-    // (carrick#2474 R2a): read by nothing.
+    // (carrick#2474 R2a) and the full path it is served at under the scope
+    // members the trace's own request verified (R2b): read by nothing.
     let mut decided = match context.declarations {
-        Some(_) => crate::request_summary::decided_sites::decided_sites_traced(
+        Some(declarations) => crate::request_summary::decided_sites::decided_sites_traced(
             inputs,
             root,
             &discovered,
             &labels,
             &crate::request_summary::decided_sites::MakerLabel::from_exports(claims),
+            &crate::request_summary::decided_sites::ScopeLabel::from_exports(
+                claims,
+                &declarations.verified_scopes,
+            ),
         ),
         None => {
             crate::request_summary::decided_sites::decided_sites(inputs, root, &discovered, &labels)

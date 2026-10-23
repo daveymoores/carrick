@@ -1,0 +1,22 @@
+[
+  {
+    "claim_id": "fixture-plugin-server@1:default:scope:register:name@1.prefix:runs@0>0:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-plugin-server/index.d.ts",
+        "decl_line": 20
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-plugin-server@1:default:scope:group:name@0:runs@1>0:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-plugin-server/index.d.ts",
+        "decl_line": 22
+      }
+    ]
+  }
+]

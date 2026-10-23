@@ -162,6 +162,20 @@ impl ExportClaims {
     /// dropped. Scope claims are left out: no reader reads the receivers a
     /// scope returns yet (carrick#1678).
     pub fn claims_by_id(&self) -> Vec<(String, &LibraryClaim)> {
+        self.by_id(false)
+    }
+
+    /// [`Self::claims_by_id`] with the scope claims in too
+    /// (`<prefix>:scope:<path.member>:name@<slot>:<binds>[:on/of…]`, where
+    /// `<binds>` is `runs@<slot>><param>`, `mounts@<slot>` or `returns` and
+    /// a slot is `<arg>` or `<arg>.<key>`): what the receiver trace sends in
+    /// its own request (carrick#2474 R2b, carrick#1678), never the library
+    /// check's.
+    pub fn claims_with_scopes_by_id(&self) -> Vec<(String, &LibraryClaim)> {
+        self.by_id(true)
+    }
+
+    fn by_id(&self, scopes: bool) -> Vec<(String, &LibraryClaim)> {
         let prefix = format!(
             "{}@{}:{}",
             self.specifier,
@@ -171,6 +185,9 @@ impl ExportClaims {
         let mut stated: Vec<(String, &LibraryClaim)> = Vec::new();
         let mut twice: HashSet<String> = HashSet::new();
         for claim in &self.claims {
+            if !scopes && matches!(claim, LibraryClaim::Scope { .. }) {
+                continue;
+            }
             let Some(id) = claim_id(&prefix, claim) else {
                 continue;
             };
@@ -287,7 +304,7 @@ fn same_form(form: MakeForm, site: MakerForm) -> bool {
     )
 }
 
-/// The id of one claim under `prefix`; `None` for a scope claim.
+/// The id of one claim under `prefix`.
 fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
     let hops = |path: &[String], member: Option<&str>| {
         let mut hops: Vec<&str> = path.iter().map(String::as_str).collect();
@@ -334,7 +351,51 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
             hops(path, Some(member)),
             selector(on, of)
         )),
-        LibraryClaim::Scope { .. } => None,
+        LibraryClaim::Scope {
+            member,
+            name,
+            path,
+            on,
+            of,
+            runs,
+            yields,
+            mounts,
+            ..
+        } => {
+            // What it binds (carrick#2474 R0's fields): two scope claims of
+            // one member on one receiver that read different slots are two
+            // claims (carrick#2474 R2b).
+            let binds = match (runs, yields, mounts) {
+                (Some(runs), Some(yields), None) => {
+                    format!("runs@{}>{}", slot(runs), yields.param)
+                }
+                (None, None, Some(mounts)) => format!("mounts@{}", slot(mounts)),
+                (None, None, None) => "returns".to_string(),
+                (runs, yields, mounts) => format!(
+                    "runs@{}>{}:mounts@{}",
+                    runs.as_ref().map(slot).unwrap_or_default(),
+                    yields
+                        .as_ref()
+                        .map(|yields| yields.param.to_string())
+                        .unwrap_or_default(),
+                    mounts.as_ref().map(slot).unwrap_or_default()
+                ),
+            };
+            Some(format!(
+                "{prefix}:scope:{}:name@{}:{binds}{}",
+                hops(path, Some(member)),
+                slot(name),
+                selector(on, of)
+            ))
+        }
+    }
+}
+
+/// A slot as a claim id spells it: `<arg>` or `<arg>.<key>`.
+fn slot(slot: &ClaimSlot) -> String {
+    match &slot.key {
+        Some(key) => format!("{}.{key}", slot.arg),
+        None => slot.arg.to_string(),
     }
 }
 
@@ -1037,6 +1098,44 @@ mod tests {
         assert_eq!(major("2.4.1"), "2");
         assert_eq!(major("^10.0.0"), "10");
         assert_eq!(major("latest"), "x");
+    }
+
+    /// carrick#2474 R2b: a scope claim's id names its name slot and what it
+    /// binds, so two scope claims on one member and one receiver that read
+    /// different slots (`use(router)` and `use("/p", router)`) are two
+    /// claims, each asked and verified on its own, and neither drops the
+    /// other as stated twice.
+    #[test]
+    fn scope_claims_on_one_member_are_told_apart_by_slot_and_binding() {
+        let server = export(json!({
+            "package": "fixture-server", "version": "2.1.0", "specifier": "fixture-server",
+            "export": "Server", "role": "server_framework",
+            "claims": [
+                { "kind": "scope", "member": "use", "of": "instance:new",
+                  "name": { "arg": 1 }, "mounts": { "arg": 0 } },
+                { "kind": "scope", "member": "use", "of": "instance:new",
+                  "name": { "arg": 0 }, "mounts": { "arg": 1 } },
+                { "kind": "scope", "member": "register", "of": "instance:new",
+                  "name": { "arg": 1, "key": "prefix" }, "runs": { "arg": 0 },
+                  "yields": { "param": 0, "export": "Server", "side": "server" } },
+                { "kind": "scope", "member": "basePath", "of": "instance:new",
+                  "name": { "arg": 0 } }
+            ]
+        }));
+        let ids: Vec<String> = server
+            .claims_with_scopes_by_id()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "fixture-server@2:Server:scope:use:name@1:mounts@0:of:instance:new",
+                "fixture-server@2:Server:scope:use:name@0:mounts@1:of:instance:new",
+                "fixture-server@2:Server:scope:register:name@1.prefix:runs@0>0:of:instance:new",
+                "fixture-server@2:Server:scope:basePath:name@0:returns:of:instance:new",
+            ]
+        );
     }
 
     /// A verified send is a publisher row and a verified receive a

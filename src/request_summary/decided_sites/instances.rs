@@ -19,18 +19,28 @@
 //!   library-site reader holds an instance in, a maker or own factory call
 //!   (followed into what the factory returns), or an import of this
 //!   service's module, whose declaration the compiler names;
+//! - **a scope** a labelled member opens (carrick#2474 R2b): the parameter
+//!   of a function a member labelled with `runs` and `yields` runs with a
+//!   scoped instance (`app.register(plugin, { prefix })`), under the prefix
+//!   its `name` slot states, whose own instance is the member's receiver,
+//!   walked the same way ([`InstanceAt::Scope`]);
 //! - **a hole**, with its reason ([`InstanceHole`]).
+//!
+//! An instance handed to a member labelled with `mounts` is served under
+//! that member's prefix: those edges are read once per service and joined
+//! into each site's composed path ([`super::composed`]).
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use super::super::{
-    CallIr, ClientRef, HeldInstance, MadeBy, MakerForm, Piece, RequestSummaryInputs,
+    CallIr, ClientRef, HeldInstance, MadeBy, MakerForm, Piece, RequestSummaryInputs, Value,
 };
 use super::{Calls, Placed, filled, holds_parameter, relative, to_definition};
-use crate::position_rows::{FLAG_ANY, Kind};
+use crate::position_rows::{FLAG_ANY, FLAG_DECLARATION_UNNAMED, Kind};
 
 /// A maker the store labels: the package (as the store keys it), the
 /// export, the member (`None`: the export itself) and whether it is
@@ -67,6 +77,165 @@ impl MakerLabel {
     }
 }
 
+/// What a scope member binds (carrick#2474 R0's fields).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeBinds {
+    /// It runs the function at `arg` (`key`) and hands it the scoped
+    /// instance at its parameter `param`.
+    Runs {
+        arg: usize,
+        key: Option<String>,
+        param: usize,
+    },
+    /// The instance at `arg` (`key`) is served under the prefix.
+    Mounts { arg: usize, key: Option<String> },
+    /// It returns the scoped instance.
+    Returns,
+}
+
+/// A scope member the store labels (carrick#2474 R2b): the package (as the
+/// store keys it), the export, the member, the receivers the trace's own
+/// request verified the claim on, the slot its prefix sits in, and what it
+/// binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeLabel {
+    pub package: String,
+    pub export: String,
+    pub member: String,
+    /// Each receiver id the verifier verified the claim on, with the member
+    /// declarations (`decl_file`, `decl_line`) its verdict names
+    /// (carrick#2636).
+    verified_on: Vec<(String, Vec<(String, u32)>)>,
+    pub name: (usize, Option<String>),
+    pub binds: ScopeBinds,
+}
+
+impl ScopeLabel {
+    /// Every scope claim of `exports` whose member is one path hop off the
+    /// receiver, on each receiver the trace's own request verified it on
+    /// ([`super::super::discovery::declaration_ask`]), by claim id: a claim
+    /// verified on no receiver is no label, whatever its siblings on the
+    /// same member were verified as.
+    pub fn from_exports(
+        exports: &[crate::library_claims::ExportClaims],
+        verified: &HashMap<super::super::discovery::AskedScope, Vec<(String, u32)>>,
+    ) -> Vec<ScopeLabel> {
+        use crate::services::type_sidecar::LibraryClaim;
+        let mut labels = Vec::new();
+        for export in exports {
+            for (claim_id, claim) in export.claims_with_scopes_by_id() {
+                let LibraryClaim::Scope {
+                    member,
+                    name,
+                    path,
+                    runs,
+                    yields,
+                    mounts,
+                    ..
+                } = claim
+                else {
+                    continue;
+                };
+                if !path.is_empty() {
+                    continue;
+                }
+                let binds = match (runs, yields, mounts) {
+                    (Some(runs), Some(yields), None) => ScopeBinds::Runs {
+                        arg: runs.arg as usize,
+                        key: runs.key.clone(),
+                        param: yields.param as usize,
+                    },
+                    (None, None, Some(mounts)) => ScopeBinds::Mounts {
+                        arg: mounts.arg as usize,
+                        key: mounts.key.clone(),
+                    },
+                    (None, None, None) => ScopeBinds::Returns,
+                    _ => continue,
+                };
+                let mut verified_on: Vec<(String, Vec<(String, u32)>)> = verified
+                    .iter()
+                    .filter(|(asked, _)| {
+                        asked.package == export.package
+                            && asked.export == export.export
+                            && asked.claim_id == claim_id
+                    })
+                    .map(|(asked, declarations)| (asked.receiver.clone(), declarations.clone()))
+                    .collect();
+                if verified_on.is_empty() {
+                    continue;
+                }
+                verified_on.sort();
+                let label = ScopeLabel {
+                    package: export.package.clone(),
+                    export: export.export.clone(),
+                    member: member.clone(),
+                    verified_on,
+                    name: (name.arg as usize, name.key.clone()),
+                    binds,
+                };
+                if !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
+        }
+        labels
+    }
+
+    /// Whether the claim applies to an instance of `package`'s `export`
+    /// read through `receiver`: it was verified there (the trace asks a
+    /// claim only on the receivers its `on` or `of` applies to).
+    fn applies(&self, package: &str, export: &str, receiver: &str) -> bool {
+        self.package == package
+            && self.export == export
+            && self.verified_on.iter().any(|(at, _)| at == receiver)
+    }
+
+    /// The receiver ids the claim was verified on whose verdict names the
+    /// member declaration `declared`.
+    fn verified_at<'s>(&'s self, declared: &'s (String, u32)) -> impl Iterator<Item = &'s str> {
+        self.verified_on
+            .iter()
+            .filter(move |(_, declarations)| declarations.contains(declared))
+            .map(|(receiver, _)| receiver.as_str())
+    }
+
+    /// Whether the claim applies to the instance `end` ends at.
+    pub(super) fn applies_to(&self, end: &InstanceEnd) -> bool {
+        match &end.end {
+            InstanceAt::Root {
+                package,
+                export,
+                receiver,
+                ..
+            }
+            | InstanceAt::Scope {
+                package,
+                export,
+                receiver,
+                ..
+            } => self.applies(package, export, receiver),
+            InstanceAt::Hole { .. } => false,
+        }
+    }
+}
+
+/// The prefix a scope or mount call states in its label's `name` slot
+/// (carrick#2474 R2b).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "prefix", rename_all = "snake_case")]
+pub enum Prefix {
+    /// The call writes nothing there: it binds no prefix.
+    Unstated,
+    /// Every value the call states. All are recorded (#2474 Q2).
+    Stated { values: Vec<String> },
+    /// A value this pass does not read as text, as written where one
+    /// expression is.
+    Unread {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+}
+
 /// Why an instance walk ends at no maker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,8 +253,14 @@ pub enum InstanceHole {
     /// package, or a file the scan does not read.
     OutsideService,
     /// A library call runs the function that holds the receiver (handed
-    /// to it as an argument, or written as one): R2b's.
+    /// to it as an argument, or written as one), and no scope label that
+    /// applies to its receiver runs it there.
     RunsByLibrary,
+    /// The function that holds the receiver is written under a key of an
+    /// object literal handed to a call (`{ extra: (app) => … }`): what calls
+    /// it is the function that reads that key, which waits on
+    /// carrick#2432's injected-callee step.
+    CallbackOption,
     /// A value the walk does not read: a field, a call's value that is no
     /// maker's and no own factory's, a maker the store does not label, a
     /// conditional.
@@ -104,6 +279,24 @@ pub enum InstanceAt {
         export: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         member: Option<String>,
+        /// The receiver id its instances are read through
+        /// (`instance:()`, `instance:new`).
+        receiver: String,
+    },
+    /// A scope a labelled member opens (carrick#2474 R2b), at the member's
+    /// call: the scoped instance is of the same export as the member's
+    /// receiver, read through the same receiver id, and served under
+    /// `prefix` below each of `parents`, the member's receiver's ends.
+    Scope {
+        file: String,
+        line: u32,
+        member: String,
+        #[serde(flatten)]
+        prefix: Prefix,
+        package: String,
+        export: String,
+        receiver: String,
+        parents: Vec<InstanceEnd>,
     },
     Hole {
         reason: InstanceHole,
@@ -124,13 +317,139 @@ pub struct InstanceEnd {
 }
 
 impl InstanceEnd {
-    /// The hole reason, or `None` for a root.
+    /// The hole reason, or `None` for a root or a scope.
     pub fn hole(&self) -> Option<InstanceHole> {
         match &self.end {
             InstanceAt::Hole { reason, .. } => Some(*reason),
-            InstanceAt::Root { .. } => None,
+            InstanceAt::Root { .. } | InstanceAt::Scope { .. } => None,
         }
     }
+}
+
+/// A library call handed a function, with the argument it is handed at.
+type Host<'a> = (Placed<'a>, usize);
+
+/// What every site's instance walk of one service reads, built once per
+/// service (carrick#2474 R2b): the library calls that may run a function,
+/// and the receiver ends of each scope call already walked.
+pub(super) struct WalkIndex<'a> {
+    /// By file and function name: the library calls written in that file
+    /// handed the function by name (`server.register(plugin)`).
+    by_name: HashMap<(PathBuf, String), Vec<Host<'a>>>,
+    /// By the declaration (`decl_file`, `decl_line`) the compiler resolves
+    /// an argument to: the calls of a `runs` scope member handed it
+    /// (`app.register(items)`, `items` imported).
+    by_declaration: HashMap<(String, u32), Vec<Host<'a>>>,
+    /// The ends of a scope call's own receiver, by the scope calls being
+    /// walked around it (outermost first) and the call: a walk reached
+    /// again from another site reads them here.
+    parents: RefCell<HashMap<ParentsKey, Vec<InstanceEnd>>>,
+}
+
+/// A call by its file and span.
+type HostSpan = (PathBuf, u32, u32);
+
+/// A scope call, with the scope calls walked around it.
+type ParentsKey = (Vec<HostSpan>, HostSpan);
+
+impl<'a> WalkIndex<'a> {
+    pub(super) fn of(
+        calls: &Calls<'a>,
+        inputs: &RequestSummaryInputs,
+        scopes: &[ScopeLabel],
+    ) -> Self {
+        let mut index = WalkIndex {
+            by_name: HashMap::new(),
+            by_declaration: HashMap::new(),
+            parents: RefCell::new(HashMap::new()),
+        };
+        let runs: HashSet<&str> = scopes
+            .iter()
+            .filter(|label| matches!(label.binds, ScopeBinds::Runs { .. }))
+            .map(|label| label.member.as_str())
+            .collect();
+        for placed in calls.by_span.values() {
+            // Read off the syntax first: the compiler's row is looked up
+            // only for a call handed a function by name, or a `runs`
+            // member's.
+            let names: Vec<(usize, &str)> = {
+                let mut names: Vec<(usize, &str)> = Vec::new();
+                for (arg, keys, name) in &placed.call.handed {
+                    if keys.is_empty() && !names.iter().any(|(_, known)| known == name) {
+                        names.push((*arg, name.as_str()));
+                    }
+                }
+                names
+            };
+            let runs_member = runs.contains(placed.call.callee.as_str());
+            if names.is_empty() && !runs_member {
+                continue;
+            }
+            if !library_call(inputs, placed.file, placed.call) {
+                continue;
+            }
+            for (arg, name) in names {
+                index
+                    .by_name
+                    .entry((placed.file.to_path_buf(), name.to_string()))
+                    .or_default()
+                    .push((*placed, arg));
+            }
+            if !runs_member {
+                continue;
+            }
+            let (Some(positions), Some(ir)) =
+                (inputs.positions.as_ref(), inputs.files.get(placed.file))
+            else {
+                continue;
+            };
+            for (arg, held) in placed.call.instance.args.iter().enumerate() {
+                let Some((lo, hi)) = held.span else {
+                    continue;
+                };
+                let Ok(row) =
+                    positions.lookup(placed.file, ir.swc_start(lo), ir.swc_start(hi), Kind::Ident)
+                else {
+                    continue;
+                };
+                if let (Some(decl_file), Some(decl_line)) = (row.decl_file(), row.decl_line()) {
+                    index
+                        .by_declaration
+                        .entry((decl_file.to_string(), decl_line))
+                        .or_default()
+                        .push((*placed, arg));
+                }
+            }
+        }
+        for hosts in index
+            .by_name
+            .values_mut()
+            .chain(index.by_declaration.values_mut())
+        {
+            sort_hosts(hosts);
+        }
+        index
+    }
+}
+
+/// `hosts` in file and source order: by file, span start, span end and
+/// argument, since a chained call starts where the call it is made on does
+/// (`app.register(a).register(b)`).
+fn sort_hosts(hosts: &mut [Host<'_>]) {
+    hosts.sort_by(|a, b| {
+        (
+            a.0.file,
+            a.0.call.site.span_start,
+            a.0.call.site.span_end,
+            a.1,
+        )
+            .cmp(&(
+                b.0.file,
+                b.0.call.site.span_start,
+                b.0.call.site.span_end,
+                b.1,
+            ))
+    });
 }
 
 /// One site's instance walk.
@@ -139,6 +458,12 @@ pub(super) struct InstanceWalk<'w, 'a> {
     pub(super) inputs: &'w RequestSummaryInputs,
     pub(super) root: &'w Path,
     pub(super) makers: &'w [MakerLabel],
+    pub(super) scopes: &'w [ScopeLabel],
+    index: &'w WalkIndex<'a>,
+    /// The scope calls whose receiver is being walked, outermost first: a
+    /// scope call reached again inside its own walk ends it (a plugin that
+    /// registers itself).
+    hosts: Vec<(PathBuf, u32, u32)>,
     ends: Vec<InstanceEnd>,
     /// The definitions walked, with the receiver as their own body reads
     /// it: a definition reached again adds nothing (a cycle, or a second
@@ -155,12 +480,17 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         inputs: &'w RequestSummaryInputs,
         root: &'w Path,
         makers: &'w [MakerLabel],
+        scopes: &'w [ScopeLabel],
+        index: &'w WalkIndex<'a>,
     ) -> Self {
         InstanceWalk {
             calls,
             inputs,
             root,
             makers,
+            scopes,
+            index,
+            hosts: Vec::new(),
             ends: Vec::new(),
             walked: HashSet::new(),
             factories: HashSet::new(),
@@ -190,11 +520,48 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// (first) to the labelled call (last), are `down`. Empty when the
     /// labelled call is made on no receiver the syntax names (a bare
     /// call).
-    pub(super) fn of(mut self, down: &[Placed<'a>]) -> Vec<InstanceEnd> {
+    pub(super) fn of(self, down: &[Placed<'a>]) -> Vec<InstanceEnd> {
         let last = down[down.len() - 1];
         let instance = &last.call.instance;
-        let Some(value) = &instance.receiver_value else {
-            if let Some(held) = &instance.receiver_held {
+        self.of_value(
+            down,
+            instance.receiver_value.as_ref(),
+            instance.receiver_held.as_ref(),
+        )
+    }
+
+    /// The instance ends of what `placed`'s call is handed at `arg`
+    /// (`key`): what a mount member serves (carrick#2474 R2b).
+    pub(super) fn of_arg(
+        self,
+        placed: Placed<'a>,
+        arg: usize,
+        key: Option<&str>,
+    ) -> Vec<InstanceEnd> {
+        let value = placed.call.args.get(arg);
+        let held = placed.call.instance.args.get(arg);
+        let (value, held) = match key {
+            None => (value, held.and_then(|held| held.whole.as_ref())),
+            Some(key) => (
+                match value {
+                    Some(Value::Obj(object)) => object.fields.get(key),
+                    _ => None,
+                },
+                held.and_then(|held| held.keys.get(key)),
+            ),
+        };
+        self.of_value(&[placed], value, held)
+    }
+
+    fn of_value(
+        mut self,
+        down: &[Placed<'a>],
+        value: Option<&Value>,
+        held: Option<&HeldInstance>,
+    ) -> Vec<InstanceEnd> {
+        let last = down[down.len() - 1];
+        let Some(value) = value else {
+            if let Some(held) = held {
                 let at = self.at(&last);
                 self.held(held, last.file, at);
             }
@@ -203,7 +570,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         let mut pieces = value.pieces();
         if !holds_parameter(&pieces) {
             let at = self.at(&last);
-            match &instance.receiver_held {
+            match held {
                 Some(held) => self.held(held, last.file, at),
                 None => self.hole(at, InstanceHole::Unread, opaque_text(&pieces)),
             }
@@ -214,7 +581,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         for k in (0..down.len() - 1).rev() {
             let below = down[k + 1];
             let Some(own) = to_definition(&pieces, below.depth) else {
-                self.callback(&below);
+                self.callback(&below, &pieces);
                 return self.ends;
             };
             let caller = down[k];
@@ -232,7 +599,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// whose receiver, as `placed`'s body reads it, is `pieces`.
     fn up(&mut self, placed: Placed<'a>, pieces: Vec<Piece>) {
         let Some(own) = to_definition(&pieces, placed.depth) else {
-            self.callback(&placed);
+            self.callback(&placed, &pieces);
             return;
         };
         let Some(key) = placed.key else {
@@ -247,14 +614,25 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             return;
         }
         let callers = self.calls.callers_of(placed.file, key);
+        // A library member may run the function as well as code calling
+        // it: each scope a labelled member opens for it is an end too
+        // (carrick#2474 R2b).
+        let hosts = self.hosts_of(placed.file, key);
+        let at = self.at(&placed);
+        let param = match own.as_slice() {
+            [Piece::Param(index, _)] => Some(*index),
+            _ => None,
+        };
+        let mut scoped = false;
+        for (host, arg) in &hosts {
+            scoped |= self.scope(host, *arg, param, at.clone());
+        }
         if callers.is_empty() {
-            let reason = if self.handed_to_library(placed.file, key) {
-                InstanceHole::RunsByLibrary
-            } else {
-                InstanceHole::EntryPoint
-            };
-            let at = self.at(&placed);
-            self.hole(at, reason, None);
+            match (hosts.is_empty(), scoped) {
+                (true, _) => self.hole(at, InstanceHole::EntryPoint, None),
+                (false, false) => self.hole(at, InstanceHole::RunsByLibrary, None),
+                (false, true) => {}
+            }
             return;
         }
         for caller in callers {
@@ -270,13 +648,207 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// The receiver is a parameter of the function `placed` is written in,
     /// several functions in from its definition: a callback. A library
     /// call that runs it is R2b's; anything else is a callback parameter.
-    fn callback(&mut self, placed: &Placed<'_>) {
+    ///
+    /// A function written as a scope member's `runs` argument opens a scope
+    /// (carrick#2474 R2b); one written under a key of an object literal is
+    /// a callback option.
+    fn callback(&mut self, placed: &Placed<'a>, pieces: &[Piece]) {
+        let at = self.at(placed);
+        let written = placed.written_in;
+        if written.is_some_and(|written| !written.path.is_empty()) {
+            self.hole(at, InstanceHole::CallbackOption, None);
+            return;
+        }
         let reason = match placed.host {
-            Some(host) if self.library_call(placed.file, host) => InstanceHole::RunsByLibrary,
+            Some(host) if self.library_call(placed.file, host) => {
+                // The callback's own parameter, read in its own body.
+                let param = match pieces {
+                    [Piece::Param(index, _)] => Some(*index),
+                    _ => None,
+                };
+                let host =
+                    self.calls
+                        .at_span(placed.file, host.site.span_start, host.site.span_end);
+                if let (Some(host), Some(written)) = (host, written)
+                    && self.scope(&host, written.arg, param, at.clone())
+                {
+                    return;
+                }
+                InstanceHole::RunsByLibrary
+            }
             _ => InstanceHole::CallbackParameter,
         };
-        let at = self.at(placed);
         self.hole(at, reason, None);
+    }
+
+    /// The scope a labelled member opens at `host` for the function it is
+    /// handed at `arg`, whose parameter `param` holds the instance: a scope
+    /// end under each of the host's receiver's ends a `runs` label applies
+    /// to. False where no label applies.
+    fn scope(&mut self, host: &Placed<'a>, arg: usize, param: Option<usize>, at: String) -> bool {
+        let Some(param) = param else {
+            return false;
+        };
+        let labels: Vec<&'w ScopeLabel> = self
+            .scopes
+            .iter()
+            .filter(|label| {
+                label.member == host.call.callee
+                    && matches!(&label.binds, ScopeBinds::Runs { arg: runs, key: None, param: yields }
+                        if *runs == arg && *yields == param)
+            })
+            .collect();
+        self.open(host, labels, at)
+    }
+
+    /// The value of the call at `span` in `file`: the scope a member a
+    /// `returns` label names opens (`app.basePath("/v2")`), or a hole.
+    fn returned(&mut self, file: &Path, span: (u32, u32), at: String) {
+        let host = self.inputs.files.get(file).and_then(|ir| {
+            self.calls
+                .at_span(file, ir.swc_start(span.0), ir.swc_start(span.1))
+        });
+        let Some(host) = host else {
+            self.hole(at, InstanceHole::Unread, None);
+            return;
+        };
+        self.returned_at(host, at);
+    }
+
+    /// The value of `host`'s call: the scope a member a `returns` label
+    /// names opens there, or a hole.
+    fn returned_at(&mut self, host: Placed<'a>, at: String) {
+        let labels: Vec<&'w ScopeLabel> = self
+            .scopes
+            .iter()
+            .filter(|label| label.member == host.call.callee && label.binds == ScopeBinds::Returns)
+            .collect();
+        if !self.library_call(host.file, host.call) || !self.open(&host, labels, at.clone()) {
+            self.hole(
+                at,
+                InstanceHole::Unread,
+                Some(host.call.callee_text.clone()),
+            );
+        }
+    }
+
+    /// A scope end under each of `host`'s receiver's ends one of `labels`
+    /// applies to. False where none applies.
+    fn open(&mut self, host: &Placed<'a>, labels: Vec<&'w ScopeLabel>, at: String) -> bool {
+        if labels.is_empty() {
+            return false;
+        }
+        let here = (
+            host.file.to_path_buf(),
+            host.call.site.span_start,
+            host.call.site.span_end,
+        );
+        if self.hosts.contains(&here) {
+            return false;
+        }
+        let parents = self.parents(host, here);
+        // Where every end above is a hole (a plugin's own app, handed in by
+        // whatever runs it), the member declaration the call resolves to
+        // says which scope opens: exactly one label verified on exactly one
+        // receiver whose verdict names it (carrick#2636), or none. The path
+        // below is relative to those holes.
+        if !parents.is_empty() && parents.iter().all(|end| end.hole().is_some()) {
+            let Some(declared) = self.declaration_of(host) else {
+                return false;
+            };
+            let matched: Vec<(&ScopeLabel, &str)> = labels
+                .iter()
+                .flat_map(|label| label.verified_at(&declared).map(move |at| (*label, at)))
+                .collect();
+            let [(label, receiver)] = matched.as_slice() else {
+                return false;
+            };
+            let scope = InstanceAt::Scope {
+                file: relative(self.root, host.file),
+                line: host.call.site.line,
+                member: label.member.clone(),
+                prefix: prefix_of(host, &label.name),
+                package: label.package.clone(),
+                export: label.export.clone(),
+                receiver: receiver.to_string(),
+                parents,
+            };
+            self.push(at, scope);
+            return true;
+        }
+        let mut opened = false;
+        for label in labels {
+            let applies: Vec<InstanceEnd> = parents
+                .iter()
+                .filter(|end| label.applies_to(end))
+                .cloned()
+                .collect();
+            let Some((package, export, receiver)) = applies.first().and_then(identity) else {
+                continue;
+            };
+            self.push(
+                at.clone(),
+                InstanceAt::Scope {
+                    file: relative(self.root, host.file),
+                    line: host.call.site.line,
+                    member: label.member.clone(),
+                    prefix: prefix_of(host, &label.name),
+                    package,
+                    export,
+                    receiver,
+                    parents: applies,
+                },
+            );
+            opened = true;
+        }
+        opened
+    }
+
+    /// The ends of `host`'s own receiver, walked inside this walk's scope
+    /// calls and `here`, `host`'s span: read from the index once walked.
+    fn parents(&self, host: &Placed<'a>, here: HostSpan) -> Vec<InstanceEnd> {
+        let key = (self.hosts.clone(), here.clone());
+        if let Some(parents) = self.index.parents.borrow().get(&key) {
+            return parents.clone();
+        }
+        let parents = self.nested().with_host(here).of(&[*host]);
+        self.index.parents.borrow_mut().insert(key, parents.clone());
+        parents
+    }
+
+    /// The member declaration (`decl_file`, `decl_line`) `host`'s call
+    /// resolves to, as the compiler's call row names it.
+    fn declaration_of(&self, host: &Placed<'_>) -> Option<(String, u32)> {
+        let positions = self.inputs.positions.as_ref()?;
+        let ir = self.inputs.files.get(host.file)?;
+        let row = positions
+            .lookup(
+                host.file,
+                ir.swc_start(host.call.site.lo),
+                ir.swc_start(host.call.site.hi),
+                Kind::Call,
+            )
+            .ok()?;
+        Some((row.decl_file()?.to_string(), row.decl_line()?))
+    }
+
+    /// A fresh walk for another value, inside this one's scope calls.
+    pub(super) fn nested(&self) -> InstanceWalk<'w, 'a> {
+        let mut walk = InstanceWalk::new(
+            self.calls,
+            self.inputs,
+            self.root,
+            self.makers,
+            self.scopes,
+            self.index,
+        );
+        walk.hosts = self.hosts.clone();
+        walk
+    }
+
+    pub(super) fn with_host(mut self, host: (PathBuf, u32, u32)) -> Self {
+        self.hosts.push(host);
+        self
     }
 
     /// The caller `caller` hands in `value`, its argument at the parameter
@@ -300,6 +872,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         match held {
             HeldInstance::Client(client) => self.client(client, file, at),
             HeldInstance::Imported(lo, hi) => self.imported(file, (*lo, *hi), at),
+            HeldInstance::Returned(lo, hi) => self.returned(file, (*lo, *hi), at),
         }
     }
 
@@ -314,11 +887,12 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         match &instance.made_by {
             MadeBy::Export => {
                 let package = super::super::package_name(&client.package).to_string();
+                let new = instance.form == MakerForm::New;
                 let labelled = self.makers.iter().any(|maker| {
                     maker.package == package
                         && maker.export == client.export
                         && maker.member == instance.member
-                        && maker.new == (instance.form == MakerForm::New)
+                        && maker.new == new
                 });
                 if labelled {
                     self.push(
@@ -329,6 +903,10 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                             package,
                             export: client.export.clone(),
                             member: instance.member.clone(),
+                            receiver: super::super::library_sites::maker_receiver_id(
+                                new,
+                                instance.member.as_deref(),
+                            ),
                         },
                     );
                 } else {
@@ -336,11 +914,19 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 }
             }
             MadeBy::Call(_) => {
-                let target = self
-                    .calls
-                    .at_span(file, instance.site.span_start, instance.site.span_end)
+                let placed =
+                    self.calls
+                        .at_span(file, instance.site.span_start, instance.site.span_end);
+                let target = placed
                     .and_then(|placed| self.calls.target(&placed))
                     .cloned();
+                // A member call the call graph does not resolve into this
+                // service: a scope a labelled member returns, if any
+                // (carrick#2474 R2b).
+                if let (None, Some(placed)) = (&target, placed) {
+                    self.returned_at(placed, at);
+                    return;
+                }
                 let returned = target.as_ref().and_then(|(target_file, key)| {
                     self.inputs
                         .files
@@ -421,7 +1007,12 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             .declared_at
             .get(symbol)
             .filter(|(starts, _)| *starts == line)
-            .and_then(|(_, name)| declared.module_clients.get(name))
+            .and_then(|(_, name)| {
+                declared
+                    .module_clients
+                    .get(name)
+                    .or_else(|| declared.shadowed_clients.get(name))
+            })
             .cloned();
         match client {
             Some(client) => self.client(&client, &declaring, at),
@@ -429,35 +1020,117 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         }
     }
 
-    /// Whether `call`, written in `file`, is a library call: its callee is
-    /// declared outside the repository, as the compiler names it.
-    fn library_call(&self, file: &Path, call: &CallIr) -> bool {
-        let (Some(positions), Some(ir)) =
-            (self.inputs.positions.as_ref(), self.inputs.files.get(file))
-        else {
-            return false;
-        };
-        positions
-            .lookup(
-                file,
-                ir.swc_start(call.site.lo),
-                ir.swc_start(call.site.hi),
-                Kind::Call,
-            )
-            .is_ok_and(|row| row.decl_file().is_some() && !super::super::discovery::in_repo(row))
+    /// Whether `call`, written in `file`, is a library call
+    /// ([`library_call`]).
+    pub(super) fn library_call(&self, file: &Path, call: &CallIr) -> bool {
+        library_call(self.inputs, file, call)
     }
 
-    /// Whether a library call in `file` is handed the function `key` by
-    /// name (`server.register(plugin)`).
-    fn handed_to_library(&self, file: &Path, key: &str) -> bool {
-        self.calls.in_file(file).any(|placed| {
-            placed
-                .call
-                .handed
-                .iter()
-                .any(|(_, keys, name)| keys.is_empty() && name == key)
-                && self.library_call(file, placed.call)
+    /// The library calls that may run the function `key` of `file`, each
+    /// with the argument it is handed at, in file and source order: those
+    /// in `file` handed it by name (`server.register(plugin)`), then the
+    /// calls of a `runs` scope member in another file handed a name the
+    /// compiler resolves to it (`app.register(items)`, `items` imported;
+    /// carrick#2474 R2b).
+    fn hosts_of(&self, file: &Path, key: &str) -> Vec<Host<'a>> {
+        let mut hosts: Vec<Host<'a>> = self
+            .index
+            .by_name
+            .get(&(file.to_path_buf(), key.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        let line = self
+            .inputs
+            .files
+            .get(file)
+            .and_then(|declared| declared.declared_at.get(key))
+            .map(|(line, _)| *line);
+        if let Some(line) = line
+            && let Some(by_declaration) = self
+                .index
+                .by_declaration
+                .get(&(relative(self.root, file), line))
+        {
+            hosts.extend(
+                by_declaration
+                    .iter()
+                    .filter(|(placed, _)| placed.file != file)
+                    .copied(),
+            );
+        }
+        hosts
+    }
+}
+
+/// Whether `call`, written in `file`, is a library call: its callee is
+/// declared outside the repository, as the compiler names it.
+fn library_call(inputs: &RequestSummaryInputs, file: &Path, call: &CallIr) -> bool {
+    let (Some(positions), Some(ir)) = (inputs.positions.as_ref(), inputs.files.get(file)) else {
+        return false;
+    };
+    positions
+        .lookup(
+            file,
+            ir.swc_start(call.site.lo),
+            ir.swc_start(call.site.hi),
+            Kind::Call,
+        )
+        .is_ok_and(library_row)
+}
+
+/// Whether a call row's declaration is outside the repository. One the rows
+/// could not name a file for is outside too (carrick#2474 R2b).
+fn library_row(row: &crate::position_rows::Row) -> bool {
+    (row.decl_file().is_some() || row.flags() & FLAG_DECLARATION_UNNAMED != 0)
+        && !super::super::discovery::in_repo(row)
+}
+
+/// The package, export and receiver id of the instance `end` ends at.
+pub(super) fn identity(end: &InstanceEnd) -> Option<(String, String, String)> {
+    match &end.end {
+        InstanceAt::Root {
+            package,
+            export,
+            receiver,
+            ..
+        }
+        | InstanceAt::Scope {
+            package,
+            export,
+            receiver,
+            ..
+        } => Some((package.clone(), export.clone(), receiver.clone())),
+        InstanceAt::Hole { .. } => None,
+    }
+}
+
+/// The prefix `placed`'s call states in the slot `name` (an argument, or a
+/// key of an object-literal one): text where every piece is literal.
+pub(super) fn prefix_of(placed: &Placed<'_>, name: &(usize, Option<String>)) -> Prefix {
+    let (arg, key) = name;
+    let value = match (placed.call.args.get(*arg), key) {
+        (None, _) => return Prefix::Unstated,
+        (Some(value), None) => value,
+        (Some(Value::Obj(object)), Some(key)) => match object.fields.get(key) {
+            Some(value) => value,
+            None if object.open => return Prefix::Unread { text: None },
+            None => return Prefix::Unstated,
+        },
+        (Some(_), Some(_)) => return Prefix::Unread { text: None },
+    };
+    let pieces = value.pieces();
+    let text: Option<String> = pieces
+        .iter()
+        .map(|piece| match piece {
+            Piece::Lit(text) => Some(text.as_str()),
+            _ => None,
         })
+        .collect();
+    match text {
+        Some(text) => Prefix::Stated { values: vec![text] },
+        None => Prefix::Unread {
+            text: opaque_text(&pieces),
+        },
     }
 }
 
@@ -466,5 +1139,83 @@ fn opaque_text(pieces: &[Piece]) -> Option<String> {
     match pieces {
         [Piece::Opaque { text, .. }] => Some(text.clone()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::super::super::discovery::AskedScope;
+    use super::*;
+    use crate::position_rows::Row;
+
+    /// carrick#2474 R2b: a scope label is the claim the trace verified, by
+    /// claim id: a sibling claim on the same member that the verifier
+    /// refuted gives no label, whatever its sibling was verified as.
+    #[test]
+    fn a_refuted_scope_claim_is_no_label_beside_a_verified_sibling() {
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([{
+                "package": "fixture-server", "version": "2.1.0", "specifier": "fixture-server",
+                "export": "default", "role": "server_framework",
+                "claims": [
+                    { "kind": "make", "form": "call", "member": null },
+                    { "kind": "scope", "member": "use", "of": "instance:()",
+                      "name": { "arg": 0 }, "mounts": { "arg": 1 } },
+                    { "kind": "scope", "member": "use", "of": "instance:()",
+                      "name": { "arg": 1 }, "mounts": { "arg": 0 } }
+                ]
+            }]))
+            .expect("claims in the store's shape");
+        let ids: Vec<String> = exports[0]
+            .claims_with_scopes_by_id()
+            .into_iter()
+            .filter(|(id, _)| id.contains(":scope:"))
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        // Only the claim that mounts the instance at 1 under the name at 0
+        // is verified.
+        let verified: HashMap<AskedScope, Vec<(String, u32)>> = HashMap::from([(
+            AskedScope {
+                package: "fixture-server".to_string(),
+                export: "default".to_string(),
+                claim_id: ids[0].clone(),
+                receiver: "instance:()".to_string(),
+            },
+            Vec::new(),
+        )]);
+        let labels = ScopeLabel::from_exports(&exports, &verified);
+        assert_eq!(labels.len(), 1, "{labels:#?}");
+        assert_eq!(labels[0].name, (0, None));
+        assert_eq!(labels[0].binds, ScopeBinds::Mounts { arg: 1, key: None });
+    }
+
+    /// carrick#2474 R2b: a call row whose declaration the rows could not
+    /// name a file for (flagged unnamed) is a library call; one with no
+    /// declaration at all, or one in the repository, is not.
+    #[test]
+    fn a_call_row_with_an_unnamed_declaration_is_a_library_call() {
+        let row = |decl_file: Option<&str>, flags: u8| {
+            Row(
+                Kind::Call,
+                0,
+                1,
+                Some("register".to_string()),
+                decl_file.map(str::to_string),
+                decl_file.map(|_| 3),
+                None,
+                None,
+                flags,
+            )
+        };
+        assert!(library_row(&row(None, FLAG_DECLARATION_UNNAMED)));
+        assert!(!library_row(&row(None, 0)));
+        assert!(library_row(&row(
+            Some("node_modules/fixture-server/index.d.ts"),
+            0
+        )));
+        assert!(!library_row(&row(Some("src/server.ts"), 0)));
     }
 }

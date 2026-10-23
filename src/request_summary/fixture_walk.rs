@@ -48,6 +48,40 @@ pub(crate) const NODENEXT: (&str, &str) = (
     r#"{ "compilerOptions": { "target": "ES2020", "module": "NodeNext", "moduleResolution": "NodeNext", "jsx": "react-jsx", "strict": true }, "include": ["src"] }"#,
 );
 
+/// The member declarations the trace's own verify request returns for one
+/// service of a real repo, asked of the built sidecar from the service's
+/// root as a scan asks it (carrick#2474 R1, R2b): the offline censuses'.
+pub(crate) fn census_declarations(
+    script: &Path,
+    root: &Path,
+    service: &Config,
+    inputs: &RequestSummaryInputs,
+    exports: &[crate::library_claims::ExportClaims],
+) -> super::discovery::MemberDeclarations {
+    let name = service.service_name.as_deref().unwrap_or("(root)");
+    let service_root = root.join(service.directory.as_deref().unwrap_or("."));
+    let sidecar = crate::services::TypeSidecar::spawn(script).expect("spawn the sidecar");
+    sidecar.set_scan_root(root);
+    sidecar.start_init(&service_root, None);
+    sidecar
+        .wait_ready(std::time::Duration::from_secs(900))
+        .expect("the sidecar is ready");
+    let ask = super::discovery::declaration_ask(inputs, exports);
+    let verdicts = sidecar
+        .verify_library_claims(&service_root, &ask.checks)
+        .map(|answer| answer.verdicts)
+        .unwrap_or_default();
+    let declarations = super::discovery::MemberDeclarations::of(&ask, &verdicts);
+    crate::outln!(
+        "  {name}: {} check(s), {} not reached, {} declaration(s), {} scope(s) verified",
+        declarations.checks,
+        declarations.not_reached,
+        declarations.len(),
+        declarations.verified_scopes.len()
+    );
+    declarations
+}
+
 /// A fixture service, read.
 pub(crate) struct Walked {
     _dir: tempfile::TempDir,
@@ -118,9 +152,13 @@ pub(crate) fn walked_within(
             std::fs::write(&path, text).unwrap();
         }
     }
-    let config = Config::load_services(vec![repo.join("carrick.json")])
-        .unwrap()
-        .remove(0);
+    // The service named `service`, else the first.
+    let mut services = Config::load_services(vec![repo.join("carrick.json")]).unwrap();
+    let at = services
+        .iter()
+        .position(|config| config.service_name.as_deref() == Some(service))
+        .unwrap_or(0);
+    let config = services.remove(at);
     let positions = with_rows.then(|| {
         let mut files =
             crate::file_finder::walk_service(&repo.to_string_lossy(), &config, &[]).files;

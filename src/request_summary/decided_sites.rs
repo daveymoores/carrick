@@ -58,8 +58,12 @@ use swc_ecma_visit::{Visit, VisitWith};
 use super::row_calls::Reach;
 use super::{CallIr, FnIr, Piece, RequestSummaryInputs, Value, concat, render_target};
 
+mod composed;
 mod instances;
-pub use instances::{InstanceAt, InstanceEnd, InstanceHole, MakerLabel};
+pub use composed::Composed;
+pub use instances::{
+    InstanceAt, InstanceEnd, InstanceHole, MakerLabel, Prefix, ScopeBinds, ScopeLabel,
+};
 
 /// The labelled call a discovery site reaches: the store key of the package
 /// (`lib:lib.dom.d.ts` for the language's own library), the export and member, the
@@ -527,6 +531,15 @@ pub struct DecidedSite {
     /// on, one end per caller that hands one in (carrick#2474 R2a). Read by
     /// nothing; never part of a record's state.
     pub instances: Vec<InstanceEnd>,
+    /// With the receiver trace on, the full path the route is served at
+    /// per instance end, every scope and mount prefix joined from the top
+    /// down (carrick#2474 R2b). Read by nothing; never part of a record's
+    /// state.
+    pub composed: Vec<Composed>,
+    /// Whether `composed` stopped at its cap
+    /// ([`composed::MAX_COMPOSED`] chains, and paths): some paths are
+    /// left out.
+    pub composed_trimmed: bool,
 }
 
 impl DecidedSite {
@@ -749,6 +762,10 @@ struct Placed<'a> {
     /// (carrick#2474 R2a). `None` at depth 0, and for a function written
     /// anywhere else.
     host: Option<&'a CallIr>,
+    /// Where the innermost function the call is written in sits in a
+    /// call's argument (carrick#2474 R2b): the argument, and the keys down
+    /// to it. `None` at depth 0, and for a function written anywhere else.
+    written_in: Option<&'a super::guards::WrittenIn>,
 }
 
 /// Every call of the service, by file and span, by the function whose body
@@ -771,6 +788,11 @@ impl<'a> Calls<'a> {
             host: Option<&'a CallIr>,
             out: &mut Calls<'a>,
         ) {
+            let written_in = if depth == 0 {
+                None
+            } else {
+                ir.written_in.as_ref()
+            };
             for call in ir.calls.iter().chain(&ir.constructions) {
                 let placed = Placed {
                     file,
@@ -778,6 +800,7 @@ impl<'a> Calls<'a> {
                     depth,
                     call,
                     host,
+                    written_in,
                 };
                 out.by_span
                     .entry((file, call.site.span_start, call.site.span_end))
@@ -841,14 +864,6 @@ impl<'a> Calls<'a> {
         self.callers
             .get(&(file.to_path_buf(), key.to_string()))
             .map_or(&[], Vec::as_slice)
-    }
-
-    /// Every call written in `file`.
-    fn in_file<'s>(&'s self, file: &'s Path) -> impl Iterator<Item = &'s Placed<'a>> + 's {
-        self.by_span
-            .iter()
-            .filter(move |((at, ..), _)| *at == file)
-            .map(|(_, placed)| placed)
     }
 }
 
@@ -1216,6 +1231,12 @@ struct Walk<'a, 'i> {
     /// With the receiver trace on, the makers the store labels: each site's
     /// instance is walked to them ([`instances`]).
     makers: Option<&'i [MakerLabel]>,
+    /// With the receiver trace on, the scope members the store labels
+    /// (carrick#2474 R2b).
+    scopes: &'i [ScopeLabel],
+    /// With the receiver trace on, what every instance walk of the service
+    /// reads, built once.
+    index: Option<&'i instances::WalkIndex<'a>>,
     out: &'i mut Decided,
     seen: HashSet<(String, u32, Option<String>, String)>,
     /// The label of the labelled call being walked.
@@ -1279,17 +1300,25 @@ impl<'a> Walk<'a, '_> {
             receiver: self.receiver.clone(),
             reached: self.reached,
             instances,
+            composed: Vec::new(),
+            composed_trimmed: false,
         });
     }
 
     /// With the receiver trace on, the instance ends of the site whose
     /// calls are `down` ([`instances`]); none with it off.
     fn instances(&self, down: &[Placed<'a>]) -> Vec<InstanceEnd> {
-        match self.makers {
-            Some(makers) => {
-                instances::InstanceWalk::new(self.calls, self.inputs, self.root, makers).of(down)
-            }
-            None => Vec::new(),
+        match (self.makers, self.index) {
+            (Some(makers), Some(index)) => instances::InstanceWalk::new(
+                self.calls,
+                self.inputs,
+                self.root,
+                makers,
+                self.scopes,
+                index,
+            )
+            .of(down),
+            _ => Vec::new(),
         }
     }
 
@@ -1445,6 +1474,8 @@ impl<'a> Walk<'a, '_> {
                 receiver: self.receiver.clone(),
                 reached: self.reached,
                 instances: instances.clone(),
+                composed: Vec::new(),
+                composed_trimmed: false,
             });
         }
     }
@@ -1498,21 +1529,24 @@ pub fn decided_sites(
     discovered: &[DiscoverySite],
     labels: &[SiteLabel],
 ) -> Decided {
-    decide(inputs, root, discovered, labels, None)
+    decide(inputs, root, discovered, labels, None, &[])
 }
 
 /// [`decided_sites`] with the receiver trace on (carrick#2474 R2a): each
 /// site also names the instance its labelled call is made on, walked to the
 /// makers the store labels (`makers`), one end per caller that hands one in
-/// ([`DecidedSite::instances`]).
+/// ([`DecidedSite::instances`]), through the scopes the store's scope
+/// members open (`scopes`), and the full path it is served at under them
+/// and the mounts ([`DecidedSite::composed`], R2b).
 pub fn decided_sites_traced(
     inputs: &RequestSummaryInputs,
     root: &Path,
     discovered: &[DiscoverySite],
     labels: &[SiteLabel],
     makers: &[MakerLabel],
+    scopes: &[ScopeLabel],
 ) -> Decided {
-    decide(inputs, root, discovered, labels, Some(makers))
+    decide(inputs, root, discovered, labels, Some(makers), scopes)
 }
 
 fn decide(
@@ -1521,8 +1555,10 @@ fn decide(
     discovered: &[DiscoverySite],
     labels: &[SiteLabel],
     makers: Option<&[MakerLabel]>,
+    scopes: &[ScopeLabel],
 ) -> Decided {
     let calls = Calls::index(inputs);
+    let index = makers.map(|_| instances::WalkIndex::of(&calls, inputs, scopes));
     let mut out = Decided::default();
     // The functions some listed site's chain enters: a site whose value
     // still holds a parameter is decided by those callers, which discovery
@@ -1540,6 +1576,8 @@ fn decide(
         inputs,
         root,
         makers,
+        scopes,
+        index: index.as_ref(),
         out: &mut out,
         seen: HashSet::new(),
         label: None,
@@ -1662,6 +1700,13 @@ fn decide(
         if !covered {
             walked.push(format!("{}:{}", site.file, site.line));
             walk.up(&chain, &top, end, &mut Vec::new());
+        }
+    }
+    if let (Some(makers), Some(index)) = (makers, &index) {
+        let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes, index);
+        for site in &mut out.sites {
+            (site.composed, site.composed_trimmed) =
+                composed::compose(&site.instances, site.name_text().as_deref(), &mounts);
         }
     }
     walked.sort();

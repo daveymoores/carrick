@@ -1,0 +1,9 @@
+{
+  "name": "receiver-scopes-hosts-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-split-server": "^1.0.0",
+    "fixture-twin-server": "^2.0.0"
+  }
+}
