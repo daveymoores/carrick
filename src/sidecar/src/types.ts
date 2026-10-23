@@ -265,6 +265,12 @@ export interface ServerClaims {
   from_dir: string;
   scan_root?: string;
   checks: LibraryCheck[];
+  /**
+   * Per package specifier, the type-only packages the store says its surface
+   * re-exports (the store's `type_packages`): a reply member declared in one
+   * of them is the package's own.
+   */
+  type_packages?: Record<string, string[]>;
 }
 
 /** A type the model named for the row `alias` is for (carrick#2111). */

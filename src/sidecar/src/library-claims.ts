@@ -487,9 +487,9 @@ export class LibraryClaimsVerifier {
     checks: LibraryCheck[],
     budgetMs: number,
     scanRoot?: string,
-    observe?: (check: LibraryCheck, outcome: Outcome) => void,
-    readReplies = false
+    options: RunOptions = {}
   ): VerifyResult {
+    const { observe, readReplies = false, typePackages = {} } = options;
     const deadline = performance.now() + budgetMs;
     const stamp = (check: LibraryCheck, outcome: Outcome): SemanticsResult =>
       outcome.verdict === 'verified'
@@ -707,7 +707,10 @@ export class LibraryClaimsVerifier {
           value: types.map(type => ({
             type,
             pkg: check.package,
-            home: reader.homeOf(check.package, [exported.target, ...typeSymbols(type)]),
+            home: withTypePackages(
+              reader.homeOf(check.package, [exported.target, ...typeSymbols(type)]),
+              typePackages[check.package]
+            ),
             makerBindsName,
             scoped: receiverPath.scope !== undefined,
             makerHolding,
@@ -869,7 +872,13 @@ export class LibraryClaimsVerifier {
    * `payload` slot, and each verified `receive` op whose `request` names a
    * `body` path. Other checks are not judged.
    */
-  labelledMembers(fromDir: string, checks: LibraryCheck[], budgetMs: number, scanRoot?: string): LabelledMembers {
+  labelledMembers(
+    fromDir: string,
+    checks: LibraryCheck[],
+    budgetMs: number,
+    scanRoot?: string,
+    typePackages: Readonly<Record<string, readonly string[]>> = {}
+  ): LabelledMembers {
     const sends = new Map<string, ClaimSlot>();
     const bodies = new Set<string>();
     const wanted = checks.filter(
@@ -891,7 +900,7 @@ export class LibraryClaimsVerifier {
       }
       for (const member of outcome.bodyMembers ?? []) bodies.add(declarationKey(member));
     };
-    this.run(fromDir, [...context, ...wanted], budgetMs, scanRoot, observe, true);
+    this.run(fromDir, [...context, ...wanted], budgetMs, scanRoot, { observe, readReplies: true, typePackages });
     return { sends, bodies };
   }
 
@@ -1119,6 +1128,25 @@ function requestAtValid(claim: OpClaim): boolean {
   return [request.path, request.url, request.method, request.body].every(
     members => members === undefined || members.length > 0
   );
+}
+
+/** What `run` reads beyond the checks; none of it is part of a verdict. */
+interface RunOptions {
+  /** Called with each check's outcome, in request order. */
+  observe?: (check: LibraryCheck, outcome: Outcome) => void;
+  /** Read server `send` ops as replies (`SERVER_REPLY_RULES`). */
+  readReplies?: boolean;
+  /**
+   * Per package specifier, the type-only packages the store says its surface
+   * re-exports (carrick#2674): a member one of them declares is the
+   * package's own, as the store reads it.
+   */
+  typePackages?: Readonly<Record<string, readonly string[]>>;
+}
+
+/** A receiver's home packages, with the type-only packages the store lists for its package. */
+function withTypePackages(home: ReadonlySet<string>, typePackages: readonly string[] | undefined): ReadonlySet<string> {
+  return typePackages && typePackages.length > 0 ? new Set([...home, ...typePackages]) : home;
 }
 
 /**

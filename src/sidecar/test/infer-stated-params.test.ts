@@ -60,17 +60,9 @@ declare function make(): App;
 export default make;
 export declare const reply: Rep;
 
-export type Send<B, T> = (body?: B) => T;
-export interface Request2<Params = any, ResBody = any, ReqBody = any> {
-  body: ReqBody;
-  params: Params;
-}
-export interface Response2<ResBody = any> {
-  json: Send<ResBody, this>;
-  download(path: string): this;
-  echo<T>(body: ResBody | T): this;
-  status(code: number): this;
-}
+import type { CoreRequest, CoreResponse } from 'route-kit-core';
+export interface Request2<Params = any, ResBody = any, ReqBody = any> extends CoreRequest<Params, ReqBody> {}
+export interface Response2<ResBody = any> extends CoreResponse<ResBody> {}
 export type Handler2 = (req: Request2, res: Response2) => void;
 export interface Router {
   post(path: string, ...handlers: Handler2[]): Router;
@@ -174,7 +166,24 @@ export const createOrderByHelper = wrap<OrderContract>(async (req, res) => {
 });
 `;
 
+// The positional style's request and reply members live in a type-only
+// package the server package re-exports through its own types, as the store
+// lists it in `type_packages`.
+const CORE = `export type Send<B, T> = (body?: B) => T;
+export interface CoreRequest<Params = any, ReqBody = any> {
+  body: ReqBody;
+  params: Params;
+}
+export interface CoreResponse<ResBody = any> {
+  json: Send<ResBody, this>;
+  download(path: string): this;
+  echo<T>(body: ResBody | T): this;
+  status(code: number): this;
+}
+`;
+
 const PKG = 'route-kit';
+const CORE_PKG = 'route-kit-core';
 let sequence = 0;
 type Claim = Record<string, unknown> & { kind: string };
 const check = (exported: string, receiver: string, claim: Claim) => ({
@@ -234,6 +243,12 @@ describe('carrick#2674: bodies a route handler’s parameters state', () => {
       JSON.stringify({ name: PKG, version: '1.0.0', types: 'index.d.ts' })
     );
     fs.writeFileSync(path.join(root, 'node_modules', PKG, 'index.d.ts'), KIT);
+    fs.mkdirSync(path.join(root, 'node_modules', CORE_PKG), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, 'node_modules', CORE_PKG, 'package.json'),
+      JSON.stringify({ name: CORE_PKG, version: '1.0.0', types: 'index.d.ts' })
+    );
+    fs.writeFileSync(path.join(root, 'node_modules', CORE_PKG, 'index.d.ts'), CORE);
     fs.mkdirSync(path.join(root, 'src'));
     appPath = path.join(root, 'src', 'app.ts');
     fs.writeFileSync(appPath, APP);
@@ -253,15 +268,16 @@ describe('carrick#2674: bodies a route handler’s parameters state', () => {
   const infer = async (
     label: string,
     kind: 'request_body' | 'response_body',
-    labels = true
+    labels = true,
+    typePackages: Record<string, string[]> = { [PKG]: [CORE_PKG] }
   ): Promise<Inferred | undefined> => {
-    const alias = `${label}_${kind}_${labels}`;
+    const alias = `${label}_${kind}_${labels}_${Object.keys(typePackages).length}`;
     const response = await client.send<{ inferred_types?: Inferred[] }>(
       {
         action: 'infer',
         request_id: `infer-${id++}`,
         requests: [{ file_path: appPath, line_number: lineOf(label), infer_kind: kind, alias }],
-        ...(labels ? { server_claims: { from_dir: root, checks: LABELS } } : {}),
+        ...(labels ? { server_claims: { from_dir: root, checks: LABELS, type_packages: typePackages } } : {}),
       },
       60_000
     );
@@ -306,6 +322,11 @@ describe('carrick#2674: bodies a route handler’s parameters state', () => {
     assert.match(reply.type_string, /total: number/);
     assert.doesNotMatch(reply.type_string, /error: string/);
     assert.match((await infer('E', 'request_body'))?.type_string ?? '', /lines: string\[\]/);
+  });
+
+  it('E: a reply member a type-only package declares is read only where the store lists that package', async () => {
+    const reply = await infer('E', 'response_body', true, {});
+    assert.doesNotMatch(reply?.type_string ?? '', /total: number/);
   });
 
   it('F and L: with no typed success send through the reply parameter, the union is not published', async () => {

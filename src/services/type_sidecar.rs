@@ -1128,6 +1128,11 @@ pub struct ServerClaims {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_root: Option<String>,
     pub checks: Vec<LibraryCheck>,
+    /// Per package specifier, the type-only packages the store says its
+    /// surface re-exports: a reply member one of them declares is the
+    /// package's own.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub type_packages: BTreeMap<String, Vec<String>>,
 }
 
 /// One claim to check on one receiver: `export`, `instance:<member>`,
@@ -5118,6 +5123,10 @@ mod tests {
                             request: None,
                         },
                     }],
+                    type_packages: BTreeMap::from([(
+                        "@fixture/server".to_string(),
+                        vec!["@fixture/server-core".to_string()],
+                    )]),
                 }),
             },
             SidecarRequest::CaptureV2 {

@@ -5012,6 +5012,7 @@ fn server_claims_of(
     (!checks.is_empty()).then(|| crate::services::type_sidecar::ServerClaims {
         from_dir: from_dir.to_string_lossy().into_owned(),
         scan_root: None,
+        type_packages: crate::library_claims::server_type_packages(claims),
         checks,
     })
 }

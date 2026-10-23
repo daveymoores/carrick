@@ -481,7 +481,13 @@ function labelledMembersFor(
 ): LabelledMembers | undefined {
   if (!claims || claims.checks.length === 0) return undefined;
   const fromDir = path.resolve(projectLoader!.getRepoRoot(), claims.from_dir);
-  return built.claimsVerifier.labelledMembers(fromDir, claims.checks, SERVER_CLAIMS_BUDGET_MS, claims.scan_root);
+  return built.claimsVerifier.labelledMembers(
+    fromDir,
+    claims.checks,
+    SERVER_CLAIMS_BUDGET_MS,
+    claims.scan_root,
+    claims.type_packages
+  );
 }
 
 /**

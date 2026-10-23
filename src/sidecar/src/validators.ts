@@ -576,6 +576,7 @@ const ServerClaimsSchema = z
     from_dir: z.string().min(1),
     scan_root: z.string().min(1).optional(),
     checks: z.array(LibraryCheckSchema),
+    type_packages: z.record(z.string().min(1), z.array(z.string().min(1))).optional(),
   })
   .strict();
 

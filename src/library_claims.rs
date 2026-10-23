@@ -578,6 +578,21 @@ pub fn server_checks(exports: &[ExportClaims]) -> Vec<LibraryCheck> {
     checks
 }
 
+/// Per server package specifier, the type-only packages the store says its
+/// surface re-exports (`type_packages`): where a reply's send members are
+/// declared (carrick#2674).
+pub fn server_type_packages(
+    exports: &[ExportClaims],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    exports
+        .iter()
+        .filter(|export| {
+            export.role == LibraryRole::ServerFramework && !export.type_packages.is_empty()
+        })
+        .map(|export| (export.specifier.clone(), export.type_packages.clone()))
+        .collect()
+}
+
 /// The one receiver an element's own `on` or `of` names: `of` itself, or
 /// the export for `on` `export` or `both`. `on` `instance` names no one
 /// receiver.
@@ -1148,6 +1163,17 @@ mod tests {
                   "name": { "arg": 0 }, "payload": { "arg": 1 } }
             ]
         }));
+        let mut reply = reply;
+        reply.type_packages = vec!["fixture-server-core-types".into()];
+        let mut bus = bus;
+        bus.type_packages = vec!["fixture-bus-types".into()];
+        assert_eq!(
+            server_type_packages(&[reply.clone(), bus.clone()]),
+            std::collections::BTreeMap::from([(
+                "fixture-server".to_string(),
+                vec!["fixture-server-core-types".to_string()]
+            )])
+        );
         let asked: Vec<(String, String, String)> = server_checks(&[server, reply, bus])
             .into_iter()
             .map(|check| (check.export, check.receiver, check.claim_id))
