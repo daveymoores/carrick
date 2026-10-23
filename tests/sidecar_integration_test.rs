@@ -825,7 +825,7 @@ export async function getOrderCount(): Promise<number> {
     };
 
     let result = sidecar
-        .resolve_all_types(&explicit, &infer, Some(&config))
+        .resolve_all_types(&explicit, &infer, Some(&config), None)
         .expect("resolve_all_types failed");
     let dts = result.dts_content.expect("expected bundled dts content");
 
@@ -1028,7 +1028,7 @@ notificationRouter.get('/status', async () => {
     };
 
     let result = sidecar
-        .resolve_all_types(&explicit, &infer, Some(&config))
+        .resolve_all_types(&explicit, &infer, Some(&config), None)
         .expect("resolve_all_types failed");
     let dts = result.dts_content.expect("expected bundled dts content");
 
@@ -1206,7 +1206,7 @@ notificationRouter.get('/status', async () => {
     };
 
     let result = sidecar
-        .resolve_all_types(&explicit, &infer, Some(&config))
+        .resolve_all_types(&explicit, &infer, Some(&config), None)
         .expect("resolve_all_types failed");
     let dts = result.dts_content.expect("expected bundled dts content");
 
@@ -1428,7 +1428,7 @@ export function onOrderPlaced(evt: OrderPlaced): void {
     let infer = vec![infer_item(demoted_alias), infer_item(kept_alias)];
 
     let result = sidecar
-        .resolve_all_types(&explicit, &infer, None)
+        .resolve_all_types(&explicit, &infer, None, None)
         .expect("resolve_all_types failed");
 
     // The inference reported the deterministic anchor + declaration source

@@ -11112,6 +11112,7 @@ impl FileOrchestrator {
         extra_explicit: &[SymbolRequest],
         extra_infer: &[InferRequestItem],
         payload_infer: &[InferRequestItem],
+        server_claims: Option<&crate::services::type_sidecar::ServerClaims>,
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
         let (mut explicit, mut infer, inline_aliases) =
             self.collect_type_requests(file_results, repo_path, mount_graph, config, modules);
@@ -11146,7 +11147,7 @@ impl FileOrchestrator {
         // request collection (carrick#767).
         let round_trip = std::time::Instant::now();
         let result = sidecar
-            .resolve_all_types(&explicit, &infer, extraction_config)
+            .resolve_all_types(&explicit, &infer, extraction_config, server_claims)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
         debug!(
             "[FileOrchestrator] Sidecar type resolution round trip: {:.1}s",

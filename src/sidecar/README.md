@@ -64,7 +64,7 @@ let sidecar = TypeSidecar::spawn(&sidecar_path)?;
 sidecar.start_init(&absolute_repo_path, None);
 
 // Requests block until the sidecar is ready, then until they answer
-let result = sidecar.resolve_all_types(&explicit_symbols, &infer_requests, None)?;
+let result = sidecar.resolve_all_types(&explicit_symbols, &infer_requests, None, None)?;
 let captured = sidecar.capture_v2(&repo_root, service_name, &anchors, &out_dir, None)?;
 ```
 

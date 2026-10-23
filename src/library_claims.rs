@@ -530,6 +530,65 @@ pub fn checks(sites: &LibrarySites, exports: &[ExportClaims]) -> Vec<LibraryChec
     checks
 }
 
+/// The checks an `infer` request reads route handlers' parameters through
+/// (carrick#2674): of every server export, its makers (on `export`) and
+/// scopes, the receivers ops are read on, its `send` ops that carry a
+/// payload slot, and its `receive` ops that say where the request is. Each
+/// is checked on the one receiver its own `on` or `of` names: the sidecar
+/// matches a handler parameter's members by declaration, so no call site
+/// picks the receiver.
+pub fn server_checks(exports: &[ExportClaims]) -> Vec<LibraryCheck> {
+    let mut checks = Vec::new();
+    for export in exports
+        .iter()
+        .filter(|export| export.role == LibraryRole::ServerFramework)
+    {
+        for (id, claim) in export.claims_with_scopes_by_id() {
+            let receiver = match claim {
+                LibraryClaim::Make { .. } => Some("export".to_string()),
+                LibraryClaim::Scope { on, of, .. }
+                | LibraryClaim::Op {
+                    op: LibraryOp::Send,
+                    payload: Some(_),
+                    on,
+                    of,
+                    ..
+                }
+                | LibraryClaim::Op {
+                    op: LibraryOp::Receive,
+                    request: Some(_),
+                    on,
+                    of,
+                    ..
+                } => own_receiver(*on, of.as_deref()),
+                _ => None,
+            };
+            if let Some(receiver) = receiver {
+                checks.push(LibraryCheck {
+                    claim_id: id,
+                    package: export.specifier.clone(),
+                    export: export.export.clone(),
+                    role: export.role,
+                    receiver,
+                    claim: claim.clone(),
+                });
+            }
+        }
+    }
+    checks
+}
+
+/// The one receiver an element's own `on` or `of` names: `of` itself, or
+/// the export for `on` `export` or `both`. `on` `instance` names no one
+/// receiver.
+fn own_receiver(on: Option<ClaimOn>, of: Option<&str>) -> Option<String> {
+    match (on, of) {
+        (None, Some(of)) => Some(of.to_string()),
+        (Some(ClaimOn::Export | ClaimOn::Both), None) => Some("export".to_string()),
+        _ => None,
+    }
+}
+
 /// What a library row states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LibraryRowKind {
@@ -1052,6 +1111,69 @@ mod tests {
     /// A declaration found in a type-only package stands for the package
     /// whose answer lists it; an `@types/*` name keeps its convention; any
     /// other name is itself (carrick#2434).
+    /// carrick#2674: the checks an `infer` request reads a route handler's
+    /// parameters through: a server export's makers and scopes, its send ops
+    /// that carry a payload slot, and its receive ops that say where the
+    /// request is, each on the receiver its own `on` or `of` names. Other
+    /// roles, sends with no payload slot, and receive ops without `request`
+    /// ask nothing.
+    #[test]
+    fn server_checks_are_a_server_exports_makers_sends_and_request_receives() {
+        let server = export(json!({
+            "package": "fixture-server", "version": "2.1.0", "specifier": "fixture-server",
+            "export": "default", "role": "server_framework",
+            "claims": [
+                { "kind": "make", "form": "call", "member": null },
+                { "kind": "op", "op": "receive", "member": "post", "of": "instance:()",
+                  "name": { "arg": 0 }, "handler": { "arg": 1 },
+                  "request": { "param": 0, "path": ["path"] } },
+                { "kind": "op", "op": "receive", "member": "get", "of": "instance:()",
+                  "name": { "arg": 0 }, "handler": { "arg": 1 } }
+            ]
+        }));
+        let reply = export(json!({
+            "package": "fixture-server", "version": "2.1.0", "specifier": "fixture-server",
+            "export": "reply", "role": "server_framework",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "json", "on": "export", "payload": { "arg": 0 } },
+                { "kind": "op", "op": "send", "member": "end", "on": "export" },
+                { "kind": "op", "op": "send", "member": "write", "on": "instance", "payload": { "arg": 0 } }
+            ]
+        }));
+        let bus = export(json!({
+            "package": "@fixture/bus", "version": "1.4.0", "specifier": "@fixture/bus",
+            "export": "bus", "role": "broker",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "publish", "on": "export",
+                  "name": { "arg": 0 }, "payload": { "arg": 1 } }
+            ]
+        }));
+        let asked: Vec<(String, String, String)> = server_checks(&[server, reply, bus])
+            .into_iter()
+            .map(|check| (check.export, check.receiver, check.claim_id))
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                (
+                    "default".to_string(),
+                    "export".to_string(),
+                    "fixture-server@2:default:make:call:()".to_string()
+                ),
+                (
+                    "default".to_string(),
+                    "instance:()".to_string(),
+                    "fixture-server@2:default:op:receive:post:of:instance:()".to_string()
+                ),
+                (
+                    "reply".to_string(),
+                    "export".to_string(),
+                    "fixture-server@2:reply:op:send:json:on:export".to_string()
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn a_type_only_package_is_keyed_to_the_package_that_lists_it() {
         let mut core = export(json!({

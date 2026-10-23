@@ -1119,6 +1119,17 @@ pub enum LibraryClaim {
     },
 }
 
+/// The server-framework claims an `infer` request reads route handlers'
+/// parameters through (carrick#2674): the checks, verified again in the
+/// service's program from `from_dir`, as `verify_library_claims` reads them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServerClaims {
+    pub from_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_root: Option<String>,
+    pub checks: Vec<LibraryCheck>,
+}
+
 /// One claim to check on one receiver: `export`, `instance:<member>`,
 /// `instance:()`, `instance:new` or `instance:new:<member>`, each optionally
 /// followed by `>scope:<path.member>` (what that scope member returns). The
@@ -1239,6 +1250,11 @@ enum SidecarRequest {
         /// item of `requests` reads, joined by alias.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         model_symbols: Vec<ModelSymbol>,
+        /// carrick#2674: the service's settled server-framework claims, which
+        /// the sidecar verifies again and reads route handlers' parameters
+        /// through.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_claims: Option<ServerClaims>,
     },
     #[serde(rename = "capture_v2")]
     CaptureV2 {
@@ -3043,7 +3059,7 @@ impl TypeSidecar {
         requests: &[InferRequestItem],
         extraction_config: Option<&ExtractionConfig>,
     ) -> Result<SidecarResponse, SidecarError> {
-        self.infer_types_beside_model_symbols(requests, extraction_config, &[])
+        self.infer_types_beside_model_symbols(requests, extraction_config, &[], None)
     }
 
     /// `infer_types`, with the model's symbol for each producer response the
@@ -3054,6 +3070,7 @@ impl TypeSidecar {
         requests: &[InferRequestItem],
         extraction_config: Option<&ExtractionConfig>,
         model_symbols: &[ModelSymbol],
+        server_claims: Option<&ServerClaims>,
     ) -> Result<SidecarResponse, SidecarError> {
         self.ensure_ready()?;
 
@@ -3087,6 +3104,12 @@ impl TypeSidecar {
                 .filter(|config| !config.rules.is_empty())
                 .cloned(),
             model_symbols: model_symbols.to_vec(),
+            server_claims: server_claims
+                .filter(|claims| !claims.checks.is_empty())
+                .map(|claims| ServerClaims {
+                    scan_root: claims.scan_root.clone().or_else(|| self.scan_root_arg()),
+                    ..claims.clone()
+                }),
         };
 
         self.send_request(&request)?;
@@ -3454,6 +3477,8 @@ impl TypeSidecar {
     /// * `explicit` - Symbols for explicit type bundling
     /// * `infer` - Requests for type inference
     /// * `extraction_config` - Optional agent-generated unwrap rules
+    /// * `server_claims` - The service's settled server-framework claims
+    ///   (carrick#2674), or `None`
     ///
     /// # Returns
     /// Combined result with both explicit and inferred types.
@@ -3462,6 +3487,7 @@ impl TypeSidecar {
         explicit: &[SymbolRequest],
         infer: &[InferRequestItem],
         extraction_config: Option<&ExtractionConfig>,
+        server_claims: Option<&ServerClaims>,
     ) -> Result<TypeResolutionResult, SidecarError> {
         self.ensure_ready()?;
 
@@ -3483,6 +3509,7 @@ impl TypeSidecar {
                 infer,
                 extraction_config,
                 &producer_response_model_symbols(explicit, infer),
+                server_claims,
             )?;
             if let Some(inferred) = infer_response.inferred_types {
                 result.inferred_types = inferred;
@@ -5059,6 +5086,39 @@ mod tests {
                     symbol_name: "Order".into(),
                     source_file: "src/types.ts".into(),
                 }],
+                server_claims: Some(ServerClaims {
+                    from_dir: "/repo".into(),
+                    scan_root: Some("/repo".into()),
+                    checks: vec![LibraryCheck {
+                        claim_id: "c".into(),
+                        package: "@fixture/server".into(),
+                        export: "response".into(),
+                        role: LibraryRole::ServerFramework,
+                        receiver: "export".into(),
+                        claim: LibraryClaim::Op {
+                            op: LibraryOp::Send,
+                            member: Some("json".into()),
+                            path: vec![],
+                            on: Some(ClaimOn::Export),
+                            of: None,
+                            name: None,
+                            payload: Some(ClaimSlot { arg: 0, key: None }),
+                            handler: None,
+                            ack: None,
+                            key_labels: BTreeMap::new(),
+                            name_scope: None,
+                            picker: None,
+                            options: None,
+                            method: None,
+                            method_key: None,
+                            method_default: None,
+                            base: None,
+                            runs: None,
+                            yields: None,
+                            request: None,
+                        },
+                    }],
+                }),
             },
             SidecarRequest::CaptureV2 {
                 request_id: id(),
