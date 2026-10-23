@@ -3740,7 +3740,6 @@ mod tests {
     /// routes resolve by the facts alone.
     #[test]
     fn the_receiver_trace_records_boundaries_across_services() {
-        use super::super::decided_sites::Prefix;
         use super::super::decided_sites::ScopeLabel;
         use super::super::decided_sites::boundaries::{FAN_OUT, FanOut, resolve};
         let mut facts = Vec::new();
@@ -3782,14 +3781,13 @@ mod tests {
         // The main host: its own routes end at the callback option it
         // writes under `extra`, the plain call of the admin helper hands that
         // callback's scope in, and `register` runs the plugin on the root.
-        // `register`'s own `prefix` slot reads unread on this branch: the
-        // conditional spread opens the whole options object (carrick#2474
-        // R5e reads it as unstated).
+        // `register`'s own `prefix` slot is unstated: no branch of the
+        // conditional spread sets it (carrick#2474 R5e).
         let want_server = texts(&[
             "route packages/server/src/audit.ts:6 GET /audit/events <- @ callback packages/server/src/server.ts:15 arg1.extra p0 runs packages/routes/src/plugin.ts:11 Some(0)",
             "route packages/server/src/audit.ts:7 GET /audit/events/:id <- @ callback packages/server/src/server.ts:15 arg1.extra p0 runs packages/routes/src/plugin.ts:11 Some(0)",
             "call_in packages/routes/src/admin.ts:4 p0 at packages/server/src/server.ts:19 <- (callback packages/server/src/server.ts:15 arg1.extra p0 runs packages/routes/src/plugin.ts:11 Some(0))",
-            "call_in packages/routes/src/plugin.ts:11 p0 at packages/server/src/server.ts:15 [?] <- (top)",
+            "call_in packages/routes/src/plugin.ts:11 p0 at packages/server/src/server.ts:15 [-] <- (top)",
         ]);
         assert_eq!(server, want_server, "{server:#?}");
         // A closed literal that writes no `prefix`: unstated.
@@ -3811,69 +3809,46 @@ mod tests {
         }
         let services: Vec<(&str, &super::super::decided_sites::RouteBoundaries)> =
             facts.iter().map(|(name, facts)| (*name, facts)).collect();
-        let resolved: Vec<String> = resolve(&services, FAN_OUT)
-            .iter()
-            .map(|resolved| {
-                format!(
-                    "{}:{} {} -> {} unread_hosts={} {}",
-                    resolved.file,
-                    resolved.line,
-                    resolved.method,
-                    resolved.paths.join("|"),
-                    resolved.unread_hosts,
-                    resolved.untraced.as_deref().unwrap_or("")
-                )
-                .replace("->  ", "-> ")
-                .trim_end()
-                .to_string()
-            })
-            .collect();
+        let resolved_under = |fan_out: FanOut| -> Vec<String> {
+            resolve(&services, fan_out)
+                .iter()
+                .map(|resolved| {
+                    format!(
+                        "{}:{} {} -> {} unread_hosts={} {}",
+                        resolved.file,
+                        resolved.line,
+                        resolved.method,
+                        resolved.paths.join("|"),
+                        resolved.unread_hosts,
+                        resolved.untraced.as_deref().unwrap_or("")
+                    )
+                    .replace("->  ", "-> ")
+                    .trim_end()
+                    .to_string()
+                })
+                .collect()
+        };
         assert_eq!(FAN_OUT, FanOut::StatedHosts);
-        // The orders route takes the second host's path; the main host's
-        // and the third's prefixes are not read (Q5 (ii)). The callback
-        // routes are filled only by the main host, unread on this branch.
+        // The callback routes, filled only by the main host, compose under
+        // the plugin's own scope from the facts alone. The orders route takes
+        // the paths the first two hosts state; the third's prefix is not read
+        // (Q5 (ii)).
+        let resolved = resolved_under(FAN_OUT);
         let want_resolved = texts(&[
-            "packages/routes/src/admin.ts:5 GET -> unread_hosts=1 unread_prefix",
-            "packages/routes/src/admin.ts:6 POST -> unread_hosts=1 unread_prefix",
-            "packages/routes/src/orders.ts:4 GET -> /api/v1/orders unread_hosts=2",
-            "packages/server/src/audit.ts:6 GET -> unread_hosts=1 unread_prefix",
-            "packages/server/src/audit.ts:7 GET -> unread_hosts=1 unread_prefix",
+            "packages/routes/src/admin.ts:5 GET -> /api/v1/admin/users unread_hosts=0",
+            "packages/routes/src/admin.ts:6 POST -> /api/v1/admin/users unread_hosts=0",
+            "packages/routes/src/orders.ts:4 GET -> /api/v1/orders unread_hosts=1",
+            "packages/server/src/audit.ts:6 GET -> /api/v1/audit/events unread_hosts=0",
+            "packages/server/src/audit.ts:7 GET -> /api/v1/audit/events/:id unread_hosts=0",
         ]);
         assert_eq!(resolved, want_resolved, "{resolved:#?}");
-        // With the main host's `prefix` slot read as unstated (what R5e
-        // reads), the callback routes compose under the plugin's own scope,
-        // from the facts alone.
-        let mut edited = facts.clone();
-        for (_, service) in &mut edited {
-            for call_in in &mut service.call_ins {
-                if call_in.at == "packages/server/src/server.ts:15" {
-                    call_in.host_prefix = Some(Prefix::Unstated);
-                }
-            }
-        }
-        let services: Vec<(&str, &super::super::decided_sites::RouteBoundaries)> =
-            edited.iter().map(|(name, facts)| (*name, facts)).collect();
-        let resolved: Vec<String> = resolve(&services, FAN_OUT)
-            .iter()
-            .map(|resolved| {
-                format!(
-                    "{}:{} {}",
-                    resolved.file,
-                    resolved.line,
-                    resolved.paths.join("|")
-                )
-            })
-            .collect();
-        assert_eq!(
-            resolved,
-            texts(&[
-                "packages/routes/src/admin.ts:5 /api/v1/admin/users",
-                "packages/routes/src/admin.ts:6 /api/v1/admin/users",
-                "packages/routes/src/orders.ts:4 /api/v1/orders",
-                "packages/server/src/audit.ts:6 /api/v1/audit/events",
-                "packages/server/src/audit.ts:7 /api/v1/audit/events/:id",
-            ]),
-            "{resolved:#?}"
+        // Under Q5 (i) the orders route keeps today's reading.
+        let every = resolved_under(FanOut::EveryHost);
+        assert!(
+            every.contains(
+                &"packages/routes/src/orders.ts:4 GET -> unread_hosts=1 unread_host".to_string()
+            ),
+            "{every:#?}"
         );
     }
 
