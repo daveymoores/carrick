@@ -92,7 +92,9 @@ model stated nothing at these:
 | `commands.ts:121` | `POST /api/v1/audit` |
 
 The second scan empties the answers for `commands.ts` and `hooks.ts` and
-walks the compiler's rows (`CARRICK_POSITION_ROWS=1`). Every call into the
+walks the compiler's rows (`CARRICK_POSITION_ROWS=1`); `packages/cli` has a
+`tsconfig.json`, as a TypeScript package does, so the compiler resolves its
+own modules' imports. Every call into the
 client class then states its row from the source alone (`commands.ts` lines
 9, 21, 28, 34, 40, 53, 64, 101, 121 and 164), and so does `tools.ts:9`, whose
 `client` parameter only the compiler types (the table's type gives it one).
