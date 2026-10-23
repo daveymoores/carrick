@@ -1,16 +1,20 @@
-//! The dispatch routes in a scan (carrick#2474 R4a).
+//! The dispatch rows in a scan (carrick#2474 R4b).
 //!
 //! Drives the real scanner binary on `.`, as the Action runs it, over a
 //! committed copy of `tests/fixtures/dispatch-routes/repo` (one root
 //! service), offline, with the fixture's store answer replayed as the
-//! library store's, and the fact layer on (`CARRICK_POSITION_ROWS=1`,
-//! `CARRICK_SITE_QUESTIONS=1`). With `CARRICK_RECEIVER_TRACE=1` the run log
-//! holds one `receiver trace: dispatch route` line per route the answer key
-//! states, and one `receiver trace: handler records` summary (carrick#2474
-//! R4b) with the records key's counts; unset, it holds neither. Neither
-//! reaches anything else: the blobs are the same with the switch and
-//! without it.
+//! library store's, the handler questions answered from
+//! `handler-answers.json` (one repeat of the live test's stored answers,
+//! carrick#2474 comment 6358002149), and the fact layer on
+//! (`CARRICK_POSITION_ROWS=1`, `CARRICK_SITE_QUESTIONS=1`).
+//!
+//! With `CARRICK_RECEIVER_TRACE=1` the blob holds the routes the rows key
+//! (`rows.expected.json`) states, each at its comparison's line, and its
+//! possible calls; the run log holds one `receiver trace: handler records`
+//! summary with the records key's counts. Unset, the blob holds none of
+//! them and the run log no summary.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -47,14 +51,16 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// One scan: its blobs (by file name, the run's own stamps removed) and the
-/// dispatch-route lines of its run log, each as `file:line METHOD path
-/// evidence`, sorted.
+/// One scan: its blobs (by file name, the run's own stamps removed), its
+/// dispatch rows and possible calls, and the handler-records summary lines.
 struct Scan {
     blobs: Vec<(String, String)>,
-    routes: Vec<String>,
-    /// The handler-records summary lines (carrick#2474 R4b), each as
-    /// `records=… asked=… forced=…`.
+    /// Each endpoint row a site answer or the code's settled values state,
+    /// as `file:line METHOD path source`.
+    rows: BTreeSet<String>,
+    /// Each HTTP producer possible call, as `file:line reason`.
+    leads: BTreeSet<String>,
+    /// The summary lines, each as `records=… asked=… forced=…`.
     records: Vec<String>,
 }
 
@@ -69,9 +75,15 @@ fn scan(trace: Option<&str>) -> Scan {
     run_git(&repo, &["commit", "-q", "-m", "init"]);
     let cassettes = tmp.path().join("cassettes");
     std::fs::create_dir_all(cassettes.join("library-claims")).unwrap();
+    std::fs::create_dir_all(cassettes.join("site-questions")).unwrap();
     std::fs::copy(
         fixture_dir().join("library-claims.json"),
         cassettes.join("library-claims/default.json"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixture_dir().join("handler-answers.json"),
+        cassettes.join("site-questions/handler.json"),
     )
     .unwrap();
     let storage = tmp.path().join("storage");
@@ -121,6 +133,8 @@ fn scan(trace: Option<&str>) -> Scan {
         String::from_utf8_lossy(&output.stderr)
     );
     let mut blobs = Vec::new();
+    let mut rows = BTreeSet::new();
+    let mut leads = BTreeSet::new();
     for entry in std::fs::read_dir(&storage).expect("the store reads") {
         let path = entry.expect("dir entry").path();
         if path.extension().is_none_or(|ext| ext != "json") {
@@ -128,6 +142,29 @@ fn scan(trace: Option<&str>) -> Scan {
         }
         let mut blob: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for endpoint in blob["endpoints"].as_array().into_iter().flatten() {
+            let source = endpoint["resolution_source"].as_str().unwrap_or_default();
+            let by_site = endpoint["inference"]["by"] == "site_question";
+            if endpoint["key"]["protocol"] != "http" || !(by_site || source == "library_claim") {
+                continue;
+            }
+            rows.insert(format!(
+                "{} {} {} {source}",
+                endpoint["file_path"].as_str().unwrap(),
+                endpoint["key"]["method"].as_str().unwrap(),
+                endpoint["key"]["path"].as_str().unwrap()
+            ));
+        }
+        for lead in blob["possible_calls"].as_array().into_iter().flatten() {
+            if lead["kind"] == "http" && lead["role"] == "producer" {
+                leads.insert(format!(
+                    "{}:{} {}",
+                    lead["file_path"].as_str().unwrap(),
+                    lead["line_number"],
+                    lead["unread"]["reason"].as_str().unwrap()
+                ));
+            }
+        }
         if let Some(object) = blob.as_object_mut() {
             for stamp in ["scanner_version", "scanner_build", "last_updated"] {
                 object.remove(stamp);
@@ -164,47 +201,21 @@ fn scan(trace: Option<&str>) -> Scan {
             )
         })
         .collect();
-    let mut routes: Vec<String> = logs
-        .iter()
-        .flat_map(|log| {
-            log.lines()
-                .filter_map(|line| line.split_once("receiver trace: dispatch route "))
-                .map(|(_, fields)| {
-                    // `file=… line=… method=… path=… evidence=…`, each value
-                    // written bare.
-                    let field = |name: &str| {
-                        fields
-                            .split(' ')
-                            .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
-                            .unwrap_or_else(|| panic!("no {name} in {fields}"))
-                            .to_string()
-                    };
-                    format!(
-                        "{}:{} {} {} {}",
-                        field("file"),
-                        field("line"),
-                        field("method"),
-                        field("path"),
-                        field("evidence")
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    routes.sort();
     Scan {
         blobs,
-        routes,
+        rows,
+        leads,
         records,
     }
 }
 
+fn key(name: &str) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(fixture_dir().join(name)).unwrap()).unwrap()
+}
+
 /// The records key's counts, as the run log's summary line names them.
 fn key_records() -> Vec<String> {
-    let key: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(fixture_dir().join("records.expected.json")).unwrap(),
-    )
-    .unwrap();
+    let key = key("records.expected.json");
     let read = |what: &str| key["counts"][what].as_u64().unwrap_or_default();
     vec![format!(
         "records={} asked={} forced={}",
@@ -214,46 +225,44 @@ fn key_records() -> Vec<String> {
     )]
 }
 
-/// The answer key's routes, as the run log names them.
-fn key_routes() -> Vec<String> {
-    let key: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(fixture_dir().join("dispatch.expected.json")).unwrap(),
-    )
-    .unwrap();
-    let mut routes: Vec<String> = key["routes"]
+/// The rows key's rows and possible calls.
+fn key_rows(what: &str) -> BTreeSet<String> {
+    key("rows.expected.json")[what]
         .as_array()
         .unwrap()
         .iter()
-        .map(|route| {
-            format!(
-                "{}:{} {} {} {}",
-                route["file"].as_str().unwrap(),
-                route["line"],
-                route["method"].as_str().unwrap_or("-"),
-                route["path"].as_str().unwrap(),
-                route["evidence"]["kind"].as_str().unwrap()
-            )
-        })
-        .collect();
-    routes.sort();
-    routes
+        .map(|line| line.as_str().unwrap().to_string())
+        .collect()
 }
 
-/// carrick#2474 R4a: with the switch set, a scan logs each route the key
-/// states, the same in two scans; unset, none. The routes reach no blob.
+/// carrick#2474 R4b: with the switch set, a scan writes the rows key's
+/// routes, at their comparisons' lines, and its possible calls (beside the
+/// scan's own, which the switch leaves as they are), the same in two scans;
+/// no row carries a method the code did not choose. Unset, none.
 #[test]
-fn a_scan_with_the_receiver_trace_logs_each_dispatch_route() {
+fn a_scan_with_the_receiver_trace_writes_each_dispatch_row() {
     let on = scan(Some("1"));
-    assert_eq!(on.routes, key_routes());
-    let again = scan(Some("1"));
-    assert_eq!(again.routes, on.routes, "two scans log the same routes");
-    assert_eq!(again.blobs, on.blobs, "two scans store the same blobs");
     let off = scan(None);
-    assert!(off.routes.is_empty(), "unset, no route is logged");
-    // carrick#2474 R4b: the handler records are counted in one summary line
-    // per service, the key's counts, and reach no blob.
+    assert_eq!(on.rows, key_rows("rows"));
+    assert!(
+        off.leads.is_subset(&on.leads),
+        "the switch drops none of the scan's own possible calls: {:#?}",
+        off.leads.difference(&on.leads).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        on.leads
+            .difference(&off.leads)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        key_rows("possible_calls")
+    );
     assert_eq!(on.records, key_records());
-    assert_eq!(again.records, on.records);
+    let again = scan(Some("1"));
+    assert_eq!(again.blobs, on.blobs, "two scans store the same blobs");
     assert!(off.records.is_empty(), "unset, no record is counted");
-    assert_eq!(off.blobs, on.blobs, "the records reach no blob");
+    assert!(
+        off.rows.is_empty(),
+        "unset, no dispatch row: {:#?}",
+        off.rows
+    );
 }

@@ -1,0 +1,239 @@
+{
+  "question_set": "57923ce53f90f7c0",
+  "answers": [
+    {
+      "site_id": "handler:entry:src/check.ts:7:check",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "route",
+          "method": null,
+          "path": "/report",
+          "confidence": 0.55,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
+      "site_id": "handler:entry:src/edge.ts:5:handle",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "route",
+          "method": "GET",
+          "path": "/reports",
+          "confidence": 0.97,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
+      "site_id": "handler:entry:src/fake.ts:7:createFake",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "route",
+          "method": null,
+          "path": "/v1/items",
+          "confidence": 0.89,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
+      "site_id": "handler:entry:src/middleware.ts:10:fake",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "route",
+          "method": "GET",
+          "path": "/api/one",
+          "confidence": 0.98,
+          "orders_agree": true
+        },
+        {
+          "id": 1,
+          "choice": "route",
+          "method": "POST",
+          "path": "/api/two",
+          "confidence": 0.98,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
+      "site_id": "handler:entry:src/nested.ts:1:items",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "route",
+          "method": "GET",
+          "path": "/items",
+          "confidence": 0.4,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
+      "site_id": "handler:entry:src/worker.ts:11:default.fetch",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "route",
+          "method": null,
+          "path": "/assets/logo",
+          "confidence": 0.87,
+          "orders_agree": true
+        },
+        {
+          "id": 1,
+          "choice": "route",
+          "method": null,
+          "path": "/assets/font",
+          "confidence": 0.89,
+          "orders_agree": true
+        },
+        {
+          "id": 2,
+          "choice": "route",
+          "method": "GET",
+          "path": "/home",
+          "confidence": 1,
+          "orders_agree": true
+        },
+        {
+          "id": 3,
+          "choice": "route",
+          "method": "POST",
+          "path": "/orders",
+          "confidence": 1,
+          "orders_agree": true
+        },
+        {
+          "id": 4,
+          "choice": "route",
+          "method": null,
+          "path": "/health",
+          "confidence": 1,
+          "orders_agree": true
+        },
+        {
+          "id": 5,
+          "choice": "route",
+          "method": null,
+          "path": "/ready",
+          "confidence": 1,
+          "orders_agree": true
+        },
+        {
+          "id": 6,
+          "choice": "route",
+          "method": null,
+          "path": "/version",
+          "confidence": 1,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
+      "site_id": "handler:label:src/mounted.ts:18:route_files_handler",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "route",
+          "method": null,
+          "path": "/files/list",
+          "confidence": 0.94,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
+      "site_id": "handler:label:src/negatives.ts:41:createLegacyServer_handler",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "route",
+          "method": null,
+          "path": "/legacy",
+          "confidence": 0.98,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
+      "site_id": "handler:label:src/negatives.ts:8:createServer_handler",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "route",
+          "method": "GET",
+          "path": "/mixed",
+          "confidence": 0.89,
+          "orders_agree": true
+        },
+        {
+          "id": 1,
+          "choice": "route",
+          "method": "GET",
+          "path": "/both",
+          "confidence": 0.83,
+          "orders_agree": true
+        },
+        {
+          "id": 2,
+          "choice": "route",
+          "method": "POST",
+          "path": "/either",
+          "confidence": 0.94,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
+      "site_id": "handler:label:src/server.ts:20:route",
+      "ok": true,
+      "routes": [
+        {
+          "id": 3,
+          "choice": "route",
+          "method": null,
+          "path": "/profile",
+          "confidence": 0.98,
+          "orders_agree": true
+        },
+        {
+          "id": 5,
+          "choice": "route",
+          "method": "GET",
+          "path": "/feed",
+          "confidence": 0.9,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
+      "site_id": "handler:shared:src/session.ts:1:requireUser",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "none",
+          "method": null,
+          "path": null,
+          "confidence": 0.28,
+          "orders_agree": true
+        }
+      ]
+    }
+  ]
+}
