@@ -1160,9 +1160,13 @@ fn state_leaves<'g>(
     decider: &mut Decider<'g>,
 ) -> usize {
     let mut reached: HashMap<&DefinitionSite, Option<&'g Reached>> = HashMap::new();
+    // Read before any leaf row is written: two calls on one line state a row
+    // each, and a line another pass holds a row on states none.
+    let occupied = row_lines(service.data);
+    let mut written: HashSet<(String, Operation)> = HashSet::new();
     let mut stated = 0;
     for leaf in &service.sites.leaves {
-        if holds_a_row(service.data, leaf) {
+        if (leaf.line..=leaf.last_line).any(|line| occupied.contains(&(leaf.file.clone(), line))) {
             continue;
         }
         let request = *reached.entry(&leaf.callee).or_insert_with(|| {
@@ -1199,6 +1203,13 @@ fn state_leaves<'g>(
         if !crosses {
             continue;
         }
+        // One row per operation at a line.
+        if !written.insert((
+            format!("{}:{}", leaf.file, leaf.line),
+            operation_of(request),
+        )) {
+            continue;
+        }
         if state_leaf(service.data, leaf, request) {
             stated += 1;
         }
@@ -1206,24 +1217,23 @@ fn state_leaves<'g>(
     stated
 }
 
-/// Whether a row of any source sits on the lines `leaf` spans.
-fn holds_a_row(data: &CloudRepoData, leaf: &LeafCall) -> bool {
-    let on_lines =
-        |file: &str, line: u32| file == leaf.file && leaf.line <= line && line <= leaf.last_line;
+/// Every file and line a row of any source sits on, in the graph or in the
+/// calls.
+fn row_lines(data: &CloudRepoData) -> HashSet<(String, u32)> {
     let in_graph = data
         .mount_graph
         .iter()
         .flat_map(|graph| &graph.data_calls)
-        .filter_map(site_of)
-        .any(|(file, line)| on_lines(file, line));
+        .filter_map(site_of);
+    let in_calls = data.calls.iter().filter_map(|call| {
+        let text = call.file_path.to_str()?;
+        let (file, line) = text.rsplit_once(':')?;
+        Some((file, line.parse().ok()?))
+    });
     in_graph
-        || data.calls.iter().any(|call| {
-            call.file_path
-                .to_string_lossy()
-                .rsplit_once(':')
-                .and_then(|(file, line)| Some((file.to_string(), line.parse().ok()?)))
-                .is_some_and(|(file, line)| on_lines(&file, line))
-        })
+        .chain(in_calls)
+        .map(|(file, line)| (file.to_string(), line))
+        .collect()
 }
 
 /// Write the row `leaf` states for `reached` into the graph and the calls.

@@ -521,11 +521,12 @@ impl RequestSummaryInputs {
     /// as a function another file of the service declares
     /// ([`crate::call_through`]'s leaf calls). A construction (`new
     /// Client()`) is left out: it builds a value and sends nothing itself.
-    /// Sorted by file and span, each call once.
+    /// So is a JSX element: it renders a component, which is no call the
+    /// source writes. Sorted by file and span, each call once.
     pub(crate) fn calls_into_other_files(&self) -> Vec<CallIntoFile> {
         let mut out: Vec<CallIntoFile> = every_call(&self.files)
             .into_iter()
-            .filter(|(_, _, construction)| !construction)
+            .filter(|(_, call, construction)| !construction && !call.jsx)
             .filter_map(
                 |(file, call, _)| match self.reach(file, call.site.lo, call.site.hi) {
                     Reach::Function(target, key) if target != file => Some(CallIntoFile {
