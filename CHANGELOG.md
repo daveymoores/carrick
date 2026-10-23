@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.3.127](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.126...carrick-v0.3.127) (2026-10-23)
+
+
+### Features
+
+* **discovery:** walk into a sibling service's code with its own rows ([#2618](https://github.com/carrick-tools/carrick/issues/2618) slice 1) ([#2643](https://github.com/carrick-tools/carrick/issues/2643)) ([55443fd](https://github.com/carrick-tools/carrick/commit/55443fdb42e523179c43024dbc472ba45b9bb156))
+* **dispatch:** rows, fold and leads from the handler records, the method code's fact (R4b T3b) ([#2689](https://github.com/carrick-tools/carrick/issues/2689)) ([afac8c9](https://github.com/carrick-tools/carrick/commit/afac8c9a92f6951371f3e5f4325ee1a0a1940de3))
+
+
+### Bug Fixes
+
+* **discovery:** a type-only package several packages list stands for each of them ([#2661](https://github.com/carrick-tools/carrick/issues/2661)) ([#2688](https://github.com/carrick-tools/carrick/issues/2688)) ([b37a125](https://github.com/carrick-tools/carrick/commit/b37a125f4a2b570791ff5fc516854e817aff6da5))
+* **scanner:** a part carries only the modules its candidates name on the lines it shows ([#2486](https://github.com/carrick-tools/carrick/issues/2486)) ([#2690](https://github.com/carrick-tools/carrick/issues/2690)) ([5680cb1](https://github.com/carrick-tools/carrick/commit/5680cb1fab3179141ca91864606b9ba831641a74))
+* **sidecar:** a handler's framework-typed parameter is never its response body ([#2685](https://github.com/carrick-tools/carrick/issues/2685)) ([0aedf0f](https://github.com/carrick-tools/carrick/commit/0aedf0fb582a3d6e2dab9d13d9fff83e55382b3c))
+* **sidecar:** a local built from the argument and sent unchanged is the body ([#2684](https://github.com/carrick-tools/carrick/issues/2684)) ([c2c4a56](https://github.com/carrick-tools/carrick/commit/c2c4a56b58bc3047274cd6a7ff0ac6662be69067))
+* **sidecar:** a yields naming the factory reads the instance it made ([#2663](https://github.com/carrick-tools/carrick/issues/2663)) ([#2665](https://github.com/carrick-tools/carrick/issues/2665)) ([a54b4e1](https://github.com/carrick-tools/carrick/commit/a54b4e15487aceeb2df1afa5774f0076e0b56779))
+* **sidecar:** read a route's handler past its middleware and through a wrapper call ([#2472](https://github.com/carrick-tools/carrick/issues/2472) P3-2b) ([#2683](https://github.com/carrick-tools/carrick/issues/2683)) ([19b327f](https://github.com/carrick-tools/carrick/commit/19b327fd400720f4f2322f803f10a9c191123f06))
+* **sidecar:** retype reads a body bound by a .then callback or a Promise.all destructuring ([#2472](https://github.com/carrick-tools/carrick/issues/2472) P3-4) ([#2682](https://github.com/carrick-tools/carrick/issues/2682)) ([f3b6778](https://github.com/carrick-tools/carrick/commit/f3b67784da0a3d03589ca344c880570dd7075012))
+* **trace:** read the arguments before a spread, so a registration with spread handlers is a site ([#2662](https://github.com/carrick-tools/carrick/issues/2662)) ([#2667](https://github.com/carrick-tools/carrick/issues/2667)) ([e87ee05](https://github.com/carrick-tools/carrick/commit/e87ee05f0f9b1b2bdf0e4dedb98a9aa6e8fb37b9))
+
+
+### Refactoring
+
+* **fact-files:** delete reader_only, a kept candidate feeds every pass (F0, [#2440](https://github.com/carrick-tools/carrick/issues/2440)) ([#2679](https://github.com/carrick-tools/carrick/issues/2679)) ([ba466f0](https://github.com/carrick-tools/carrick/commit/ba466f073e2e014b9ec6edba7e053d4e653a6d5d))
+
+
+### CI/CD
+
+* link the linux binaries against glibc 2.28 and check the floor at release ([#2223](https://github.com/carrick-tools/carrick/issues/2223)) ([0a0ea99](https://github.com/carrick-tools/carrick/commit/0a0ea9916301d896e06d68341c711e73ce0b2c69))
+
 ## [0.3.126](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.125...carrick-v0.3.126) (2026-10-23)
 
 
