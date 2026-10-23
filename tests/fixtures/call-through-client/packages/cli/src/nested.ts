@@ -1,5 +1,5 @@
 import { createClient } from "./api-client";
-import { loadPair, localPing, statusNow, statusReader } from "./helpers";
+import { loadPair, localPing, statusNow, statusReader, statusViaReader } from "./helpers";
 
 /** The model states the request at the call written around the client's. */
 export async function showGatheredStatus() {
@@ -32,4 +32,10 @@ export async function showLocalPing() {
 export function makeReader() {
   const read = statusReader();
   return read;
+}
+
+/** The function called writes a reader and runs it. */
+export async function showViaReader() {
+  const status = await statusViaReader();
+  return status;
 }

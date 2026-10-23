@@ -1400,10 +1400,11 @@ struct ReachGraph {
     /// written inside it call.
     calls: HashMap<DefinitionSite, Vec<Edge>>,
     /// Definition -> the calls it makes when it runs: its own, and those of
-    /// the definitions written inside it that it hands to a call of its own
-    /// (`this.send(() => getRun(options))`). A function written inside it and
-    /// handed back or stored (a factory's `const read = () => getRun(..)`)
-    /// is not run by it, and its calls are not here.
+    /// the definitions written inside it that it calls or hands to a call of
+    /// its own (`this.send(() => getRun(options))`). A function written
+    /// inside it and only handed back (a factory's `const read = () =>
+    /// getRun(..); return read`) is not run by it, and its calls are not
+    /// here.
     runs: HashMap<DefinitionSite, Vec<Edge>>,
     /// Definition -> the request rows written inside its lines.
     requests: HashMap<DefinitionSite, Vec<Reached>>,
@@ -1463,9 +1464,10 @@ impl ReachGraph {
                 let (inner_first, inner_last, _) = &definitions[inner];
                 first <= inner_first && inner_last <= last
             };
-            // Handed to a call: a definition around it makes a call on the
-            // line it opens on.
-            let handed: Vec<bool> = (0..definitions.len())
+            // Run by a definition around it: that definition calls it
+            // (`const read = () => ..; await read()`), or makes a call on the
+            // line it opens on, the call it is handed to.
+            let run: Vec<bool> = (0..definitions.len())
                 .map(|inner| {
                     let (inner_first, inner_last, _) = &definitions[inner];
                     definitions
@@ -1474,7 +1476,10 @@ impl ReachGraph {
                         .any(|(around, (first, last, calls))| {
                             (first, last) != (inner_first, inner_last)
                                 && within(around, inner)
-                                && calls.iter().any(|edge| edge.line == *inner_first)
+                                && calls.iter().any(|edge| {
+                                    edge.line == *inner_first
+                                        || (edge.to.file == *file && edge.to.line == *inner_first)
+                                })
                         })
                 })
                 .collect();
@@ -1490,7 +1495,7 @@ impl ReachGraph {
                         continue;
                     }
                     callees.extend(inner_calls.iter().cloned());
-                    if handed[inner] {
+                    if run[inner] {
                         runs.extend(inner_calls.iter().cloned());
                     }
                 }

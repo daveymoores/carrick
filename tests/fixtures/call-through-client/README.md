@@ -115,7 +115,8 @@ it, and `apps/web/src/page.tsx` with `badge.tsx`:
 | `nested.ts:16` | one `GET /api/v1/status` row: two functions called on one line reach the one operation |
 | `nested.ts:21` | none: `loadPair` reaches two operations |
 | `nested.ts:27` | none: `localPing` reaches a request the CLI writes itself (`local-fetch.ts:5`) |
-| `nested.ts:33` | none: `statusReader` writes a function that requests and hands it back unrun; only a function it hands to a call of its own counts as what it runs |
+| `nested.ts:33` | none: `statusReader` writes a function that requests and hands it back unrun; only a function it calls, or hands to a call of its own, counts as what it runs |
+| `nested.ts:39` | `GET /api/v1/status`: `statusViaReader` writes a reader and calls it |
 | `page.tsx:5` | none: a JSX element is no call the source writes |
 | `page.tsx:10` | `GET /api/v1/runs`: the same component called as a function |
 

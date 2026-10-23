@@ -16,6 +16,12 @@ export async function statusNow() {
   return getStatus();
 }
 
+/** Asks for the status through a reader it writes and runs. */
+export async function statusViaReader() {
+  const readNow = () => getStatus();
+  return readNow();
+}
+
 /** Hands back a function that asks for the status; it asks nothing itself. */
 export function statusReader() {
   const read = () => getStatus();

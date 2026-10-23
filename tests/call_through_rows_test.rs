@@ -914,10 +914,7 @@ fn two_calls_of_one_operation_on_one_line_state_one_row() {
 fn no_leaf_row_where_the_callee_reaches_two_operations_its_own_request_or_hands_back_a_reader() {
     for (line, why) in [
         (21, "`loadPair` asks for one run and for every run"),
-        (
-            27,
-            "`localPing` reaches the CLI's own `fetch(\"/api/v1/ping\")`",
-        ),
+        (27, "`localPing` reaches the CLI's own `GET /api/v1/ping`"),
         (33, "`statusReader` hands back `read` unrun"),
     ] {
         let stated: Vec<Row> = rows_in(blobs(), "cli", NESTED, line)
@@ -926,6 +923,16 @@ fn no_leaf_row_where_the_callee_reaches_two_operations_its_own_request_or_hands_
             .collect();
         assert_eq!(stated, [], "{NESTED}:{line}: {why}");
     }
+}
+
+/// A function written inside the callee that the callee itself calls is
+/// what the callee runs.
+#[test]
+fn a_call_into_a_function_that_runs_a_reader_it_writes_states_its_request() {
+    assert_eq!(
+        rows_in(blobs(), "cli", NESTED, 39),
+        [corrected("GET", "/api/v1/status", 23)]
+    );
 }
 
 /// A JSX element renders a component; it is no call the source writes. The
@@ -1042,6 +1049,7 @@ fn a_pull_request_scan_reports_nothing_as_introduced_against_a_main_copy_without
             (COMMANDS, 53),
             (COMMANDS, 121),
             (NESTED, 16),
+            (NESTED, 39),
         ],
     );
     std::fs::write(&path, serde_json::to_string(&cli).unwrap()).unwrap();
