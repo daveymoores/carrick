@@ -224,14 +224,15 @@ export class StatedParams {
   reply(handler: HandlerFunction): StatedReply | undefined {
     if (this.labels.sends.size === 0) return undefined;
     for (const parameter of handler.getParameters()) {
-      const stated = this.statedPayload(parameter);
+      const sends = this.sendsThrough(handler, parameter);
+      const stated = this.statedPayload(parameter, new Set(sends.flatMap((send) => send.keys)));
       if (stated === 'none') continue;
       if (stated === 'abstain') return undefined;
       if (stated.isAny() || stated.isUnknown() || stated.isNever()) return undefined;
       const variants = stated.isUnion() ? stated.getUnionTypes().filter((t) => !t.isNull() && !t.isUndefined()) : [stated];
       const literalUnion = stated.isBoolean() || variants.every((t) => t.isLiteral() || t.isBooleanLiteral());
       if (variants.length <= 1 || literalUnion) return { variants: [stated], at: parameter };
-      const carried = this.successSendsThrough(handler, parameter);
+      const carried = this.successPayloads(sends);
       const kept = variants.filter((variant) => carried.some((sent) => sent.isAssignableTo(variant)));
       return kept.length > 0 ? { variants: kept, at: parameter } : undefined;
     }
@@ -239,11 +240,13 @@ export class StatedParams {
   }
 
   /**
-   * The payload the parameter's labelled send members state: `none` when its
-   * type has no labelled send member, `abstain` when members state different
-   * payloads, else the one payload type.
+   * The payload the labelled send members the handler calls through the
+   * parameter state: `none` when it calls none, `abstain` when they state
+   * different payloads, else the one payload type. A member the handler never
+   * calls (a reply object's status-code send beside its body send) says
+   * nothing about this route.
    */
-  private statedPayload(parameter: ParameterDeclaration): Type | 'none' | 'abstain' {
+  private statedPayload(parameter: ParameterDeclaration, called: ReadonlySet<string>): Type | 'none' | 'abstain' {
     let type: Type;
     try {
       type = parameter.getType();
@@ -253,6 +256,8 @@ export class StatedParams {
     let found = false;
     let payload: Type | undefined;
     for (const property of type.getProperties()) {
+      const keys = property.getDeclarations().map((d) => declarationKey(d.compilerNode));
+      if (!keys.some((key) => called.has(key))) continue;
       const slot = this.sendSlotOf(property.getDeclarations().map((d) => d.compilerNode));
       if (!slot) continue;
       found = true;
@@ -354,23 +359,39 @@ export class StatedParams {
   }
 
   /**
-   * The payloads the handler sends through `parameter` with a success
-   * status: calls of a labelled send member on the parameter, or on a call
-   * chain rooted at it, whose chain states a success status or none.
+   * The calls of a labelled send member the handler makes on `parameter`, or
+   * on a call chain rooted at it (`res.status(201).json(body)`), each with
+   * its payload slot and the keys of the member's declarations.
    */
-  private successSendsThrough(handler: HandlerFunction, parameter: ParameterDeclaration): Type[] {
+  private sendsThrough(
+    handler: HandlerFunction,
+    parameter: ParameterDeclaration
+  ): Array<{ call: CallExpression; slot: ClaimSlot; keys: string[] }> {
     const name = parameter.getNameNode();
     const symbol = Node.isIdentifier(name) ? name.getSymbol() : undefined;
     const body = handler.getBody();
     if (!symbol || !body) return [];
-    const sent: Type[] = [];
+    const sends: Array<{ call: CallExpression; slot: ClaimSlot; keys: string[] }> = [];
     for (const call of body.getDescendantsOfKind(SyntaxKind.CallExpression)) {
       const callee = call.getExpression();
       if (!Node.isPropertyAccessExpression(callee)) continue;
-      const declarations = callee.getNameNode().getSymbol()?.getDeclarations() ?? [];
-      const slot = this.sendSlotOf(declarations.map((d) => d.compilerNode));
+      const declarations = (callee.getNameNode().getSymbol()?.getDeclarations() ?? []).map((d) => d.compilerNode);
+      const slot = this.sendSlotOf(declarations);
       if (!slot) continue;
       if (this.rootSymbol(callee.getExpression()) !== symbol) continue;
+      sends.push({ call, slot, keys: declarations.map(declarationKey) });
+    }
+    return sends;
+  }
+
+  /**
+   * The payloads the sends carry whose chain states a success status or
+   * none. A value typed `any` or `unknown` is assignable to every variant, so
+   * it tells no success body from an error body and is left out.
+   */
+  private successPayloads(sends: ReadonlyArray<{ call: CallExpression; slot: ClaimSlot }>): Type[] {
+    const sent: Type[] = [];
+    for (const { call, slot } of sends) {
       const status = this.chainStatus(call);
       if (status !== undefined && status !== 'success') continue;
       let argument = call.getArguments()[slot.arg];
@@ -383,8 +404,6 @@ export class StatedParams {
         if (!initializer) continue;
         argument = initializer;
       }
-      // A value typed `any` or `unknown` is assignable to every variant,
-      // so it tells no success body from an error body.
       const type = argument.getType();
       if (type.isAny() || type.isUnknown()) continue;
       sent.push(type);

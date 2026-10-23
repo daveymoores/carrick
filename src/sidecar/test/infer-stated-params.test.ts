@@ -146,6 +146,8 @@ export const createOrder = wrap<OrderContract>(async (req, res) => {
     return;
   }
   const created = await create(req.body);
+  res.download('/receipts/latest');
+  res.echo(created);
   res.status(201).json(created);
 });
 
@@ -174,8 +176,9 @@ export interface CoreRequest<Params = any, ReqBody = any> {
   body: ReqBody;
   params: Params;
 }
-export interface CoreResponse<ResBody = any> {
+export interface CoreResponse<ResBody = any, Code extends number = number> {
   json: Send<ResBody, this>;
+  sendCode(code: Code): this;
   download(path: string): this;
   echo<T>(body: ResBody | T): this;
   status(code: number): this;
@@ -220,6 +223,7 @@ const LABELS = [
   send('response', 'json'),
   send('response', 'download'),
   send('response', 'echo'),
+  send('response', 'sendCode'),
 ];
 
 interface Inferred {
