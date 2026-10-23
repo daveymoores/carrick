@@ -649,16 +649,8 @@ function bodyReadsOf(call: CallExpression): CallExpression[] | string {
   const chained = bodyReadOn(top);
   if (chained) return checkedBodyReads([chained]);
 
-  const declaration = top.getParent();
-  if (
-    !declaration ||
-    !Node.isVariableDeclaration(declaration) ||
-    declaration.getInitializer() !== top
-  ) {
-    return [];
-  }
-  const name = declaration.getNameNode();
-  if (!Node.isIdentifier(name)) return [];
+  const name = responseBinding(top);
+  if (!name) return [];
 
   const reads: CallExpression[] = [];
   let handedOn = false;
@@ -686,6 +678,93 @@ function bodyReadsOf(call: CallExpression): CallExpression[] | string {
     return 'the response object is handed on, so its body may be read elsewhere';
   }
   return checkedBodyReads(reads);
+}
+
+/**
+ * The name the located call's response is bound to, when the source binds it
+ * in one of three ways: `const res = await call`, the first parameter of a
+ * `.then` callback (`call.then((res) => res.json())`), or an element of an
+ * array destructured off `Promise.all` (`const [a, b] = await Promise.all([call, ...])`).
+ */
+function responseBinding(top: Node): Identifier | undefined {
+  const declaration = top.getParent();
+  if (declaration && Node.isVariableDeclaration(declaration) && declaration.getInitializer() === top) {
+    const name = declaration.getNameNode();
+    return Node.isIdentifier(name) ? name : undefined;
+  }
+  return thenParameter(top) ?? promiseAllElement(top);
+}
+
+/** `top.then((res) => ...)`: the callback's first parameter. */
+function thenParameter(top: Node): Identifier | undefined {
+  const access = top.getParent();
+  if (!access || !Node.isPropertyAccessExpression(access) || access.getExpression() !== top) {
+    return undefined;
+  }
+  if (access.getName() !== 'then') return undefined;
+  const then = access.getParent();
+  if (!then || !Node.isCallExpression(then) || then.getExpression() !== access) return undefined;
+  const callback = then.getArguments()[0];
+  if (!callback || !(Node.isArrowFunction(callback) || Node.isFunctionExpression(callback))) {
+    return undefined;
+  }
+  const name = callback.getParameters()[0]?.getNameNode();
+  return name && Node.isIdentifier(name) ? name : undefined;
+}
+
+/**
+ * The name `top` is destructured to, when `top` is one element of the array
+ * literal handed to the language library's `Promise.all` and the call's
+ * awaited result is destructured to names:
+ * `const [a, b] = await Promise.all([call, other])`. An element after a
+ * spread has no position the destructuring can be read against.
+ */
+function promiseAllElement(top: Node): Identifier | undefined {
+  const array = top.getParent();
+  if (!array || !Node.isArrayLiteralExpression(array)) return undefined;
+  const elements = array.getElements();
+  const index = elements.indexOf(top as (typeof elements)[number]);
+  if (index < 0 || elements.slice(0, index + 1).some((e) => Node.isSpreadElement(e))) {
+    return undefined;
+  }
+  const all = array.getParent();
+  if (
+    !all ||
+    !Node.isCallExpression(all) ||
+    all.getArguments()[0] !== array ||
+    !isLibraryPromiseAll(all)
+  ) {
+    return undefined;
+  }
+  let result: Node = all;
+  while (
+    Node.isAwaitExpression(result.getParentOrThrow()) ||
+    Node.isParenthesizedExpression(result.getParentOrThrow())
+  ) {
+    result = result.getParentOrThrow();
+  }
+  const declaration = result.getParent();
+  if (!declaration || !Node.isVariableDeclaration(declaration) || declaration.getInitializer() !== result) {
+    return undefined;
+  }
+  const pattern = declaration.getNameNode();
+  if (!Node.isArrayBindingPattern(pattern)) return undefined;
+  const element = pattern.getElements()[index];
+  if (!element || !Node.isBindingElement(element) || element.getDotDotDotToken()) return undefined;
+  const name = element.getNameNode();
+  return Node.isIdentifier(name) ? name : undefined;
+}
+
+/** `Promise.all` as the language library declares it, not a lookalike. */
+function isLibraryPromiseAll(call: CallExpression): boolean {
+  const callee = call.getExpression();
+  if (!Node.isPropertyAccessExpression(callee) || callee.getName() !== 'all') return false;
+  const declaration = resolvedDeclaration(call);
+  if (!declaration) return false;
+  return call
+    .getProject()
+    .getProgram()
+    .compilerObject.isSourceFileDefaultLibrary(declaration.getSourceFile());
 }
 
 /**
