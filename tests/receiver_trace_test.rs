@@ -232,3 +232,72 @@ fn the_scope_trace_writes_nothing_of_its_own() {
         scan_fixture("receiver-scopes", false, None)
     );
 }
+
+/// Why each possible call's path is unread, as `file:line` to reason. A call
+/// whose path is read and whose owner is not is `owner_unknown`.
+fn unread_reasons(blobs: &Blobs) -> BTreeMap<String, String> {
+    blobs
+        .values()
+        .flat_map(|text| {
+            let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+            blob["possible_calls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .map(|call| {
+            (
+                format!(
+                    "{}:{}",
+                    call["file_path"].as_str().unwrap_or_default(),
+                    call["line_number"]
+                ),
+                call["unread"]["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// carrick#2662: a registration with a spread argument is a route site like
+/// any other once the receiver trace is on. The arguments before the spread
+/// read as written (the path is read, so only the owner is unknown, as for a
+/// registration with none), and a slot at or after it reads as unread. The
+/// registrations are on a local instance, on a parameter, and on a router
+/// whose members no declaration verifies for, so only the instance the
+/// maker builds names the op. Without the trace they stay no site.
+#[test]
+fn a_spread_argument_leaves_the_slots_before_it_read() {
+    let on = unread_reasons(&scan_fixture("receiver-spread", true, Some("1")));
+    let off = unread_reasons(&scan_fixture("receiver-spread", true, None));
+    // The registrations with no spread, on the instances the maker builds.
+    for line in ["src/app.ts:20", "src/app.ts:29"] {
+        assert_eq!(on.get(line).map(String::as_str), Some("owner_unknown"));
+        assert_eq!(off.get(line).map(String::as_str), Some("owner_unknown"));
+    }
+    for line in [
+        // A spread of a call after a handler; a spread at the handler slot.
+        "src/app.ts:21",
+        "src/app.ts:22",
+        // The same on the router whose declarations verify nothing.
+        "src/app.ts:30",
+        "src/app.ts:31",
+        // A parameter.
+        "src/spread.ts:15",
+        "src/spread.ts:16",
+    ] {
+        assert_eq!(
+            on.get(line).map(String::as_str),
+            Some("owner_unknown"),
+            "{line}: the path is read and only the owner is unknown"
+        );
+        assert!(!off.contains_key(line), "{line}: no site without the trace");
+    }
+    // With the fact layer off the switch changes no byte.
+    assert_eq!(
+        scan_fixture("receiver-spread", false, Some("1")),
+        scan_fixture("receiver-spread", false, None)
+    );
+}

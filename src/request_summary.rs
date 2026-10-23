@@ -852,6 +852,11 @@ struct CallIr {
     /// a name from a parameter (carrick#1562). `None` when an argument is
     /// spread: it moves every position after it.
     site_args: Option<Vec<SiteArg>>,
+    /// The position of the first spread argument, when the receiver trace is
+    /// on (carrick#2662): a decided site reads the arguments before it as
+    /// written, and every position from it on as unread. `None` without a
+    /// spread, and with the trace off.
+    spread_from: Option<usize>,
     /// The line of the member the call names, or of the callee: where a
     /// library call a caller fills is placed ([`LibrarySite::line`]).
     name_line: u32,
@@ -6711,6 +6716,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             invokes_param,
             receiver,
             site_args,
+            spread_from: library_sites::spread_from(&call.args),
             name_line,
             jsx: false,
             arg_subjects,
@@ -6792,6 +6798,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 invokes_param: None,
                 receiver: None,
                 site_args: None,
+                spread_from: None,
                 name_line: self.reader.line(element.span),
                 jsx: true,
                 arg_subjects: Vec::new(),
