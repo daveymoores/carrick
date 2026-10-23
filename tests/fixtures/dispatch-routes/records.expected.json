@@ -1,14 +1,14 @@
 {
   "counts": {
-    "asked": 16,
-    "comparisons": 29,
+    "asked": 20,
+    "comparisons": 33,
     "forced": 7,
-    "handlers": 15,
-    "holes": 4,
+    "handlers": 18,
+    "holes": 6,
     "methods_in_branch": 2,
     "no_method": 6,
-    "records": 13,
-    "records_asked": 9,
+    "records": 16,
+    "records_asked": 12,
     "records_shared": 1
   },
   "not_attached": {
@@ -19,6 +19,80 @@
     "steps_not_path": 1
   },
   "places": [
+    [
+      {
+        "file": "src/action.ts",
+        "id": 0,
+        "label": null,
+        "line": 10,
+        "served": true,
+        "span_end": 346,
+        "span_start": 320,
+        "within": [
+          {
+            "file": "src/action.ts",
+            "first": 7,
+            "last": 17
+          }
+        ]
+      },
+      {
+        "file": "src/action.ts",
+        "id": 1,
+        "label": null,
+        "line": 13,
+        "served": true,
+        "span_end": 458,
+        "span_start": 422,
+        "within": [
+          {
+            "file": "src/action.ts",
+            "first": 7,
+            "last": 17
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/action.ts",
+        "id": 0,
+        "label": null,
+        "line": 20,
+        "served": true,
+        "span_end": 700,
+        "span_start": 675,
+        "within": [
+          {
+            "file": "src/action.ts",
+            "first": 19,
+            "last": 24
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/action.ts",
+        "id": 0,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 27,
+        "served": true,
+        "span_end": 864,
+        "span_start": 830,
+        "within": [
+          {
+            "file": "src/action.ts",
+            "first": 26,
+            "last": 30
+          }
+        ]
+      }
+    ],
     [
       {
         "file": "src/report.ts",
@@ -611,6 +685,146 @@
     ]
   ],
   "records": [
+    {
+      "asked": [
+        0,
+        1
+      ],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/action.ts:10",
+          "expression": "url.pathname",
+          "hole": null,
+          "id": 0,
+          "literal": "/drafts",
+          "position": "equality",
+          "read": {
+            "param": "request",
+            "steps": [
+              "url",
+              "URL",
+              "pathname"
+            ]
+          }
+        },
+        {
+          "at": "src/action.ts:13",
+          "expression": "clean(request.url)",
+          "hole": {
+            "reason": "unread_expression",
+            "text": "clean(request.url)"
+          },
+          "id": 1,
+          "literal": "/drafts/all",
+          "position": "equality",
+          "read": null
+        }
+      ],
+      "forced": {},
+      "methods": [
+        {
+          "at": "src/action.ts:10",
+          "literal": "PUT"
+        },
+        {
+          "at": "src/action.ts:13",
+          "literal": "DELETE"
+        }
+      ],
+      "scopes": [],
+      "subject": {
+        "at": "src/action.ts:7",
+        "code": "7: export async function act(request: Request): Promise<Response> {\n8:   const body = await request.json();\n9:   const url = new URL(request.url);\n10:   if (body.action === \"PUT\" && url.pathname === \"/drafts\") {\n11:     return new Response(\"saved\");\n12:   }\n13:   if (body.action === \"DELETE\" && clean(request.url) === \"/drafts/all\") {\n14:     return new Response(\"cleared\");\n15:   }\n16:   return new Response(\"not found\", { status: 404 });\n17: }",
+        "key": "act",
+        "kind": "entry",
+        "params": [
+          "request"
+        ]
+      }
+    },
+    {
+      "asked": [
+        0
+      ],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/action.ts:20",
+          "expression": "req.url",
+          "hole": null,
+          "id": 0,
+          "literal": "/drafts/one",
+          "position": "equality",
+          "read": {
+            "param": "req",
+            "steps": [
+              "url"
+            ]
+          }
+        }
+      ],
+      "forced": {},
+      "methods": [
+        {
+          "at": "src/action.ts:20",
+          "literal": "PATCH"
+        }
+      ],
+      "scopes": [],
+      "subject": {
+        "at": "src/action.ts:19",
+        "code": "19: export function patch(req: { url: string; body: { action: string } }): string {\n20:   if (req.body.action === \"PATCH\" && req.url === \"/drafts/one\") {\n21:     return \"patched\";\n22:   }\n23:   return \"not found\";\n24: }",
+        "key": "patch",
+        "kind": "entry",
+        "params": [
+          "req"
+        ]
+      }
+    },
+    {
+      "asked": [
+        0
+      ],
+      "code": [],
+      "comparisons": [
+        {
+          "at": "src/action.ts:27",
+          "expression": "clean(req.url ?? \"/\")",
+          "hole": {
+            "reason": "unread_expression",
+            "text": "clean(req.url ?? \"/\")"
+          },
+          "id": 0,
+          "literal": "/purge",
+          "position": "equality",
+          "read": null
+        }
+      ],
+      "forced": {},
+      "methods": [
+        {
+          "at": "src/action.ts:27",
+          "literal": "DELETE"
+        }
+      ],
+      "scopes": [],
+      "subject": {
+        "at": "src/action.ts:26",
+        "code": "26: createServer((req, res) => {\n27:   if (req.headers[\"x-action\"] === \"DELETE\" && clean(req.url ?? \"/\") === \"/purge\") {\n28:     res.end(\"purged\");\n29:   }\n30: });",
+        "key": "createServer_handler",
+        "kind": "label",
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "params": [
+          "req",
+          "res"
+        ]
+      }
+    },
     {
       "asked": [
         0
@@ -1473,6 +1687,9 @@
     }
   ],
   "settled": [
+    {},
+    {},
+    {},
     {},
     {},
     {},

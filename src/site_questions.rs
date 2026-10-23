@@ -527,50 +527,14 @@ struct RawResponse {
     answers: Vec<Value>,
 }
 
-/// The answers a response body holds, by site id, and its question-set id.
-/// An element that cannot be read is skipped, and its site reads as
-/// unanswered. A body that is not the response's shape holds none.
-pub fn parse_response(text: &str) -> (Option<String>, BTreeMap<String, SiteAnswer>) {
-    let (question_set, answers) = read_response::<SiteQuestion>(text);
-    let answers = answers
-        .into_iter()
-        .map(|(site_id, answer)| {
-            let answer = match answer {
-                Ok(answered) => SiteAnswer::Answered(Box::new(answered)),
-                Err(failed) => SiteAnswer::Failed(failed),
-            };
-            (site_id, answer)
-        })
-        .collect();
-    (question_set, answers)
-}
-
-/// A response body for sites of variant `Q`, read as [`ask`] keeps it: each
-/// answered site, and each failed one with its code.
-pub fn answers_of<Q: Question>(text: &str) -> Answers<Q::Answer> {
-    let (question_set, answers) = read_response::<Q>(text);
-    let mut out = Answers {
-        question_set,
-        ..Answers::default()
-    };
-    for (site_id, answer) in answers {
-        match answer {
-            Ok(answered) => {
-                out.answered.insert(site_id, answered);
-            }
-            Err(failed) => {
-                out.unanswered.insert(site_id, failed);
-            }
-        }
-    }
-    out
-}
-
 /// Each site's answer or failure, by site id.
-type ReadAnswers<A> = BTreeMap<String, Result<A, Unanswered>>;
+pub type ReadAnswers<A> = BTreeMap<String, Result<A, Unanswered>>;
 
-/// [`parse_response`] for sites of variant `Q`.
-fn read_response<Q: Question>(text: &str) -> (Option<String>, ReadAnswers<Q::Answer>) {
+/// The answers a response body for sites of variant `Q` holds, by site id,
+/// and its question-set id. An element that cannot be read is skipped, and
+/// its site reads as unanswered. A body that is not the response's shape
+/// holds none.
+pub fn read_response<Q: Question>(text: &str) -> (Option<String>, ReadAnswers<Q::Answer>) {
     let Ok(raw) = serde_json::from_str::<RawResponse>(text) else {
         return (None, BTreeMap::new());
     };

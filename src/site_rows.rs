@@ -391,6 +391,24 @@ fn agrees(reader: &OperationKey, site: &OperationKey) -> bool {
     }
 }
 
+/// Whether a reader row's key is a dispatch row's: for HTTP the same method
+/// and the same path, as written.
+fn same_route(reader: &OperationKey, site: &OperationKey) -> bool {
+    match (reader, site) {
+        (
+            OperationKey::Http {
+                method: reader_method,
+                path: reader_path,
+            },
+            OperationKey::Http {
+                method: site_method,
+                path: site_path,
+            },
+        ) => reader_method.eq_ignore_ascii_case(site_method) && reader_path == site_path,
+        _ => reader == site,
+    }
+}
+
 /// The decided site a record was built for.
 fn site_of<'d>(decided: &'d Decided, anchors: &TypeAnchors) -> Option<&'d DecidedSite> {
     decided.sites.iter().find(|site| {
@@ -672,8 +690,10 @@ pub fn fold_rows(
             out.withdrawn
                 .push((row.file.clone(), row.line, gone.key, row.side));
         }
-        // A dispatch row: a reader row in its handler that agrees on its key
-        // is the same route read again at another line (carrick#2474 R4b).
+        // A dispatch row: a reader row in its handler with its key is the
+        // same route read again at another line (carrick#2474 R4b). Only the
+        // same key: `/api/:id` or `/api/*` beside a compared `/api/one` is
+        // another route of the handler (carrick#2693).
         let mut index = 0;
         while !row.within.is_empty() && index < rows.len() {
             let inside = place(root, &rows[index]).filter(|(file, line)| {
@@ -683,7 +703,7 @@ pub fn fold_rows(
             });
             match inside {
                 Some((file, line))
-                    if is_reader(&rows[index]) && agrees(&rows[index].key, &row.key) =>
+                    if is_reader(&rows[index]) && same_route(&rows[index].key, &row.key) =>
                 {
                     let gone = rows.remove(index);
                     out.withdrawn.push((file, line, gone.key, row.side));

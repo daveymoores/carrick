@@ -17,9 +17,11 @@
 //!   comparison chooses a route is asked: no label names the request's
 //!   members.
 //!
-//! The method is a method literal compared, not negated, on the same
-//! request: a top-level `&&` operand of the same test, or a guard (an `if`
-//! test operand or a `case`) whose branch holds the path comparison. For a
+//! The method is a method literal compared, not negated, with the same
+//! request's method member (carrick#2693: a literal compared with another
+//! value, such as a body's `action`, chooses no method): a top-level `&&`
+//! operand of the same test, or a guard (an `if` test operand or a `case`)
+//! whose branch holds the path comparison. For a
 //! predicate the comparison is first looked for in the predicate, then at
 //! the caller's call that tests it. A `startsWith` literal states a scope,
 //! never a route. Every comparison that reaches no handler is counted by a
@@ -36,27 +38,14 @@ use serde::Serialize;
 use super::Site;
 use super::decided_sites::{ArgSlot, DiscoverySite, LabelledEnd, SiteLabel};
 use super::guards::{
-    ChainEnd, ChainFacts, Chains, GuardBranch, GuardChain, GuardIr, GuardPosition, Handoff, Step,
+    ChainEnd, ChainFacts, Chains, EntryAt, GuardBranch, GuardChain, GuardIr, GuardPosition,
+    Handoff, Step,
 };
 use crate::services::type_sidecar::RequestAt;
+use crate::site_questions::SubjectLabel;
 
 mod records;
 pub use records::{ComparisonPlace, HandlerRecords, HoleReach, LineRange, handler_records};
-
-/// What makes a comparison a route.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Evidence {
-    /// The labelled `receive` call the handler is handed to, at `file:line`.
-    Label {
-        package: String,
-        export: String,
-        member: Option<String>,
-        at: String,
-    },
-    /// The function nothing in the repository calls, at `file:line`.
-    EntryPoint { function: String, at: String },
-}
 
 /// The request parameter a comparison reads, and the accesses down from it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -78,7 +67,8 @@ enum Anchor {
 #[derive(Clone)]
 struct Reached {
     anchor: Anchor,
-    evidence: Evidence,
+    /// The labelled `receive` call's label (label arm only).
+    label: Option<SubjectLabel>,
     request: RequestRead,
     /// The label's method member path, as steps (label arm only).
     method_steps: Option<Vec<Step>>,
@@ -183,23 +173,15 @@ impl Reader<'_, '_> {
             return self.labelled(chain, handoff);
         }
         match (&chain.end, &facts.entry) {
-            (ChainEnd::EntryPoint { function, .. }, Some(entry)) => {
-                let node = &self.chains.nodes[entry.node];
-                let file = self.chains.rel(node.file);
-                let line = self.chains.line_of(entry.node);
-                Ok(Reached {
-                    anchor: Anchor::Entry(entry.node, entry.param),
-                    evidence: Evidence::EntryPoint {
-                        function: function.clone(),
-                        at: format!("{file}:{line}"),
-                    },
-                    request: RequestRead {
-                        param: entry.param,
-                        steps: entry.steps.iter().map(Step::render).collect(),
-                    },
-                    method_steps: None,
-                })
-            }
+            (ChainEnd::EntryPoint { .. }, Some(entry)) => Ok(Reached {
+                anchor: Anchor::Entry(entry.node, entry.param),
+                label: None,
+                request: RequestRead {
+                    param: entry.param,
+                    steps: entry.steps.iter().map(Step::render).collect(),
+                },
+                method_steps: None,
+            }),
             (ChainEnd::Hole { .. }, _) => Err(format!("hole:{}", end_kind(&chain.end))),
             (end, _) => Err(format!("end:{}", end_kind(end))),
         }
@@ -255,6 +237,55 @@ impl Reader<'_, '_> {
     /// The label arm: the handoff call is a labelled `receive` whose label
     /// names the handler slot, the request parameter and the path read.
     fn labelled(&self, chain: &GuardChain, handoff: &Handoff) -> Result<Reached, String> {
+        let (end, request) = self.request_of(chain, handoff)?;
+        if !reads_path(&handoff.steps, request) {
+            return Err("steps_not_path".to_string());
+        }
+        Ok(Reached {
+            anchor: Anchor::Call(
+                handoff.caller,
+                handoff.site.span_start,
+                handoff.site.span_end,
+                handoff.param,
+            ),
+            label: Some(SubjectLabel {
+                package: end.package.clone(),
+                export: end.export.clone(),
+                member: end.member.clone(),
+            }),
+            request: RequestRead {
+                param: handoff.param,
+                steps: handoff.steps.iter().map(Step::render).collect(),
+            },
+            method_steps: request.method.as_deref().map(key_steps),
+        })
+    }
+
+    /// Whether a method literal's `chain` reads the request's method member
+    /// (carrick#2693): on the label arm the member the label names, read off
+    /// the label's request parameter; at an entry point the request's own
+    /// `method` ([`reads_entry_method`]). A chain that ends at a hole reads
+    /// no member the code shows.
+    fn reads_method(&self, chain: &GuardChain, facts: &ChainFacts) -> bool {
+        if let Some(handoff) = &facts.handoff {
+            return self.request_of(chain, handoff).is_ok_and(|(_, request)| {
+                request.method.as_deref().is_some_and(|method| {
+                    read_steps(&handoff.steps) == key_steps(method).as_slice()
+                })
+            });
+        }
+        matches!(chain.end, ChainEnd::EntryPoint { .. })
+            && facts.entry.as_ref().is_some_and(reads_entry_method)
+    }
+
+    /// The labelled `receive` call a chain is handed to and the request its
+    /// one label names, at the handler slot and request parameter the chain
+    /// was handed in.
+    fn request_of(
+        &self,
+        chain: &GuardChain,
+        handoff: &Handoff,
+    ) -> Result<(&LabelledEnd, &RequestAt), String> {
         let chains = self.chains;
         let file = chains.rel(chains.nodes[handoff.caller].file);
         let Some(end) = self.end_at(&file, handoff) else {
@@ -290,49 +321,29 @@ impl Reader<'_, '_> {
         if request.param as usize != handoff.param {
             return Err("request_param_mismatch".to_string());
         }
-        if !reads_path(&handoff.steps, request) {
-            return Err("steps_not_path".to_string());
-        }
-        Ok(Reached {
-            anchor: Anchor::Call(
-                handoff.caller,
-                handoff.site.span_start,
-                handoff.site.span_end,
-                handoff.param,
-            ),
-            evidence: Evidence::Label {
-                package: end.package.clone(),
-                export: end.export.clone(),
-                member: end.member.clone(),
-                at: end.at(),
-            },
-            request: RequestRead {
-                param: handoff.param,
-                steps: handoff.steps.iter().map(Step::render).collect(),
-            },
-            method_steps: request.method.as_deref().map(key_steps),
-        })
+        Ok((end, request))
     }
 }
 
-/// The methods a path comparison qualifies: the code chooses one, or it
-/// does not (none, or several, such as `case "GET": case "HEAD":` sharing
-/// one branch or methods that disagree).
-enum Methods {
-    None,
-    One(String),
-    Several,
+/// Whether an entry point's chain reads its request's `method`: the member
+/// the web platform's `Request` and Node's `IncomingMessage` both hold the
+/// method at (String methods after it dropped).
+fn reads_entry_method(entry: &EntryAt) -> bool {
+    read_steps(&entry.steps) == [Step::Key("method".to_string())]
 }
 
 /// The method a path guard's route states: looked for at the comparison,
 /// then, for a predicate's comparison, at the caller's call that tests it.
+/// `None` when the code chooses no one method (none qualifies, or several,
+/// such as `case "GET": case "HEAD":` sharing one branch or methods that
+/// disagree).
 fn method_of(
     node: usize,
     guard: &GuardIr,
     facts: &ChainFacts,
     reached: &Reached,
     methods: &HashMap<usize, Vec<MethodGuard<'_>>>,
-) -> Methods {
+) -> Option<String> {
     method_reaching(node, guard, facts, methods, &|candidate| {
         candidate
             .chains
@@ -350,7 +361,7 @@ fn method_reaching(
     facts: &ChainFacts,
     methods: &HashMap<usize, Vec<MethodGuard<'_>>>,
     reaches: &dyn Fn(&MethodGuard<'_>) -> bool,
-) -> Methods {
+) -> Option<String> {
     let own = Decision {
         node,
         span: (guard.site.lo, guard.site.hi),
@@ -378,9 +389,8 @@ fn method_reaching(
     each.sort();
     each.dedup();
     match each.len() {
-        0 => Methods::None,
-        1 => Methods::One(each.remove(0)),
-        _ => Methods::Several,
+        1 => each.pop(),
+        _ => None,
     }
 }
 
@@ -415,7 +425,8 @@ fn qualifying(
 
 /// Whether a method guard's chain reaches the request the route does: the
 /// same handoff call and parameter, reading the label's method member; or
-/// the same entry function and parameter.
+/// the same entry function and parameter, reading its `method`
+/// ([`reads_entry_method`], carrick#2693).
 fn reaches_same(facts: &ChainFacts, reached: &Reached) -> bool {
     match &reached.anchor {
         Anchor::Call(caller, start, end, param) => {
@@ -430,10 +441,9 @@ fn reaches_same(facts: &ChainFacts, reached: &Reached) -> bool {
         }
         Anchor::Entry(node, param) => {
             facts.handoff.is_none()
-                && facts
-                    .entry
-                    .as_ref()
-                    .is_some_and(|entry| entry.node == *node && entry.param == *param)
+                && facts.entry.as_ref().is_some_and(|entry| {
+                    entry.node == *node && entry.param == *param && reads_entry_method(entry)
+                })
         }
     }
 }
@@ -964,7 +974,25 @@ mod census {
                 .and_then(|dir| {
                     std::fs::read_to_string(Path::new(&dir).join(format!("{label}.json"))).ok()
                 })
-                .map(|text| crate::site_questions::answers_of::<HandlerQuestion>(&text));
+                .map(|text| {
+                    let (question_set, read) =
+                        crate::site_questions::read_response::<HandlerQuestion>(&text);
+                    let mut answers = HandlerAnswers {
+                        question_set,
+                        ..HandlerAnswers::default()
+                    };
+                    for (site_id, answer) in read {
+                        match answer {
+                            Ok(routes) => {
+                                answers.answered.insert(site_id, routes);
+                            }
+                            Err(failed) => {
+                                answers.unanswered.insert(site_id, failed);
+                            }
+                        }
+                    }
+                    answers
+                });
             let (census, asked, what_if) = census_repo(
                 Path::new(root),
                 Path::new(positions),

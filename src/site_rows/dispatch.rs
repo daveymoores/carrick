@@ -20,8 +20,9 @@
 //!   (`below_band`), method unstated (`no_method`), a path the handler does
 //!   not see whole (`owner_unknown`). `none` in band states nothing.
 //! - **The fold** ([`super::fold_rows`]): a dispatch row also replaces a
-//!   reader endpoint row in its handler whose key agrees, at another line
-//!   ([`SiteRow::within`]).
+//!   reader endpoint row in its handler with the same key, at another line
+//!   ([`SiteRow::within`]); a reader row of another route the handler
+//!   serves (`/api/:id` beside `/api/one`) stands.
 //!
 //! Plan: carrick#2386 comment 6341789125, sections 1-2; ruling:
 //! carrick#2474 comment 6358002149.
@@ -129,21 +130,18 @@ fn instead(place: &ComparisonPlace, reason: UnreadReason) -> Box<PossibleCall> {
     Box::new(lead(place, reason))
 }
 
-/// The row a comparison states with `method`, or the possible call it is
-/// when the method is none a route is served under.
+/// The row a comparison states with `method`, an HTTP method the code
+/// compared.
 fn row(
     place: &ComparisonPlace,
     method: &str,
     path: &str,
     inference: Option<SiteInference>,
-) -> Stated<SiteRow> {
-    if !crate::type_manifest::is_producer_method(method) {
-        return Err(instead(place, UnreadReason::NoMethod));
-    }
+) -> SiteRow {
     let in_band = inference
         .as_ref()
         .is_none_or(|answer| answer.confidence >= BAND && answer.orders_agree);
-    Ok(SiteRow {
+    SiteRow {
         file: place.file.clone(),
         line: place.line,
         key: OperationKey::http(method, path),
@@ -171,7 +169,7 @@ fn row(
         lead: lead(place, UnreadReason::BelowBand),
         needs_reader: false,
         within: place.within.clone(),
-    })
+    }
 }
 
 /// The rows and possible calls `records` come to with `answers`.
@@ -221,7 +219,7 @@ pub fn dispatch_rows(records: &HandlerRecords, answers: &HandlerAnswers) -> Disp
                 match (place.served, forced.method.as_deref()) {
                     (false, _) => Err(instead(place, UnreadReason::OwnerUnknown)),
                     (true, None) => Err(instead(place, UnreadReason::NoMethod)),
-                    (true, Some(method)) => row(place, method, path, None).map(Some),
+                    (true, Some(method)) => Ok(Some(row(place, method, path, None))),
                 }
             };
             match stated_row {
@@ -264,7 +262,7 @@ fn asked(
         }
         RouteChoice::None | RouteChoice::CantTell => Err(instead(place, UnreadReason::BelowBand)),
         RouteChoice::Route => match (place.served, method) {
-            (true, Some(method)) => row(
+            (true, Some(method)) => Ok(Some(row(
                 place,
                 method,
                 path,
@@ -274,8 +272,7 @@ fn asked(
                     confidence: answer.confidence,
                     orders_agree: answer.orders_agree,
                 }),
-            )
-            .map(Some),
+            ))),
             _ if !in_band => Err(instead(place, UnreadReason::BelowBand)),
             (false, _) => Err(instead(place, UnreadReason::OwnerUnknown)),
             (true, None) => Err(instead(place, UnreadReason::NoMethod)),
@@ -678,6 +675,51 @@ mod tests {
         let fold = fold_rows(&mut Vec::new(), &mut endpoints, &site, Path::new("."), make);
         assert_eq!(endpoints.len(), 2);
         assert!(fold.withdrawn.is_empty());
+    }
+
+    /// carrick#2693: the fold takes a reader row of the dispatch row's own
+    /// key only. A reader row of a parameter or wildcard route in the same
+    /// handler (`GET /api/:id`, `GET /api/*` beside a compared `GET
+    /// /api/one`) is another route the handler serves, and stands.
+    #[test]
+    fn a_dispatch_row_folds_only_its_own_key() {
+        let records = handler(&[(12, "/api/one", Some("GET"))], true);
+        let answers = answered(&records, vec![answer(0, RouteChoice::Route, None, 0.98)]);
+        let site = SiteRows {
+            enabled: true,
+            rows: dispatch_rows(&records, &answers).rows,
+            ..SiteRows::default()
+        };
+        let mut endpoints = vec![
+            reader(OperationKey::http("GET", "/api/one"), 10),
+            reader(OperationKey::http("GET", "/api/:id"), 10),
+            reader(OperationKey::http("GET", "/api/*"), 11),
+        ];
+        let fold = fold_rows(&mut Vec::new(), &mut endpoints, &site, Path::new("."), make);
+        let mut left: Vec<(String, OperationKey)> = endpoints
+            .iter()
+            .map(|row| {
+                (
+                    row.file_path.to_string_lossy().into_owned(),
+                    row.key.clone(),
+                )
+            })
+            .collect();
+        left.sort_by_key(|(file, key)| (file.clone(), format!("{key:?}")));
+        assert_eq!(
+            left,
+            vec![
+                (format!("{FILE}:10"), OperationKey::http("GET", "/api/:id")),
+                (format!("{FILE}:11"), OperationKey::http("GET", "/api/*")),
+                (format!("{FILE}:12"), OperationKey::http("GET", "/api/one")),
+            ]
+        );
+        let withdrawn: Vec<(u32, OperationKey)> = fold
+            .withdrawn
+            .iter()
+            .map(|(_, line, key, _)| (*line, key.clone()))
+            .collect();
+        assert_eq!(withdrawn, vec![(10, OperationKey::http("GET", "/api/one"))]);
     }
 
     /// A record asking more than [`MAX_ASKED_COMPARISONS`] goes in parts
