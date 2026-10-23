@@ -3,9 +3,9 @@
  * a local and forwards that local, unchanged, to a helper that sends it as the
  * body.
  *
- *   export async function createRate(token, org, input: RateInput) {
- *     const payload: RateInput = { source: norm(input.source), rate: input.rate };
- *     return await post<Res>(token, `/v1/${org}/rates`, payload);
+ *   export async function createPrice(token, org, input: PriceInput) {
+ *     const payload: PriceInput = { label: norm(input.label), amount: input.amount };
+ *     return await post<Res>(token, `/v1/${org}/prices`, payload);
  *   }
  *
  * The body sent is the local, so the request is the local's type. It is not
@@ -44,24 +44,24 @@ async function wrapPost(path: string, item: object) {
   return fetch(BASE + path, { method: 'POST', body: JSON.stringify({ item }) });
 }
 
-export interface RateInput {
-  source: string | null;
-  rate: number | null;
+export interface PriceInput {
+  label: string | null;
+  amount: number | null;
 }
 
-export async function createRate(token: string, org: number, input: RateInput) {
-  const payload: RateInput = { source: norm(input.source ?? ''), rate: input.rate };
-  return await post<{ id: string }>(token, \`/v1/\${org}/rates\`, payload);
+export async function createPrice(token: string, org: number, input: PriceInput) {
+  const payload: PriceInput = { label: norm(input.label ?? ''), amount: input.amount };
+  return await post<{ id: string }>(token, \`/v1/\${org}/prices\`, payload);
 }
 
-export interface EntryInput {
-  journal: string;
-  currency?: string;
+export interface OrderInput {
+  owner: string;
+  code?: string;
 }
 
-export async function createEntry(token: string, org: number, entry: EntryInput) {
-  const payload = entry.currency == null ? entry : { ...entry, currency: norm(entry.currency) };
-  return await post<{ id: string }>(token, \`/v1/\${org}/entries\`, payload);
+export async function createOrder(token: string, org: number, order: OrderInput) {
+  const payload = order.code == null ? order : { ...order, code: norm(order.code) };
+  return await post<{ id: string }>(token, \`/v1/\${org}/orders\`, payload);
 }
 
 export async function notify(message: { text: string; channel?: string }) {
@@ -93,11 +93,11 @@ export async function logOnly(token: string, change: { name: string }) {
 }
 `;
 
-const CALLS_TS = `import { createRate, createEntry, notify, wrapItem, sendAndWrap, sendAndForward, logOnly } from './api';
+const CALLS_TS = `import { createPrice, createOrder, notify, wrapItem, sendAndWrap, sendAndForward, logOnly } from './api';
 
 export async function run(token: string, org: number, id: string) {
-  await createRate(token, org, { source: id, rate: 1 });
-  await createEntry(token, org, { journal: id, currency: 'eur' });
+  await createPrice(token, org, { label: id, amount: 1 });
+  await createOrder(token, org, { owner: id, code: 'ab' });
   await notify({ text: id });
   await wrapItem({ label: id });
   await sendAndWrap(token, { code: id });
@@ -178,13 +178,13 @@ describe('carrick#2671: a function that forwards a local copy of its argument to
   }
 
   it('reads the declared local a function builds from its argument and forwards to a helper that sends it', async () => {
-    const body = await request('{ source: id, rate: 1 }');
-    assert.strictEqual(body, '{ source: null | string; rate: null | number; }');
+    const body = await request('{ label: id, amount: 1 }');
+    assert.strictEqual(body, '{ label: null | string; amount: null | number; }');
   });
 
   it('reads a local that is the argument or a copy of it with one field rewritten', async () => {
-    const body = await request("{ journal: id, currency: 'eur' }");
-    assert.strictEqual(body, '{ journal: string; currency?: string; }');
+    const body = await request("{ owner: id, code: 'ab' }");
+    assert.strictEqual(body, '{ owner: string; code?: string; }');
   });
 
   it('reads the body a function builds into a local and sends itself, never the argument', async () => {
