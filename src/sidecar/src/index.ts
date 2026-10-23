@@ -79,6 +79,13 @@ interface ProjectComponents {
   typeInferrer: TypeInferrer;
   retyper: Retyper;
   claimsVerifier: LibraryClaimsVerifier;
+  /**
+   * carrick#2674: the members a set of server claims names in this program,
+   * by the claims' text. Read once: a scan sends its claims with every
+   * `infer` batch, and each reading adds a probe file, so the program is
+   * built again.
+   */
+  labelledMembers: Map<string, LabelledMembers>;
 }
 
 /**
@@ -161,6 +168,7 @@ function projectComponents(key = ''): ProjectComponents {
         packageDirectoryOf: (file) => loader.packageDirectoryOf(file),
         resolveModule: (name, from, options) => loader.resolveThroughGraph(name, from, options),
       }),
+      labelledMembers: new Map(),
     };
     components.set(key, built);
   }
@@ -467,8 +475,12 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
   }
 }
 
-/** How long reading one program's server-framework labels may take on an `infer` request. */
-const SERVER_CLAIMS_BUDGET_MS = 60_000;
+/**
+ * How long reading one program's server-framework labels may take: as
+ * long as a verify_library_claims request, since the first reading pays the
+ * program build. Labels it does not reach are not read.
+ */
+const SERVER_CLAIMS_BUDGET_MS = 600_000;
 
 /**
  * carrick#2674: the members an `infer` request's server-framework claims
@@ -480,14 +492,21 @@ function labelledMembersFor(
   claims: ServerClaims | undefined
 ): LabelledMembers | undefined {
   if (!claims || claims.checks.length === 0) return undefined;
-  const fromDir = path.resolve(projectLoader!.getRepoRoot(), claims.from_dir);
-  return built.claimsVerifier.labelledMembers(
-    fromDir,
-    claims.checks,
-    SERVER_CLAIMS_BUDGET_MS,
-    claims.scan_root,
-    claims.type_packages
-  );
+  const key = JSON.stringify(claims);
+  let labels = built.labelledMembers.get(key);
+  if (!labels) {
+    const fromDir = path.resolve(projectLoader!.getRepoRoot(), claims.from_dir);
+    labels = built.claimsVerifier.labelledMembers(
+      fromDir,
+      claims.checks,
+      SERVER_CLAIMS_BUDGET_MS,
+      claims.scan_root,
+      claims.type_packages
+    );
+    log(`Read ${labels.sends.size} labelled send and ${labels.bodies.size} body member(s) for handler parameters`);
+    built.labelledMembers.set(key, labels);
+  }
+  return labels;
 }
 
 /**
