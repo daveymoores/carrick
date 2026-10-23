@@ -75,4 +75,32 @@ scanner reads that row off the source and this pass never touches it.
 `commands.ts:101` reaches a request the API serves under another verb, which
 is the finding the pull request test reads.
 
+## Calls the model stated no row at
+
+A call into a function of its own service that another file declares, where
+that function itself calls into another service and the walk from it reaches
+exactly one request there, states that request at its own line, with the
+source `request_summary`, the role `wrapper_call` and `reaches_request`,
+whether or not the model stated a row there. With the cassette as it is, the
+model stated nothing at these:
+
+| Site | Reached |
+|---|---|
+| `commands.ts:34` | `GET /api/v1/token` |
+| `commands.ts:40` | `PUT /api/v1/runs/:id` |
+| `commands.ts:53` | `GET /api/v1/runs/:id` and `GET /api/v1/runs`: two calls, one row each |
+| `commands.ts:121` | `POST /api/v1/audit` |
+
+The second scan empties the answers for `commands.ts` and `hooks.ts` and
+walks the compiler's rows (`CARRICK_POSITION_ROWS=1`). Every call into the
+client class then states its row from the source alone (`commands.ts` lines
+9, 21, 28, 34, 40, 53, 64, 101, 121 and 164), and so does `tools.ts:9`, whose
+`client` parameter only the compiler types (the table's type gives it one).
+None is stated at a call one hop further up (`commands.ts:15` and `:46` call
+a command of the same file, `:57` a helper of the same file that reaches two
+operations), at a call nothing resolves (`commands.ts:70`), or in
+`hooks.ts`: the hooks call the client package directly, and `withSpinner`
+(`:19`) only runs the callback it is handed, so no function of the web's own
+calls into the other service on their behalf.
+
 Driven by `tests/call_through_rows_test.rs`.

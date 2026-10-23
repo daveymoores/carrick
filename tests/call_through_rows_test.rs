@@ -22,6 +22,7 @@ const SERVICES: [&str; 4] = ["api", "cli", "client", "web"];
 const COMMANDS: &str = "packages/cli/src/commands.ts";
 const HOOKS: &str = "apps/web/src/hooks.ts";
 const REQUESTS: &str = "packages/client/src/requests.ts";
+const TOOLS: &str = "packages/cli/src/tools.ts";
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/call-through-client")
@@ -55,8 +56,14 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 /// A committed copy of the fixture under `tmp`.
 fn committed_copy(tmp: &Path) -> PathBuf {
+    committed_copy_with(tmp, |_| {})
+}
+
+/// A committed copy of the fixture under `tmp`, `edit`ed before the commit.
+fn committed_copy_with(tmp: &Path, edit: impl FnOnce(&Path)) -> PathBuf {
     let repo = tmp.join("workspace");
     copy_dir(&fixture_dir(), &repo);
+    edit(&repo);
     run_git(&repo, &["init", "-q"]);
     run_git(&repo, &["add", "-A"]);
     run_git(&repo, &["commit", "-q", "-m", "init"]);
@@ -222,8 +229,17 @@ fn data_calls(service: &str) -> &'static Vec<serde_json::Value> {
 
 /// The one call row of `service` at `file:line`.
 fn row_at(service: &str, file: &str, line: u32) -> Row {
+    let rows = rows_in(blobs(), service, file, line);
+    assert_eq!(rows.len(), 1, "one row at {file}:{line}, got {rows:?}");
+    rows.into_iter().next().unwrap()
+}
+
+/// Every call row of `service` at `file:line` in `blobs`, sorted by path.
+fn rows_in(blobs: &Blobs, service: &str, file: &str, line: u32) -> Vec<Row> {
     let site = format!("{file}:{line}");
-    let rows: Vec<Row> = data_calls(service)
+    let mut rows: Vec<Row> = blobs[service]["mount_graph"]["data_calls"]
+        .as_array()
+        .expect("the blob holds a mount graph")
         .iter()
         .filter(|call| call["file_location"] == site.as_str())
         .map(|call| Row {
@@ -235,8 +251,8 @@ fn row_at(service: &str, file: &str, line: u32) -> Row {
             reaches: text(&call["reaches_request"]),
         })
         .collect();
-    assert_eq!(rows.len(), 1, "one row at {site}, got {rows:?}");
-    rows.into_iter().next().unwrap()
+    rows.sort_by(|a, b| (&a.path, &a.method).cmp(&(&b.path, &b.method)));
+    rows
 }
 
 /// A row that took the operation of the request written at `REQUESTS:line`.
@@ -739,6 +755,130 @@ fn the_boundary_counts_the_settled_rows() {
     }
 }
 
+/// A call into the client class the model stated no row at states the request
+/// it reaches from the source alone.
+#[test]
+fn a_call_into_the_client_the_model_left_unstated_states_the_request_it_reaches() {
+    for (line, method, path, request_line) in [
+        (34, "GET", "/api/v1/token", 14),
+        (40, "PUT", "/api/v1/runs/:id", 11),
+        (121, "POST", "/api/v1/audit", 17),
+    ] {
+        assert_eq!(
+            row_at("cli", COMMANDS, line),
+            corrected(method, path, request_line),
+            "{COMMANDS}:{line}"
+        );
+    }
+    // Two calls on one line state a row each.
+    assert_eq!(
+        rows_in(blobs(), "cli", COMMANDS, 53),
+        [
+            corrected("GET", "/api/v1/runs", 8),
+            corrected("GET", "/api/v1/runs/:id", 5),
+        ]
+    );
+    // Without the compiler's rows nothing types the table's parameter.
+    assert_eq!(rows_in(blobs(), "cli", TOOLS, 9), []);
+}
+
+/// The fixture with the model's answers for the CLI's commands and the web's
+/// hooks emptied, scanned once with the compiler's rows: every row at a call
+/// through the client class is then the source's alone.
+fn unanswered() -> &'static Blobs {
+    static SCAN: OnceLock<Blobs> = OnceLock::new();
+    SCAN.get_or_init(|| {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let repo = committed_copy_with(tmp.path(), |repo| {
+            let empty = serde_json::json!({
+                "mounts": [], "endpoints": [], "data_calls": [], "pubsub_operations": []
+            });
+            for answer in ["commands.json", "hooks.json"] {
+                std::fs::write(
+                    repo.join("__llm__/analyze-file").join(answer),
+                    serde_json::to_string_pretty(&empty).unwrap(),
+                )
+                .unwrap();
+            }
+        });
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut cmd = scan_command(&repo, &storage);
+        cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+            .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
+            .env("CARRICK_POSITION_ROWS", "1")
+            .env("HOME", &home);
+        run(cmd);
+        read_blobs(&storage)
+            .into_iter()
+            .map(|(service, (_, blob))| (service, blob))
+            .collect()
+    })
+}
+
+#[test]
+fn every_call_into_the_client_states_its_request_with_no_model_row() {
+    let blobs = unanswered();
+    for (file, line, method, path, request_line) in [
+        (COMMANDS, 9, "GET", "/api/v1/runs/:id", 5),
+        (COMMANDS, 21, "GET", "/api/v1/runs", 8),
+        (COMMANDS, 28, "GET", "/api/v1/status", 23),
+        (COMMANDS, 34, "GET", "/api/v1/token", 14),
+        (COMMANDS, 40, "PUT", "/api/v1/runs/:id", 11),
+        // The client's own probe is a side request.
+        (COMMANDS, 64, "GET", "/api/v1/runs/:id", 5),
+        (COMMANDS, 101, "POST", "/api/v1/runs/:id/archive", 39),
+        (COMMANDS, 121, "POST", "/api/v1/audit", 17),
+        (COMMANDS, 164, "GET", "/api/v1/runs/:id", 5),
+        // Only the compiler types the parameter: this row needs the
+        // compiler's rows, which the scan walks with the sidecar's build
+        // (`src/sidecar/dist`).
+        (TOOLS, 9, "GET", "/api/v1/runs/:id", 5),
+    ] {
+        assert_eq!(
+            rows_in(blobs, "cli", file, line),
+            [corrected(method, path, request_line)],
+            "{file}:{line}"
+        );
+    }
+    assert_eq!(
+        rows_in(blobs, "cli", COMMANDS, 53),
+        [
+            corrected("GET", "/api/v1/runs", 8),
+            corrected("GET", "/api/v1/runs/:id", 5),
+        ]
+    );
+}
+
+#[test]
+fn no_row_is_stated_a_hop_above_the_client_or_where_no_function_crosses_for_the_call() {
+    let blobs = unanswered();
+    let mut stated = Vec::new();
+    for (service, file, line) in [
+        // A command of the same file, and a helper of the same file.
+        ("cli", COMMANDS, 15),
+        ("cli", COMMANDS, 46),
+        ("cli", COMMANDS, 57),
+        // Nothing resolves the receiver.
+        ("cli", COMMANDS, 70),
+        // Calls straight into the client package, and a runner of the web's
+        // own that only runs the callback it is handed.
+        ("web", HOOKS, 9),
+        ("web", HOOKS, 14),
+        ("web", HOOKS, 19),
+    ] {
+        stated.extend(
+            rows_in(blobs, service, file, line)
+                .into_iter()
+                .filter(|row| row.role.as_deref() == Some("wrapper_call"))
+                .map(|row| (format!("{file}:{line}"), row)),
+        );
+    }
+    assert!(stated.is_empty(), "no call-through row here: {stated:#?}");
+}
+
 /// The version of the scanner that wrote main's stored copy before this pass
 /// existed.
 const EARLIER_SCANNER: &str = "0.0.1";
@@ -775,6 +915,32 @@ fn unsettle(blob: &mut serde_json::Value, stated: &[(&str, u32, &str, &str, &str
     }
 }
 
+/// Take out of a stored blob every row at the sites `at`, in the graph and in
+/// its projection.
+fn drop_rows(blob: &mut serde_json::Value, at: &[(&str, u32)]) {
+    let sites: Vec<String> = at
+        .iter()
+        .map(|(file, line)| format!("{file}:{line}"))
+        .collect();
+    let before = blob["mount_graph"]["data_calls"].as_array().unwrap().len();
+    blob["mount_graph"]["data_calls"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|call| {
+            !sites
+                .iter()
+                .any(|site| call["file_location"] == site.as_str())
+        });
+    blob["calls"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|call| !sites.iter().any(|site| call["file_path"] == site.as_str()));
+    assert!(
+        blob["mount_graph"]["data_calls"].as_array().unwrap().len() < before,
+        "a row stood at {sites:?}"
+    );
+}
+
 /// A pull request scan compares its rows with the copy of main the index
 /// holds. Where that copy was written before this pass existed, the pass
 /// alone must not make the scan report anything as the pull request's doing.
@@ -805,6 +971,16 @@ fn a_pull_request_scan_reports_nothing_as_introduced_against_a_main_copy_without
             (COMMANDS, 28, "GET", "/api/v1/status", "/api/v1/status"),
             (COMMANDS, 46, "POST", "/save", "/save"),
             (COMMANDS, 101, "POST", "/archive", "/archive"),
+        ],
+    );
+    // The rows the pass states where the model stated none were not there.
+    drop_rows(
+        &mut cli,
+        &[
+            (COMMANDS, 34),
+            (COMMANDS, 40),
+            (COMMANDS, 53),
+            (COMMANDS, 121),
         ],
     );
     std::fs::write(&path, serde_json::to_string(&cli).unwrap()).unwrap();
