@@ -37,6 +37,7 @@ import {
   type PropertyAssignment,
   type StringLiteral,
   type Type,
+  type VariableDeclaration,
   type Symbol as TsSymbol,
   ts,
 } from 'ts-morph';
@@ -8350,6 +8351,23 @@ export class TypeInferrer {
     | { kind: 'none' }
     | { kind: 'abstain'; why: string }
     | { kind: 'body_type'; type: Type; at: Node; from: string } {
+    const read = this.calleeBodyRead(node, 0);
+    return read.kind === 'passes' ? { kind: 'none' } : read;
+  }
+
+  /**
+   * `bodyBuiltByCallee`, telling apart a callee that sends the argument
+   * unchanged (`passes`) from one that states nothing about it (`none`).
+   * `depth` counts the forwarded locals followed (carrick#2671).
+   */
+  private calleeBodyRead(
+    node: Node,
+    depth: number
+  ):
+    | { kind: 'none' }
+    | { kind: 'passes' }
+    | { kind: 'abstain'; why: string }
+    | { kind: 'body_type'; type: Type; at: Node; from: string } {
     const own = node.getType();
     if (own.isAny() || own.isUnknown()) return { kind: 'none' };
     const call = this.receivingCallOf(node, (candidate) => Node.isCallExpression(candidate));
@@ -8418,6 +8436,15 @@ export class TypeInferrer {
         built.push(value);
         continue;
       }
+      // carrick#2671: the use builds a local (`const payload = { ...input,
+      // code: norm(input.code) }`) the function then sends unchanged, itself
+      // or through a helper that passes it on as the body. The body is that
+      // local.
+      const forwarded = this.forwardedLocalHolding(use, body, depth);
+      if (forwarded) {
+        built.push(forwarded);
+        continue;
+      }
       const ancestors = use.getAncestors();
       const insideLiteral = ancestors
         .slice(0, ancestors.indexOf(body))
@@ -8429,7 +8456,7 @@ export class TypeInferrer {
         };
       }
     }
-    if (built.length === 0) return { kind: 'none' };
+    if (built.length === 0) return passedThrough ? { kind: 'passes' } : { kind: 'none' };
     if (passedThrough) {
       return { kind: 'abstain', why: `the called function both sends the argument and builds a body from it (${from})` };
     }
@@ -8483,6 +8510,73 @@ export class TypeInferrer {
       current = parent;
     }
     return undefined;
+  }
+
+  /**
+   * carrick#2671: the `const` local whose initializer holds `use`, inside
+   * `scope`, when `scope` sends that local unchanged as the body: whole in a
+   * body slot, or as an argument into a function that passes it on as its
+   * body. The local's name, so its declared type is read. Undefined when the
+   * local is never sent, when a further body is built from it, or when a
+   * function lies between `use` and the declaration.
+   */
+  private forwardedLocalHolding(use: Node, scope: Node, depth: number): Node | undefined {
+    if (depth >= 2) return undefined;
+    let current: Node = use;
+    let declaration: VariableDeclaration | undefined;
+    while (current !== scope) {
+      const parent = current.getParent();
+      if (!parent) return undefined;
+      if (
+        Node.isArrowFunction(parent) ||
+        Node.isFunctionExpression(parent) ||
+        Node.isFunctionDeclaration(parent) ||
+        Node.isMethodDeclaration(parent)
+      ) {
+        return undefined;
+      }
+      if (Node.isVariableDeclaration(parent) && parent.getInitializer() === current) {
+        declaration = parent;
+        break;
+      }
+      current = parent;
+    }
+    if (!declaration) return undefined;
+    if (declaration.getVariableStatement()?.getDeclarationKind() !== VariableDeclarationKind.Const) {
+      return undefined;
+    }
+    const name = declaration.getNameNode();
+    if (!Node.isIdentifier(name)) return undefined;
+    const symbol = name.getSymbol()?.compilerSymbol;
+    if (!symbol) return undefined;
+
+    const checker = this.project.getTypeChecker().compilerObject;
+    let sent = false;
+    for (const ref of scope.getDescendantsOfKind(SyntaxKind.Identifier)) {
+      if (ref === name) continue;
+      const parent = ref.getParent();
+      const refSymbol =
+        parent && Node.isShorthandPropertyAssignment(parent)
+          ? checker.getShorthandAssignmentValueSymbol(parent.compilerNode)
+          : ref.getSymbol()?.compilerSymbol;
+      if (refSymbol !== symbol) continue;
+      if (this.inSendNothingTest(ref, scope)) continue;
+      const value = this.bodyValueAround(ref, scope);
+      if (value === ref) {
+        sent = true;
+        continue;
+      }
+      if (value) return undefined;
+      if (parent && Node.isCallExpression(parent) && parent.getArguments().includes(ref)) {
+        const onward = this.calleeBodyRead(ref, depth + 1);
+        if (onward.kind === 'passes') {
+          sent = true;
+          continue;
+        }
+        if (onward.kind !== 'none') return undefined;
+      }
+    }
+    return sent ? name : undefined;
   }
 
   /** `value` is `use` behind what `sentValue` sees through. */
