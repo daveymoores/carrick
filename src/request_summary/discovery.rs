@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 use super::row_calls::Reach;
 use super::values::ValueAt;
 use super::*;
-use crate::library_claims::{ExportClaims, applies, runtime_package_of};
+use crate::library_claims::{ExportClaims, applies, runtime_packages_of};
 use crate::library_store::LibraryAnswer;
 use crate::library_store::RUNTIME_TYPES;
 use crate::position_rows::{
@@ -299,7 +299,7 @@ impl<'a> Labels<'a> {
 /// ([`runtime_globals`]). None for any other row.
 fn runtime_global_key(row: &Row) -> Option<String> {
     (row.decl_package() == Some(RUNTIME_TYPES))
-        .then(|| store_key(row, &[]))
+        .then(|| store_keys(row, &[]).into_iter().next())
         .flatten()
 }
 
@@ -570,7 +570,12 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
     let called: HashSet<(String, String)> = positions
         .call_rows()
         .filter(|row| !in_repo(row))
-        .filter_map(|row| Some((store_key(row, exports)?, row.symbol()?.to_string())))
+        .flat_map(|row| {
+            let symbol = row.symbol().map(str::to_string);
+            store_keys(row, exports)
+                .into_iter()
+                .filter_map(move |key| Some((key, symbol.clone()?)))
+        })
         .collect();
     // The scope checks, asked once every export's op checks are in.
     let mut scope_checks: Vec<(LibraryCheck, AskedScope)> = Vec::new();
@@ -751,25 +756,31 @@ impl MemberDeclarations {
     }
 }
 
-/// The store's key for the package a row's declaration is in: the default
+/// The store's keys for the package a row's declaration is in: the default
 /// library's file, as the store keys it (`lib:lib.dom.d.ts`), a runtime module (`node:<module>`, the file
-/// the runtime's types declare it in), or the package the declaring package
-/// stands for ([`runtime_package_of`]).
-fn store_key(row: &Row, exports: &[ExportClaims]) -> Option<String> {
-    let file = row.decl_file()?;
+/// the runtime's types declare it in), or every package the declaring package
+/// stands for ([`runtime_packages_of`]). Empty when the row names no
+/// declaration.
+pub(super) fn store_keys(row: &Row, exports: &[ExportClaims]) -> Vec<String> {
+    let Some(file) = row.decl_file() else {
+        return Vec::new();
+    };
     if file.starts_with("lib:") {
-        return Some(file.to_string());
+        return vec![file.to_string()];
     }
-    let package = row.decl_package()?;
+    let Some(package) = row.decl_package() else {
+        return Vec::new();
+    };
     if package == RUNTIME_TYPES {
-        let (_, module) = file.rsplit_once(&format!("{RUNTIME_TYPES}/"))?;
-        let module = module.strip_suffix(".d.ts")?;
-        return Some(format!(
-            "node:{}",
-            module.strip_suffix("/index").unwrap_or(module)
-        ));
+        let module = file
+            .rsplit_once(&format!("{RUNTIME_TYPES}/"))
+            .and_then(|(_, module)| module.strip_suffix(".d.ts"));
+        return module
+            .map(|module| format!("node:{}", module.strip_suffix("/index").unwrap_or(module)))
+            .into_iter()
+            .collect();
     }
-    Some(runtime_package_of(package, exports))
+    runtime_packages_of(package, exports)
 }
 
 /// The names a row's declaration is published as, as the store keys an
@@ -1197,8 +1208,8 @@ impl<'a> Walker<'a> {
         let end = |package: &str, export: &str, member: Option<&str>, claims: &ExportClaims| {
             self.end_at(invoke, package, export, member, claims)
         };
-        let package = store_key(row, self.labels.exports);
-        if let Some(package) = &package {
+        let packages = store_keys(row, self.labels.exports);
+        for package in &packages {
             for export in published_names(row) {
                 if let Some(claims) = self.labels.get(package, export) {
                     return Some((end(package, export, None, claims), ReachedBy::Name));
@@ -1290,7 +1301,7 @@ impl<'a> Walker<'a> {
                 }
             }
         }
-        if let Some(package) = &package
+        if !packages.is_empty()
             && let Some(positions) = inputs.positions.as_ref()
         {
             for (lo, hi, member) in &call.receiver_spans {
@@ -1304,8 +1315,13 @@ impl<'a> Walker<'a> {
                     .into_iter()
                     .flatten()
                 {
-                    if let Some(claims) = self.labels.get(package, name) {
-                        return Some((end(package, name, Some(symbol), claims), ReachedBy::Name));
+                    for package in &packages {
+                        if let Some(claims) = self.labels.get(package, name) {
+                            return Some((
+                                end(package, name, Some(symbol), claims),
+                                ReachedBy::Name,
+                            ));
+                        }
                     }
                 }
             }
@@ -1381,11 +1397,24 @@ impl<'a> Walker<'a> {
                     // read; a value that is no definition is the gap.
                     return (!construction).then_some(VALUE_CALLEE);
                 }
-                let key = store_key(row, self.labels.exports)?;
-                if self.labelled_none_export(file, call, row, &key) {
+                // Missed only when every package the declaration stands for
+                // misses it: one labelled none, or answered and matched,
+                // reads it.
+                let keys = store_keys(row, self.labels.exports);
+                if keys
+                    .iter()
+                    .any(|key| self.labelled_none_export(file, call, row, key))
+                {
                     return None;
                 }
-                self.labels.package_reason(&key)
+                let reasons: Vec<Option<&'static str>> = keys
+                    .iter()
+                    .map(|key| self.labels.package_reason(key))
+                    .collect();
+                if reasons.iter().any(Option::is_none) {
+                    return None;
+                }
+                reasons.into_iter().flatten().next()
             }
             _ => None,
         }
@@ -1820,7 +1849,7 @@ impl<'a> Walker<'a> {
         if in_repo(row) {
             return None;
         }
-        if let Some(package) = store_key(row, self.labels.exports) {
+        for package in store_keys(row, self.labels.exports) {
             for export in published_names(row) {
                 if let Some(claims) = self.labels.get(&package, export) {
                     return Some(self.end_at(invoke, &package, export, None, claims));
@@ -2244,12 +2273,12 @@ mod tests {
             )
         };
         assert_eq!(
-            store_key(&row("lib:lib.dom.d.ts"), &[]),
-            Some("lib:lib.dom.d.ts".to_string())
+            store_keys(&row("lib:lib.dom.d.ts"), &[]),
+            ["lib:lib.dom.d.ts"]
         );
         assert_eq!(
-            store_key(&row("lib:lib.es2015.promise.d.ts"), &[]),
-            Some("lib:lib.es2015.promise.d.ts".to_string())
+            store_keys(&row("lib:lib.es2015.promise.d.ts"), &[]),
+            ["lib:lib.es2015.promise.d.ts"]
         );
     }
 
@@ -2865,6 +2894,21 @@ mod tests {
         Vec<ExportClaims>,
         MemberDeclarations,
     )> {
+        traced_fixture_edited(name, dir, service, |_| {})
+    }
+
+    /// [`traced_fixture_in`] with the store answer edited by `edit` before
+    /// the trace asks it.
+    fn traced_fixture_edited(
+        name: &str,
+        dir: &str,
+        service: &str,
+        edit: impl FnOnce(&mut Vec<ExportClaims>),
+    ) -> Option<(
+        super::super::fixture_walk::Walked,
+        Vec<ExportClaims>,
+        MemberDeclarations,
+    )> {
         let on = walked(name, dir, service, &[], true)?;
         let text = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2873,7 +2917,8 @@ mod tests {
         .unwrap();
         let answer = crate::library_store::parse_answer(&text);
         assert_eq!(answer.dropped, 0, "every fixture claim parses");
-        let exports = answer.exports;
+        let mut exports = answer.exports;
+        edit(&mut exports);
         let ask = declaration_ask(&on.inputs, &exports);
         let script = super::super::fixture_walk::sidecar()?;
         let sidecar = crate::services::TypeSidecar::spawn(&script).expect("spawn the sidecar");
@@ -3656,6 +3701,52 @@ mod tests {
             ]),
             "{:#?}",
             ends_in_order(&decided)
+        );
+    }
+
+    /// carrick#2661: a package whose surface extends a server's types lists
+    /// the server's type-only package too. Answered before the server, it
+    /// must not take the server's declarations away from it: the scope its
+    /// member's call resolves to is still asked, verified and opened.
+    #[test]
+    fn a_types_package_another_package_also_lists_keeps_its_scope() {
+        let Some((on, exports, declarations)) =
+            traced_fixture_edited("receiver-scopes-hosts", ".", "web", |exports| {
+                let mut extension = exports
+                    .iter()
+                    .find(|export| export.package == "fixture-split-server")
+                    .expect("the split server is answered")
+                    .clone();
+                extension.package = "fixture-split-extension".into();
+                extension.specifier = "fixture-split-extension".into();
+                extension.claims.clear();
+                extension.type_packages = vec![
+                    "fixture-split-types".into(),
+                    "fixture-split-extension-types".into(),
+                ];
+                exports.insert(0, extension);
+            })
+        else {
+            return;
+        };
+        let hub = |scope: &AskedScope| {
+            scope.package == "fixture-split-server" && scope.receiver == "instance:()"
+        };
+        assert!(
+            declarations.verified_scopes.keys().any(hub),
+            "{:#?}",
+            declarations.verified_scopes
+        );
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let ends = ends_in_order(&decided);
+        assert!(
+            ends.iter().any(|end| end
+                == "src/things.ts:4 <- src/things.ts:4 scope src/plugins.ts:21 fixture-split-server default instance:() /hub"),
+            "{ends:#?}"
         );
     }
 

@@ -120,7 +120,7 @@ pub struct ExportClaims {
     /// Label v2: the type-only packages whose declarations this package's
     /// surface re-exports (`@types/<name>` and types-only core packages). A
     /// declaration found in one of them is this package's
-    /// ([`runtime_package_of`]).
+    /// ([`runtime_packages_of`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_packages: Vec<String>,
     #[serde(default)]
@@ -133,17 +133,33 @@ pub struct ExportClaims {
     pub patterns: Vec<String>,
 }
 
-/// The package a declaration found in `declaring` stands for: the package
-/// whose answered `type_packages` lists it, or, by the DefinitelyTyped
-/// convention, the package an `@types/*` name types. Anything else is itself.
-pub fn runtime_package_of(declaring: &str, exports: &[ExportClaims]) -> String {
-    if let Some(export) = exports
+/// The packages a declaration found in `declaring` stands for: every package
+/// whose answered `type_packages` lists it, in answer order, or, when none
+/// does, by the DefinitelyTyped convention, the package an `@types/*` name
+/// types. Anything else is itself.
+///
+/// A type-only package is often in several packages' lists: a package whose
+/// surface extends another's types lists the other's type packages too. Each
+/// of them is a package the declaration may stand for, and the store's labels
+/// on any of them may name it; which one holds is the verifier's to judge, so
+/// none is picked here (carrick#2661: the first match took a package's own
+/// declarations away from it).
+pub fn runtime_packages_of(declaring: &str, exports: &[ExportClaims]) -> Vec<String> {
+    let mut packages: Vec<String> = Vec::new();
+    for export in exports
         .iter()
-        .find(|export| export.type_packages.iter().any(|types| types == declaring))
+        .filter(|export| export.type_packages.iter().any(|types| types == declaring))
     {
-        return export.package.clone();
+        if !packages.contains(&export.package) {
+            packages.push(export.package.clone());
+        }
     }
-    crate::engine::type_compat_v2::types_package_runtime_name(declaring)
+    if packages.is_empty() {
+        packages.push(crate::engine::type_compat_v2::types_package_runtime_name(
+            declaring,
+        ));
+    }
+    packages
 }
 
 /// The roles whose rows this module writes.
@@ -1026,15 +1042,47 @@ mod tests {
         core.type_packages = vec!["fixture-server-core-types".into()];
         let exports = vec![core];
         assert_eq!(
-            runtime_package_of("fixture-server-core-types", &exports),
-            "fixture-server"
+            runtime_packages_of("fixture-server-core-types", &exports),
+            ["fixture-server"]
         );
         assert_eq!(
-            runtime_package_of("@types/scope__name", &exports),
-            "@scope/name"
+            runtime_packages_of("@types/scope__name", &exports),
+            ["@scope/name"]
         );
-        assert_eq!(runtime_package_of("@types/plain", &[]), "plain");
-        assert_eq!(runtime_package_of("other", &exports), "other");
+        assert_eq!(runtime_packages_of("@types/plain", &[]), ["plain"]);
+        assert_eq!(runtime_packages_of("other", &exports), ["other"]);
+    }
+
+    /// A type-only package two packages list (a middleware package whose
+    /// surface extends a server package's types lists the server's type
+    /// packages too) stands for both, in answer order, whichever comes
+    /// first (carrick#2661).
+    #[test]
+    fn a_type_only_package_two_packages_list_stands_for_both() {
+        let mut middleware = export(json!({
+            "package": "fixture-middleware", "version": "1.0.0", "specifier": "fixture-middleware",
+            "export": "default", "role": "server_framework"
+        }));
+        middleware.type_packages = vec![
+            "fixture-server-core-types".into(),
+            "fixture-middleware-types".into(),
+        ];
+        let mut server = export(json!({
+            "package": "fixture-server", "version": "4.0.0", "specifier": "fixture-server",
+            "export": "default", "role": "server_framework"
+        }));
+        server.type_packages = vec!["fixture-server-core-types".into()];
+        let mut router = server.clone();
+        router.export = "Router".into();
+        let exports = vec![middleware, server, router];
+        assert_eq!(
+            runtime_packages_of("fixture-server-core-types", &exports),
+            ["fixture-middleware", "fixture-server"]
+        );
+        assert_eq!(
+            runtime_packages_of("fixture-middleware-types", &exports),
+            ["fixture-middleware"]
+        );
     }
 
     fn bus() -> ExportClaims {
