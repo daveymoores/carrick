@@ -388,7 +388,7 @@ pub(super) struct GuardIr {
     /// call or the indexing member.
     pub(super) site: Site,
     subject: Subject,
-    subject_text: String,
+    pub(super) subject_text: String,
     /// The other operands of the `&&` test it stands in, as text and line,
     /// unfiltered: a method test rides along without this pass naming it.
     conjoined: Vec<(String, u32)>,
@@ -1865,7 +1865,7 @@ pub(super) struct Node<'a> {
     exported: bool,
     pub(super) ir: &'a FnIr,
     /// The function this one is written in.
-    parent: Option<usize>,
+    pub(super) parent: Option<usize>,
 }
 
 /// A chain being followed.
@@ -1892,6 +1892,10 @@ pub(super) struct ChainFacts {
     pub(super) handoff: Option<Handoff>,
     pub(super) entry: Option<EntryAt>,
     pub(super) decided_at: Option<DecidedAt>,
+    /// The function the trace was last in: where a chain that ends at a
+    /// hole stopped (carrick#2474 R4b), which places the hole in a request
+    /// handler or in a function written inside one.
+    pub(super) stopped: Option<usize>,
 }
 
 /// The first call a chain's function is handed to.
@@ -2114,6 +2118,51 @@ impl<'a> Chains<'a> {
         self.nodes[node].ir.site.map_or(0, |site| site.line)
     }
 
+    /// Whether `open` ends a chain in `node` at an entry point: a keyed
+    /// function the module exports that nothing in the repository calls
+    /// and that is handed to no call (carrick#2474 R4b).
+    pub(super) fn is_entry(&self, node: usize) -> bool {
+        let current = &self.nodes[node];
+        current.exported
+            && current.key.as_ref().is_some_and(|key| {
+                self.callers
+                    .get(&(current.file.to_path_buf(), key.clone()))
+                    .is_none_or(|callers| callers.is_empty())
+            })
+            && self.handed_at(node).is_empty()
+    }
+
+    /// Each call `node` is handed to (carrick#2474 R4b): the function the
+    /// call is written in, the call, the argument and the keys down to the
+    /// function inside it.
+    pub(super) fn handed_calls(&self, node: usize) -> Vec<(usize, Site, usize, Vec<String>)> {
+        self.handed_at(node)
+            .into_iter()
+            .map(|(caller, at, arg, path)| (caller, self.call(caller, at).site, arg, path))
+            .collect()
+    }
+
+    /// The functions one call above `node` (carrick#2474 R4b, the census's
+    /// what-if arm alone): its in-repo callers and the functions that hand
+    /// it on.
+    pub(super) fn one_call_up(&self, node: usize) -> Vec<usize> {
+        let current = &self.nodes[node];
+        let mut up = Vec::new();
+        if let Some(key) = &current.key
+            && let Some(callers) = self.callers.get(&(current.file.to_path_buf(), key.clone()))
+        {
+            for (file, lo, hi) in callers {
+                if let Some(&(caller, _)) = self.calls.get(&(file.as_path(), *lo, *hi)) {
+                    up.push(caller);
+                }
+            }
+        }
+        up.extend(self.handed_at(node).into_iter().map(|(caller, ..)| caller));
+        up.sort();
+        up.dedup();
+        up
+    }
+
     fn hole(&self, reason: HoleReason, node: usize) -> ChainEnd {
         ChainEnd::Hole {
             reason,
@@ -2224,7 +2273,7 @@ impl<'a> Chains<'a> {
     }
 
     /// The calls written in `node` between `lo` and `hi`, in source order.
-    fn branch_calls(&self, node: usize, (lo, hi): (u32, u32)) -> Vec<Branch> {
+    pub(super) fn branch_calls(&self, node: usize, (lo, hi): (u32, u32)) -> Vec<Branch> {
         let node = &self.nodes[node];
         let mut calls: Vec<_> = node
             .ir
@@ -2360,6 +2409,7 @@ impl<'a> Chains<'a> {
     }
 
     fn follow(&self, node: usize, mut trace: Trace, ends: &mut Ends) {
+        trace.facts.stopped = Some(node);
         if ends.full() {
             ends.cap(self.hole(HoleReason::FanOutCap, node), trace);
             return;
@@ -2420,6 +2470,7 @@ impl<'a> Chains<'a> {
     /// Where `node`'s parameter `index` comes from: its callers, the calls
     /// it is handed to, or the function itself.
     fn open(&self, node: usize, index: usize, mut trace: Trace, ends: &mut Ends) {
+        trace.facts.stopped = Some(node);
         if trace.passed.contains(&node) {
             let end = self.hole(HoleReason::Recursion, node);
             ends.push(trace, end);

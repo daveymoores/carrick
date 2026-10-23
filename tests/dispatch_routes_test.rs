@@ -6,8 +6,10 @@
 //! library store's, and the fact layer on (`CARRICK_POSITION_ROWS=1`,
 //! `CARRICK_SITE_QUESTIONS=1`). With `CARRICK_RECEIVER_TRACE=1` the run log
 //! holds one `receiver trace: dispatch route` line per route the answer key
-//! states; unset, it holds none. The routes reach nothing else: the blobs
-//! are the same with the pass's lines and without them.
+//! states, and one `receiver trace: handler records` summary (carrick#2474
+//! R4b) with the records key's counts; unset, it holds neither. Neither
+//! reaches anything else: the blobs are the same with the switch and
+//! without it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,6 +53,9 @@ fn copy_dir(src: &Path, dst: &Path) {
 struct Scan {
     blobs: Vec<(String, String)>,
     routes: Vec<String>,
+    /// The handler-records summary lines (carrick#2474 R4b), each as
+    /// `records=… asked=… forced=…`.
+    records: Vec<String>,
 }
 
 /// One offline scan of a committed copy of the fixture with the fact layer
@@ -135,9 +140,32 @@ fn scan(trace: Option<&str>) -> Scan {
     }
     blobs.sort();
     assert!(!blobs.is_empty(), "the scan stored a blob");
-    let mut routes: Vec<String> = std::fs::read_dir(home.join(".carrick/logs/runs"))
+    let logs: Vec<String> = std::fs::read_dir(home.join(".carrick/logs/runs"))
         .expect("the scan keeps a run log")
         .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+        .collect();
+    let records: Vec<String> = logs
+        .iter()
+        .flat_map(|log| log.lines())
+        .filter_map(|line| line.split_once("receiver trace: handler records "))
+        .map(|(_, fields)| {
+            let field = |name: &str| {
+                fields
+                    .split(' ')
+                    .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+                    .unwrap_or_else(|| panic!("no {name} in {fields}"))
+                    .to_string()
+            };
+            format!(
+                "records={} asked={} forced={}",
+                field("records"),
+                field("asked"),
+                field("forced")
+            )
+        })
+        .collect();
+    let mut routes: Vec<String> = logs
+        .iter()
         .flat_map(|log| {
             log.lines()
                 .filter_map(|line| line.split_once("receiver trace: dispatch route "))
@@ -164,7 +192,26 @@ fn scan(trace: Option<&str>) -> Scan {
         })
         .collect();
     routes.sort();
-    Scan { blobs, routes }
+    Scan {
+        blobs,
+        routes,
+        records,
+    }
+}
+
+/// The records key's counts, as the run log's summary line names them.
+fn key_records() -> Vec<String> {
+    let key: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture_dir().join("records.expected.json")).unwrap(),
+    )
+    .unwrap();
+    let read = |what: &str| key["counts"][what].as_u64().unwrap_or_default();
+    vec![format!(
+        "records={} asked={} forced={}",
+        read("records"),
+        read("asked"),
+        read("forced")
+    )]
 }
 
 /// The answer key's routes, as the run log names them.
@@ -203,4 +250,10 @@ fn a_scan_with_the_receiver_trace_logs_each_dispatch_route() {
     assert_eq!(again.blobs, on.blobs, "two scans store the same blobs");
     let off = scan(None);
     assert!(off.routes.is_empty(), "unset, no route is logged");
+    // carrick#2474 R4b: the handler records are counted in one summary line
+    // per service, the key's counts, and reach no blob.
+    assert_eq!(on.records, key_records());
+    assert_eq!(again.records, on.records);
+    assert!(off.records.is_empty(), "unset, no record is counted");
+    assert_eq!(off.blobs, on.blobs, "the records reach no blob");
 }

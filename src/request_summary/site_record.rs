@@ -412,19 +412,25 @@ impl Parsed {
 
     /// Lines `from..=to` (1-based), each numbered.
     fn numbered(&self, from: u32, to: u32) -> String {
-        self.text
-            .lines()
-            .enumerate()
-            .map(|(index, line)| (index as u32 + 1, line))
-            .filter(|(number, _)| *number >= from && *number <= to)
-            .map(|(number, line)| format!("{number}: {}", cap(line, MAX_LINE_CHARS)))
-            .collect::<Vec<_>>()
-            .join("\n")
+        numbered(&self.text, from, to)
     }
 
     fn line_text(&self, line: u32) -> Option<&str> {
         self.text.lines().nth(line.checked_sub(1)? as usize)
     }
+}
+
+/// Lines `from..=to` (1-based) of `text`, each numbered `NN: ` and cut at
+/// [`MAX_LINE_CHARS`]: the form a site's `point.code` and a handler
+/// record's `code` share (carrick#2474 R4b).
+pub(super) fn numbered(text: &str, from: u32, to: u32) -> String {
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| (index as u32 + 1, line))
+        .filter(|(number, _)| *number >= from && *number <= to)
+        .map(|(number, line)| format!("{number}: {}", cap(line, MAX_LINE_CHARS)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn cap(text: &str, chars: usize) -> String {

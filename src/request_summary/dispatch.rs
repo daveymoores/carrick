@@ -26,6 +26,10 @@
 //!
 //! Record-only: a scan with the receiver trace on logs the routes and drops
 //! them. Nothing reaches the blob.
+//!
+//! [`handler_records`] (carrick#2474 R4b, in `dispatch/records.rs`) groups
+//! the same comparisons by the request handler they sit in, as the record a
+//! model is asked about.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -33,6 +37,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use super::RequestSummaryInputs;
+use super::Site;
 use super::decided_sites::{ArgSlot, DiscoverySite, LabelledEnd, SiteLabel};
 use super::guards::{
     Branch, ChainEnd, ChainFacts, Chains, GuardBranch, GuardChain, GuardIr, GuardPosition,
@@ -40,6 +45,9 @@ use super::guards::{
 };
 use crate::services::type_sidecar::RequestAt;
 use crate::type_manifest::is_http_method;
+
+mod records;
+pub use records::{HoleReach, handler_records};
 
 /// Where a route's method comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -151,6 +159,7 @@ enum Anchor {
 }
 
 /// A chain that reached the request: how, and what it reads.
+#[derive(Clone)]
 struct Reached {
     anchor: Anchor,
     evidence: Evidence,
@@ -424,13 +433,49 @@ impl Reader<'_, '_> {
 
     /// The labelled end discovery found at the handoff call.
     fn end_at(&self, file: &str, handoff: &Handoff) -> Option<&LabelledEnd> {
-        self.discovered.iter().find_map(|site| {
-            site.end.as_ref().filter(|end| {
+        self.end_at_site(file, &handoff.site)
+    }
+
+    /// The labelled end discovery found at the call `site` in `file`.
+    fn end_at_site(&self, file: &str, site: &Site) -> Option<&LabelledEnd> {
+        self.discovered.iter().find_map(|found| {
+            found.end.as_ref().filter(|end| {
                 end.file == file
-                    && end.span_start == handoff.site.span_start
-                    && end.span_end == handoff.site.span_end
+                    && end.span_start == site.span_start
+                    && end.span_end == site.span_end
             })
         })
+    }
+
+    /// The labelled `receive` call written in `caller` at `site` whose
+    /// label's handler slot is `arg` and `path`, the slot a function is
+    /// handed in (carrick#2474 R4b): the function is that label's handler,
+    /// whether or not the label names the request's members.
+    fn receive_at(
+        &self,
+        caller: usize,
+        site: &Site,
+        arg: usize,
+        path: &[String],
+    ) -> Option<&LabelledEnd> {
+        let file = self.chains.rel(self.chains.nodes[caller].file);
+        let end = self.end_at_site(&file, site)?;
+        if end.op.as_deref() != Some("receive") {
+            return None;
+        }
+        self.labels
+            .iter()
+            .any(|label| {
+                label.op.as_deref() == Some("receive")
+                    && label.package == end.package
+                    && label.export == end.export
+                    && label.member == end.member
+                    && label
+                        .handler
+                        .as_ref()
+                        .is_some_and(|slot| slot_is(slot, arg, path))
+            })
+            .then_some(end)
     }
 
     /// The label arm: the handoff call is a labelled `receive` whose label
@@ -532,6 +577,24 @@ fn method_of(
     reached: &Reached,
     methods: &HashMap<usize, Vec<MethodGuard<'_>>>,
 ) -> (Methods, MethodFrom) {
+    method_reaching(node, guard, facts, methods, &|candidate| {
+        candidate
+            .chains
+            .iter()
+            .any(|(_, facts)| reaches_same(facts, reached))
+    })
+}
+
+/// [`method_of`], with `reaches` saying whether a method guard reaches the
+/// request the path comparison does (carrick#2474 R4b: a hole's comparison
+/// has no anchor, only the handler both attach to).
+fn method_reaching(
+    node: usize,
+    guard: &GuardIr,
+    facts: &ChainFacts,
+    methods: &HashMap<usize, Vec<MethodGuard<'_>>>,
+    reaches: &dyn Fn(&MethodGuard<'_>) -> bool,
+) -> (Methods, MethodFrom) {
     let own = Decision {
         node,
         span: (guard.site.lo, guard.site.hi),
@@ -541,7 +604,7 @@ fn method_of(
         },
         conjunct: guard.conjunct,
     };
-    let found = qualifying(&own, reached, methods);
+    let found = qualifying(&own, reaches, methods);
     let found = match (found.is_empty(), &guard.branch, facts.decided_at) {
         (true, GuardBranch::Returned, Some(at)) => qualifying(
             &Decision {
@@ -550,7 +613,7 @@ fn method_of(
                 branch: Some(at.branch),
                 conjunct: at.conjunct,
             },
-            reached,
+            reaches,
             methods,
         ),
         _ => found,
@@ -587,7 +650,7 @@ fn method_of(
 /// method, how it qualifies and the guard.
 fn qualifying<'g>(
     at: &Decision,
-    reached: &Reached,
+    reaches: &dyn Fn(&MethodGuard<'_>) -> bool,
     methods: &'g HashMap<usize, Vec<MethodGuard<'g>>>,
 ) -> Vec<(String, MethodFrom, &'g GuardIr)> {
     let mut found = Vec::new();
@@ -611,11 +674,7 @@ fn qualifying<'g>(
         } else {
             continue;
         };
-        if !candidate
-            .chains
-            .iter()
-            .any(|(_, facts)| reaches_same(facts, reached))
-        {
+        if !reaches(candidate) {
             continue;
         }
         found.push((candidate.method.clone(), from, guard));
@@ -785,8 +844,13 @@ mod tests {
         let without = dispatch_of(
             &on,
             &claims(|answer| {
-                let op = &mut answer["library_claims"][0]["exports"][0]["ops"][0];
-                op.as_object_mut().unwrap().remove("request");
+                for package in answer["library_claims"].as_array_mut().unwrap() {
+                    for export in package["exports"].as_array_mut().unwrap() {
+                        for op in export["ops"].as_array_mut().unwrap() {
+                            op.as_object_mut().unwrap().remove("request");
+                        }
+                    }
+                }
             }),
         );
         let with = key();
@@ -840,6 +904,173 @@ mod tests {
         assert_eq!(keys, sorted, "routes are sorted, one per key");
     }
 
+    fn records_of(
+        walked: &Walked,
+        exports: &[ExportClaims],
+        reach: HoleReach,
+    ) -> serde_json::Value {
+        let labels = SiteLabel::from_exports(exports);
+        let records = handler_records(
+            &walked.inputs,
+            &discovered(walked, exports),
+            &labels,
+            &walked.repo,
+            reach,
+        );
+        serde_json::to_value(&records).unwrap()
+    }
+
+    fn records_key() -> serde_json::Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(fixture("records.expected.json")).expect("the key reads"),
+        )
+        .expect("the key is JSON")
+    }
+
+    /// carrick#2474 R4b: one record per request handler, holding every
+    /// comparison only it reaches (a hole in it or in a function written
+    /// inside it among them), and one shared record per function for a
+    /// comparison several handlers reach. What the code proves is forced;
+    /// the rest is asked.
+    #[test]
+    fn each_handler_asks_what_it_does_not_state() {
+        let Some(on) = the_fixture() else {
+            return;
+        };
+        let got = records_of(&on, &claims(|_| {}), HoleReach::Nested);
+        assert_eq!(
+            got,
+            records_key(),
+            "records:\n{}",
+            serde_json::to_string_pretty(&got).unwrap()
+        );
+        // Every record's asked ids name its comparisons; the wire type reads
+        // each record back unchanged.
+        for record in got["records"].as_array().unwrap() {
+            let typed: crate::site_questions::HandlerRecord =
+                serde_json::from_value(record.clone()).unwrap();
+            assert_eq!(&serde_json::to_value(&typed).unwrap(), record);
+            assert!(
+                typed
+                    .asked
+                    .iter()
+                    .all(|id| typed.comparisons.iter().any(|c| c.id == *id))
+            );
+            // `forced` names asked comparisons only, as the cloud checks.
+            assert!(
+                typed
+                    .forced
+                    .keys()
+                    .all(|id| typed.asked.iter().any(|asked| asked.to_string() == *id)),
+                "{}",
+                typed.subject.at
+            );
+        }
+    }
+
+    /// Every route R4a states is a comparison of a record, at its line: a
+    /// label route's path forced, an entry route's asked.
+    #[test]
+    fn every_dispatch_route_is_a_comparison_of_a_record() {
+        let Some(on) = the_fixture() else {
+            return;
+        };
+        let exports = claims(|_| {});
+        let routes = dispatch_of(&on, &exports);
+        let records = records_of(&on, &exports, HoleReach::Nested);
+        for route in routes["routes"].as_array().unwrap() {
+            let at = format!("{}:{}", route["file"].as_str().unwrap(), route["line"]);
+            let path = route["path"].as_str().unwrap();
+            let found = records["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .find_map(|(index, record)| {
+                    let comparison = record["comparisons"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|c| c["at"] == at.as_str() && c["literal"] == path)?;
+                    Some((index, record, comparison["id"].to_string()))
+                });
+            let Some((index, record, id)) = found else {
+                panic!("{at} {path} is in no record");
+            };
+            // Asked: on the wire's `forced`; asked nothing: settled beside it.
+            let forced_path = record["forced"][&id]["path"]
+                .as_str()
+                .or(records["settled"][index][&id]["path"].as_str());
+            match route["evidence"]["kind"].as_str().unwrap() {
+                "label" => assert_eq!(forced_path, Some(path), "{at} {path}"),
+                _ => assert_eq!(forced_path, None, "{at} {path}"),
+            }
+        }
+    }
+
+    /// A record as the cloud keys it (`withoutPositions` in the
+    /// site-questions lambda): each `at` without its line, each `code`
+    /// string without its line numbers.
+    fn without_positions(value: &serde_json::Value, key: Option<&str>) -> serde_json::Value {
+        use serde_json::Value;
+        let line = regex::Regex::new(r"^(.+?):\d+(?::\d+)?$").unwrap();
+        let number = regex::Regex::new(r"(?m)^\d+:( |$)").unwrap();
+        match value {
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| without_positions(item, None))
+                    .collect(),
+            ),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), without_positions(v, Some(k))))
+                    .collect(),
+            ),
+            Value::String(text) if matches!(key, Some("at" | "declaration")) => {
+                Value::String(line.replace(text, "$1").into_owned())
+            }
+            Value::String(text) if key == Some("code") => {
+                Value::String(number.replace_all(text, "").into_owned())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Lines added above a handler, and above a function its comparison is
+    /// written in, move no record's key: every position is under `at`.
+    #[test]
+    fn a_record_moves_no_key_with_an_edit_above_it() {
+        let read = |name: &str| {
+            std::fs::read_to_string(fixture("repo").join(name)).expect("the fixture reads")
+        };
+        let edge = format!("\n\n{}", read("src/edge.ts"));
+        let report = format!("// a note\n\n{}", read("src/report.ts"));
+        let (Some(before), Some(after)) = (
+            the_fixture(),
+            walked(
+                "dispatch-routes",
+                ".",
+                "web",
+                &[
+                    ("src/edge.ts", edge.as_str()),
+                    ("src/report.ts", report.as_str()),
+                ],
+                true,
+            ),
+        ) else {
+            return;
+        };
+        let exports = claims(|_| {});
+        let before = records_of(&before, &exports, HoleReach::Nested);
+        let after = records_of(&after, &exports, HoleReach::Nested);
+        assert_ne!(before, after, "the edit moves positions");
+        assert_eq!(
+            without_positions(&before["records"], None),
+            without_positions(&after["records"], None)
+        );
+    }
+
     /// What the answer key is written against: today's chains and
     /// discovery's sites on the fixture, and this pass's output.
     #[test]
@@ -859,6 +1090,10 @@ mod tests {
             "{}",
             serde_json::to_string_pretty(&dispatch_of(&on, &exports)).unwrap()
         );
+        crate::outln!(
+            "{}",
+            serde_json::to_string_pretty(&records_of(&on, &exports, HoleReach::Nested)).unwrap()
+        );
     }
 }
 
@@ -869,9 +1104,14 @@ mod tests {
 /// scan's blobs:
 ///
 /// `CARRICK_DISPATCH_CENSUS='<label>=<repo>=<positions dir>=<sites.json>=<store answer>=<blobs dir>[;…]'
-/// [CARRICK_DISPATCH_CENSUS_OUT=<file>] cargo test --lib dispatch_census -- --ignored --nocapture`
+/// [CARRICK_DISPATCH_CENSUS_OUT=<file>] [CARRICK_DISPATCH_CENSUS_RECORDS_DIR=<dir>]
+/// cargo test --lib dispatch_census -- --ignored --nocapture`
 ///
-/// The out file carries other repositories' paths: it stays private.
+/// With a records dir, each repository's asked handler records (carrick#2474
+/// R4b) are written to `<dir>/<label>.json` as the site-questions pack runner
+/// reads them, and the what-if arm's added records to
+/// `<dir>/<label>.what-if.json`. The out file carries other repositories'
+/// paths and the records their code: both stay private.
 #[cfg(test)]
 mod census {
     use std::collections::{BTreeMap, HashSet};
@@ -880,7 +1120,7 @@ mod census {
     use serde::Serialize;
 
     use super::super::decided_sites::{DiscoveryFile, SiteLabel, relative};
-    use super::{Dispatch, dispatch_routes};
+    use super::{Dispatch, HoleReach, dispatch_routes, handler_records};
     use crate::config::Config;
     use crate::position_rows::PositionIndex;
 
@@ -911,6 +1151,32 @@ mod census {
         /// Rows in those files no route states.
         unstated_rows: Vec<String>,
         ms: u128,
+        /// The handler records (carrick#2474 R4b): their counts, what
+        /// attaches to no handler, and per record `at kind key asked/all`.
+        records: BTreeMap<String, usize>,
+        records_not_attached: BTreeMap<String, usize>,
+        per_record: Vec<String>,
+        /// The what-if arm: holes one call below a handler attached too.
+        what_if: BTreeMap<String, usize>,
+        records_ms: u128,
+    }
+
+    /// One service's asked records, as the site-questions request's `sites`.
+    fn sites_of(
+        service: &str,
+        records: &[crate::site_questions::HandlerRecord],
+    ) -> Vec<serde_json::Value> {
+        records
+            .iter()
+            .filter(|record| !record.asked.is_empty())
+            .enumerate()
+            .map(|(index, record)| {
+                serde_json::json!({
+                    "site_id": format!("{service}#{index:04}"),
+                    "handler": record,
+                })
+            })
+            .collect()
     }
 
     /// The blob's HTTP endpoint rows: (method, path, file, line).
@@ -960,7 +1226,7 @@ mod census {
         sites: &Path,
         claims: &Path,
         blobs: &Path,
-    ) -> RepoCensus {
+    ) -> (RepoCensus, Vec<serde_json::Value>, Vec<serde_json::Value>) {
         let root = std::fs::canonicalize(root).expect("the repo exists");
         let config = root.join("carrick.json");
         let services = if config.exists() {
@@ -989,6 +1255,8 @@ mod census {
         }
         let mut census = RepoCensus::default();
         let mut all = Dispatch::default();
+        let mut asked_sites: Vec<serde_json::Value> = Vec::new();
+        let mut what_if_sites: Vec<serde_json::Value> = Vec::new();
         for service in &services {
             let label = service
                 .service_name
@@ -1021,6 +1289,47 @@ mod census {
                 serde_json::to_string(&again).unwrap(),
                 "two reads of {label} state the same routes"
             );
+            let started = std::time::Instant::now();
+            let records = handler_records(&inputs, &mine, &labels, &root, HoleReach::Nested);
+            census.records_ms += started.elapsed().as_millis();
+            let again = handler_records(&inputs, &mine, &labels, &root, HoleReach::Nested);
+            assert_eq!(
+                serde_json::to_string(&records).unwrap(),
+                serde_json::to_string(&again).unwrap(),
+                "two reads of {label} state the same records"
+            );
+            let what_if = handler_records(&inputs, &mine, &labels, &root, HoleReach::OneCallBelow);
+            for (what, n) in &records.counts {
+                *census.records.entry(what.clone()).or_default() += n;
+            }
+            for (what, n) in &records.not_attached {
+                *census.records_not_attached.entry(what.clone()).or_default() += n;
+            }
+            for (what, n) in &what_if.counts {
+                *census.what_if.entry(what.clone()).or_default() += n;
+            }
+            for record in &records.records {
+                census.per_record.push(format!(
+                    "{} {:?} {} asked {}/{}",
+                    record.subject.at,
+                    record.subject.kind,
+                    record.subject.key,
+                    record.asked.len(),
+                    record.comparisons.len()
+                ));
+            }
+            asked_sites.extend(sites_of(&label, &records.records));
+            let base: Vec<serde_json::Value> = records
+                .records
+                .iter()
+                .map(|record| serde_json::to_value(record).unwrap())
+                .collect();
+            let added: Vec<_> = what_if
+                .records
+                .into_iter()
+                .filter(|record| !base.contains(&serde_json::to_value(record).unwrap()))
+                .collect();
+            what_if_sites.extend(sites_of(&format!("{label}+w"), &added));
             all.routes.extend(dispatch.routes);
             all.scopes.extend(dispatch.scopes);
             for (reason, n) in dispatch.not_routes {
@@ -1109,7 +1418,19 @@ mod census {
                     .push(format!("{file}:{line} {method} {path}"));
             }
         }
-        census
+        (census, asked_sites, what_if_sites)
+    }
+
+    /// `sites` as a records file the site-questions pack runner reads.
+    fn write_records(path: &Path, label: &str, sites: Vec<serde_json::Value>) {
+        let file = serde_json::json!({
+            "repo": label,
+            "service": null,
+            "question_set": null,
+            "sites": sites,
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&file).unwrap())
+            .expect("the records write");
     }
 
     #[test]
@@ -1125,16 +1446,21 @@ mod census {
             let [label, root, positions, sites, claims, blobs] = parts.as_slice() else {
                 panic!("expected <label>=<repo>=<positions>=<sites>=<answer>=<blobs>, got {repo}");
             };
-            out.insert(
-                label.to_string(),
-                census_repo(
-                    Path::new(root),
-                    Path::new(positions),
-                    Path::new(sites),
-                    Path::new(claims),
-                    Path::new(blobs),
-                ),
+            let (census, asked, what_if) = census_repo(
+                Path::new(root),
+                Path::new(positions),
+                Path::new(sites),
+                Path::new(claims),
+                Path::new(blobs),
             );
+            // The records are the repository's code: private files only.
+            if let Ok(dir) = std::env::var("CARRICK_DISPATCH_CENSUS_RECORDS_DIR") {
+                let dir = Path::new(&dir);
+                std::fs::create_dir_all(dir).expect("the records dir");
+                write_records(&dir.join(format!("{label}.json")), label, asked);
+                write_records(&dir.join(format!("{label}.what-if.json")), label, what_if);
+            }
+            out.insert(label.to_string(), census);
         }
         let text = serde_json::to_string_pretty(&out).expect("the census serialises");
         match std::env::var("CARRICK_DISPATCH_CENSUS_OUT") {
