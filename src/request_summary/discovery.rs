@@ -3629,6 +3629,256 @@ mod tests {
         assert_eq!(routes, want, "{routes:#?}");
     }
 
+    /// One service's boundary facts as text (carrick#2474 R5a): `route
+    /// file:line METHOD path <- below @ boundary`, `call_in function pN at
+    /// call [host prefix] <- above`, `hand_out function pN.key argN <-
+    /// instance`.
+    fn boundary_lines(boundaries: &super::super::decided_sites::RouteBoundaries) -> Vec<String> {
+        use super::super::decided_sites::Prefix;
+        use super::super::decided_sites::boundaries::{Above, Boundary, End, FnAt, Part};
+        let prefix = |prefix: &Prefix| match prefix {
+            Prefix::Unstated => "-".to_string(),
+            Prefix::Stated { values } => values.join("|"),
+            Prefix::Unread { .. } => "?".to_string(),
+        };
+        let function = |at: &FnAt| format!("{}:{}", at.decl_file, at.decl_line);
+        let boundary = |at: &Boundary| match at {
+            Boundary::EntryParam { function: f, param } => {
+                format!("entry {} p{param}", function(f))
+            }
+            Boundary::CallbackOption {
+                host_at,
+                arg,
+                key,
+                param,
+                runs,
+                runs_arg,
+            } => format!(
+                "callback {host_at} arg{arg}.{key} p{param} runs {} {runs_arg:?}",
+                function(runs)
+            ),
+        };
+        let parts = |parts: &[Part]| {
+            parts
+                .iter()
+                .map(|part| match part {
+                    Part::Edge { edge } => edge.clone(),
+                    Part::Prefix { prefix: p } => format!("[{}]", prefix(p)),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let above = |aboves: &[Above]| {
+            aboves
+                .iter()
+                .map(|above| {
+                    let end = match &above.end {
+                        End::Top => "top".to_string(),
+                        End::Boundary { boundary: at } => boundary(at),
+                        End::Hole { reason } => reason.clone(),
+                        End::MountUnverified => "mount_unverified".to_string(),
+                    };
+                    format!("({end}) {}", parts(&above.parts))
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(" ; ")
+        };
+        let mut out = Vec::new();
+        for route in &boundaries.routes {
+            out.push(
+                format!(
+                    "route {}:{} {} {} <- {} @ {}",
+                    route.file,
+                    route.line,
+                    route.method,
+                    route.path,
+                    parts(&route.below),
+                    boundary(&route.at)
+                )
+                .replace("<-  @", "<- @"),
+            );
+        }
+        for call_in in &boundaries.call_ins {
+            out.push(format!(
+                "call_in {} p{} at {}{} <- {}",
+                function(&call_in.function),
+                call_in.param,
+                call_in.at,
+                call_in
+                    .host_prefix
+                    .as_ref()
+                    .map(|p| format!(" [{}]", prefix(p)))
+                    .unwrap_or_default(),
+                above(&call_in.above)
+            ));
+        }
+        for hand_out in &boundaries.hand_outs {
+            out.push(format!(
+                "hand_out {} p{}.{} arg{} <- {}",
+                function(&hand_out.function),
+                hand_out.param,
+                hand_out.key,
+                hand_out.arg,
+                above(&hand_out.instance)
+            ));
+        }
+        out
+    }
+
+    /// carrick#2474 R5a: with the receiver trace on, each service records
+    /// where its route chains leave it, without reading another service's
+    /// code. The receiving package's routes end at its plugin's parameter
+    /// and at its admin helper's (nothing in its service calls either), and
+    /// the plugin hands its scope to `opts.extra`. The hosts record each
+    /// call into the package: through `register`, with the prefix
+    /// `register`'s own slot states there, and the plain call of the admin
+    /// helper from the callback the main host writes under `extra`, whose
+    /// own route ends at that callback option. No host's `basePrefix` is
+    /// read (2026-10-14 ruling 1). Read across the four services, the
+    /// routes resolve by the facts alone.
+    #[test]
+    fn the_receiver_trace_records_boundaries_across_services() {
+        use super::super::decided_sites::Prefix;
+        use super::super::decided_sites::ScopeLabel;
+        use super::super::decided_sites::boundaries::{FAN_OUT, FanOut, resolve};
+        let mut facts = Vec::new();
+        for service in ["routes", "server", "app", "demo"] {
+            let Some((on, exports, declarations)) = traced_fixture_in(
+                "receiver-scopes-across",
+                &format!("packages/{service}"),
+                service,
+            ) else {
+                return;
+            };
+            let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+            let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+            facts.push((service, decided.boundaries));
+        }
+        let lines = |service: &str| {
+            boundary_lines(
+                &facts
+                    .iter()
+                    .find(|(name, _)| *name == service)
+                    .expect("the service is read")
+                    .1,
+            )
+        };
+        let routes = lines("routes");
+        let server = lines("server");
+        let app = lines("app");
+        let demo = lines("demo");
+        crate::outln!("{routes:#?}\n{server:#?}\n{app:#?}\n{demo:#?}");
+        // The receiving package: its admin helper and its plugin are entry
+        // points; the plugin's own default prefix stands (nothing in its
+        // service hands it a value), and it hands its scope to `extra`.
+        let want_routes = texts(&[
+            "route packages/routes/src/admin.ts:5 GET /admin/users <- @ entry packages/routes/src/admin.ts:4 p0",
+            "route packages/routes/src/admin.ts:6 POST /admin/users <- @ entry packages/routes/src/admin.ts:4 p0",
+            "route packages/routes/src/orders.ts:4 GET /orders <- packages/routes/src/plugin.ts:12 register /api/v1 [/api/v1] packages/routes/src/plugin.ts:14 register - [-] @ entry packages/routes/src/plugin.ts:11 p0",
+            "hand_out packages/routes/src/plugin.ts:11 p1.extra arg0 <- (entry packages/routes/src/plugin.ts:11 p0) packages/routes/src/plugin.ts:12 register /api/v1 [/api/v1]",
+        ]);
+        assert_eq!(routes, want_routes, "{routes:#?}");
+        // The main host: its own routes end at the callback option it
+        // writes under `extra`, the plain call of the admin helper hands that
+        // callback's scope in, and `register` runs the plugin on the root.
+        // `register`'s own `prefix` slot reads unread on this branch: the
+        // conditional spread opens the whole options object (carrick#2474
+        // R5e reads it as unstated).
+        let want_server = texts(&[
+            "route packages/server/src/audit.ts:6 GET /audit/events <- @ callback packages/server/src/server.ts:15 arg1.extra p0 runs packages/routes/src/plugin.ts:11 Some(0)",
+            "route packages/server/src/audit.ts:7 GET /audit/events/:id <- @ callback packages/server/src/server.ts:15 arg1.extra p0 runs packages/routes/src/plugin.ts:11 Some(0)",
+            "call_in packages/routes/src/admin.ts:4 p0 at packages/server/src/server.ts:19 <- (callback packages/server/src/server.ts:15 arg1.extra p0 runs packages/routes/src/plugin.ts:11 Some(0))",
+            "call_in packages/routes/src/plugin.ts:11 p0 at packages/server/src/server.ts:15 [?] <- (top)",
+        ]);
+        assert_eq!(server, want_server, "{server:#?}");
+        // A closed literal that writes no `prefix`: unstated.
+        let want_app = texts(&[
+            "call_in packages/routes/src/plugin.ts:11 p0 at packages/app/src/main.ts:8 [-] <- (top)",
+        ]);
+        assert_eq!(app, want_app, "{app:#?}");
+        // A spread of a value the source does not state: unread.
+        let want_demo = texts(&[
+            "call_in packages/routes/src/plugin.ts:11 p0 at packages/demo/src/main.ts:8 [?] <- (top)",
+        ]);
+        assert_eq!(demo, want_demo, "{demo:#?}");
+        // Ruling 1: no host's own prefix option crosses into a record.
+        for line in routes.iter().chain(&server).chain(&app).chain(&demo) {
+            assert!(
+                !line.contains("${base}") && !line.contains("api/v1api"),
+                "{line}"
+            );
+        }
+        let services: Vec<(&str, &super::super::decided_sites::RouteBoundaries)> =
+            facts.iter().map(|(name, facts)| (*name, facts)).collect();
+        let resolved: Vec<String> = resolve(&services, FAN_OUT)
+            .iter()
+            .map(|resolved| {
+                format!(
+                    "{}:{} {} -> {} unread_hosts={} {}",
+                    resolved.file,
+                    resolved.line,
+                    resolved.method,
+                    resolved.paths.join("|"),
+                    resolved.unread_hosts,
+                    resolved.untraced.as_deref().unwrap_or("")
+                )
+                .replace("->  ", "-> ")
+                .trim_end()
+                .to_string()
+            })
+            .collect();
+        crate::outln!("{resolved:#?}");
+        assert_eq!(FAN_OUT, FanOut::StatedHosts);
+        // The orders route takes the second host's path; the main host's
+        // and the third's prefixes are not read (Q5 (ii)). The callback
+        // routes are filled only by the main host, unread on this branch.
+        let want_resolved = texts(&[
+            "packages/routes/src/admin.ts:5 GET -> unread_hosts=1 unread_prefix",
+            "packages/routes/src/admin.ts:6 POST -> unread_hosts=1 unread_prefix",
+            "packages/routes/src/orders.ts:4 GET -> /api/v1/orders unread_hosts=2",
+            "packages/server/src/audit.ts:6 GET -> unread_hosts=1 unread_prefix",
+            "packages/server/src/audit.ts:7 GET -> unread_hosts=1 unread_prefix",
+        ]);
+        assert_eq!(resolved, want_resolved, "{resolved:#?}");
+        // With the main host's `prefix` slot read as unstated (what R5e
+        // reads), the callback routes compose under the plugin's own scope,
+        // from the facts alone.
+        let mut edited = facts.clone();
+        for (_, service) in &mut edited {
+            for call_in in &mut service.call_ins {
+                if call_in.at == "packages/server/src/server.ts:15" {
+                    call_in.host_prefix = Some(Prefix::Unstated);
+                }
+            }
+        }
+        let services: Vec<(&str, &super::super::decided_sites::RouteBoundaries)> =
+            edited.iter().map(|(name, facts)| (*name, facts)).collect();
+        let resolved: Vec<String> = resolve(&services, FAN_OUT)
+            .iter()
+            .map(|resolved| {
+                format!(
+                    "{}:{} {}",
+                    resolved.file,
+                    resolved.line,
+                    resolved.paths.join("|")
+                )
+            })
+            .collect();
+        assert_eq!(
+            resolved,
+            texts(&[
+                "packages/routes/src/admin.ts:5 /api/v1/admin/users",
+                "packages/routes/src/admin.ts:6 /api/v1/admin/users",
+                "packages/routes/src/orders.ts:4 /api/v1/orders",
+                "packages/server/src/audit.ts:6 /api/v1/audit/events",
+                "packages/server/src/audit.ts:7 /api/v1/audit/events/:id",
+            ]),
+            "{resolved:#?}"
+        );
+    }
+
     /// Each route site's instance ends, in the order the walk gives them:
     /// `file:line <- at root|scope [call] package export receiver [prefix]` or
     /// `<- at <hole>`.

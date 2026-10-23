@@ -58,8 +58,10 @@ use swc_ecma_visit::{Visit, VisitWith};
 use super::row_calls::Reach;
 use super::{CallIr, FnIr, Piece, RequestSummaryInputs, Value, concat, render_target};
 
+pub mod boundaries;
 mod composed;
 mod instances;
+pub use boundaries::RouteBoundaries;
 pub use composed::Composed;
 pub use instances::{
     InstanceAt, InstanceEnd, InstanceHole, MakerLabel, Prefix, ScopeBinds, ScopeLabel,
@@ -706,6 +708,10 @@ pub struct Decided {
     pub reserved: Vec<String>,
     /// Calls above a decided site on its chain (carrick#2614).
     pub through: Vec<Through>,
+    /// With the receiver trace on, where the service's route chains leave
+    /// it (carrick#2474 R5a). Read by nothing yet; never part of a record's
+    /// state.
+    pub boundaries: RouteBoundaries,
 }
 
 /// A discovered call whose request is decided lower down its chain
@@ -1770,13 +1776,17 @@ fn decide(
             walk.up(&chain, &top, end, &mut Vec::new());
         }
     }
-    if let (Some(makers), Some(index)) = (makers, &index) {
-        let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes, index);
-        for site in &mut out.sites {
-            (site.composed, site.composed_trimmed) =
-                composed::compose(&site.instances, site.name_text().as_deref(), &mounts);
+    let mounts = match (makers, &index) {
+        (Some(makers), Some(index)) => {
+            let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes, index);
+            for site in &mut out.sites {
+                (site.composed, site.composed_trimmed) =
+                    composed::compose(&site.instances, site.name_text().as_deref(), &mounts);
+            }
+            mounts
         }
-    }
+        _ => Vec::new(),
+    };
     walked.sort();
     walked.dedup();
     out.walked = walked;
@@ -1796,6 +1806,18 @@ fn decide(
     });
     out.leads
         .sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+    if let (Some(makers), Some(index)) = (makers, &index) {
+        out.boundaries = boundaries::Collect {
+            calls: &calls,
+            inputs,
+            root,
+            makers,
+            scopes,
+            index,
+            mounts: &mounts,
+        }
+        .of(&out, labels);
+    }
     out
 }
 
