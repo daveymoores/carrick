@@ -9545,8 +9545,9 @@ fn stamp_response_modes(
     }
 }
 
-/// Mark each producer response entry whose published inference was owed an
-/// unwidened reading the sidecar ran out of time to make (carrick#2100), and
+/// Mark each producer response entry, and each consumer request entry
+/// (carrick#2011), whose published inference was owed an unwidened reading
+/// the sidecar ran out of time to make (carrick#2100), and
 /// return how many were marked. The check reads the mark to keep a mismatch
 /// judged on the widened type alone off the index.
 fn stamp_unwidened_out_of_budget(
@@ -9556,9 +9557,12 @@ fn stamp_unwidened_out_of_budget(
     let spent = type_compat_v2::unwidened_out_of_budget_aliases(inferred);
     let mut marked = 0;
     for entry in manifest.iter_mut() {
-        entry.unwidened_out_of_budget = entry.role == ManifestRole::Producer
-            && entry.type_kind == ManifestTypeKind::Response
-            && spent.contains(entry.type_alias.as_str());
+        let sends = matches!(
+            (entry.role, entry.type_kind),
+            (ManifestRole::Producer, ManifestTypeKind::Response)
+                | (ManifestRole::Consumer, ManifestTypeKind::Request)
+        );
+        entry.unwidened_out_of_budget = sends && spent.contains(entry.type_alias.as_str());
         marked += usize::from(entry.unwidened_out_of_budget);
     }
     marked
@@ -19713,6 +19717,38 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
 
         assert_eq!(manifest[0].type_state, ManifestTypeState::Implicit);
+    }
+
+    /// carrick#2011: the sending side's entry carries the spent-budget mark,
+    /// a producer response or a consumer request; a consumer response and a
+    /// producer request never do.
+    #[test]
+    fn a_spent_unwidened_reading_marks_the_side_that_sends() {
+        let entry_for = |alias: &str, role: ManifestRole, kind: ManifestTypeKind| {
+            let mut entry = consumer_entry(alias);
+            entry.role = role;
+            entry.type_kind = kind;
+            entry
+        };
+        let mut manifest = vec![
+            entry_for("PRes", ManifestRole::Producer, ManifestTypeKind::Response),
+            entry_for("CReq", ManifestRole::Consumer, ManifestTypeKind::Request),
+            entry_for("CRes", ManifestRole::Consumer, ManifestTypeKind::Response),
+            entry_for("PReq", ManifestRole::Producer, ManifestTypeKind::Request),
+        ];
+        let spent: Vec<InferredType> = ["PRes", "CReq", "CRes", "PReq"]
+            .iter()
+            .map(|alias| {
+                let mut inferred = inferred_with_symbol("Order");
+                inferred.alias = (*alias).to_string();
+                inferred.type_string = "{ state: string }".to_string();
+                inferred.unwidened_out_of_budget = true;
+                inferred
+            })
+            .collect();
+        assert_eq!(stamp_unwidened_out_of_budget(&mut manifest, &spent), 2);
+        let marked: Vec<bool> = manifest.iter().map(|e| e.unwidened_out_of_budget).collect();
+        assert_eq!(marked, vec![true, true, false, false]);
     }
 
     /// A consumer alias that only resolves to `unknown` must stay `Unknown` so

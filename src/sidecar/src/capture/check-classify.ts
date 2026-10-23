@@ -17,7 +17,9 @@
  *   assignment error, sent union taken in part by a weak expected type
  *                                         -> unverifiable (carrick#1995)
  *   assignment error on the published type that the sent side's unwidened
- *   reading does not repeat               -> producer_wider (carrick#1538)
+ *   reading does not repeat               -> producer_wider (carrick#1538),
+ *                                            or compatible with a note when
+ *                                            the consumer sends (carrick#2011)
  *   assignment-class error                -> incompatible
  *   no diagnostics                        -> compatible     [lowest precedence]
  *
@@ -364,7 +366,19 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
   //     return read with no literal widened fits what the other side expects,
   //     so what travels agrees and only the published type is wider. Its own
   //     bucket, which carries no diagnostic: a reason is read as a mismatch.
+  //     carrick#2011: the same for a request body, where the consumer sends
+  //     and its body was read with the literals the call writes kept. A
+  //     consumer has no class of its own on the wire, so the pair is the
+  //     compatible it is, and a note says the published type is wider.
   if (assignDiag && unwidenedReadingFits(input)) {
+    if (plan.direction.sent === 'consumer') {
+      return {
+        ...base,
+        bucket: 'compatible',
+        notes: [...base.notes, CONSUMER_WIDER_NOTE],
+        ...factness(input),
+      };
+    }
     return { ...base, bucket: 'producer_wider', ...factness(input) };
   }
   if (assignDiag) {
@@ -441,6 +455,14 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
   // 6. No diagnostics -> compatible.
   return { ...base, bucket: 'compatible', ...factness(input) };
 }
+
+/**
+ * The note on a request the consumer's unwidened reading cleared
+ * (carrick#2011).
+ */
+export const CONSUMER_WIDER_NOTE =
+  "the consumer's published request type is wider than what the call sends: " +
+  'it widened a literal the call writes, and the values sent fit the producer';
 
 function onUnwidenedLines(plan: ProbePlan, diagnostic: RawDiagnostic): boolean {
   return plan.unwidenedFromLine !== undefined && diagnostic.line >= plan.unwidenedFromLine;

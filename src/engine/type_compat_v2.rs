@@ -1585,8 +1585,9 @@ pub(crate) struct BuiltPair {
     /// is still judged against the whole union, and only an incompatible
     /// verdict is published unverifiable ([`abstain_on_unstated_modes`]).
     pub unstated_mode: Option<String>,
-    /// Set when the producer's response was owed an unwidened reading and
-    /// the sidecar ran out of time to make it (carrick#2100): the pair is
+    /// Set when the sending side's payload was owed an unwidened reading and
+    /// the sidecar ran out of time to make it (carrick#2100): a producer's
+    /// response, or a consumer's http request body (carrick#2011). The pair is
     /// judged on the widened type alone, and only an incompatible verdict is
     /// published unverifiable ([`abstain_on_unwidened_out_of_budget`]).
     pub unwidened_out_of_budget: bool,
@@ -2050,6 +2051,10 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
             }
             ModeSelection::Unstated(reason) => unstated_mode = Some(reason),
         }
+    } else if protocol == ProbeProtocol::Http {
+        // carrick#2011: an http request body is the consumer's to send, and
+        // the check reads the consumer's unwidened reading of it.
+        unwidened_out_of_budget = consumer.entry.unwidened_out_of_budget;
     }
 
     Some(BuiltPair {
@@ -2350,6 +2355,13 @@ const UNWIDENED_OUT_OF_BUDGET_GATE: &str = "producer:unwidened_out_of_budget";
 /// verified" lines.
 pub(crate) const UNWIDENED_OUT_OF_BUDGET_REASON: &str = "the producer's response was judged with its literal values widened (for example `string` for `\"ready\"`), because reading them ran out of time on this scan";
 
+/// The same, for a consumer's request body (carrick#2011).
+const CONSUMER_UNWIDENED_OUT_OF_BUDGET_GATE: &str = "consumer:unwidened_out_of_budget";
+
+/// Why a request mismatch judged without the consumer's unwidened reading is
+/// not reported (carrick#2011).
+pub(crate) const CONSUMER_UNWIDENED_OUT_OF_BUDGET_REASON: &str = "the consumer's request body was judged with its literal values widened (for example `string` for `\"open\"`), because reading them ran out of time on this scan";
+
 /// Publish every pair [`BuiltPair::unwidened_out_of_budget`] marks that the
 /// check found incompatible as unverifiable (carrick#2100).
 ///
@@ -2361,22 +2373,31 @@ pub(crate) const UNWIDENED_OUT_OF_BUDGET_REASON: &str = "the producer's response
 /// and is kept. What the check found stays as the outcome's `diagnostic`, as
 /// in [`abstain_on_unstated_modes`].
 fn abstain_on_unwidened_out_of_budget(pairs: &[BuiltPair], outcomes: &mut [PairCheckOutcome]) {
-    let marked: HashSet<&str> = pairs
+    let marked: HashMap<&str, ProbeTypeKind> = pairs
         .iter()
         .filter(|pair| pair.unwidened_out_of_budget)
-        .map(|pair| pair.spec.pair_key.as_str())
+        .map(|pair| (pair.spec.pair_key.as_str(), pair.spec.type_kind))
         .collect();
     for outcome in outcomes.iter_mut() {
-        if outcome.bucket != VerdictBucket::Incompatible
-            || !marked.contains(outcome.pair_key.as_str())
-        {
+        if outcome.bucket != VerdictBucket::Incompatible {
             continue;
         }
+        let Some(kind) = marked.get(outcome.pair_key.as_str()) else {
+            continue;
+        };
+        let (gate, reason) = if *kind == ProbeTypeKind::Request {
+            (
+                CONSUMER_UNWIDENED_OUT_OF_BUDGET_GATE,
+                CONSUMER_UNWIDENED_OUT_OF_BUDGET_REASON,
+            )
+        } else {
+            (UNWIDENED_OUT_OF_BUDGET_GATE, UNWIDENED_OUT_OF_BUDGET_REASON)
+        };
         outcome.bucket = VerdictBucket::Unverifiable;
-        outcome.gate = Some(UNWIDENED_OUT_OF_BUDGET_GATE.to_string());
+        outcome.gate = Some(gate.to_string());
         outcome.diagnostic = outcome.diagnostic.take().filter(|found| !found.is_empty());
         outcome.resolved = false;
-        outcome.unresolved_reason = Some(UNWIDENED_OUT_OF_BUDGET_REASON.to_string());
+        outcome.unresolved_reason = Some(reason.to_string());
         outcome.notes.clear();
         outcome.consumer_reads.clear();
     }
@@ -5173,6 +5194,87 @@ mod tests {
             !narrowed[0].unwidened_out_of_budget,
             "a pair narrowed to a case never reads the unwidened reading"
         );
+    }
+
+    /// carrick#2011: on an http request the consumer sends, so the mark that
+    /// counts is the consumer's. A request mismatch judged without the
+    /// consumer's spent reading is published unverifiable with the consumer's
+    /// gate; a producer's mark on its request entry decides nothing.
+    #[test]
+    fn a_request_mismatch_judged_without_the_consumers_spent_reading_is_unverifiable() {
+        let key = OperationKey::http("PUT", "/state");
+        let producer = |out_of_budget: bool| {
+            let mut producer = entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Request,
+                "P",
+                "src/state.ts",
+                3,
+                ManifestTypeState::Explicit,
+            );
+            producer.unwidened_out_of_budget = out_of_budget;
+            producer
+        };
+        let consumer = |out_of_budget: bool| {
+            let mut consumer = entry(
+                key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Request,
+                "C",
+                "src/client.ts",
+                8,
+                ManifestTypeState::Implicit,
+            );
+            consumer.unwidened_out_of_budget = out_of_budget;
+            consumer
+        };
+        let pairs_for = |producer_spent: bool, consumer_spent: bool| {
+            build_check_pairs(&[
+                repo(
+                    "api",
+                    None,
+                    vec![producer(producer_spent)],
+                    Some(fake_artifact()),
+                ),
+                repo(
+                    "web",
+                    None,
+                    vec![consumer(consumer_spent)],
+                    Some(fake_artifact()),
+                ),
+            ])
+        };
+        let judged = |pairs: &[BuiltPair]| {
+            let mut outcomes = vec![outcome_for(
+                &pairs[0],
+                VerdictBucket::Incompatible,
+                None,
+                Some("Type 'string' is not assignable to type '\"open\" | \"closed\"'".to_string()),
+                true,
+                None,
+                vec![],
+            )];
+            abstain_on_unwidened_out_of_budget(pairs, &mut outcomes);
+            outcomes.remove(0)
+        };
+
+        let spent = pairs_for(false, true);
+        assert!(spent[0].unwidened_out_of_budget);
+        let held = judged(&spent);
+        assert_eq!(held.bucket, VerdictBucket::Unverifiable, "{held:?}");
+        assert_eq!(
+            held.gate.as_deref(),
+            Some(CONSUMER_UNWIDENED_OUT_OF_BUDGET_GATE)
+        );
+        assert_eq!(
+            held.unresolved_reason.as_deref(),
+            Some(CONSUMER_UNWIDENED_OUT_OF_BUDGET_REASON)
+        );
+
+        let producer_marked = pairs_for(true, false);
+        assert!(!producer_marked[0].unwidened_out_of_budget);
+        assert_eq!(judged(&producer_marked).bucket, VerdictBucket::Incompatible);
     }
 
     /// carrick#2054: a mismatch against a response whose case the call does

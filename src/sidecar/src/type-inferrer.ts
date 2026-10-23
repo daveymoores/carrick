@@ -760,6 +760,8 @@ export class TypeInferrer {
     const errors: string[] = [];
     /** Response inferences the unwidened reading re-reads (carrick#1516). */
     const responses: Array<{ request: InferRequestItem; result: InferredType }> = [];
+    /** Request-body inferences it re-reads after them (carrick#2011). */
+    const bodies: Array<{ request: InferRequestItem; result: InferredType }> = [];
     /** How long each request took, in the order they were done (carrick#1985). */
     const timings: InferSlotTiming[] = [];
 
@@ -798,6 +800,8 @@ export class TypeInferrer {
           inferredTypes.push(result);
           if (request.infer_kind === 'response_body' || request.infer_kind === 'function_return') {
             responses.push({ request, result });
+          } else if (request.infer_kind === 'request_body') {
+            bodies.push({ request, result });
           }
         } else {
           errors.push(
@@ -834,9 +838,48 @@ export class TypeInferrer {
         performance.now() + this.unwidenedBudgetMs,
         started + UNWIDENED_LATEST_MS
       );
-      this.addUnwidenedReadings(responses, extractionConfig, deadline);
+      // The responses' rewrite forgets every node of the files it touches, so
+      // each body's read node is kept as its span, taken now and found again
+      // in the restored file.
+      const bodySpans = bodies.map((body) => {
+        const node = this.readNodes.get(body.result.source_location);
+        return {
+          ...body,
+          readSpan: node && {
+            file: node.getSourceFile(),
+            start: node.getStart(),
+            end: node.getEnd(),
+            kind: node.getKind(),
+          },
+        };
+      });
+      try {
+        this.addUnwidenedReadings(responses, extractionConfig, deadline, 'response');
+      } catch (err) {
+        // The reading only ever adds a field; it never costs an answer.
+        this.logError(
+          `Unwidened reading failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      try {
+        // Second, and in a rewrite of its own: the bodies' files never delay a
+        // response's reading, whose budget a spent deadline turns into an
+        // abstention (carrick#2100).
+        this.addUnwidenedReadings(bodySpans, extractionConfig, deadline, 'request_body');
+      } catch (err) {
+        this.logError(
+          `Unwidened reading of request bodies failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+        // carrick#2011: a body whose reading was not made is judged on its
+        // widened type alone, so it is marked the way a spent budget marks it
+        // and its pair abstains on a mismatch rather than report one.
+        for (const body of bodies) {
+          if (body.result.unwidened_type_string === undefined) {
+            body.result.unwidened_out_of_budget = true;
+          }
+        }
+      }
     } catch (err) {
-      // The reading only ever adds a field; it never costs an answer.
       this.logError(
         `Unwidened reading failed: ${err instanceof Error ? err.message : String(err)}`
       );
@@ -948,6 +991,10 @@ export class TypeInferrer {
    * really returns beside the published one (`unwidened_type_string`). See
    * `unwidened.ts` for what is marked and why the reading is sound.
    *
+   * carrick#2011: a request body (`read` is `'request_body'`) is read the same
+   * way, the call that sends it in place of the handler, except that a literal
+   * handed to any call other than the send is never marked.
+   *
    * One rewrite for the whole batch: every file on any request's path is
    * rewritten once, type-checked before and after, the requests re-inferred,
    * and every file restored before returning, so the project other requests
@@ -960,9 +1007,10 @@ export class TypeInferrer {
    * its own (a marking that added a diagnostic) is never marked.
    */
   private addUnwidenedReadings(
-    responses: Array<{ request: InferRequestItem; result: InferredType }>,
+    responses: Array<{ request: InferRequestItem; result: InferredType; readSpan?: SavedSpan }>,
     extractionConfig: ExtractionConfig | undefined,
-    deadline: number
+    deadline: number,
+    read: 'response' | 'request_body'
   ): void {
     const outOfTime = (stage: string, unread: ReadonlyArray<{ result: InferredType }>): boolean => {
       if (performance.now() <= deadline) return false;
@@ -987,15 +1035,17 @@ export class TypeInferrer {
 
     // Every position is read before the first rewrite: a rewrite forgets
     // every node of its file.
-    for (const { request, result } of responses) {
+    for (const { request, result, readSpan } of responses) {
       // A declared return type is the contract; nothing was widened.
       if (result.is_explicit) continue;
-      const read = this.readNodes.get(result.source_location);
-      if (!read) continue;
-      const functions = pathOf(read);
+      const readNode = readSpan
+        ? nodeAtSpan(readSpan)
+        : this.readNodes.get(result.source_location);
+      if (!readNode) continue;
+      const functions = pathOf(readNode);
       let marked = 0;
       for (const fn of functions) {
-        const insertions = literalInsertions(fn);
+        const insertions = literalInsertions(fn, read === 'request_body' ? readNode : undefined);
         marked += insertions.length;
         if (insertions.length === 0) continue;
         const file = fn.getSourceFile();
@@ -1020,7 +1070,7 @@ export class TypeInferrer {
       plans.push({
         request,
         result,
-        read: { file: read.getSourceFile(), start: read.getStart(), end: read.getEnd() },
+        read: { file: readNode.getSourceFile(), start: readNode.getStart(), end: readNode.getEnd() },
         path,
         locatedByText,
       });
@@ -10778,4 +10828,24 @@ export class TypeInferrer {
   private logError(message: string): void {
     console.error(`[sidecar:type-inferrer:error] ${message}`);
   }
+}
+
+/** A node kept by its place, for a reading made after its file was rewritten. */
+interface SavedSpan {
+  file: SourceFile;
+  start: number;
+  end: number;
+  kind: SyntaxKind;
+}
+
+/** The node a `SavedSpan` was taken from, in the file as it reads now. */
+function nodeAtSpan(span: SavedSpan): Node | undefined {
+  let node: Node | undefined = span.file.getDescendantAtPos(span.start);
+  while (
+    node &&
+    !(node.getStart() === span.start && node.getEnd() === span.end && node.getKind() === span.kind)
+  ) {
+    node = node.getParent();
+  }
+  return node;
 }

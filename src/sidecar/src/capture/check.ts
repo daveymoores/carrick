@@ -504,19 +504,19 @@ function readStubAliasRecords(
 }
 
 /**
- * The unwidened reading a producer's stub ships beside one of its aliases
- * (carrick#1538), as `buildProbe` asks for it. Read from the same manifest the
+ * The unwidened reading a sending side's stub ships beside one of its aliases
+ * (carrick#1538, carrick#2011), as `buildProbe` asks for it. Read from the same manifest the
  * pre-gate reads. A reading the capture already found a member-level
  * `any`/`unknown` in is not offered: it would assign to whatever the other
  * side declares.
  */
 function unwidenedAliasIn(
   aliasRecords: Map<string, Map<string, CaptureAliasRecord>>
-): (sentProducer: CheckPairEndpoint) => string | undefined {
-  return (sentProducer) => {
+): (sent: CheckPairEndpoint) => string | undefined {
+  return (sent) => {
     const record = aliasRecords
-      .get(sentProducer.service_name)
-      ?.get(unwidenedAliasOf(sentProducer.alias));
+      .get(sent.service_name)
+      ?.get(unwidenedAliasOf(sent.alias));
     if (!record || record.any_provenance?.length) return undefined;
     return record.alias;
   };
