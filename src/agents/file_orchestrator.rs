@@ -3511,6 +3511,18 @@ impl FileOrchestrator {
                 pending.push(pf);
             }
             deferred_zero_candidates = still_deferred;
+        } else {
+            // The engine sent no fact files (site questions off, nothing
+            // asked, no rows): every candidate stays, and the files whose
+            // line phase 1 held back are read as today.
+            for pf in pending.iter().filter(|pf| !pf.held.is_empty()) {
+                debug!(
+                    "Analyzing: {} [{} HTTP candidate(s), {} unrouted]",
+                    pf.path_str,
+                    pf.listed.len(),
+                    pf.unrouted
+                );
+            }
         }
 
         // PHASE 1b (#369 — cross-file wrapper-site resolution). Wrapper map:

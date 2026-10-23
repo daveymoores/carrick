@@ -428,6 +428,22 @@ fn with_the_site_questions_off_nothing_is_recorded_and_the_scan_runs() {
     );
 }
 
+/// With the switch on and no fact files to choose by (the site questions
+/// off), selection fails closed: every candidate stays, and every file a
+/// candidate selects is read and says so.
+#[test]
+fn with_the_switch_on_and_no_fact_files_every_candidate_stays() {
+    let scan = run_scan(false, true);
+    for file in ["src/hook.ts", "src/twice.ts", "src/nested.ts"] {
+        assert!(scan.prompt(file).is_some(), "{file} is read");
+        assert!(
+            scan.log_has(&["Analyzing: ", file]),
+            "{file} is logged as read"
+        );
+    }
+    assert!(!scan.log_has(&["Fact-layer file"]));
+}
+
 /// T3 test 2, with the span check: the fact layer sends the reader the file
 /// no signal raised a candidate in, with its call listed at the span the
 /// bytes give, past multi-byte characters, and the reader's row there joins.
