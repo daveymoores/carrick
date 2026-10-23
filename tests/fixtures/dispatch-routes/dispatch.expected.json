@@ -1,0 +1,840 @@
+{
+  "counts": {
+    "path_guards": 25,
+    "starts_with": 1,
+    "table_keys": 2
+  },
+  "not_routes": {
+    "end:global": 1,
+    "handler_slot_mismatch": 1,
+    "handoff_unlabelled:callback_into_own_function": 1,
+    "label_without_request": 1,
+    "negated": 1,
+    "steps_not_path": 1
+  },
+  "routes": [
+    {
+      "branch": [
+        {
+          "callee": "end",
+          "file": "src/api.ts",
+          "kind": "call",
+          "line": 6,
+          "target": null
+        }
+      ],
+      "evidence": {
+        "at": "src/server.ts:48",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/api.ts",
+      "handler": {
+        "file": "src/server.ts",
+        "function": "route",
+        "line": 20
+      },
+      "kind_slot": "forced",
+      "line": 5,
+      "method": "GET",
+      "method_from": "conjunct",
+      "path": "/api/items",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "end",
+          "file": "src/api.ts",
+          "kind": "call",
+          "line": 8,
+          "target": null
+        }
+      ],
+      "evidence": {
+        "at": "src/server.ts:48",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/api.ts",
+      "handler": {
+        "file": "src/server.ts",
+        "function": "route",
+        "line": 20
+      },
+      "kind_slot": "forced",
+      "line": 7,
+      "method": "PUT",
+      "method_from": "conjunct",
+      "path": "/api/items",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "end",
+          "file": "src/middleware.ts",
+          "kind": "call",
+          "line": 13,
+          "target": null
+        }
+      ],
+      "evidence": {
+        "at": "src/middleware.ts:10",
+        "function": "fake",
+        "kind": "entry_point"
+      },
+      "file": "src/middleware.ts",
+      "handler": {
+        "file": "src/middleware.ts",
+        "function": "fake",
+        "line": 10
+      },
+      "kind_slot": "asked",
+      "line": 12,
+      "method": "GET",
+      "method_from": "conjunct",
+      "path": "/api/one",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "end",
+          "file": "src/middleware.ts",
+          "kind": "call",
+          "line": 21,
+          "target": null
+        }
+      ],
+      "evidence": {
+        "at": "src/middleware.ts:10",
+        "function": "fake",
+        "kind": "entry_point"
+      },
+      "file": "src/middleware.ts",
+      "handler": {
+        "file": "src/middleware.ts",
+        "function": "fake",
+        "line": 10
+      },
+      "kind_slot": "asked",
+      "line": 20,
+      "method": "POST",
+      "method_from": "conjunct",
+      "path": "/api/two",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "end",
+          "file": "src/negatives.ts",
+          "kind": "call",
+          "line": 21,
+          "target": null
+        }
+      ],
+      "evidence": {
+        "at": "src/negatives.ts:8",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/negatives.ts",
+      "handler": {
+        "file": "src/negatives.ts",
+        "function": "createServer_handler",
+        "line": 8
+      },
+      "kind_slot": "forced",
+      "line": 20,
+      "method": null,
+      "method_from": "none",
+      "path": "/mixed",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "end",
+          "file": "src/negatives.ts",
+          "kind": "call",
+          "line": 24,
+          "target": null
+        }
+      ],
+      "evidence": {
+        "at": "src/negatives.ts:8",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/negatives.ts",
+      "handler": {
+        "file": "src/negatives.ts",
+        "function": "createServer_handler",
+        "line": 8
+      },
+      "kind_slot": "forced",
+      "line": 23,
+      "method": null,
+      "method_from": "none",
+      "path": "/both",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "end",
+          "file": "src/negatives.ts",
+          "kind": "call",
+          "line": 27,
+          "target": null
+        }
+      ],
+      "evidence": {
+        "at": "src/negatives.ts:8",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/negatives.ts",
+      "handler": {
+        "file": "src/negatives.ts",
+        "function": "createServer_handler",
+        "line": 8
+      },
+      "kind_slot": "forced",
+      "line": 26,
+      "method": null,
+      "method_from": "none",
+      "path": "/either",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "send",
+          "file": "src/server.ts",
+          "kind": "call",
+          "line": 27,
+          "target": "src/server.ts:send"
+        }
+      ],
+      "evidence": {
+        "at": "src/server.ts:48",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/routes.ts",
+      "handler": {
+        "file": "src/server.ts",
+        "function": "route",
+        "line": 20
+      },
+      "kind_slot": "forced",
+      "line": 1,
+      "method": "POST",
+      "method_from": "conjunct",
+      "path": "/orders/export",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "send",
+          "file": "src/server.ts",
+          "kind": "call",
+          "line": 12,
+          "target": "src/server.ts:send"
+        }
+      ],
+      "evidence": {
+        "at": "src/server.ts:10",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/server.ts",
+      "handler": {
+        "file": "src/server.ts",
+        "function": "createServer_handler",
+        "line": 10
+      },
+      "kind_slot": "forced",
+      "line": 11,
+      "method": "GET",
+      "method_from": "conjunct",
+      "path": "/orders",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "send",
+          "file": "src/server.ts",
+          "kind": "call",
+          "line": 14,
+          "target": "src/server.ts:send"
+        }
+      ],
+      "evidence": {
+        "at": "src/server.ts:10",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/server.ts",
+      "handler": {
+        "file": "src/server.ts",
+        "function": "createServer_handler",
+        "line": 10
+      },
+      "kind_slot": "forced",
+      "line": 13,
+      "method": "POST",
+      "method_from": "conjunct",
+      "path": "/orders",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "send",
+          "file": "src/server.ts",
+          "kind": "call",
+          "line": 16,
+          "target": "src/server.ts:send"
+        }
+      ],
+      "evidence": {
+        "at": "src/server.ts:10",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/server.ts",
+      "handler": {
+        "file": "src/server.ts",
+        "function": "createServer_handler",
+        "line": 10
+      },
+      "kind_slot": "forced",
+      "line": 15,
+      "method": "GET",
+      "method_from": "conjunct",
+      "path": "/status",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "send",
+          "file": "src/server.ts",
+          "kind": "call",
+          "line": 31,
+          "target": "src/server.ts:send"
+        }
+      ],
+      "evidence": {
+        "at": "src/server.ts:48",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/server.ts",
+      "handler": {
+        "file": "src/server.ts",
+        "function": "route",
+        "line": 20
+      },
+      "kind_slot": "forced",
+      "line": 30,
+      "method": null,
+      "method_from": "none",
+      "path": "/profile",
+      "position": "case",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "send",
+          "file": "src/server.ts",
+          "kind": "call",
+          "line": 36,
+          "target": "src/server.ts:send"
+        }
+      ],
+      "evidence": {
+        "at": "src/server.ts:48",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/server.ts",
+      "handler": {
+        "file": "src/server.ts",
+        "function": "route",
+        "line": 20
+      },
+      "kind_slot": "forced",
+      "line": 35,
+      "method": "DELETE",
+      "method_from": "enclosing",
+      "path": "/cache",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "send",
+          "file": "src/server.ts",
+          "kind": "call",
+          "line": 43,
+          "target": "src/server.ts:send"
+        }
+      ],
+      "evidence": {
+        "at": "src/server.ts:48",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/server.ts",
+      "handler": {
+        "file": "src/server.ts",
+        "function": "route",
+        "line": 20
+      },
+      "kind_slot": "forced",
+      "line": 42,
+      "method": "GET",
+      "method_from": "enclosing",
+      "path": "/feed",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "send",
+          "file": "src/server.ts",
+          "kind": "call",
+          "line": 43,
+          "target": "src/server.ts:send"
+        }
+      ],
+      "evidence": {
+        "at": "src/server.ts:48",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/server.ts",
+      "handler": {
+        "file": "src/server.ts",
+        "function": "route",
+        "line": 20
+      },
+      "kind_slot": "forced",
+      "line": 42,
+      "method": "HEAD",
+      "method_from": "enclosing",
+      "path": "/feed",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "file": "src/worker.ts",
+          "kind": "value",
+          "line": 2,
+          "text": "\"logo\""
+        }
+      ],
+      "evidence": {
+        "at": "src/worker.ts:11",
+        "function": "default.fetch",
+        "kind": "entry_point"
+      },
+      "file": "src/worker.ts",
+      "handler": {
+        "file": "src/worker.ts",
+        "function": "default.fetch",
+        "line": 11
+      },
+      "kind_slot": "asked",
+      "line": 2,
+      "method": null,
+      "method_from": "none",
+      "path": "/assets/logo",
+      "position": "table_key",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "file": "src/worker.ts",
+          "kind": "value",
+          "line": 3,
+          "text": "\"font\""
+        }
+      ],
+      "evidence": {
+        "at": "src/worker.ts:11",
+        "function": "default.fetch",
+        "kind": "entry_point"
+      },
+      "file": "src/worker.ts",
+      "handler": {
+        "file": "src/worker.ts",
+        "function": "default.fetch",
+        "line": 11
+      },
+      "kind_slot": "asked",
+      "line": 3,
+      "method": null,
+      "method_from": "none",
+      "path": "/assets/font",
+      "position": "table_key",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "reply",
+          "file": "src/worker.ts",
+          "kind": "call",
+          "line": 14,
+          "target": "src/worker.ts:reply"
+        }
+      ],
+      "evidence": {
+        "at": "src/worker.ts:11",
+        "function": "default.fetch",
+        "kind": "entry_point"
+      },
+      "file": "src/worker.ts",
+      "handler": {
+        "file": "src/worker.ts",
+        "function": "default.fetch",
+        "line": 11
+      },
+      "kind_slot": "asked",
+      "line": 13,
+      "method": "GET",
+      "method_from": "conjunct",
+      "path": "/home",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "reply",
+          "file": "src/worker.ts",
+          "kind": "call",
+          "line": 16,
+          "target": "src/worker.ts:reply"
+        }
+      ],
+      "evidence": {
+        "at": "src/worker.ts:11",
+        "function": "default.fetch",
+        "kind": "entry_point"
+      },
+      "file": "src/worker.ts",
+      "handler": {
+        "file": "src/worker.ts",
+        "function": "default.fetch",
+        "line": 11
+      },
+      "kind_slot": "asked",
+      "line": 15,
+      "method": "POST",
+      "method_from": "conjunct",
+      "path": "/orders",
+      "position": "equality",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "reply",
+          "file": "src/worker.ts",
+          "kind": "call",
+          "line": 21,
+          "target": "src/worker.ts:reply"
+        }
+      ],
+      "evidence": {
+        "at": "src/worker.ts:11",
+        "function": "default.fetch",
+        "kind": "entry_point"
+      },
+      "file": "src/worker.ts",
+      "handler": {
+        "file": "src/worker.ts",
+        "function": "default.fetch",
+        "line": 11
+      },
+      "kind_slot": "asked",
+      "line": 19,
+      "method": null,
+      "method_from": "none",
+      "path": "/health",
+      "position": "case",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "reply",
+          "file": "src/worker.ts",
+          "kind": "call",
+          "line": 21,
+          "target": "src/worker.ts:reply"
+        }
+      ],
+      "evidence": {
+        "at": "src/worker.ts:11",
+        "function": "default.fetch",
+        "kind": "entry_point"
+      },
+      "file": "src/worker.ts",
+      "handler": {
+        "file": "src/worker.ts",
+        "function": "default.fetch",
+        "line": 11
+      },
+      "kind_slot": "asked",
+      "line": 20,
+      "method": null,
+      "method_from": "none",
+      "path": "/ready",
+      "position": "case",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    },
+    {
+      "branch": [
+        {
+          "callee": "reply",
+          "file": "src/worker.ts",
+          "kind": "call",
+          "line": 23,
+          "target": "src/worker.ts:reply"
+        }
+      ],
+      "evidence": {
+        "at": "src/worker.ts:11",
+        "function": "default.fetch",
+        "kind": "entry_point"
+      },
+      "file": "src/worker.ts",
+      "handler": {
+        "file": "src/worker.ts",
+        "function": "default.fetch",
+        "line": 11
+      },
+      "kind_slot": "asked",
+      "line": 22,
+      "method": null,
+      "method_from": "none",
+      "path": "/version",
+      "position": "case",
+      "request": {
+        "param": 0,
+        "steps": [
+          "url",
+          "URL",
+          "pathname"
+        ]
+      }
+    }
+  ],
+  "scopes": [
+    {
+      "delegates": [
+        {
+          "callee": "api",
+          "file": "src/server.ts",
+          "kind": "call",
+          "line": 24,
+          "target": "src/api.ts:api"
+        }
+      ],
+      "evidence": {
+        "at": "src/server.ts:48",
+        "export": "createServer",
+        "kind": "label",
+        "member": null,
+        "package": "node:http"
+      },
+      "file": "src/server.ts",
+      "line": 23,
+      "prefix": "/api/"
+    }
+  ]
+}

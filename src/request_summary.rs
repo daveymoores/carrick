@@ -223,6 +223,10 @@ pub use rows_join::ROWS_JOIN_BUDGET;
 #[allow(dead_code)]
 pub(crate) mod discovery;
 
+// The routes a hand-written dispatch states (carrick#2474 R4a): record-only,
+// logged by a scan with the receiver trace on and dropped.
+pub(crate) mod dispatch;
+
 // One fixture service walked with or without rows, for the tests of what
 // the summaries read through them.
 #[cfg(test)]
