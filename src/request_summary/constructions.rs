@@ -400,6 +400,8 @@ pub(super) fn constructed(inputs: &RequestSummaryInputs) -> HashMap<(&Path, u32)
                     key,
                     depth,
                     call,
+                    host: None,
+                    written_in: None,
                 });
         }
         for inner in ir.nested.iter().chain(&ir.detached) {

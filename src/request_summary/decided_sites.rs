@@ -768,11 +768,11 @@ pub(super) struct Placed<'a> {
     /// call: what runs the innermost function the call is written in
     /// (carrick#2474 R2a). `None` at depth 0, and for a function written
     /// anywhere else.
-    host: Option<&'a CallIr>,
+    pub(super) host: Option<&'a CallIr>,
     /// Where the innermost function the call is written in sits in a
     /// call's argument (carrick#2474 R2b): the argument, and the keys down
     /// to it. `None` at depth 0, and for a function written anywhere else.
-    written_in: Option<&'a super::guards::WrittenIn>,
+    pub(super) written_in: Option<&'a super::guards::WrittenIn>,
 }
 
 /// The definition a call reaches, as a callers index reads it: its file and
