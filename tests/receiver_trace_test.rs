@@ -221,6 +221,9 @@ fn the_scope_trace_writes_nothing_of_its_own() {
         "src/index.ts:37 get",
         "src/index.ts:38 get",
         "src/options.ts:16 get",
+        "src/versioned.ts:10 get",
+        "src/versioned.ts:22 get",
+        "src/versioned.ts:28 get",
     ]);
     traced.sort();
     assert_eq!(possible_calls(&on), traced);
