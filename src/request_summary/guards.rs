@@ -1396,6 +1396,7 @@ impl CallWalker<'_, '_, '_> {
                     .map(|arg| super::library_sites::site_arg(&arg.expr, self.scope))
                     .collect()
             }),
+            spread_from: None,
             name_line: self.reader.line(new.callee.span()),
             jsx: false,
             arg_subjects: self.reader.arg_subjects(args, self.scope, bound),
@@ -1442,6 +1443,7 @@ impl CallWalker<'_, '_, '_> {
             },
             receiver: None,
             site_args: None,
+            spread_from: None,
             name_line: self.reader.line(call.callee.span()),
             jsx: false,
             arg_subjects: Vec::new(),

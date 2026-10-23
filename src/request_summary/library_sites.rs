@@ -133,6 +133,10 @@ pub struct SiteArg {
     /// ([`text_pieces`]): a hole each caller fills with its own argument
     /// (carrick#1562). `text` is `None` while a hole is open.
     pub(super) holes: Option<Vec<TextPiece>>,
+    /// The argument is a spread, or follows one: it holds a value the source
+    /// does not state, so a slot reading it reads nothing, and supplies
+    /// whatever the claim asks of it (carrick#2662).
+    pub spread: bool,
 }
 
 /// An object literal's keys, each with its literal text when the value is
@@ -226,6 +230,7 @@ impl SiteArg {
                 object,
                 function: self.function,
                 holes,
+                spread: self.spread,
             },
             filled,
         )
@@ -1888,6 +1893,7 @@ impl<'a> LinkedNames<'a> {
             object,
             function: arg.function,
             holes,
+            spread: arg.spread,
         }
     }
 
@@ -2000,7 +2006,9 @@ type LibraryReceiver = (SiteBinding, Vec<String>, Option<String>, Span);
 impl Reader<'_> {
     /// The library site a call or a `new` writes, when its callee names a
     /// library client. A spread argument moves every position after it, and
-    /// the claims say what a position means, so such a call is no site.
+    /// the claims say what a position means: with the receiver trace on, a
+    /// call carries them unread ([`site_args`]); otherwise such a call is no
+    /// site. A `new` with a spread is never a site.
     pub(super) fn library_site(
         &self,
         span: Span,
@@ -2009,7 +2017,9 @@ impl Reader<'_> {
         args: &[ExprOrSpread],
         scope: &Scope<'_>,
     ) -> Option<LibrarySiteIr> {
-        if args.iter().any(|arg| arg.spread.is_some()) {
+        if args.iter().any(|arg| arg.spread.is_some())
+            && (form == MakerForm::New || spread_from(args).is_none())
+        {
             return None;
         }
         let (binding, path, member, named) = self.library_receiver(callee, scope)?;
@@ -2020,7 +2030,7 @@ impl Reader<'_> {
             binding,
             path,
             member,
-            args: args.iter().map(|arg| site_arg(&arg.expr, scope)).collect(),
+            args: site_args(args, scope),
         })
     }
 
@@ -3138,7 +3148,40 @@ pub(super) fn site_arg(expr: &Expr, scope: &Scope<'_>) -> SiteArg {
         },
         function: matches!(expr, Expr::Arrow(_) | Expr::Fn(_)),
         holes,
+        spread: false,
     }
+}
+
+/// The position of the first spread argument, when the receiver trace is on
+/// (carrick#2662): the arguments before it read as written, and it and
+/// every argument after it hold a value the source does not state. With the
+/// trace off a spread moves every position, and no call with one is read.
+pub(super) fn spread_from(args: &[ExprOrSpread]) -> Option<usize> {
+    if !super::discovery::receiver_trace_enabled() {
+        return None;
+    }
+    args.iter().position(|arg| arg.spread.is_some())
+}
+
+/// A call's arguments as a claim's slots read them. A spread holds any
+/// number of arguments, so it and every argument after it hold a value the
+/// source does not state, and the arguments before it read as written
+/// (carrick#2662).
+pub(super) fn site_args(args: &[ExprOrSpread], scope: &Scope<'_>) -> Vec<SiteArg> {
+    let mut spread = false;
+    args.iter()
+        .map(|arg| {
+            spread |= arg.spread.is_some();
+            if spread {
+                SiteArg {
+                    spread: true,
+                    ..SiteArg::default()
+                }
+            } else {
+                site_arg(&arg.expr, scope)
+            }
+        })
+        .collect()
 }
 
 /// What a serialiser call states: `JSON.stringify(x)`, or with a replacer
@@ -3469,6 +3512,9 @@ pub(super) fn builder(builder: &super::Builder, module: &ModuleScope) -> Option<
 
 fn arg_literal<'a>(args: &'a [SiteArg], arg: usize, key: Option<&str>) -> Option<&'a str> {
     let arg = args.get(arg)?;
+    if arg.spread {
+        return None;
+    }
     match key {
         None => arg.text.as_deref(),
         Some(key) => arg.object.as_ref()?.fields.get(key)?.as_deref(),
@@ -3480,6 +3526,8 @@ fn arg_supplied(args: &[SiteArg], arg: usize, key: Option<&str>) -> bool {
         return false;
     };
     match key {
+        // A spread may hold the argument, or the key: it is not absent.
+        _ if arg.spread => true,
         None => true,
         Some(key) => arg
             .object

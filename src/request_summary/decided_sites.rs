@@ -936,10 +936,14 @@ fn to_definition(pieces: &[Piece], depth: u8) -> Option<Vec<Piece>> {
 }
 
 /// The argument `call` writes at `index`, unless a spread before it moves
-/// every position.
+/// every position. With the receiver trace on, a spread leaves the
+/// arguments before it as written ([`CallIr::spread_from`]).
 fn argument(call: &CallIr, index: usize) -> Option<&Value> {
-    call.site_args.as_ref()?;
-    call.args.get(index)
+    match (&call.site_args, call.spread_from) {
+        (Some(_), _) => call.args.get(index),
+        (None, Some(from)) if index < from => call.args.get(index),
+        _ => None,
+    }
 }
 
 /// `pieces` (the callee's own, its parameters by position) with each
