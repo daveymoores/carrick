@@ -40,3 +40,8 @@ app.basePath("/v3").get("/y", ok);
 app.register(bare);
 // An option the code calls with the app (waits on carrick#2432).
 withOptions(app);
+// A router handed to a member no scope claim names: served somewhere the
+// trace cannot say.
+const sub = router();
+sub.get("/s", ok);
+app.attach(sub);
