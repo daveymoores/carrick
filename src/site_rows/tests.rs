@@ -74,6 +74,7 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
             line: LINE,
             span_start: 120,
             span_end: 129,
+            name: None,
         }),
         method: None,
         receiver: None,
@@ -537,9 +538,7 @@ fn fold_one(
             .into_iter()
             .filter(|row| row.file == file)
             .collect(),
-        leads: Vec::new(),
-        routes: Vec::new(),
-        through: Vec::new(),
+        ..SiteRows::default()
     };
     fold_rows(calls, endpoints, &one, Path::new("."), make)
 }
@@ -732,8 +731,7 @@ fn a_lead_on_a_line_with_a_row_is_dropped() {
             lead_at("src/b.ts", 5, Some("consumer")),
             lead_at("src/b.ts", 5, Some("producer")),
         ],
-        routes: Vec::new(),
-        through: Vec::new(),
+        ..SiteRows::default()
     };
     let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), make);
     let kept: Vec<(&str, u32, Option<&str>)> = fold

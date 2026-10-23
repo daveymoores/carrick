@@ -12072,7 +12072,7 @@ impl FileOrchestrator {
     /// With no partner the descriptor stays, as the only row of its
     /// operation. With several, every row stays: which one the documentation
     /// describes is not something the paths can say.
-    fn fold_documented_operations(graph: &mut MountGraph) -> usize {
+    pub(crate) fn fold_documented_operations(graph: &mut MountGraph) -> usize {
         let documentation = |endpoint: &ResolvedEndpoint| {
             endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute)
                 && endpoint.handler.as_deref() == Some(ROUTE_DESCRIPTOR_OWNER)

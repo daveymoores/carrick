@@ -1714,6 +1714,7 @@ fn record(
              line,
              span_start,
              span_end,
+             ..
          }| {
             let param_name = sources
                 .get(&file)
