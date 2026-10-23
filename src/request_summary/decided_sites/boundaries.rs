@@ -31,7 +31,6 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::super::RequestSummaryInputs;
-use super::super::site_record::Bucket;
 use super::super::values::ValueAt;
 use super::composed::MountEdge;
 use super::instances::{
@@ -39,7 +38,6 @@ use super::instances::{
 };
 use super::{Calls, Decided, Placed, SiteLabel, relative};
 use crate::position_rows::{FLAG_DECLARATION_UNNAMED, Kind};
-use crate::site_questions::Slot;
 
 /// A function's declaration as the compiler's rows spell it: the file,
 /// repo-relative, and the line its declaration starts on.
@@ -197,6 +195,35 @@ fn repo_file(file: &str) -> bool {
         && !file.split('/').any(|part| part == "node_modules")
 }
 
+/// The method a route site's label forces, upper case: the label states an
+/// HTTP route it handles, and one producer method, as the member always
+/// sends it, as the default where nothing writes the slot, or as literal
+/// text the code writes there. The site record forces the same, and reads
+/// written values through the source as well; a value only that read
+/// states gives no segment here.
+fn forced_route_method(site: &super::DecidedSite, labels: &[SiteLabel]) -> Option<String> {
+    let label = SiteLabel::find(labels, &site.end)?;
+    let (kind, role) = super::super::site_record::kind_and_role(&label.role, label.op.as_deref());
+    if kind != Some("http") || role != Some("handles") {
+        return None;
+    }
+    let method = label.method.clone().unwrap_or_default();
+    let text = match (&method.literal, &method.from, &site.method) {
+        (Some(literal), _, _) => Some(literal.clone()),
+        (None, Some(_), Some(super::MethodValue::Unwritten)) | (None, None, _) => method.default,
+        (None, Some(_), Some(super::MethodValue::Pieces(pieces))) => pieces
+            .iter()
+            .map(|piece| match piece {
+                super::Piece::Lit(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Option<String>>(),
+        (None, Some(_), None) => None,
+    }?
+    .to_ascii_uppercase();
+    crate::type_manifest::is_http_method(&text).then_some(text)
+}
+
 /// Whether every chain ends at a value the walk does not read: nothing a
 /// boundary continues.
 fn unread(aboves: &[Above]) -> bool {
@@ -242,45 +269,20 @@ impl<'c, 'a> Collect<'c, 'a> {
         .sorted()
     }
 
-    /// 1. A route site whose label forces its method (as a traced route's
-    ///    record does), one per chain that ends at a boundary.
+    /// 1. A route site whose label forces its method, one per chain that
+    ///    ends at a boundary.
     fn routes(&self, decided: &Decided, labels: &[SiteLabel]) -> Vec<RouteSegment> {
-        let crossing = |site: &super::DecidedSite| {
-            site.composed
+        let mut out = Vec::new();
+        for site in &decided.sites {
+            if !site
+                .composed
                 .iter()
                 .any(|composed| matches!(composed.end.as_str(), "entry_point" | "callback_option"))
-        };
-        if !decided.sites.iter().any(crossing) {
-            return Vec::new();
-        }
-        let records =
-            super::super::site_record::site_records(self.inputs, self.root, decided, labels);
-        let mut out = Vec::new();
-        for record in &records {
-            let forced = |slot| record.state.forced.get(&slot).map(String::as_str);
-            if record.bucket == Bucket::Lead
-                || forced(Slot::Kind) != Some("http")
-                || forced(Slot::Role) != Some("handles")
             {
                 continue;
             }
-            let Some(method) = forced(Slot::Method)
-                .filter(|method| crate::type_manifest::is_producer_method(method))
+            let (Some(method), Some(path)) = (forced_route_method(site, labels), site.name_text())
             else {
-                continue;
-            };
-            let call = &record.anchors.call;
-            let Some(site) = decided.sites.iter().find(|site| {
-                site.file == call.file
-                    && site.span_start == call.span_start
-                    && site.span_end == call.span_end
-            }) else {
-                continue;
-            };
-            if !crossing(site) {
-                continue;
-            }
-            let Some(path) = site.name_text() else {
                 continue;
             };
             for above in super::composed::aboves(&site.instances, self.mounts) {
@@ -454,6 +456,11 @@ impl<'c, 'a> Collect<'c, 'a> {
 /// read (carrick#2474 Q5). This is the one switch point for that ruling:
 /// the census below and R5b's writer at the engine's join point read
 /// [`FAN_OUT`].
+///
+/// A host is the call-in at the segment's own boundary (for a callback
+/// option, its one host). A host is unread when any of its ways does not
+/// give a full path (a chain above it, a prefix, a hole): its other ways'
+/// paths are not written either, so a partly read host fails closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FanOut {
     /// (i) The route keeps today's reading: nothing is resolved unless every

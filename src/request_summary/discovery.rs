@@ -3769,7 +3769,6 @@ mod tests {
         let server = lines("server");
         let app = lines("app");
         let demo = lines("demo");
-        crate::outln!("{routes:#?}\n{server:#?}\n{app:#?}\n{demo:#?}");
         // The receiving package: its admin helper and its plugin are entry
         // points; the plugin's own default prefix stands (nothing in its
         // service hands it a value), and it hands its scope to `extra`.
@@ -3829,7 +3828,6 @@ mod tests {
                 .to_string()
             })
             .collect();
-        crate::outln!("{resolved:#?}");
         assert_eq!(FAN_OUT, FanOut::StatedHosts);
         // The orders route takes the second host's path; the main host's
         // and the third's prefixes are not read (Q5 (ii)). The callback
