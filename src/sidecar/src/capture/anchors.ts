@@ -1433,9 +1433,13 @@ function paramLocatorHints(request: InferAnchorRequest): string {
  * node unchanged. The mirror of the v1 inferrer's `unwrapJsonStringifyArg`:
  * the global serialiser is identified by the standard `JSON` object, the one
  * name every runtime shares.
+ *
+ * carrick#2010: a property whose value is the serialiser call (`body:
+ * JSON.stringify(...)`, the node the line fallback prefers on that line) is
+ * read through to the call, and so to its argument.
  */
 function serialisedArgument(node: ts.Node): ts.Node {
-  let current = node;
+  let current = ts.isPropertyAssignment(node) ? node.initializer : node;
   while (ts.isParenthesizedExpression(current)) current = current.expression;
   if (
     ts.isCallExpression(current) &&
