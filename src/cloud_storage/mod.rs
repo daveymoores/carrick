@@ -1297,36 +1297,42 @@ pub fn mount_graph_to_api_details(
     let calls: Vec<ApiEndpointDetails> = mount_graph
         .get_data_calls()
         .iter()
-        .map(|call| ApiEndpointDetails {
-            owner: None,
-            key: OperationKey::http(&call.method, call.canonical_path.clone()),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: Some(call.client.clone()),
-            request_type: None,
-            response_type: None,
-            file_path: PathBuf::from(&call.file_location),
-            repo_name: None,
-            service_name: None,
-            // Provenance is producer-side metadata; calls keep the default.
-            provenance: Default::default(),
-            resolution_source: call.resolution_source,
-            // Likewise: a view module is a property of a route's module.
-            view_module: false,
-            // The value this call sends for the field its target dispatches
-            // on (carrick#831): the consumer half of the same identity.
-            dispatch: call.dispatch.clone(),
-            schema_binding: None,
-            // A call has no handler.
-            handler_span: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
-        })
+        .map(call_details)
         .collect();
 
     (endpoints, calls)
+}
+
+/// One consumer call of a `MountGraph` as the cloud index keys it: on its
+/// pre-computed `canonical_path` ([`mount_graph_to_api_details`]).
+pub fn call_details(call: &crate::mount_graph::DataFetchingCall) -> ApiEndpointDetails {
+    ApiEndpointDetails {
+        owner: None,
+        key: OperationKey::http(&call.method, call.canonical_path.clone()),
+        params: vec![],
+        request_body: None,
+        response_body: None,
+        handler_name: Some(call.client.clone()),
+        request_type: None,
+        response_type: None,
+        file_path: PathBuf::from(&call.file_location),
+        repo_name: None,
+        service_name: None,
+        // Provenance is producer-side metadata; calls keep the default.
+        provenance: Default::default(),
+        resolution_source: call.resolution_source,
+        // Likewise: a view module is a property of a route's module.
+        view_module: false,
+        // The value this call sends for the field its target dispatches
+        // on (carrick#831): the consumer half of the same identity.
+        dispatch: call.dispatch.clone(),
+        schema_binding: None,
+        // A call has no handler.
+        handler_span: None,
+        name_scope: None,
+        library_semantics: Vec::new(),
+        inference: None,
+    }
 }
 
 /// A write action that failed AFTER an attempt whose outcome nobody saw, so

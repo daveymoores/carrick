@@ -75,4 +75,49 @@ scanner reads that row off the source and this pass never touches it.
 `commands.ts:101` reaches a request the API serves under another verb, which
 is the finding the pull request test reads.
 
+## Calls the model stated no row at
+
+A call into a function of its own service that another file declares, where
+that function itself calls into another service and the walk from it reaches
+exactly one request there, states that request at its own line, with the
+source `request_summary`, the role `wrapper_call` and `reaches_request`,
+whether or not the model stated a row there. With the cassette as it is, the
+model stated nothing at these:
+
+| Site | Reached |
+|---|---|
+| `commands.ts:34` | `GET /api/v1/token` |
+| `commands.ts:40` | `PUT /api/v1/runs/:id` |
+| `commands.ts:53` | `GET /api/v1/runs/:id` and `GET /api/v1/runs`: two calls, one row each |
+| `commands.ts:121` | `POST /api/v1/audit` |
+
+The second scan empties the answers for `commands.ts` and `hooks.ts` and
+walks the compiler's rows (`CARRICK_POSITION_ROWS=1`); `packages/cli` has a
+`tsconfig.json`, as a TypeScript package does, so the compiler resolves its
+own modules' imports. Every call into the
+client class then states its row from the source alone (`commands.ts` lines
+9, 21, 28, 34, 40, 53, 64, 101, 121 and 164), and so does `tools.ts:9`, whose
+`client` parameter only the compiler types (the table's type gives it one).
+None is stated at a call one hop further up (`main.ts:5` calls a command of
+another file, which calls the client; `commands.ts:15` and `:46` call a
+command of the same file, `:57` a helper of the same file that reaches two
+operations), at a call nothing resolves (`commands.ts:70`), or in
+`hooks.ts`: the hooks call the client package directly, and `withSpinner`
+(`:19`) only runs the callback it is handed, so no function of the web's own
+calls into the other service on their behalf.
+
+`packages/cli/src/nested.ts`, with `helpers.ts` and `local-fetch.ts` beside
+it, and `apps/web/src/page.tsx` with `badge.tsx`:
+
+| Site | Rows |
+|---|---|
+| `nested.ts:7`, `:8` | the model states `GET /api/v1/status` at `Promise.all(` (line 7); the call into the client inside it (line 8) is that row's call and states none |
+| `nested.ts:16` | one `GET /api/v1/status` row: two functions called on one line reach the one operation |
+| `nested.ts:21` | none: `loadPair` reaches two operations |
+| `nested.ts:27` | none: `localPing` reaches a request the CLI writes itself (`local-fetch.ts:5`) |
+| `nested.ts:33` | none: `statusReader` writes a function that requests and hands it back unrun; only a function it calls, or hands to a call of its own, counts as what it runs |
+| `nested.ts:39` | `GET /api/v1/status`: `statusViaReader` writes a reader and calls it |
+| `page.tsx:5` | none: a JSX element is no call the source writes |
+| `page.tsx:10` | `GET /api/v1/runs`: the same component called as a function |
+
 Driven by `tests/call_through_rows_test.rs`.
