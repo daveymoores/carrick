@@ -628,7 +628,7 @@ fn published_names(row: &Row) -> Vec<&str> {
 }
 
 /// Whether a row's declaration is a file of the repository.
-fn in_repo(row: &Row) -> bool {
+pub(super) fn in_repo(row: &Row) -> bool {
     row.flags() & FLAG_DECLARATION_UNNAMED == 0
         && row.decl_file().is_some_and(|file| {
             !file.starts_with("lib:")
@@ -2013,6 +2013,30 @@ mod tests {
             "src/app.ts:25 build().get -> default get receive instance call_result:build@src/build.ts:3",
             "src/build.ts:4 make -> default - - name -",
             "src/client.ts:5 client.get -> default get request declaration parameter:client@src/client.ts:4",
+            // carrick#2474 R2a's instance shapes.
+            "src/helpers.ts:10 app.get -> default get receive declaration parameter:app@src/helpers.ts:9",
+            "src/helpers.ts:15 app.get -> default get receive declaration parameter:app@src/helpers.ts:14",
+            "src/helpers.ts:18 three -> default get receive declaration parameter:app@src/helpers.ts:14",
+            "src/helpers.ts:21 two -> default get receive declaration parameter:app@src/helpers.ts:14",
+            "src/helpers.ts:27 pong -> default get receive declaration parameter:app@src/helpers.ts:25",
+            "src/helpers.ts:29 app.get -> default get receive declaration parameter:app@src/helpers.ts:25",
+            "src/helpers.ts:32 ping -> default get receive declaration parameter:app@src/helpers.ts:25",
+            "src/helpers.ts:37 app.get -> default get receive declaration parameter:app@src/helpers.ts:36",
+            "src/helpers.ts:42 deps.app.get -> default get receive declaration field:app@src/helpers.ts:41",
+            "src/helpers.ts:47 scoped.get -> default get receive declaration parameter:scoped@src/helpers.ts:46",
+            "src/helpers.ts:51 make -> default - - name -",
+            "src/helpers.ts:52 make -> default - - name -",
+            "src/helpers.ts:53 health -> default get receive declaration parameter:app@src/helpers.ts:9",
+            "src/helpers.ts:54 health -> default get receive declaration parameter:app@src/helpers.ts:9",
+            "src/helpers.ts:55 health -> default get receive declaration parameter:app@src/helpers.ts:9",
+            "src/helpers.ts:55 build -> default - - name -",
+            "src/helpers.ts:56 health -> default get receive declaration parameter:app@src/helpers.ts:9",
+            "src/helpers.ts:57 one -> default get receive declaration parameter:app@src/helpers.ts:14",
+            "src/helpers.ts:58 ping -> default get receive declaration parameter:app@src/helpers.ts:25",
+            "src/helpers.ts:59 keyed -> default get receive declaration field:app@src/helpers.ts:41",
+            "src/helpers.ts:61 inner.get -> default get receive declaration parameter:inner@src/helpers.ts:61",
+            "src/helpers.ts:62 health -> default get receive declaration parameter:app@src/helpers.ts:9",
+            "src/helpers.ts:62 build -> default - - name -",
             "src/routes.ts:11 this.app.get -> default get receive declaration field:app@src/routes.ts:8",
             "src/users.ts:8 app.get -> default get receive declaration parameter:app@src/users.ts:7",
             "src/with-app.ts:4 make -> default - - name -",
@@ -2041,7 +2065,9 @@ mod tests {
 
     /// carrick#2474 R1: with the trace off, discovery on the fixture is what
     /// it was: the trace's own records add only sites and fields, and every
-    /// site found without it is the same record, with no receiver.
+    /// site found without it is the same record, with no receiver. A walk
+    /// that stopped with nothing found (a cycle through a helper whose
+    /// receiver is a parameter) may find the labelled call with it on.
     #[test]
     fn with_the_trace_off_discovery_is_unchanged() {
         let Some((on, exports, declarations)) = traced_fixture() else {
@@ -2065,7 +2091,7 @@ mod tests {
                 ..site
             })
             .collect();
-        for site in &off.sites {
+        for site in off.sites.iter().filter(|site| site.end.is_some()) {
             assert!(plain.contains(site), "{site:?} is kept with the trace on");
         }
         assert_eq!(
@@ -2081,6 +2107,10 @@ mod tests {
                 "src/app.ts:25",
                 "src/app.ts:25",
                 "src/build.ts:4",
+                "src/helpers.ts:51",
+                "src/helpers.ts:52",
+                "src/helpers.ts:55",
+                "src/helpers.ts:62",
                 "src/with-app.ts:4"
             ]),
             "the trace's sites are not found without it"
@@ -2158,6 +2188,109 @@ mod tests {
                 serde_json::to_string(&record.state).unwrap()
             );
         }
+    }
+
+    /// Each site of `decided`, with the receiver trace's instance
+    /// walk, as `file:line <- at root|hole …`, one line per instance end.
+    fn instance_ends(decided: &super::super::decided_sites::Decided) -> Vec<String> {
+        use super::super::decided_sites::InstanceAt;
+        let mut out = Vec::new();
+        for site in &decided.sites {
+            for end in &site.instances {
+                let what = match &end.end {
+                    InstanceAt::Root { file, line, .. } => format!("root {file}:{line}"),
+                    InstanceAt::Hole { reason, .. } => serde_json::to_value(reason)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                };
+                out.push(format!("{}:{} <- {} {what}", site.file, site.line, end.at));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// carrick#2474 R2a: each decided site names the instance its labelled
+    /// call is made on, one end per caller that hands one in. A receiver
+    /// that is a parameter, or a key of one, is filled at each caller and
+    /// walked up through helpers to the labelled maker whose result it is:
+    /// held in a binding (a module's or a function's), built by an own
+    /// factory in another module (called twice, two ends), or one helper
+    /// handed two apps (two roots). A cycle ends, giving the root its other
+    /// caller hands in.
+    /// The holes: a function nothing calls (`entry_point`), a callback
+    /// this code runs (`callback_parameter`), a function a library call
+    /// runs, by name or written in place (`runs_by_library`), an app a
+    /// package declares (`outside_service`), and a field (`unread`).
+    #[test]
+    fn each_deciding_caller_gives_its_own_instance_end() {
+        let Some((on, exports, declarations)) = traced_fixture() else {
+            return;
+        };
+        let discovery = discover(
+            &on.inputs,
+            &Labels::traced(&exports, &declarations),
+            &on.repo,
+        );
+        use super::super::decided_sites::{MakerLabel, SiteLabel, decided_sites_traced};
+        let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
+            .collect();
+        let labels = SiteLabel::from_exports(&exports);
+        let decided = decided_sites_traced(
+            &on.inputs,
+            &on.repo,
+            &discovered,
+            &labels,
+            &MakerLabel::from_exports(&exports),
+        );
+        let got = instance_ends(&decided);
+        let want = texts(&[
+            "src/app.ts:13 <- src/app.ts:13 root src/app.ts:12",
+            "src/app.ts:19 <- src/app.ts:19 callback_parameter",
+            "src/app.ts:25 <- src/app.ts:25 root src/build.ts:4",
+            "src/client.ts:5 <- src/client.ts:5 entry_point",
+            "src/helpers.ts:10 <- src/helpers.ts:53 root src/helpers.ts:51",
+            "src/helpers.ts:10 <- src/helpers.ts:54 root src/helpers.ts:52",
+            "src/helpers.ts:10 <- src/helpers.ts:55 root src/build.ts:4",
+            "src/helpers.ts:10 <- src/helpers.ts:56 outside_service",
+            "src/helpers.ts:10 <- src/helpers.ts:62 root src/build.ts:4",
+            "src/helpers.ts:15 <- src/helpers.ts:57 root src/helpers.ts:51",
+            "src/helpers.ts:29 <- src/helpers.ts:58 root src/helpers.ts:51",
+            "src/helpers.ts:37 <- src/helpers.ts:37 entry_point",
+            "src/helpers.ts:42 <- src/helpers.ts:59 root src/helpers.ts:51",
+            "src/helpers.ts:47 <- src/helpers.ts:47 runs_by_library",
+            "src/helpers.ts:61 <- src/helpers.ts:61 runs_by_library",
+            "src/routes.ts:11 <- src/routes.ts:11 unread",
+            "src/users.ts:8 <- src/app.ts:16 root src/app.ts:12",
+        ]);
+        assert_eq!(got, want, "{got:#?}");
+        // Without the makers, no site names an instance; with them, every
+        // record keeps its state byte for byte, so no site's sha moves.
+        let (untraced, records) = records_of(&on, &exports, &discovery);
+        assert!(untraced.sites.iter().all(|site| site.instances.is_empty()));
+        let traced =
+            super::super::site_record::site_records(&on.inputs, &on.repo, &decided, &labels);
+        assert_eq!(
+            serde_json::to_string(
+                &traced
+                    .iter()
+                    .map(|record| &record.state)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
+            serde_json::to_string(
+                &records
+                    .iter()
+                    .map(|record| &record.state)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+        );
     }
 
     /// carrick#2474 R1: the ask holds each export's maker on `export` and

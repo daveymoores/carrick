@@ -78,6 +78,7 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
         method: None,
         receiver: None,
         reached: None,
+        instances: Vec::new(),
     }
 }
 

@@ -21,14 +21,19 @@
 //! that scan's endpoint rows (carrick#2474 R1): by what holds the receiver
 //! and how discovery reached them (a sites file from `discovery_census` with
 //! `CARRICK_RECEIVER_TRACE=1` names both), recall, extras, and the
-//! mount-shaped sites apart.
+//! mount-shaped sites apart. It also counts the route sites by where their
+//! instance walks end, a labelled maker's result or a hole by its reason,
+//! and by how many ends each has, one per caller that hands an instance in
+//! (carrick#2474 R2a).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use super::decided_sites::{DiscoveryFile, SiteLabel, decided_sites, relative};
+use super::decided_sites::{
+    DiscoveryFile, InstanceAt, InstanceEnd, MakerLabel, SiteLabel, decided_sites_traced, relative,
+};
 use super::site_record::{Bucket, site_records};
 use crate::config::Config;
 use crate::position_rows::PositionIndex;
@@ -94,6 +99,30 @@ struct RoutesCensus {
     mount_shaped: Vec<String>,
     /// Every route site: `file:line METHOD path receiver-kind reached`.
     sites: Vec<String>,
+    /// Route sites by where their instance walks end (carrick#2474 R2a):
+    /// `root`, a hole's reason, `root+<reason>` for a site with both, or
+    /// `none` for a site that names no instance.
+    by_instance_end: BTreeMap<String, usize>,
+    /// Every instance end, one per caller that hands one in, by `root` or
+    /// the hole's reason.
+    instance_ends: BTreeMap<String, usize>,
+    /// Route sites by how many instance ends they have: the per-caller
+    /// fan-out.
+    fan_out: BTreeMap<usize, usize>,
+    /// Every instance end: `file:line <- at root file:line` or `<- at
+    /// <reason> [text]`.
+    instances: Vec<String>,
+}
+
+/// An instance end's kind: `root`, or the hole's reason.
+fn end_kind(end: &InstanceEnd) -> String {
+    match end.hole() {
+        None => "root".to_string(),
+        Some(reason) => serde_json::to_value(reason)
+            .ok()
+            .and_then(|reason| reason.as_str().map(str::to_string))
+            .unwrap_or_default(),
+    }
 }
 
 /// One endpoint row of the scan: method, path, `file:line`.
@@ -131,13 +160,15 @@ fn endpoint_rows(blobs: &Path) -> Vec<(String, String, String)> {
 
 /// One record with what the census reads beside it: how discovery reached
 /// its labelled call, the path its decided site's code writes
-/// ([`super::decided_sites::DecidedSite::name_text`]), and whether its
-/// label states no method at all (the mount shape).
+/// ([`super::decided_sites::DecidedSite::name_text`]), whether its
+/// label states no method at all (the mount shape), and the instance ends
+/// its decided site names (carrick#2474 R2a).
 struct Routed {
     record: super::site_record::SiteRecord,
     reached: Option<String>,
     written: Option<String>,
     no_method: bool,
+    instances: Vec<InstanceEnd>,
 }
 
 /// The routes section: `records` against the scan's endpoint rows in
@@ -177,6 +208,37 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
         census
             .sites
             .push(format!("{at} {method} {name} {kind} {reached}"));
+        let instances = &routed.instances;
+        let kinds: std::collections::BTreeSet<String> = instances.iter().map(end_kind).collect();
+        let site_kind = match (kinds.contains("root"), kinds.len()) {
+            (_, 0) => "none".to_string(),
+            (true, 1) => "root".to_string(),
+            (true, _) => format!(
+                "root+{}",
+                kinds
+                    .iter()
+                    .filter(|kind| *kind != "root")
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("+")
+            ),
+            (false, _) => kinds.iter().cloned().collect::<Vec<_>>().join("+"),
+        };
+        *census.by_instance_end.entry(site_kind).or_default() += 1;
+        *census.fan_out.entry(instances.len()).or_default() += 1;
+        for end in instances {
+            *census.instance_ends.entry(end_kind(end)).or_default() += 1;
+            let what = match &end.end {
+                InstanceAt::Root { file, line, .. } => format!("root {file}:{line}"),
+                InstanceAt::Hole { text, .. } => match text {
+                    Some(text) => format!("{} {text}", end_kind(end)),
+                    None => end_kind(end),
+                },
+            };
+            census
+                .instances
+                .push(format!("{at} {method} {name} <- {} {what}", end.at));
+        }
         if routed.no_method {
             census.mount_shaped.push(format!("{at} {method} {name}"));
             continue;
@@ -215,6 +277,7 @@ fn census_routes(records: &[Routed], blobs: &Path) -> RoutesCensus {
         &mut census.extras,
         &mut census.mount_shaped,
         &mut census.sites,
+        &mut census.instances,
     ] {
         list.sort();
         list.dedup();
@@ -255,6 +318,7 @@ fn census_repo(
     )
     .exports;
     let labels = SiteLabel::from_exports(&exports);
+    let makers = MakerLabel::from_exports(&exports);
     let mut by_service: BTreeMap<String, PathBuf> = BTreeMap::new();
     for entry in std::fs::read_dir(positions).expect("the positions dir reads") {
         let path = entry.expect("dir entry").path();
@@ -302,7 +366,9 @@ fn census_repo(
             .filter(|site| files.contains(&site.file))
             .cloned()
             .collect();
-        let decided = decided_sites(&inputs, &root, &mine, &labels);
+        // Traced: each site also names its instance (carrick#2474 R2a),
+        // which only the routes section reads.
+        let decided = decided_sites_traced(&inputs, &root, &mine, &labels, &makers);
         census.decided_sites += decided.sites.len();
         census.unplaced += decided.unplaced.len();
         census.walked += decided.walked.len();
@@ -314,8 +380,9 @@ fn census_repo(
             *census.leads.entry(reason).or_default() += 1;
         }
         let records = site_records(&inputs, &root, &decided, &labels);
-        // How discovery reached each record's labelled call, as the decided
-        // site at the record's call says.
+        // How discovery reached each record's labelled call, and the
+        // instance it is made on, as the decided site at the record's call
+        // says.
         for record in &records {
             let call = &record.anchors.call;
             let site = decided.sites.iter().find(|site| {
@@ -339,6 +406,7 @@ fn census_repo(
                                 && method.default.is_none()
                         })
                     }),
+                instances: site.map(|site| site.instances.clone()).unwrap_or_default(),
             });
         }
         for record in &records {

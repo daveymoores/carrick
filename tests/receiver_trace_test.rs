@@ -177,6 +177,9 @@ fn the_receiver_trace_switch_moves_only_what_it_finds() {
         vec![
             "src/app.ts:19 post".to_string(),
             "src/app.ts:25 get".to_string(),
+            // The file's other routes have endpoint rows at their lines.
+            "src/helpers.ts:47 get".to_string(),
+            "src/helpers.ts:61 get".to_string(),
             "src/routes.ts:11 get".to_string(),
             "src/users.ts:8 get".to_string(),
         ]

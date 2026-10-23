@@ -5207,8 +5207,20 @@ fn site_records_of(
         .count();
     let discovered = discovered_sites(discovery);
     let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
-    let mut decided =
-        crate::request_summary::decided_sites::decided_sites(inputs, root, &discovered, &labels);
+    // With the receiver trace on, each site also names its instance
+    // (carrick#2474 R2a): read by nothing.
+    let mut decided = match context.declarations {
+        Some(_) => crate::request_summary::decided_sites::decided_sites_traced(
+            inputs,
+            root,
+            &discovered,
+            &labels,
+            &crate::request_summary::decided_sites::MakerLabel::from_exports(claims),
+        ),
+        None => {
+            crate::request_summary::decided_sites::decided_sites(inputs, root, &discovered, &labels)
+        }
+    };
     let yielded = context
         .placements
         .map_or(0, |placed| decided.yield_to_summaries(root, placed));
