@@ -103,16 +103,16 @@ export function requireAuth(_req: Req, _res: Res, next?: () => void): void {
     .unwrap();
     fs::write(
         repo.join("src/items.handlers.ts"),
-        r#"import { Req, Res } from './framework';
+        r#"import { Req } from './framework';
 
 export interface ItemList {
   items: { id: string; label: string }[];
   total: number;
 }
 
-export function listItems(_req: Req, res: Res<ItemList>): Res<ItemList> {
+export async function listItems(_req: Req): Promise<ItemList> {
   const body: ItemList = { items: [{ id: 'a', label: 'first' }], total: 1 };
-  return res.json(body);
+  return body;
 }
 "#,
     )
