@@ -261,8 +261,15 @@ export class StatedParams {
       const slot = this.sendSlotOf(property.getDeclarations().map((d) => d.compilerNode));
       if (!slot) continue;
       found = true;
-      const declared = property.getDeclarations().find((d) => this.payloadIsTypeSlot(d.compilerNode, slot));
-      if (!declared) continue;
+      const through = property
+        .getDeclarations()
+        .map((d) => this.payloadTypeParameters(d.compilerNode, slot))
+        .find((named) => named.length > 0);
+      if (!through) continue;
+      const checker = parameter.getProject().getTypeChecker().compilerObject;
+      const defaults = new Set(
+        through.flatMap((named) => (named.default ? [checker.getTypeFromTypeNode(named.default)] : []))
+      );
       let member: Type;
       try {
         member = property.getTypeAtLocation(parameter);
@@ -275,6 +282,9 @@ export class StatedParams {
         if (signature.getTypeParameters().length > 0) continue;
         const at = this.payloadAt(signature.getParameters(), slot, parameter);
         if (!at) continue;
+        // The type parameter at its declared default: the route filled
+        // nothing there (a status-code send left at `number`).
+        if (defaults.has(at.compilerType)) continue;
         if (payload === undefined) payload = at;
         else if (payload.compilerType !== at.compilerType) return 'abstain';
       }
@@ -293,39 +303,38 @@ export class StatedParams {
   }
 
   /**
-   * The library declares the member's payload through a type parameter of
-   * the type that declares the member: a slot each route fills. A payload
-   * declared with a fixed type (a file path, a status code) says nothing
-   * about any one route.
+   * The type parameters of the type that declares the member that its
+   * payload is declared through: a slot each route fills. None for a payload
+   * declared with a fixed type (a file path), which says nothing about any
+   * one route.
    */
-  private payloadIsTypeSlot(declaration: ts.Node, slot: ClaimSlot): boolean {
+  private payloadTypeParameters(declaration: ts.Node, slot: ClaimSlot): ts.TypeParameterDeclaration[] {
     const owner = declaration.parent;
     const ownParameters = new Set<ts.Node>(
       owner && (ts.isInterfaceDeclaration(owner) || ts.isClassDeclaration(owner) || ts.isClassExpression(owner))
         ? (owner.typeParameters ?? [])
         : []
     );
-    if (ownParameters.size === 0) return false;
+    if (ownParameters.size === 0) return [];
     let typeNode: ts.TypeNode | undefined;
     if (ts.isMethodSignature(declaration) || ts.isMethodDeclaration(declaration)) {
       typeNode = declaration.parameters[slot.arg]?.type;
     } else if (ts.isPropertySignature(declaration) || ts.isPropertyDeclaration(declaration)) {
       typeNode = declaration.type;
     }
-    if (!typeNode) return false;
-    let mentions = false;
+    if (!typeNode) return [];
+    const mentioned = new Set<ts.TypeParameterDeclaration>();
     const visit = (node: ts.Node): void => {
-      if (mentions) return;
       if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
         const name = node.typeName.text;
         for (const parameter of ownParameters) {
-          if (ts.isTypeParameterDeclaration(parameter) && parameter.name.text === name) mentions = true;
+          if (ts.isTypeParameterDeclaration(parameter) && parameter.name.text === name) mentioned.add(parameter);
         }
       }
       ts.forEachChild(node, visit);
     };
     visit(typeNode);
-    return mentions;
+    return [...mentioned];
   }
 
   /** The type the call signature takes at the payload slot, read at `at`. */

@@ -147,6 +147,7 @@ export const createOrder = wrap<OrderContract>(async (req, res) => {
   }
   const created = await create(req.body);
   res.download('/receipts/latest');
+  res.sendCode(201);
   res.echo(created);
   res.status(201).json(created);
 });
