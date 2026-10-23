@@ -1384,10 +1384,20 @@ impl CallWalker<'_, '_, '_> {
             _ => String::new(),
         };
         let bound = &self.guard.bound;
+        // What each argument states, for the fields a class's constructor
+        // sets from its parameters (carrick#2452). A function written in
+        // place is no text.
+        let values = args
+            .iter()
+            .map(|arg| match unwrap_expression(&arg.expr) {
+                Expr::Arrow(_) | Expr::Fn(_) => Value::Str(vec![Piece::Unknown]),
+                expr => self.reader.eval(expr, self.scope),
+            })
+            .collect();
         let construction = CallIr {
             site,
             callee,
-            args: Vec::new(),
+            args: values,
             request: None,
             waited: false,
             inert: false,
@@ -1405,7 +1415,7 @@ impl CallWalker<'_, '_, '_> {
             callee_subject: Some(self.reader.subject(&new.callee, self.scope, bound)),
             callee_text,
             callee_values: Vec::new(),
-            arg_values: Vec::new(),
+            arg_values: self.reader.arg_values(args, self.scope, bound),
             tested: None,
             handed: self.reader.handed(args, self.scope, bound),
             names: self.reader.arg_names(args, self.scope),

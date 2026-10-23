@@ -233,6 +233,11 @@ pub(crate) mod dispatch;
 mod values;
 use values::ValueAt;
 
+// What each construction of a class passes, across the service, for the
+// fields its constructor sets from a parameter (carrick#2452 slice 2).
+mod constructions;
+use constructions::{ClassOrigin, FieldLink};
+
 // One fixture service walked with or without rows, for the tests of what
 // the summaries read through them.
 #[cfg(test)]
@@ -308,10 +313,14 @@ pub enum Piece {
     /// a link that resolves to nothing changes nothing. A binding whose text
     /// the names cannot read hands the importer what its own module reads it
     /// as: its text, or one written path after the piece (carrick#2540).
+    ///
+    /// A field the class's constructor sets from a parameter (`this.base`)
+    /// links to that field instead: it takes the value every construction
+    /// in the service passes there ([`FieldLink`], carrick#2452).
     Opaque {
         text: String,
         end: Root,
-        link: Option<Box<library_sites::NamedRef>>,
+        link: Option<Box<Link>>,
     },
     /// A query one of the service's own functions builds (carrick#1950):
     /// nothing, or text that starts with `?`. It ends the path and states
@@ -327,6 +336,16 @@ pub enum Piece {
     /// arguments, so only a call of the enclosing function fills it in, once
     /// the effect is lifted there ([`Effect::lifted`]).
     Outer(u8, Box<Piece>),
+}
+
+/// What an opaque piece reads through, resolved once every module is read
+/// ([`RequestSummaryInputs::linked`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Link {
+    /// A module-scope binding (carrick#2447).
+    Named(library_sites::NamedRef),
+    /// A field of a class the file declares (carrick#2452).
+    Field(FieldLink),
 }
 
 impl Piece {
@@ -1429,6 +1448,12 @@ pub struct FileIr {
     /// The same for each module builder with no [`Self::names`] entry, read
     /// called (carrick#2540).
     held_returns: HashMap<String, Held>,
+    /// Each module-scope class's fields its constructor sets from a
+    /// parameter, by the class's span start (carrick#2452).
+    class_origins: HashMap<u32, ClassOrigin>,
+    /// Every `new` the file writes, wherever it is, and every class it
+    /// extends ([`constructions::NewsAndBases`], carrick#2452).
+    news: constructions::NewsAndBases,
 }
 
 /// Text a link resolves to, and what a binding hands an importer where it
@@ -1651,6 +1676,7 @@ pub fn extract_file_ir(
         computed_load,
         declared_at: module_declarations(module, source_map),
         declaration_lines: row_calls::DeclarationLines::of(module, source_map),
+        news: constructions::NewsAndBases::of(module),
         names_commonjs_exports: names_commonjs_exports(module),
         source_start: source_map
             .try_lookup_byte_offset(module.span.lo)
@@ -3604,6 +3630,11 @@ struct ClassFields {
     /// with a body, never assigned over as a field, and declared again by no
     /// class in this file that extends this one.
     query_builders: HashSet<String>,
+    /// The fields the constructor sets from a parameter, and its
+    /// parameters' defaults ([`Reader::ctor_origins`], carrick#2452): read
+    /// once every module is, through the class's constructions.
+    origins: HashMap<String, constructions::FieldOrigin>,
+    ctor_defaults: Vec<(usize, Vec<String>, Vec<ValueAt>)>,
 }
 
 /// What a function written inside another can read of it, by binding.
@@ -4619,6 +4650,26 @@ impl Reader<'_> {
         for (field, client) in receivers {
             file.field_receivers.insert((fields.class, field), client);
         }
+        if !fields.origins.is_empty() {
+            let mut lines: Vec<u32> = class
+                .decorators
+                .iter()
+                .map(|decorator| decorator.span)
+                .chain([class.span, ident.span])
+                .map(|span| self.site(span).line)
+                .collect();
+            lines.sort_unstable();
+            lines.dedup();
+            file.class_origins.insert(
+                fields.class,
+                ClassOrigin {
+                    name: name.to_string(),
+                    lines,
+                    fields: std::mem::take(&mut fields.origins),
+                    defaults: std::mem::take(&mut fields.ctor_defaults),
+                },
+            );
+        }
     }
 
     /// For each class only this file can construct, the value every
@@ -4757,6 +4808,10 @@ impl Reader<'_> {
         // Fields set to the platform's `fetch`, or to a constructor parameter
         // whose default it is (carrick#1562).
         let mut fetches: HashSet<String> = HashSet::new();
+        // Fields set from a constructor parameter, read through the class's
+        // constructions once every module is (carrick#2452).
+        let mut origins: HashMap<String, constructions::FieldOrigin> = HashMap::new();
+        let mut ctor_defaults = Vec::new();
         let mut assign = |name: String,
                           value: Value,
                           client: Option<ClientRef>,
@@ -4797,6 +4852,7 @@ impl Reader<'_> {
                     }
                 }
                 ClassMember::Constructor(ctor) => {
+                    (origins, ctor_defaults) = self.ctor_origins(ctor, module);
                     let mut scope = Scope::module(module);
                     let mut fetch_params: HashSet<BindingKey> = HashSet::new();
                     for (position, param) in ctor.params.iter().enumerate() {
@@ -4903,6 +4959,7 @@ impl Reader<'_> {
         contested.extend(writes.fields);
         contested.extend(redeclared.into_iter().flatten().cloned());
         fetches.retain(|name| !contested.contains(name));
+        origins.retain(|name, _| !contested.contains(name));
         for name in contested {
             receivers.remove(&name);
             fields.insert(
@@ -4920,10 +4977,24 @@ impl Reader<'_> {
         // A field holding only a value the class is handed (`this.baseUrl =
         // baseUrl`, a parameter property) is written the way the request
         // writes it; one the class BUILDS is read through.
+        // A field whose text is a constructor parameter links to the field,
+        // which its class's constructions fill once every module is read
+        // (carrick#2452).
         let values = fields
             .into_iter()
             .map(|(name, value)| {
-                let value = bound(format!("this.{name}"), value);
+                let mut value = bound(format!("this.{name}"), value);
+                if origins.get(&name).is_some_and(|from| from.text.is_some())
+                    && let Value::Str(pieces) = &mut value
+                    && let [Piece::Opaque { text, link, .. }] = pieces.as_mut_slice()
+                    && *text == format!("this.{name}")
+                    && link.is_none()
+                {
+                    *link = Some(Box::new(Link::Field(FieldLink {
+                        class: class.span.lo.0,
+                        field: name.clone(),
+                    })));
+                }
                 (name, value)
             })
             .collect();
@@ -4933,6 +5004,8 @@ impl Reader<'_> {
             receivers,
             fetches,
             query_builders: HashSet::new(),
+            origins,
+            ctor_defaults,
         }
     }
 
@@ -5526,7 +5599,7 @@ impl Reader<'_> {
             && let Value::Str(inner) = &mut value
             && let [Piece::Opaque { link, .. }] = inner.as_mut_slice()
         {
-            *link = Some(named.clone());
+            *link = Some(Box::new(Link::Named((**named).clone())));
         }
         value
     }
@@ -7842,7 +7915,12 @@ impl RequestSummaryInputs {
         if self.positions.is_some() {
             let mut join = rows_join::RowsJoin::start(service, budget);
             if let Some(reads) = self.bind_rows(&mut join) {
-                return self.read_through(reads);
+                // A class's constructions are found by the rows at each
+                // `new` (carrick#2452), so a field reads through them only
+                // here.
+                let mut linked = self.read_through(reads);
+                linked.read_fields();
+                return linked;
             }
             self.positions = None;
             self.links = None;
@@ -7888,10 +7966,11 @@ impl RequestSummaryInputs {
             ir.visit_pieces(path, &mut |scope, pieces| {
                 for piece in pieces.iter() {
                     if let Piece::Opaque {
-                        link: Some(named), ..
+                        link: Some(link), ..
                     } = piece
+                        && let Link::Named(named) = &**link
                     {
-                        wanted.insert((scope.to_path_buf(), (**named).clone()));
+                        wanted.insert((scope.to_path_buf(), named.clone()));
                     }
                 }
             });
@@ -7929,9 +8008,12 @@ impl RequestSummaryInputs {
             ir.visit_pieces(path, &mut |scope, pieces| {
                 let read = |piece: &Piece| match piece {
                     Piece::Opaque {
-                        link: Some(named), ..
+                        link: Some(link), ..
                     } => {
-                        let key = (scope.to_path_buf(), (**named).clone());
+                        let Link::Named(named) = &**link else {
+                            return None;
+                        };
+                        let key = (scope.to_path_buf(), named.clone());
                         match (resolved.get(&key), held.get(&key)) {
                             (Some(text), _) => Some(vec![Piece::Lit(text.clone())]),
                             (None, Some(Held::Text(text))) => Some(vec![Piece::Lit(text.clone())]),

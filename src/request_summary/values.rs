@@ -29,6 +29,17 @@ pub(super) enum ValueAt {
     /// A name or a member read here, by its span (discovery numbering): the
     /// compiler's row there says what it holds.
     Read { lo: u32, hi: u32, member: bool },
+    /// `this.<field>` (spanning `lo..hi`) in a member of the class whose
+    /// span starts at `class`, a field its constructor sets from a parameter
+    /// (carrick#2452): what each construction of the class passes there.
+    /// Read as the member it is where the class is not read through its
+    /// constructions.
+    Field {
+        lo: u32,
+        hi: u32,
+        class: u32,
+        field: String,
+    },
     /// What the call spanning `lo..hi` returns.
     Returned { lo: u32, hi: u32 },
     /// A function written here, by where its node starts.
@@ -143,6 +154,21 @@ impl Reader<'_> {
                 }
             }
             Expr::Member(member) => {
+                // A field the class's constructor sets from a parameter.
+                if matches!(
+                    crate::graphql_document_sites::unwrap_expression(&member.obj),
+                    Expr::This(_)
+                ) && let Some(fields) = scope.fields
+                    && let Some(field) = this_field(member)
+                    && fields.origins.contains_key(&field)
+                {
+                    return vec![ValueAt::Field {
+                        lo: member.span.lo.0,
+                        hi: member.span.hi.0,
+                        class: fields.class,
+                        field,
+                    }];
+                }
                 let key = match &member.prop {
                     MemberProp::Ident(prop) => Some(prop.sym.to_string()),
                     MemberProp::Computed(computed) => match &*computed.expr {
