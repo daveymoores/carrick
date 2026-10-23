@@ -34,12 +34,13 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::super::{
     CallIr, ClientRef, HeldInstance, KeyState, MadeBy, MakerForm, Piece, RequestSummaryInputs,
     Value, Way,
 };
+use super::boundaries::{Boundary, FnAt};
 use super::{Calls, Placed, filled, holds_parameter, relative, to_definition};
 use crate::position_rows::{FLAG_ANY, FLAG_DECLARATION_UNNAMED, Kind};
 
@@ -222,7 +223,7 @@ impl ScopeLabel {
 
 /// The prefix a scope or mount call states in its label's `name` slot
 /// (carrick#2474 R2b).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "prefix", rename_all = "snake_case")]
 pub enum Prefix {
     /// The call writes nothing there: it binds no prefix.
@@ -304,6 +305,11 @@ pub enum InstanceAt {
         /// What the walk stopped at, as written, where one expression is.
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// For an entry point or a callback option, where the chain leaves
+        /// the service, as another service's facts name it (carrick#2474
+        /// R5a).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        boundary: Option<Boundary>,
     },
 }
 
@@ -433,6 +439,17 @@ impl<'a> WalkIndex<'a> {
     }
 }
 
+impl<'a> WalkIndex<'a> {
+    /// The calls of a `runs` scope member handed a name the compiler
+    /// resolves to the declaration `(decl_file, decl_line)`, by that
+    /// declaration (carrick#2474 R5a).
+    pub(super) fn runs_hosts(&self) -> impl Iterator<Item = (&(String, u32), &[Host<'a>])> {
+        self.by_declaration
+            .iter()
+            .map(|(declared, hosts)| (declared, hosts.as_slice()))
+    }
+}
+
 /// `hosts` in file and source order: by file, span start, span end and
 /// argument, since a chained call starts where the call it is made on does
 /// (`app.register(a).register(b)`).
@@ -514,7 +531,37 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     }
 
     fn hole(&mut self, at: String, reason: InstanceHole, text: Option<String>) {
-        self.push(at, InstanceAt::Hole { reason, text });
+        self.push(
+            at,
+            InstanceAt::Hole {
+                reason,
+                text,
+                boundary: None,
+            },
+        );
+    }
+
+    /// A hole where the chain leaves the service at `boundary`, when the
+    /// walk can name it (carrick#2474 R5a).
+    fn boundary_hole(&mut self, at: String, reason: InstanceHole, boundary: Option<Boundary>) {
+        self.push(
+            at,
+            InstanceAt::Hole {
+                reason,
+                text: None,
+                boundary,
+            },
+        );
+    }
+
+    /// The declaration of the function `key` of `file`, as the rows name
+    /// it: the file repo-relative and the line its declaration starts on.
+    pub(super) fn fn_at(&self, file: &Path, key: &str) -> Option<FnAt> {
+        let (line, _) = self.inputs.files.get(file)?.declared_at.get(key)?;
+        Some(FnAt {
+            decl_file: relative(self.root, file),
+            decl_line: *line,
+        })
     }
 
     /// The instance ends of the site whose calls, from the deciding call
@@ -630,7 +677,17 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         }
         if callers.is_empty() {
             match (hosts.is_empty(), scoped) {
-                (true, _) => self.hole(at, InstanceHole::EntryPoint, None),
+                (true, _) => {
+                    // Another service may call it (carrick#2474 R5a).
+                    let boundary =
+                        param
+                            .zip(self.fn_at(placed.file, key))
+                            .map(|(param, function)| Boundary::EntryParam {
+                                function,
+                                param: param as u32,
+                            });
+                    self.boundary_hole(at, InstanceHole::EntryPoint, boundary);
+                }
                 (false, false) => self.hole(at, InstanceHole::RunsByLibrary, None),
                 (false, true) => {}
             }
@@ -656,8 +713,30 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     fn callback(&mut self, placed: &Placed<'a>, pieces: &[Piece]) {
         let at = self.at(placed);
         let written = placed.written_in;
-        if written.is_some_and(|written| !written.path.is_empty()) {
-            self.hole(at, InstanceHole::CallbackOption, None);
+        if let Some(written) = written.filter(|written| !written.path.is_empty()) {
+            // Where the function is written under one key and its own
+            // parameter holds the instance, the function the host runs or
+            // calls reads that key (carrick#2474 R5a).
+            // The call the object literal is written in: `host` names only
+            // a call handed the function itself.
+            let host = self
+                .calls
+                .at_span(placed.file, written.site.span_start, written.site.span_end)
+                .map(|host| host.call);
+            let boundary = match (pieces, written.path.as_slice(), host) {
+                ([Piece::Param(param, _)], [key], Some(host)) => self
+                    .runs_of(placed.file, host)
+                    .map(|(runs, runs_arg)| Boundary::CallbackOption {
+                        host_at: self.at_call(placed.file, host),
+                        arg: written.arg as u32,
+                        key: key.clone(),
+                        param: *param as u32,
+                        runs,
+                        runs_arg,
+                    }),
+                _ => None,
+            };
+            self.boundary_hole(at, InstanceHole::CallbackOption, boundary);
             return;
         }
         let reason = match placed.host {
@@ -830,6 +909,47 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             opened = true;
         }
         opened
+    }
+
+    /// The function `host`, a call written in `file`, runs or calls, as the
+    /// rows name its declaration in the repository: for a library member a
+    /// `runs` label names, the function handed at the label's `runs`
+    /// argument (with that argument); for a call of the repository's own
+    /// code, the callee (carrick#2474 R5a).
+    fn runs_of(&self, file: &Path, host: &CallIr) -> Option<(FnAt, Option<u32>)> {
+        let positions = self.inputs.positions.as_ref()?;
+        let ir = self.inputs.files.get(file)?;
+        let named = |row: &crate::position_rows::Row| {
+            if !super::super::discovery::in_repo(row) {
+                return None;
+            }
+            Some(FnAt {
+                decl_file: row.decl_file()?.to_string(),
+                decl_line: row.decl_line()?,
+            })
+        };
+        if self.library_call(file, host) {
+            let runs = self.scopes.iter().find_map(|label| match &label.binds {
+                ScopeBinds::Runs { arg, key: None, .. } if label.member == host.callee => {
+                    Some(*arg)
+                }
+                _ => None,
+            })?;
+            let (lo, hi) = host.instance.args.get(runs)?.span?;
+            let row = positions
+                .lookup(file, ir.swc_start(lo), ir.swc_start(hi), Kind::Ident)
+                .ok()?;
+            return Some((named(row)?, Some(runs as u32)));
+        }
+        let row = positions
+            .lookup(
+                file,
+                ir.swc_start(host.site.lo),
+                ir.swc_start(host.site.hi),
+                Kind::Call,
+            )
+            .ok()?;
+        Some((named(row)?, None))
     }
 
     /// The ends of `host`'s own receiver, walked inside this walk's scope
@@ -1060,7 +1180,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     /// calls of a `runs` scope member in another file handed a name the
     /// compiler resolves to it (`app.register(items)`, `items` imported;
     /// carrick#2474 R2b).
-    fn hosts_of(&self, file: &Path, key: &str) -> Vec<Host<'a>> {
+    pub(super) fn hosts_of(&self, file: &Path, key: &str) -> Vec<Host<'a>> {
         let mut hosts: Vec<Host<'a>> = self
             .index
             .by_name
@@ -1437,7 +1557,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
 
     /// `file:line` of `call`, as an instance end names the call that hands
     /// it in.
-    fn at_call(&self, file: &Path, call: &CallIr) -> String {
+    pub(super) fn at_call(&self, file: &Path, call: &CallIr) -> String {
         format!("{}:{}", relative(self.root, file), call.site.line)
     }
 }

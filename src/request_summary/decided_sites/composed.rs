@@ -18,6 +18,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use super::super::RequestSummaryInputs;
+use super::boundaries::{Above, Boundary, End, Part};
 use super::instances::{
     InstanceAt, InstanceEnd, InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, WalkIndex,
 };
@@ -135,6 +136,9 @@ struct Chain {
     prefixes: Vec<Prefix>,
     edges: Vec<String>,
     end: String,
+    /// Where the chain leaves the service, for a hole that names it
+    /// (carrick#2474 R5a).
+    boundary: Option<Boundary>,
 }
 
 fn edge_text(at: &str, member: &str, prefix: &Prefix) -> String {
@@ -181,33 +185,37 @@ fn chains(
         budget.trimmed = true;
         return Vec::new();
     }
-    let ended = |end: String, budget: &mut Budget| {
+    let ended = |end: String, boundary: Option<Boundary>, budget: &mut Budget| {
         if budget.take() {
             vec![Chain {
                 prefixes: Vec::new(),
                 edges: Vec::new(),
                 end,
+                boundary,
             }]
         } else {
             Vec::new()
         }
     };
     match &end.end {
-        InstanceAt::Hole { reason, .. } => ended(
+        InstanceAt::Hole {
+            reason, boundary, ..
+        } => ended(
             serde_json::to_value(reason)
                 .ok()
                 .and_then(|reason| reason.as_str().map(str::to_string))
                 .unwrap_or_default(),
+            boundary.clone(),
             budget,
         ),
         InstanceAt::Root { file, line, .. } => {
             let here = (file.clone(), *line);
             if seen.contains(&here) {
-                return ended("cycle".to_string(), budget);
+                return ended("cycle".to_string(), None, budget);
             }
             let served: Vec<&MountEdge> = mounts.iter().filter(|edge| edge.child == here).collect();
             if served.is_empty() {
-                return ended("top".to_string(), budget);
+                return ended("top".to_string(), None, budget);
             }
             seen.push(here);
             let mut out = Vec::new();
@@ -253,6 +261,40 @@ fn join_path(parts: &[&str]) -> String {
     parts.iter().fold(String::new(), |path, part| {
         crate::utils::join_prefix_and_path(&path, part)
     })
+}
+
+/// Each chain up `ends`, at most [`MAX_COMPOSED`], as a boundary record
+/// holds it (carrick#2474 R5a): its edges and prefixes from where it ends
+/// down, and that end.
+pub(super) fn aboves(ends: &[InstanceEnd], mounts: &[MountEdge]) -> Vec<Above> {
+    let mut budget = Budget {
+        left: MAX_COMPOSED,
+        trimmed: false,
+    };
+    let mut out: Vec<Above> = Vec::new();
+    for end in ends {
+        for chain in chains(end, mounts, &mut Vec::new(), &mut budget) {
+            let parts = chain
+                .edges
+                .into_iter()
+                .zip(chain.prefixes)
+                .flat_map(|(edge, prefix)| [Part::Edge { edge }, Part::Prefix { prefix }])
+                .collect();
+            let end = match (chain.end.as_str(), chain.boundary) {
+                ("top", _) => End::Top,
+                ("mount_unverified", _) => End::MountUnverified,
+                (_, Some(boundary)) => End::Boundary { boundary },
+                (reason, None) => End::Hole {
+                    reason: reason.to_string(),
+                },
+            };
+            let above = Above { parts, end };
+            if !out.contains(&above) {
+                out.push(above);
+            }
+        }
+    }
+    out
 }
 
 /// The paths a route site whose call writes `route`, made on `ends`, is

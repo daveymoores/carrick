@@ -133,6 +133,103 @@ struct RoutesCensus {
     composed_trimmed: usize,
     /// Every composed path: `file:line METHOD path <- edges`.
     composed: Vec<String>,
+    /// Where route chains leave their service, and how they resolve
+    /// across the repo's services (carrick#2474 R5a).
+    boundaries: BoundariesCensus,
+}
+
+/// The services' boundary facts (carrick#2474 R5a), resolved across them
+/// under the Q5 switch ([`super::decided_sites::boundaries::FAN_OUT`]).
+#[derive(Debug, Default, Serialize)]
+struct BoundariesCensus {
+    /// Route segments by boundary kind (`entry_param`, `callback_option`).
+    segments: BTreeMap<String, usize>,
+    /// Route segments by the boundary they end at, `kind file:line`.
+    segments_at: BTreeMap<String, usize>,
+    /// Call-ins by the function they call, `file:line pN`.
+    call_ins: BTreeMap<String, usize>,
+    /// Hand-outs by the function, `file:line pN.key`.
+    hand_outs: BTreeMap<String, usize>,
+    /// Segments by outcome: `resolved`, or why not.
+    resolved: BTreeMap<String, usize>,
+    /// Hosts whose path is not read, over every segment.
+    unread_hosts: usize,
+    /// Every segment: `service file:line METHOD -> paths (unread hosts)` or
+    /// `-> (reason)`.
+    lines: Vec<String>,
+}
+
+/// The census of `facts`, each service's name and boundary facts.
+fn census_boundaries(
+    facts: &[(String, super::decided_sites::RouteBoundaries)],
+) -> BoundariesCensus {
+    use super::decided_sites::boundaries::{Boundary, FAN_OUT, resolve};
+    let mut census = BoundariesCensus::default();
+    let fn_at =
+        |at: &super::decided_sites::boundaries::FnAt| format!("{}:{}", at.decl_file, at.decl_line);
+    for (_, service) in facts {
+        for segment in &service.routes {
+            let (kind, at) = match &segment.at {
+                Boundary::EntryParam { function, param } => {
+                    ("entry_param", format!("{} p{param}", fn_at(function)))
+                }
+                Boundary::CallbackOption { host_at, key, .. } => {
+                    ("callback_option", format!("{host_at} {key}"))
+                }
+            };
+            *census.segments.entry(kind.to_string()).or_default() += 1;
+            *census
+                .segments_at
+                .entry(format!("{kind} {at}"))
+                .or_default() += 1;
+        }
+        for call_in in &service.call_ins {
+            *census
+                .call_ins
+                .entry(format!("{} p{}", fn_at(&call_in.function), call_in.param))
+                .or_default() += 1;
+        }
+        for hand_out in &service.hand_outs {
+            *census
+                .hand_outs
+                .entry(format!(
+                    "{} p{}.{}",
+                    fn_at(&hand_out.function),
+                    hand_out.param,
+                    hand_out.key
+                ))
+                .or_default() += 1;
+        }
+    }
+    let services: Vec<(&str, &super::decided_sites::RouteBoundaries)> = facts
+        .iter()
+        .map(|(name, facts)| (name.as_str(), facts))
+        .collect();
+    for resolved in resolve(&services, FAN_OUT) {
+        census.unread_hosts += resolved.unread_hosts;
+        let outcome = resolved
+            .untraced
+            .clone()
+            .unwrap_or_else(|| "resolved".to_string());
+        *census.resolved.entry(outcome).or_default() += 1;
+        census.lines.push(format!(
+            "{} {}:{} {} -> {}",
+            resolved.service,
+            resolved.file,
+            resolved.line,
+            resolved.method,
+            match &resolved.untraced {
+                Some(reason) => format!("({reason})"),
+                None => format!(
+                    "{} ({} unread hosts)",
+                    resolved.paths.join("|"),
+                    resolved.unread_hosts
+                ),
+            }
+        ));
+    }
+    census.lines.sort();
+    census
 }
 
 /// An instance end's kind: `root`, or the hole's reason.
@@ -441,6 +538,7 @@ fn census_repo(
     let mut bytes: Vec<usize> = Vec::new();
     let mut per_file: HashMap<String, usize> = HashMap::new();
     let mut routed: Vec<Routed> = Vec::new();
+    let mut boundaries: Vec<(String, super::decided_sites::RouteBoundaries)> = Vec::new();
     for service in &services {
         let label = service
             .service_name
@@ -473,6 +571,7 @@ fn census_repo(
         let started = std::time::Instant::now();
         let decided = decided_sites_traced(&inputs, &root, &mine, &labels, &makers, &scopes);
         census.traced_ms += started.elapsed().as_millis();
+        boundaries.push((label.clone(), decided.boundaries.clone()));
         census.decided_sites += decided.sites.len();
         census.unplaced += decided.unplaced.len();
         census.walked += decided.walked.len();
@@ -583,7 +682,11 @@ fn census_repo(
     }
     census.summary_rows_off_site.sort();
     census.summary_rows_off_site.dedup();
-    census.routes = blobs.map(|blobs| census_routes(&routed, blobs));
+    census.routes = blobs.map(|blobs| {
+        let mut routes = census_routes(&routed, blobs);
+        routes.boundaries = census_boundaries(&boundaries);
+        routes
+    });
     census
 }
 

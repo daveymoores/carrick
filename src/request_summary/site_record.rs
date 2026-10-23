@@ -1226,7 +1226,10 @@ fn place(from: PlaceFrom, at: &str) -> Place {
 }
 
 /// The kind and role a label's role and op force, where they force one.
-fn kind_and_role(role: &str, op: Option<&str>) -> (Option<&'static str>, Option<&'static str>) {
+pub(super) fn kind_and_role(
+    role: &str,
+    op: Option<&str>,
+) -> (Option<&'static str>, Option<&'static str>) {
     let kind = match role {
         "http_client" | "server_framework" => Some("http"),
         "socket" => Some("socket_event"),
