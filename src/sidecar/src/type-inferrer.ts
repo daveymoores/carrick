@@ -1272,6 +1272,22 @@ export class TypeInferrer {
     if (this.serialisedBodyEnvelopeEngages(awaitedType, func)) {
       return this.inferSerialisedBodyEnvelope(request, func);
     }
+    // A handler that returns the reply it was handed (`return reply`) states
+    // no body by that return; the reply's type is built from the route's
+    // request type argument (carrick-cloud#2576).
+    const returned = this.returnedExpressions(func);
+    if (
+      returned.length > 0 &&
+      returned.every((expression) =>
+        this.isLibraryTypedParameter(this.unwrapExpressionNode(expression))
+      )
+    ) {
+      this.log(
+        `Return at ${request.file_path}:${request.line_number} is an object the ` +
+          'framework handed the handler; it states no body'
+      );
+      return null;
+    }
     const unwrapResult = this.unwrapTypeWithConfig(awaitedType, func, extractionConfig);
     if (unwrapResult.wasUnwrapped && !unwrapResult.verifiedMachinery) {
       typeString = unwrapResult.typeString;
@@ -1798,6 +1814,18 @@ export class TypeInferrer {
         payloadNode = args[0];
       }
     }
+    // An object the framework handed the handler is never its body: not the
+    // reply a handler returns (`return reply`), and not the request the drill
+    // reaches in a call that forwards it (`return finish(request, reply)`),
+    // whose type the framework built from the route's request type argument
+    // (carrick-cloud#2576).
+    if (this.isLibraryTypedParameter(payloadNode)) {
+      this.log(
+        `Response payload at ${request.file_path}:${request.line_number} is an object ` +
+          'the framework handed the handler; it states no body'
+      );
+      return null;
+    }
 
     const payloadType = payloadNode.getType();
     let typeString = typeText(payloadType, payloadNode);
@@ -2025,6 +2053,29 @@ export class TypeInferrer {
       return peeled;
     }
     return this.receivingCallOf(located, isReturned);
+  }
+
+  /**
+   * True when `node` is a bare reference to a function parameter whose type an
+   * installed library declares: an object a framework hands its handler (the
+   * request, the reply, a context), never a body the route sends
+   * (carrick-cloud#2576). A parameter typed by the repo is data
+   * (`.then((item) => reply.send(item))`), and so is one typed by a default
+   * TypeScript library (`Date`, `Map`).
+   */
+  private isLibraryTypedParameter(node: Node): boolean {
+    if (!Node.isIdentifier(node)) return false;
+    const symbol = node.getSymbol();
+    if (!symbol?.getDeclarations().some((decl) => Node.isParameterDeclaration(decl))) {
+      return false;
+    }
+    const type = node.getType();
+    const typeSymbol = type.getAliasSymbol() ?? type.getSymbol();
+    if (!typeSymbol || !this.symbolIsLibOrExternalOrigin(typeSymbol)) return false;
+    const program = this.project.getProgram().compilerObject;
+    return !typeSymbol
+      .getDeclarations()
+      .some((decl) => program.isSourceFileDefaultLibrary(decl.getSourceFile().compilerNode));
   }
 
   /**
