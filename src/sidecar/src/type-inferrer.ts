@@ -66,6 +66,8 @@ import { functionAtLine } from './function-line-index.js';
 import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
 import { endLineOf, startLineOf } from './line-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
+import type { LabelledMembers } from './library-claims.js';
+import { StatedParams } from './stated-params.js';
 import {
   classifyStatusCodes,
   constituents,
@@ -268,6 +270,19 @@ const STATUS_MEMBER_NAMES = ['status', 'statusCode'] as const;
  */
 type ResponseSiteStatus = 'success' | 'error' | 'redirect' | 'variable' | 'undecided';
 
+/**
+ * The reasons an `unknown` answer is a decision, not a failure to read: the
+ * list `DECIDED_ABSTAIN_REASONS` in `src/engine/type_compat_v2.rs` holds
+ * final. A stated reply never replaces one (carrick#2674).
+ */
+const DECIDED_ABSTAIN_REASONS: ReadonlySet<string> = new Set([
+  'no_success_payload',
+  'no_request_body',
+  'projected_value_only',
+  'serialised_body_unread',
+  'body_built_by_callee',
+]);
+
 /** One response branch's payload, before branches are joined. */
 interface PayloadCandidate {
   typeString: string;
@@ -429,6 +444,11 @@ const RAW_TEXT_FORMAT = 'text';
 interface DeclaredContract {
   text: string;
   provenance?: TypeProvenance[];
+  /**
+   * carrick#2674: the route states it takes no request body, and why. The
+   * contract is then the decided `no_request_body` abstain, not `text`.
+   */
+  noRequestBody?: string;
 }
 
 /** A type the function a value is made in states for it (carrick#2594). */
@@ -752,10 +772,12 @@ export class TypeInferrer {
     requests: InferRequestItem[],
     extractionConfig?: ExtractionConfig,
     onRequestDone?: InferRequestDone,
-    modelSymbols?: ModelSymbol[]
+    modelSymbols?: ModelSymbol[],
+    labels?: LabelledMembers
   ): InferResult {
     const started = performance.now();
     this.modelSymbols = new Map((modelSymbols ?? []).map((symbol) => [symbol.alias, symbol]));
+    this.statedParams = this.statedParamsFor(labels ?? { sends: new Map(), bodies: new Set() });
     const inferredTypes: InferredType[] = [];
     const errors: string[] = [];
     /** Response inferences the unwidened reading re-reads (carrick#1516). */
@@ -895,6 +917,12 @@ export class TypeInferrer {
 
   /** The types the model named, by the alias of the row each is for (carrick#2111). */
   private modelSymbols = new Map<string, ModelSymbol>();
+  /**
+   * carrick#2674: what route handlers' parameters state, through the
+   * members the batch's verified server-framework labels name. Empty when
+   * the batch carries no labels, and then it reads nothing.
+   */
+  private statedParams = this.statedParamsFor({ sends: new Map(), bodies: new Set() });
 
   /**
    * carrick#2111: where the model named a type for the response this request
@@ -1204,7 +1232,11 @@ export class TypeInferrer {
       case 'function_return':
         return this.inferFunctionReturn(sourceFile, request, extractionConfig);
       case 'response_body':
-        return this.inferResponseBody(sourceFile, request, extractionConfig);
+        return this.withStatedReply(
+          sourceFile,
+          request,
+          this.inferResponseBody(sourceFile, request, extractionConfig)
+        );
       case 'call_result':
         return this.inferCallResult(sourceFile, request, extractionConfig);
       case 'variable':
@@ -9049,6 +9081,17 @@ export class TypeInferrer {
     contract: DeclaredContract,
     location: SourceLocation
   ): InferredType {
+    if (contract.noRequestBody !== undefined) {
+      this.log(
+        `Route at ${request.file_path}:${request.line_number} states no request body: ${contract.noRequestBody}`
+      );
+      return this.decidedAbstain(request, location, {
+        path: '',
+        kind: 'unknown',
+        reason: 'no_request_body',
+        detail: contract.noRequestBody,
+      });
+    }
     const inferred = this.createInferredType(
       request,
       contract.text,
@@ -9078,13 +9121,89 @@ export class TypeInferrer {
     registration: Node,
     handler: FunctionLike
   ): DeclaredContract | null {
+    // carrick#2674: the body member a verified label names, read at the
+    // handler's parameter, comes first. Where no label answers, the old rule
+    // that reads a member by its name stands.
+    const stated = this.statedParams.request(handler);
+    if (stated?.kind === 'body') {
+      const text = this.structuralTextFromType(stated.type, stated.at);
+      if (text) {
+        return { text };
+      }
+    }
     const annotated = this.requestBodyFromHandlerParams(handler);
     if (annotated) {
       return { text: annotated };
     }
-    return (
+    const schema =
       this.routeSchemaContract(registration, 'body') ??
-      this.validatedBodyContract(registration)
+      this.validatedBodyContract(registration);
+    if (schema) {
+      return schema;
+    }
+    return stated?.kind === 'no_body' ? { text: 'unknown', noRequestBody: stated.detail } : null;
+  }
+
+  /** The stated-parameter reader over `labels`, judging files and statuses as this inferrer does. */
+  private statedParamsFor(labels: LabelledMembers): StatedParams {
+    return new StatedParams(
+      labels,
+      (file) => {
+        const sourceFile = file.getSourceFile();
+        if (sourceFile.isDeclarationFile()) return false;
+        return !isExternalOrigin(
+          this.project.getProgram().compilerObject,
+          sourceFile.compilerNode,
+          this.repoRoot,
+          externalImportsOf(this.project)
+        );
+      },
+      (call) => this.chainStatus(call)
+    );
+  }
+
+  /**
+   * carrick#2674: where today's reading of a route's response is empty
+   * (nothing, `void`, or an `unknown` the inferrer did not decide), the reply
+   * its handler's parameter states, cut to its success variants. A typed
+   * reading, or a decided abstain, stands as it is.
+   */
+  private withStatedReply(
+    sourceFile: SourceFile,
+    request: InferRequestItem,
+    today: InferredType | null
+  ): InferredType | null {
+    if (!this.statedParams.readsReplies) return today;
+    if (today && !this.isEmptyResponseReading(today)) return today;
+    const handler =
+      this.registrationAtLine(sourceFile, request.line_number)?.handler ??
+      this.exportedFunctionOpeningOn(sourceFile, request.line_number);
+    if (!handler) return today;
+    const stated = this.statedParams.reply(handler);
+    if (!stated) return today;
+    const texts: string[] = [];
+    for (const variant of stated.variants) {
+      const text = this.structuralTextFromType(variant, stated.at);
+      if (!text) return today;
+      texts.push(text);
+    }
+    this.log(
+      `Route at ${request.file_path}:${request.line_number}: its handler's reply parameter states the body`
+    );
+    return this.createInferredType(
+      request,
+      texts.length === 1 ? texts[0] : texts.map((text) => `(${text})`).join(' | '),
+      true,
+      this.getNodeLocation(handler)
+    );
+  }
+
+  /** Nothing read: `void`, or an `unknown` with no decided reason at its root. */
+  private isEmptyResponseReading(inferred: InferredType): boolean {
+    if (inferred.type_string === 'void') return true;
+    if (inferred.type_string !== 'unknown') return false;
+    return !(inferred.any_provenance ?? []).some(
+      (provenance) => provenance.path === '' && DECIDED_ABSTAIN_REASONS.has(provenance.reason)
     );
   }
 

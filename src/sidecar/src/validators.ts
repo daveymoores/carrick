@@ -296,6 +296,8 @@ export const InferRequestSchema = BaseRequestSchema.extend({
       })
     )
     .optional(),
+  // Declared below with the library claims; read lazily (carrick#2674).
+  server_claims: z.lazy(() => ServerClaimsSchema).optional(),
 });
 
 export const HealthRequestSchema = BaseRequestSchema.extend({
@@ -458,6 +460,7 @@ const RequestAtSchema = z
     path: z.array(z.string().min(1)).optional(),
     url: z.array(z.string().min(1)).optional(),
     method: z.array(z.string().min(1)).optional(),
+    body: z.array(z.string().min(1)).optional(),
   })
   .strict();
 
@@ -564,6 +567,15 @@ const LibraryCheckSchema = z
     // Any other receiver answers `unchecked` (`receiver_invalid`) on its own.
     receiver: z.string().min(1),
     claim: LibraryClaimSchema,
+  })
+  .strict();
+
+/** The server-framework claims an `infer` request reads handler parameters through (carrick#2674). */
+const ServerClaimsSchema = z
+  .object({
+    from_dir: z.string().min(1),
+    scan_root: z.string().min(1).optional(),
+    checks: z.array(LibraryCheckSchema),
   })
   .strict();
 

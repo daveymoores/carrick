@@ -1,0 +1,423 @@
+/**
+ * What a route handler's own parameters state about the route's bodies
+ * (carrick#2674), read through the members the service's verified
+ * server-framework labels name ({@link LabelledMembers}). A member is matched
+ * by its declaration, never by its name, so a type the repo declares itself
+ * with a member of the same name states nothing here.
+ *
+ * - The request: the member a receive op's `request.body` path ends on, read
+ *   at the handler's parameter. A type the source fills is the body. A body
+ *   the source leaves `never`, or leaves at the library's unfilled `unknown`
+ *   while it writes a type argument for the route, is "no request body",
+ *   provided nothing reads it (`bodyIsUnread`).
+ * - The reply: the payload a labelled `send` member's slot takes, read at the
+ *   handler's parameter, where the library declares that payload through a
+ *   type parameter of the reply type. A union of success and error bodies is
+ *   cut to the variants a success-status send through the parameter carries.
+ */
+
+import {
+  Node,
+  SyntaxKind,
+  ts,
+  type ArrowFunction,
+  type CallExpression,
+  type FunctionDeclaration,
+  type FunctionExpression,
+  type MethodDeclaration,
+  type ParameterDeclaration,
+  type Symbol as TsSymbol,
+  type Type,
+} from 'ts-morph';
+import { declarationKey, type LabelledMembers } from './library-claims.js';
+import type { ClaimSlot } from './types.js';
+
+/** A function a handler can be: what the inferrer follows a registration to. */
+export type HandlerFunction = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
+
+/** What a handler's parameters state about the request body. */
+export type StatedRequest =
+  | { kind: 'body'; type: Type; at: ParameterDeclaration }
+  | { kind: 'no_body'; at: ParameterDeclaration; detail: string };
+
+/** The reply a handler's parameters state: one or more success variants. */
+export interface StatedReply {
+  variants: Type[];
+  at: ParameterDeclaration;
+}
+
+/** The status a send's own chain states, as the inferrer reads it. */
+export type ChainStatus = (call: CallExpression) => 'success' | 'error' | 'redirect' | 'variable' | 'undecided' | undefined;
+
+/** How many repo functions the request may be handed through before a read is unprovable. */
+const REACH_DEPTH = 2;
+
+export class StatedParams {
+  constructor(
+    private readonly labels: LabelledMembers,
+    /** True for a file the repo declares itself (not a library's or the runtime's). */
+    private readonly isRepoFile: (file: Node) => boolean,
+    private readonly chainStatus: ChainStatus
+  ) {}
+
+  /** No label names a member: every reading answers nothing. */
+  get isEmpty(): boolean {
+    return this.labels.sends.size === 0 && this.labels.bodies.size === 0;
+  }
+
+  /** Whether some label names a reply's send member. */
+  get readsReplies(): boolean {
+    return this.labels.sends.size > 0;
+  }
+
+  // ===========================================================================
+  // Request
+  // ===========================================================================
+
+  /**
+   * The request body the handler's parameters state, the first parameter
+   * whose type has a labelled body member deciding. Undefined when no
+   * parameter has one, or the one that does states nothing decidable.
+   */
+  request(handler: HandlerFunction): StatedRequest | undefined {
+    if (this.labels.bodies.size === 0) return undefined;
+    const parameters = handler.getParameters();
+    for (const parameter of parameters) {
+      const member = this.labelledMember(parameter, (key) => this.labels.bodies.has(key));
+      if (!member) continue;
+      let body: Type;
+      try {
+        body = member.getTypeAtLocation(parameter);
+      } catch {
+        return undefined;
+      }
+      if (body.isAny()) return undefined;
+      if (!body.isUnknown() && !body.isNever()) return { kind: 'body', type: body, at: parameter };
+      if (body.isUnknown() && !this.writesTypeArgument(handler, parameter)) return undefined;
+      const declarations = new Set((member.getDeclarations() ?? []).map((d) => declarationKey(d.compilerNode)));
+      if (!this.bodyIsUnread(handler, parameters.indexOf(parameter), declarations, 0, new Set())) {
+        return undefined;
+      }
+      return {
+        kind: 'no_body',
+        at: parameter,
+        detail: body.isNever()
+          ? "the route's request type states its body as never, and nothing the handler hands the request to reads it"
+          : "the route's request type states its parts and no body, and nothing the handler hands the request to reads it",
+      };
+    }
+    return undefined;
+  }
+
+  /**
+   * A type argument the source writes for this route: on a call the handler
+   * is passed to (the registration, or a wrapper that makes the handler),
+   * through any calls enclosing that one as an argument, or on the
+   * parameter's own annotation.
+   */
+  private writesTypeArgument(handler: HandlerFunction, parameter: ParameterDeclaration): boolean {
+    const annotation = parameter.getTypeNode();
+    if (annotation && Node.isTypeReference(annotation) && annotation.getTypeArguments().length > 0) {
+      return true;
+    }
+    let node: Node = handler;
+    let parent = node.getParent();
+    while (parent && Node.isCallExpression(parent) && parent.getArguments().includes(node)) {
+      if (parent.getTypeArguments().length > 0) return true;
+      node = parent;
+      parent = node.getParent();
+    }
+    return false;
+  }
+
+  /**
+   * Nothing reads the labelled body member off parameter `index` of
+   * `func`, nor off the request in the repo functions it is handed to, up to
+   * `REACH_DEPTH` calls deep. Every use of the request must be a member
+   * read that is not the body and is not itself called (a framework's own
+   * body reader), or a hand-off to a function the repo declares, whole and
+   * by position. Anything else (a destructured parameter, a library
+   * function, an alias, a spread) is a read this cannot rule out.
+   */
+  private bodyIsUnread(
+    func: HandlerFunction,
+    index: number,
+    bodyKeys: ReadonlySet<string>,
+    depth: number,
+    seen: Set<Node>
+  ): boolean {
+    if (seen.has(func)) return true;
+    seen.add(func);
+    const parameter = func.getParameters()[index];
+    if (!parameter) return true;
+    if (parameter.isRestParameter()) return false;
+    const name = parameter.getNameNode();
+    if (!Node.isIdentifier(name)) return false;
+    const symbol = name.getSymbol();
+    const body = func.getBody();
+    if (!symbol || !body) return false;
+    for (const use of body.getDescendantsOfKind(SyntaxKind.Identifier)) {
+      if (use.getSymbol() !== symbol) continue;
+      const parent = use.getParent();
+      if (!parent) return false;
+      if (Node.isPropertyAccessExpression(parent) && parent.getExpression() === use) {
+        const declarations = parent.getNameNode().getSymbol()?.getDeclarations() ?? [];
+        if (declarations.some((d) => bodyKeys.has(declarationKey(d.compilerNode)))) return false;
+        const outer = parent.getParent();
+        if (outer && Node.isCallExpression(outer) && outer.getExpression() === parent) return false;
+        continue;
+      }
+      if (Node.isCallExpression(parent) && parent.getArguments().includes(use)) {
+        const position = parent.getArguments().indexOf(use);
+        if (parent.getArguments().slice(0, position).some(Node.isSpreadElement)) return false;
+        if (depth >= REACH_DEPTH) return false;
+        const callee = this.repoFunction(parent.getExpression());
+        if (!callee) return false;
+        // A helper that takes the request under a type without the labelled
+        // body member could read the body under another declaration, which
+        // nothing here can match.
+        const taken = callee.getParameters()[position];
+        if (!taken || !this.labelledMember(taken, (key) => bodyKeys.has(key))) return false;
+        if (!this.bodyIsUnread(callee, position, bodyKeys, depth + 1, seen)) return false;
+        continue;
+      }
+      return false;
+    }
+    return true;
+  }
+
+  /** The function a callee names, where the repo declares it; undefined otherwise. */
+  private repoFunction(callee: Node): HandlerFunction | undefined {
+    let symbol = callee.getSymbol();
+    if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
+    for (const declaration of symbol?.getDeclarations() ?? []) {
+      if (!this.isRepoFile(declaration.getSourceFile())) continue;
+      if (
+        Node.isFunctionDeclaration(declaration) ||
+        Node.isMethodDeclaration(declaration) ||
+        Node.isArrowFunction(declaration) ||
+        Node.isFunctionExpression(declaration)
+      ) {
+        return declaration.getBody() ? declaration : undefined;
+      }
+      if (Node.isVariableDeclaration(declaration) || Node.isPropertyAssignment(declaration)) {
+        const initializer = declaration.getInitializer();
+        if (initializer && (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer))) {
+          return initializer;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  // ===========================================================================
+  // Reply
+  // ===========================================================================
+
+  /**
+   * The reply the handler's parameters state, cut to its success variants.
+   * Undefined when no parameter has a labelled send member that states a
+   * payload, when two such members disagree, when the payload is `any`,
+   * `unknown` or `never`, or when a union of bodies has no variant a
+   * success send through the parameter carries.
+   */
+  reply(handler: HandlerFunction): StatedReply | undefined {
+    if (this.labels.sends.size === 0) return undefined;
+    for (const parameter of handler.getParameters()) {
+      const stated = this.statedPayload(parameter);
+      if (stated === 'none') continue;
+      if (stated === 'abstain') return undefined;
+      if (stated.isAny() || stated.isUnknown() || stated.isNever()) return undefined;
+      const variants = stated.isUnion() ? stated.getUnionTypes().filter((t) => !t.isNull() && !t.isUndefined()) : [stated];
+      const literalUnion = stated.isBoolean() || variants.every((t) => t.isLiteral() || t.isBooleanLiteral());
+      if (variants.length <= 1 || literalUnion) return { variants: [stated], at: parameter };
+      const carried = this.successSendsThrough(handler, parameter);
+      const kept = variants.filter((variant) => carried.some((sent) => sent.isAssignableTo(variant)));
+      return kept.length > 0 ? { variants: kept, at: parameter } : undefined;
+    }
+    return undefined;
+  }
+
+  /**
+   * The payload the parameter's labelled send members state: `none` when its
+   * type has no labelled send member, `abstain` when members state different
+   * payloads, else the one payload type.
+   */
+  private statedPayload(parameter: ParameterDeclaration): Type | 'none' | 'abstain' {
+    let type: Type;
+    try {
+      type = parameter.getType();
+    } catch {
+      return 'none';
+    }
+    let found = false;
+    let payload: Type | undefined;
+    for (const property of type.getProperties()) {
+      const slot = this.sendSlotOf(property.getDeclarations().map((d) => d.compilerNode));
+      if (!slot) continue;
+      found = true;
+      const declared = property.getDeclarations().find((d) => this.payloadIsTypeSlot(d.compilerNode, slot));
+      if (!declared) continue;
+      let member: Type;
+      try {
+        member = property.getTypeAtLocation(parameter);
+      } catch {
+        continue;
+      }
+      for (const signature of member.getCallSignatures()) {
+        // A payload the member's own type parameter types is whatever each
+        // call passes: the parameter states nothing.
+        if (signature.getTypeParameters().length > 0) continue;
+        const at = this.payloadAt(signature.getParameters(), slot, parameter);
+        if (!at) continue;
+        if (payload === undefined) payload = at;
+        else if (payload.compilerType !== at.compilerType) return 'abstain';
+      }
+    }
+    if (!found) return 'none';
+    return payload ?? 'none';
+  }
+
+  /** The payload slot a labelled send member takes, by any of its declarations. */
+  private sendSlotOf(declarations: readonly ts.Node[]): ClaimSlot | undefined {
+    for (const declaration of declarations) {
+      const slot = this.labels.sends.get(declarationKey(declaration));
+      if (slot) return slot;
+    }
+    return undefined;
+  }
+
+  /**
+   * The library declares the member's payload through a type parameter of
+   * the type that declares the member: a slot each route fills. A payload
+   * declared with a fixed type (a file path, a status code) says nothing
+   * about any one route.
+   */
+  private payloadIsTypeSlot(declaration: ts.Node, slot: ClaimSlot): boolean {
+    const owner = declaration.parent;
+    const ownParameters = new Set<ts.Node>(
+      owner && (ts.isInterfaceDeclaration(owner) || ts.isClassDeclaration(owner) || ts.isClassExpression(owner))
+        ? (owner.typeParameters ?? [])
+        : []
+    );
+    if (ownParameters.size === 0) return false;
+    let typeNode: ts.TypeNode | undefined;
+    if (ts.isMethodSignature(declaration) || ts.isMethodDeclaration(declaration)) {
+      typeNode = declaration.parameters[slot.arg]?.type;
+    } else if (ts.isPropertySignature(declaration) || ts.isPropertyDeclaration(declaration)) {
+      typeNode = declaration.type;
+    }
+    if (!typeNode) return false;
+    let mentions = false;
+    const visit = (node: ts.Node): void => {
+      if (mentions) return;
+      if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
+        const name = node.typeName.text;
+        for (const parameter of ownParameters) {
+          if (ts.isTypeParameterDeclaration(parameter) && parameter.name.text === name) mentions = true;
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(typeNode);
+    return mentions;
+  }
+
+  /** The type the call signature takes at the payload slot, read at `at`. */
+  private payloadAt(
+    parameters: readonly TsSymbol[],
+    slot: ClaimSlot,
+    at: ParameterDeclaration
+  ): Type | undefined {
+    const symbol = parameters[slot.arg];
+    if (!symbol) return undefined;
+    const declaration = symbol.getDeclarations()[0];
+    let type = symbol.getTypeAtLocation(at);
+    if (declaration && Node.isParameterDeclaration(declaration) && declaration.isRestParameter()) {
+      if (!type.isTuple()) return undefined;
+      const first = type.getTupleElements()[0];
+      if (!first) return undefined;
+      type = first;
+    }
+    if (slot.key !== undefined) {
+      const property = type.getProperty(slot.key);
+      if (!property) return undefined;
+      type = property.getTypeAtLocation(at);
+    }
+    const optional =
+      declaration !== undefined && Node.isParameterDeclaration(declaration) && declaration.isOptional();
+    if (optional && type.isUnion()) {
+      const defined = type.getUnionTypes().filter((t) => !t.isUndefined());
+      if (defined.length === 1) return defined[0];
+    }
+    return type;
+  }
+
+  /**
+   * The payloads the handler sends through `parameter` with a success
+   * status: calls of a labelled send member on the parameter, or on a call
+   * chain rooted at it, whose chain states a success status or none.
+   */
+  private successSendsThrough(handler: HandlerFunction, parameter: ParameterDeclaration): Type[] {
+    const name = parameter.getNameNode();
+    const symbol = Node.isIdentifier(name) ? name.getSymbol() : undefined;
+    const body = handler.getBody();
+    if (!symbol || !body) return [];
+    const sent: Type[] = [];
+    for (const call of body.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const callee = call.getExpression();
+      if (!Node.isPropertyAccessExpression(callee)) continue;
+      const declarations = callee.getNameNode().getSymbol()?.getDeclarations() ?? [];
+      const slot = this.sendSlotOf(declarations.map((d) => d.compilerNode));
+      if (!slot) continue;
+      if (this.rootSymbol(callee.getExpression()) !== symbol) continue;
+      const status = this.chainStatus(call);
+      if (status !== undefined && status !== 'success') continue;
+      let argument = call.getArguments()[slot.arg];
+      if (!argument || Node.isSpreadElement(argument)) continue;
+      if (slot.key !== undefined) {
+        if (!Node.isObjectLiteralExpression(argument)) continue;
+        const property = argument.getProperty(slot.key);
+        if (!property || !Node.isPropertyAssignment(property)) continue;
+        const initializer = property.getInitializer();
+        if (!initializer) continue;
+        argument = initializer;
+      }
+      // A value typed `any` or `unknown` is assignable to every variant,
+      // so it tells no success body from an error body.
+      const type = argument.getType();
+      if (type.isAny() || type.isUnknown()) continue;
+      sent.push(type);
+    }
+    return sent;
+  }
+
+  /** The symbol at the root of a member or call chain (`res.status(201)` is `res`). */
+  private rootSymbol(expression: Node): TsSymbol | undefined {
+    let node = expression;
+    for (;;) {
+      if (Node.isPropertyAccessExpression(node) || Node.isCallExpression(node) || Node.isParenthesizedExpression(node) || Node.isNonNullExpression(node)) {
+        node = node.getExpression();
+        continue;
+      }
+      break;
+    }
+    return Node.isIdentifier(node) ? node.getSymbol() : undefined;
+  }
+
+  /** The member of the parameter's type whose declaration a label names. */
+  private labelledMember(
+    parameter: ParameterDeclaration,
+    labelled: (key: string) => boolean
+  ): TsSymbol | undefined {
+    let type: Type;
+    try {
+      type = parameter.getType();
+    } catch {
+      return undefined;
+    }
+    return type
+      .getProperties()
+      .find((property) => property.getDeclarations().some((d) => labelled(declarationKey(d.compilerNode))));
+  }
+}

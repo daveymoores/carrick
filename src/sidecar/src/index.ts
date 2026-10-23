@@ -31,7 +31,7 @@ import {
   runCheck,
 } from './capture/index.js';
 import { Retyper, type TopTypeWalk } from './retype.js';
-import { LibraryClaimsVerifier, httpCheck } from './library-claims.js';
+import { LibraryClaimsVerifier, httpCheck, type LabelledMembers } from './library-claims.js';
 import { PROGRESS_INTERVAL_MS, atMostEvery } from './progress.js';
 import { mergeInferTimings } from './infer-timing.js';
 import { addProgramFiles, listProgramFiles } from './program-files.js';
@@ -59,6 +59,7 @@ import type {
   PositionRowsResponse,
   ImplementationsResponse,
   ErrorResponse,
+  ServerClaims,
 } from './types.js';
 
 // ===========================================================================
@@ -418,16 +419,19 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
       writeProgress(request.request_id, 'infer', `${done} of ${request.requests.length}`)
     );
     const results = [...byProject(request.requests, (item) => item.file_path)].map(
-      ([key, items]) =>
-        projectComponents(key).typeInferrer.infer(
+      ([key, items]) => {
+        const built = projectComponents(key);
+        return built.typeInferrer.infer(
           items,
           request.extraction_config,
           () => {
             done += 1;
             report();
           },
-          request.model_symbols
-        )
+          request.model_symbols,
+          labelledMembersFor(built, request.server_claims)
+        );
+      }
     );
     const result =
       results.length === 1
@@ -461,6 +465,23 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
       errors: [error],
     };
   }
+}
+
+/** How long reading one program's server-framework labels may take on an `infer` request. */
+const SERVER_CLAIMS_BUDGET_MS = 60_000;
+
+/**
+ * carrick#2674: the members an `infer` request's server-framework claims
+ * name, verified again in this program. Undefined when the request carries
+ * none, so the inferrer reads nothing new.
+ */
+function labelledMembersFor(
+  built: ProjectComponents,
+  claims: ServerClaims | undefined
+): LabelledMembers | undefined {
+  if (!claims || claims.checks.length === 0) return undefined;
+  const fromDir = path.resolve(projectLoader!.getRepoRoot(), claims.from_dir);
+  return built.claimsVerifier.labelledMembers(fromDir, claims.checks, SERVER_CLAIMS_BUDGET_MS, claims.scan_root);
 }
 
 /**

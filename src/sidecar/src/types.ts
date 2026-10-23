@@ -249,6 +249,22 @@ export interface InferRequest extends BaseRequest {
    * how each relates to what it read (`InferredType.model_symbol_relation`).
    */
   model_symbols?: ModelSymbol[];
+  /**
+   * carrick#2674: the service's settled server-framework claims. Each is
+   * verified again in the service's program, and the members the verified
+   * ones name are what a route handler's own parameters are read through:
+   * the reply a `send` op's payload slot states, and the request body a
+   * receive op's `request.body` path names. Absent or empty, nothing is read.
+   */
+  server_claims?: ServerClaims;
+}
+
+/** The server-framework claims an `infer` request reads handler parameters through (carrick#2674). */
+export interface ServerClaims {
+  /** The service root module resolution starts from, as on `verify_library_claims`. */
+  from_dir: string;
+  scan_root?: string;
+  checks: LibraryCheck[];
 }
 
 /** A type the model named for the row `alias` is for (carrick#2111). */
@@ -527,6 +543,8 @@ export interface RequestAt {
   path?: string[];
   url?: string[];
   method?: string[];
+  /** The member that holds the request's body (carrick#2674). */
+  body?: string[];
 }
 
 /** The closed role list; the role alone picks the checks a claim needs. */
