@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.3.126](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.125...carrick-v0.3.126) (2026-10-23)
+
+
+### Features
+
+* **call-graph:** take a call-bound receiver's member edge from the call row ([#2615](https://github.com/carrick-tools/carrick/issues/2615)) ([#2623](https://github.com/carrick-tools/carrick/issues/2623)) ([bd3996b](https://github.com/carrick-tools/carrick/commit/bd3996b495039d6dd13b27db5198b27485ee3845))
+* **decided-sites:** read the stated values of a scope prefix (record-only) ([#2644](https://github.com/carrick-tools/carrick/issues/2644)) ([26ff5f7](https://github.com/carrick-tools/carrick/commit/26ff5f7c8d87f42da8a08662f59be8236aac8064))
+* **decided-sites:** scope and mount edges and the composed path (record-only, [#2474](https://github.com/carrick-tools/carrick/issues/2474) R2b) ([#2637](https://github.com/carrick-tools/carrick/issues/2637)) ([beb628a](https://github.com/carrick-tools/carrick/commit/beb628a66d5b21f04af8777f8fa7ed1fb12134d2))
+* **decided-sites:** the instance root per deciding caller (record-only) ([#2606](https://github.com/carrick-tools/carrick/issues/2606)) ([9792f5e](https://github.com/carrick-tools/carrick/commit/9792f5e762e718efa72afad061d123b6725324c9))
+* **discovery:** follow the values a callee holds through its callers ([#2432](https://github.com/carrick-tools/carrick/issues/2432) slice A) ([#2642](https://github.com/carrick-tools/carrick/issues/2642)) ([23bb7c5](https://github.com/carrick-tools/carrick/commit/23bb7c510b0e3d2e4ad1cbb8dbfb5481cc0baa06))
+* **discovery:** route sites by the receiver's declaration, each naming its receiver (record-only) ([#2587](https://github.com/carrick-tools/carrick/issues/2587)) ([5627971](https://github.com/carrick-tools/carrick/commit/56279717a5cc73bfad07f9be5b6d0831c6984b0a))
+* **discovery:** say why a call it cannot follow was not followed (T2 of [#2613](https://github.com/carrick-tools/carrick/issues/2613)) ([#2620](https://github.com/carrick-tools/carrick/issues/2620)) ([127036a](https://github.com/carrick-tools/carrick/commit/127036adf60d3bc077621ce364bc46983d403e31))
+* **dispatch:** handler records, record-only behind the receiver trace (R4b T3a) ([#2646](https://github.com/carrick-tools/carrick/issues/2646)) ([0f953ac](https://github.com/carrick-tools/carrick/commit/0f953acc3a704953a8203394736a828080e06353))
+* **dispatch:** routes chosen by comparing the request's path and method, record-only ([#2474](https://github.com/carrick-tools/carrick/issues/2474) R4a) ([#2605](https://github.com/carrick-tools/carrick/issues/2605)) ([e977468](https://github.com/carrick-tools/carrick/commit/e9774684e53800b1ea5e8cb637105258148c14c1))
+* **engine:** record the fact layer's file set before the reader dispatches ([#2613](https://github.com/carrick-tools/carrick/issues/2613) T1) ([#2621](https://github.com/carrick-tools/carrick/issues/2621)) ([964d617](https://github.com/carrick-tools/carrick/commit/964d617061627b42505e721483bbc5905ca204ea))
+* **scanner:** ask the store for a global the runtime's types declare ([#2445](https://github.com/carrick-tools/carrick/issues/2445)) ([#2633](https://github.com/carrick-tools/carrick/issues/2633)) ([a5550e8](https://github.com/carrick-tools/carrick/commit/a5550e80349e8a7eff7b825f6545404956975d20))
+* **scan:** the fact layer chooses the file reader's files behind CARRICK_FACT_FILES ([#2613](https://github.com/carrick-tools/carrick/issues/2613) T3) ([#2625](https://github.com/carrick-tools/carrick/issues/2625)) ([641ed7c](https://github.com/carrick-tools/carrick/commit/641ed7c21c937d2bc09b810cf74d54037eb5eab5))
+* **sidecar:** a verified scope verdict names the declarations its member resolves to ([#2636](https://github.com/carrick-tools/carrick/issues/2636)) ([#2639](https://github.com/carrick-tools/carrick/issues/2639)) ([72713e6](https://github.com/carrick-tools/carrick/commit/72713e65b0ad90ab3b11a3154b37955f3cdbab56))
+* **sidecar:** implementations action for calls through bodyless declarations ([#2432](https://github.com/carrick-tools/carrick/issues/2432) slice B) ([#2632](https://github.com/carrick-tools/carrick/issues/2632)) ([1474710](https://github.com/carrick-tools/carrick/commit/1474710d09dca49e6d371cc50a01fca73cb9f5e4))
+* **sidecar:** position rows state which calls run the function they are handed ([#2634](https://github.com/carrick-tools/carrick/issues/2634)) ([#2645](https://github.com/carrick-tools/carrick/issues/2645)) ([c318644](https://github.com/carrick-tools/carrick/commit/c318644a68e2696fce77d2e6287a83a80ffa45a8))
+* **sidecar:** verify and list a runtime types global under node:&lt;file&gt; ([#2445](https://github.com/carrick-tools/carrick/issues/2445) slice 2) ([#2631](https://github.com/carrick-tools/carrick/issues/2631)) ([a0ec643](https://github.com/carrick-tools/carrick/commit/a0ec64301389a7b26997a92d2e508adb3416cc60))
+* **site-questions:** handler record and routes answer on the wire (R4b T1) ([#2612](https://github.com/carrick-tools/carrick/issues/2612)) ([3b68977](https://github.com/carrick-tools/carrick/commit/3b689772787bf0ee03b8dc24ec4826a8c5ab98d0))
+
+
+### Bug Fixes
+
+* **scanner:** a final loss is named apart on the upload and the blob, never owed ([#2488](https://github.com/carrick-tools/carrick/issues/2488)) ([#2622](https://github.com/carrick-tools/carrick/issues/2622)) ([847ddbe](https://github.com/carrick-tools/carrick/commit/847ddbee78240e0533f9ebe1db4f05d3ee6a798f))
+* **sidecar:** a body sent only when given is the argument sent unchanged ([#2670](https://github.com/carrick-tools/carrick/issues/2670)) ([e9b81ab](https://github.com/carrick-tools/carrick/commit/e9b81aba9aeb264c70a3e7f2b698b03642100eaa))
+* **sidecar:** a client method's argument is not the body it builds; re-apply [#2593](https://github.com/carrick-tools/carrick/issues/2593) ([#2628](https://github.com/carrick-tools/carrick/issues/2628)) ([#2650](https://github.com/carrick-tools/carrick/issues/2650)) ([05afd6f](https://github.com/carrick-tools/carrick/commit/05afd6f229589ec91c10cdffc38564d3a6b7ddc5))
+* **sidecar:** a converter's return type is not the response body it was handed ([#2601](https://github.com/carrick-tools/carrick/issues/2601)) ([6ceee14](https://github.com/carrick-tools/carrick/commit/6ceee1472acd685742ef5ef529192adeea594a1b))
+* **sidecar:** a verified verdict names the declaration its call row names ([#2654](https://github.com/carrick-tools/carrick/issues/2654)) ([#2659](https://github.com/carrick-tools/carrick/issues/2659)) ([447b51c](https://github.com/carrick-tools/carrick/commit/447b51cf79c74d3eea64aef1fd097482f15a3bee))
+* **sidecar:** list the app an overloaded default-export maker returns ([#2617](https://github.com/carrick-tools/carrick/issues/2617)) ([#2619](https://github.com/carrick-tools/carrick/issues/2619)) ([526efa5](https://github.com/carrick-tools/carrick/commit/526efa5a420cc3f21c41470c7a7b800eb85cefb5))
+* **sidecar:** list the instance of an overloaded maker exported by name ([#2640](https://github.com/carrick-tools/carrick/issues/2640)) ([#2641](https://github.com/carrick-tools/carrick/issues/2641)) ([6c4dd0d](https://github.com/carrick-tools/carrick/commit/6c4dd0d649573f2416c6280a449edd8dc013eb0f))
+* **sidecar:** name a package the module graph places outside the root ([#2599](https://github.com/carrick-tools/carrick/issues/2599)) ([#2653](https://github.com/carrick-tools/carrick/issues/2653)) ([9b858dd](https://github.com/carrick-tools/carrick/commit/9b858dd056547502e57c3f95d744fb8b73275b45))
+* **sidecar:** read a scope's mounts parameter with the member's own type parameters erased ([#2652](https://github.com/carrick-tools/carrick/issues/2652)) ([#2657](https://github.com/carrick-tools/carrick/issues/2657)) ([904368e](https://github.com/carrick-tools/carrick/commit/904368e50faf31f868c2d473ff7638f0f45783f0))
+* **site:** fold a reader row at a caller onto the request its callee states ([#2614](https://github.com/carrick-tools/carrick/issues/2614)) ([#2624](https://github.com/carrick-tools/carrick/issues/2624)) ([0707a59](https://github.com/carrick-tools/carrick/commit/0707a5975c6a273b7a7da6c57b78fcd5175d0a87))
+
+
+### Refactoring
+
+* **call-graph:** delete the function-type annotation reader (C5, [#2440](https://github.com/carrick-tools/carrick/issues/2440) target 5) ([#2626](https://github.com/carrick-tools/carrick/issues/2626)) ([7b172bc](https://github.com/carrick-tools/carrick/commit/7b172bc7f37177b873a9ecbc508b98b68ac93408))
+
 ## [0.3.125](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.124...carrick-v0.3.125) (2026-10-22)
 
 
