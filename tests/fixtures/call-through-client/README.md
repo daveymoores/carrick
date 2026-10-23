@@ -106,4 +106,17 @@ operations), at a call nothing resolves (`commands.ts:70`), or in
 (`:19`) only runs the callback it is handed, so no function of the web's own
 calls into the other service on their behalf.
 
+`packages/cli/src/nested.ts`, with `helpers.ts` and `local-fetch.ts` beside
+it, and `apps/web/src/page.tsx` with `badge.tsx`:
+
+| Site | Rows |
+|---|---|
+| `nested.ts:7`, `:8` | the model states `GET /api/v1/status` at `Promise.all(` (line 7); the call into the client inside it (line 8) is that row's call and states none |
+| `nested.ts:16` | one `GET /api/v1/status` row: two functions called on one line reach the one operation |
+| `nested.ts:21` | none: `loadPair` reaches two operations |
+| `nested.ts:27` | none: `localPing` reaches a request the CLI writes itself (`local-fetch.ts:5`) |
+| `nested.ts:33` | none: `statusReader` writes a function that requests and hands it back unrun; only a function it hands to a call of its own counts as what it runs |
+| `page.tsx:5` | none: a JSX element is no call the source writes |
+| `page.tsx:10` | `GET /api/v1/runs`: the same component called as a function |
+
 Driven by `tests/call_through_rows_test.rs`.

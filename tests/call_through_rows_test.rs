@@ -24,6 +24,8 @@ const HOOKS: &str = "apps/web/src/hooks.ts";
 const REQUESTS: &str = "packages/client/src/requests.ts";
 const TOOLS: &str = "packages/cli/src/tools.ts";
 const MAIN: &str = "packages/cli/src/main.ts";
+const NESTED: &str = "packages/cli/src/nested.ts";
+const PAGE: &str = "apps/web/src/page.tsx";
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/call-through-client")
@@ -736,8 +738,9 @@ fn the_calls_projection_agrees_with_the_mount_graph() {
 #[test]
 fn the_boundary_counts_the_settled_rows() {
     let boundary = &blobs()["cli"]["boundary"];
-    // Twenty rows the model alone states; nine were corrected.
-    assert_eq!(boundary["model_only_rows"], 11, "{boundary}");
+    // Eleven rows in `commands.ts` the model alone states, and the one at
+    // `nested.ts:7`.
+    assert_eq!(boundary["model_only_rows"], 12, "{boundary}");
     let untyped: Vec<String> = boundary["calls_without_expected_type"]["reasons"]
         .as_array()
         .unwrap()
@@ -883,6 +886,59 @@ fn no_row_is_stated_a_hop_above_the_client_or_where_no_function_crosses_for_the_
     assert!(stated.is_empty(), "no call-through row here: {stated:#?}");
 }
 
+/// A call written inside another call whose row states the same request is
+/// that row's call: one call, one row.
+#[test]
+fn a_call_inside_a_call_whose_row_states_its_request_states_no_second_row() {
+    // The model states `GET /api/v1/status` at `Promise.all(` on line 7; the
+    // call into the client is on line 8, inside it.
+    assert_eq!(
+        rows_in(blobs(), "cli", NESTED, 7),
+        [as_stated("GET", "/api/v1/status", "/api/v1/status")]
+    );
+    assert_eq!(rows_in(blobs(), "cli", NESTED, 8), []);
+}
+
+/// Two calls on one line that reach one operation state one row.
+#[test]
+fn two_calls_of_one_operation_on_one_line_state_one_row() {
+    assert_eq!(
+        rows_in(blobs(), "cli", NESTED, 16),
+        [corrected("GET", "/api/v1/status", 23)]
+    );
+}
+
+/// None where the function called reaches two operations, requests a route
+/// its own service writes, or only builds a function that requests.
+#[test]
+fn no_leaf_row_where_the_callee_reaches_two_operations_its_own_request_or_hands_back_a_reader() {
+    for (line, why) in [
+        (21, "`loadPair` asks for one run and for every run"),
+        (
+            27,
+            "`localPing` reaches the CLI's own `fetch(\"/api/v1/ping\")`",
+        ),
+        (33, "`statusReader` hands back `read` unrun"),
+    ] {
+        let stated: Vec<Row> = rows_in(blobs(), "cli", NESTED, line)
+            .into_iter()
+            .filter(|row| row.role.as_deref() == Some("wrapper_call"))
+            .collect();
+        assert_eq!(stated, [], "{NESTED}:{line}: {why}");
+    }
+}
+
+/// A JSX element renders a component; it is no call the source writes. The
+/// same component called as a function states the request it reaches.
+#[test]
+fn a_jsx_element_states_no_row_and_a_call_of_the_component_does() {
+    assert_eq!(rows_in(blobs(), "web", PAGE, 5), []);
+    assert_eq!(
+        rows_in(blobs(), "web", PAGE, 10),
+        [corrected("GET", "/api/v1/runs", 8)]
+    );
+}
+
 /// The version of the scanner that wrote main's stored copy before this pass
 /// existed.
 const EARLIER_SCANNER: &str = "0.0.1";
@@ -985,6 +1041,7 @@ fn a_pull_request_scan_reports_nothing_as_introduced_against_a_main_copy_without
             (COMMANDS, 40),
             (COMMANDS, 53),
             (COMMANDS, 121),
+            (NESTED, 16),
         ],
     );
     std::fs::write(&path, serde_json::to_string(&cli).unwrap()).unwrap();
@@ -997,6 +1054,7 @@ fn a_pull_request_scan_reports_nothing_as_introduced_against_a_main_copy_without
             (HOOKS, 19, "POST", "/audit", "/audit"),
         ],
     );
+    drop_rows(&mut web, &[(PAGE, 10)]);
     std::fs::write(&path, serde_json::to_string(&web).unwrap()).unwrap();
     for (_, (path, mut blob)) in stored {
         unsettle(&mut blob, &[]);

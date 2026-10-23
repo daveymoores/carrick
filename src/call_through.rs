@@ -132,6 +132,10 @@ pub struct LeafCall {
     pub file: String,
     pub line: u32,
     pub last_line: u32,
+    /// The lines the calls written around this one open on (`useQuery(` in
+    /// `useQuery({ queryFn: () => client.getRun(id) })`): where a row of that
+    /// outer call sits.
+    pub enclosing_lines: Vec<u32>,
     /// The name the call is made through, as a row names its client.
     pub client: String,
     /// The definition the callee resolves to.
@@ -396,13 +400,24 @@ fn read_leaves(
             let Some([line]) = lines.get(&(target.clone(), name)).map(Vec::as_slice) else {
                 continue;
             };
-            let last_line = extents
-                .get(&(call.span_start, call.span_end))
-                .map_or(call.line, |extent| extent.last_line);
+            let own = extents.get(&(call.span_start, call.span_end));
+            let last_line = own.map_or(call.line, |extent| extent.last_line);
+            let mut enclosing_lines: Vec<u32> = own
+                .map(|own| {
+                    extents
+                        .values()
+                        .filter(|outer| outer.contains(own) && outer.line != own.line)
+                        .map(|outer| outer.line)
+                        .collect()
+                })
+                .unwrap_or_default();
+            enclosing_lines.sort_unstable();
+            enclosing_lines.dedup();
             leaves.push(LeafCall {
                 file: file.clone(),
                 line: call.line,
                 last_line,
+                enclosing_lines,
                 client: name.rsplit('.').next().unwrap_or(name).to_string(),
                 callee: DefinitionSite {
                     file: target,
@@ -1136,7 +1151,8 @@ fn file_owners<'d>(services: impl Iterator<Item = &'d CloudRepoData>) -> HashMap
 }
 
 /// State a row at each of `service`'s leaf calls ([`LeafCall`]) that holds no
-/// row on its lines, when all of these hold:
+/// row on its lines, and whose operation no row states at the line a call
+/// written around it opens on ([`Occupied::holds`]), when all of these hold:
 ///
 /// - the walk from the callee reaches exactly ONE request operation
 ///   ([`Decider::decide`], the callee's own step only);
@@ -1162,13 +1178,10 @@ fn state_leaves<'g>(
     let mut reached: HashMap<&DefinitionSite, Option<&'g Reached>> = HashMap::new();
     // Read before any leaf row is written: two calls on one line state a row
     // each, and a line another pass holds a row on states none.
-    let occupied = row_lines(service.data);
+    let occupied = Occupied::of(service.data);
     let mut written: HashSet<(String, Operation)> = HashSet::new();
     let mut stated = 0;
     for leaf in &service.sites.leaves {
-        if (leaf.line..=leaf.last_line).any(|line| occupied.contains(&(leaf.file.clone(), line))) {
-            continue;
-        }
         let request = *reached.entry(&leaf.callee).or_insert_with(|| {
             let row = SiteRow {
                 file: leaf.file.clone(),
@@ -1195,7 +1208,7 @@ fn state_leaves<'g>(
         if request_owner == index {
             continue;
         }
-        let crosses = graph.calls.get(&leaf.callee).is_some_and(|edges| {
+        let crosses = graph.runs.get(&leaf.callee).is_some_and(|edges| {
             edges
                 .iter()
                 .any(|edge| owners.get(&edge.to.file) == Some(&request_owner))
@@ -1203,11 +1216,12 @@ fn state_leaves<'g>(
         if !crosses {
             continue;
         }
+        let operation = operation_of(request);
+        if occupied.holds(leaf, &operation) {
+            continue;
+        }
         // One row per operation at a line.
-        if !written.insert((
-            format!("{}:{}", leaf.file, leaf.line),
-            operation_of(request),
-        )) {
+        if !written.insert((format!("{}:{}", leaf.file, leaf.line), operation)) {
             continue;
         }
         if state_leaf(service.data, leaf, request) {
@@ -1217,31 +1231,58 @@ fn state_leaves<'g>(
     stated
 }
 
-/// Every file and line a row of any source sits on, in the graph or in the
-/// calls.
-fn row_lines(data: &CloudRepoData) -> HashSet<(String, u32)> {
-    let in_graph = data
-        .mount_graph
-        .iter()
-        .flat_map(|graph| &graph.data_calls)
-        .filter_map(site_of);
-    let in_calls = data.calls.iter().filter_map(|call| {
-        let text = call.file_path.to_str()?;
-        let (file, line) = text.rsplit_once(':')?;
-        Some((file, line.parse().ok()?))
-    });
-    in_graph
-        .chain(in_calls)
-        .map(|(file, line)| (file.to_string(), line))
-        .collect()
+/// The rows a service already holds, before any leaf row is written.
+struct Occupied {
+    /// Every file and line a row of any source sits on, in the graph or in
+    /// the calls.
+    lines: HashSet<(String, u32)>,
+    /// The operations the graph's rows state at each file and line.
+    operations: HashMap<(String, u32), HashSet<Operation>>,
 }
 
-/// Write the row `leaf` states for `reached` into the graph and the calls.
-fn state_leaf(data: &mut CloudRepoData, leaf: &LeafCall, reached: &Reached) -> bool {
-    let Some(graph) = data.mount_graph.as_mut() else {
-        return false;
-    };
-    let own_route = graph
+impl Occupied {
+    fn of(data: &CloudRepoData) -> Self {
+        let mut operations: HashMap<(String, u32), HashSet<Operation>> = HashMap::new();
+        for call in data.mount_graph.iter().flat_map(|graph| &graph.data_calls) {
+            if let Some((file, line)) = site_of(call) {
+                operations
+                    .entry((file.to_string(), line))
+                    .or_default()
+                    .insert(operation(
+                        &call.method,
+                        &call.canonical_path,
+                        call.dispatch.as_ref(),
+                    ));
+            }
+        }
+        let in_calls = data.calls.iter().filter_map(|call| {
+            let text = call.file_path.to_str()?;
+            let (file, line) = text.rsplit_once(':')?;
+            Some((file.to_string(), line.parse().ok()?))
+        });
+        Self {
+            lines: operations.keys().cloned().chain(in_calls).collect(),
+            operations,
+        }
+    }
+
+    /// Whether a row already stands for `leaf`: one on its own lines, or one
+    /// of `operation` on the line a call written around it opens on, the
+    /// outer call's row for the same request (one call, one row).
+    fn holds(&self, leaf: &LeafCall, operation: &Operation) -> bool {
+        let file = &leaf.file;
+        (leaf.line..=leaf.last_line).any(|line| self.lines.contains(&(file.clone(), line)))
+            || leaf.enclosing_lines.iter().any(|line| {
+                self.operations
+                    .get(&(file.clone(), *line))
+                    .is_some_and(|stated| stated.contains(operation))
+            })
+    }
+}
+
+/// Whether the service serves the route `reached` requests itself.
+fn serves_own_route(graph: &crate::mount_graph::MountGraph, reached: &Reached) -> bool {
+    graph
         .find_matching_endpoints(&reached.canonical_path, &reached.method)
         .iter()
         .any(|endpoint| {
@@ -1249,7 +1290,15 @@ fn state_leaf(data: &mut CloudRepoData, leaf: &LeafCall, reached: &Reached) -> b
                 && carrick_match::match_agreement(&endpoint.full_path, &reached.canonical_path)
                     .unwrap_or(0)
                     > 0
-        });
+        })
+}
+
+/// Write the row `leaf` states for `reached` into the graph and the calls.
+fn state_leaf(data: &mut CloudRepoData, leaf: &LeafCall, reached: &Reached) -> bool {
+    let Some(graph) = data.mount_graph.as_mut() else {
+        return false;
+    };
+    let own_route = serves_own_route(graph, reached);
     let call = DataFetchingCall {
         method: reached.method.clone(),
         target_url: reached.target_url.clone(),
@@ -1308,10 +1357,22 @@ enum Reach<'g> {
 type Operation = (String, String, String);
 
 fn operation_of(request: &Reached) -> Operation {
+    operation(
+        &request.method,
+        &request.canonical_path,
+        request.dispatch.as_ref(),
+    )
+}
+
+fn operation(
+    method: &str,
+    canonical_path: &str,
+    dispatch: Option<&crate::dispatch::Dispatch>,
+) -> Operation {
     (
-        request.method.to_uppercase(),
-        request.canonical_path.clone(),
-        crate::dispatch::Dispatch::key_suffix(request.dispatch.as_ref()),
+        method.to_uppercase(),
+        canonical_path.to_string(),
+        crate::dispatch::Dispatch::key_suffix(dispatch),
     )
 }
 
@@ -1338,6 +1399,12 @@ struct ReachGraph {
     /// Definition -> the definitions it calls, and the ones the definitions
     /// written inside it call.
     calls: HashMap<DefinitionSite, Vec<Edge>>,
+    /// Definition -> the calls it makes when it runs: its own, and those of
+    /// the definitions written inside it that it hands to a call of its own
+    /// (`this.send(() => getRun(options))`). A function written inside it and
+    /// handed back or stored (a factory's `const read = () => getRun(..)`)
+    /// is not run by it, and its calls are not here.
+    runs: HashMap<DefinitionSite, Vec<Edge>>,
     /// Definition -> the request rows written inside its lines.
     requests: HashMap<DefinitionSite, Vec<Reached>>,
     /// Definition -> the lines inside it that a request row is written on.
@@ -1391,22 +1458,53 @@ impl ReachGraph {
             }
         }
         for (file, definitions) in &by_file {
-            for (first, last, _) in definitions {
-                let callees = graph
-                    .calls
-                    .entry(DefinitionSite {
-                        file: file.clone(),
-                        line: *first,
-                    })
-                    .or_default();
-                for (inner_first, inner_last, inner_calls) in definitions {
-                    if first <= inner_first && inner_last <= last {
-                        callees.extend(inner_calls.iter().cloned());
+            let within = |outer: usize, inner: usize| {
+                let (first, last, _) = &definitions[outer];
+                let (inner_first, inner_last, _) = &definitions[inner];
+                first <= inner_first && inner_last <= last
+            };
+            // Handed to a call: a definition around it makes a call on the
+            // line it opens on.
+            let handed: Vec<bool> = (0..definitions.len())
+                .map(|inner| {
+                    let (inner_first, inner_last, _) = &definitions[inner];
+                    definitions
+                        .iter()
+                        .enumerate()
+                        .any(|(around, (first, last, calls))| {
+                            (first, last) != (inner_first, inner_last)
+                                && within(around, inner)
+                                && calls.iter().any(|edge| edge.line == *inner_first)
+                        })
+                })
+                .collect();
+            for (outer, (first, _, own)) in definitions.iter().enumerate() {
+                let site = DefinitionSite {
+                    file: file.clone(),
+                    line: *first,
+                };
+                let mut callees: Vec<Edge> = Vec::new();
+                let mut runs: Vec<Edge> = own.clone();
+                for (inner, (_, _, inner_calls)) in definitions.iter().enumerate() {
+                    if !within(outer, inner) {
+                        continue;
+                    }
+                    callees.extend(inner_calls.iter().cloned());
+                    if handed[inner] {
+                        runs.extend(inner_calls.iter().cloned());
                     }
                 }
                 callees.sort();
                 callees.dedup();
+                runs.sort();
+                runs.dedup();
+                graph.calls.entry(site.clone()).or_default().extend(callees);
+                graph.runs.entry(site).or_default().extend(runs);
             }
+        }
+        for edges in graph.calls.values_mut().chain(graph.runs.values_mut()) {
+            edges.sort();
+            edges.dedup();
         }
         for data in services {
             let Some(mount_graph) = data.mount_graph.as_ref() else {
@@ -1828,15 +1926,7 @@ fn apply(
             && call.canonical_path == reached.canonical_path
             && call.dispatch == reached.dispatch
     });
-    let own_route = graph
-        .find_matching_endpoints(&reached.canonical_path, &reached.method)
-        .iter()
-        .any(|endpoint| {
-            endpoint.evidence == carrick_match::MatchEvidence::RouteDefinition
-                && carrick_match::match_agreement(&endpoint.full_path, &reached.canonical_path)
-                    .unwrap_or(0)
-                    > 0
-        });
+    let own_route = serves_own_route(graph, reached);
     if twin {
         graph.data_calls.remove(index);
     } else {
