@@ -3544,8 +3544,14 @@ mod tests {
             "src/items.ts:3 <- /api/v3/items (entry_point) via src/ternary.ts:5 register /api/v3|/legacy > src/ternary.ts:7 register -",
             "src/items.ts:3 <- /api/v4/items (entry_point) via src/param-default.ts:5 register /api/v4 > src/param-default.ts:7 register -",
             "src/items.ts:3 <- /api/v5/items (entry_point) via src/const-prefix.ts:7 register /api/v5 > src/const-prefix.ts:9 register -",
+            // A spread no key of which is `prefix` leaves the slot stated
+            // as absent; one that may set it, or a spread of a value, leaves
+            // it unread (carrick#2474 R5e).
+            "src/items.ts:3 <- /items (entry_point) via src/spread-absent.ts:5 register - > src/spread-absent.ts:7 register -",
             "src/items.ts:3 <- /legacy/items (entry_point) via src/ternary.ts:5 register /api/v3|/legacy > src/ternary.ts:7 register -",
             "src/items.ts:3 <- /root/root/items (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /root > src/nullish.ts:7 register -",
+            "src/items.ts:3 <- ? (entry_point) via src/spread-sets.ts:5 register ? > src/spread-sets.ts:7 register -",
+            "src/items.ts:3 <- ? (entry_point) via src/spread-value.ts:5 register ? > src/spread-value.ts:7 register -",
             "src/items.ts:3 <- ? (entry_point) via src/unread.ts:5 register ? > src/unread.ts:7 register -",
             "src/nullish.ts:8 <- /root/root/health (entry_point) via src/index.ts:5 register /root > src/nullish.ts:5 register /root",
             "src/orders.ts:3 <- /b/orders (entry_point) via src/two-scopes.ts:12 register /b > src/two-scopes.ts:14 register -",

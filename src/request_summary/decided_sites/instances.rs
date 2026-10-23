@@ -37,7 +37,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::super::{
-    CallIr, ClientRef, HeldInstance, MadeBy, MakerForm, Piece, RequestSummaryInputs, Value, Way,
+    CallIr, ClientRef, HeldInstance, KeyState, MadeBy, MakerForm, Piece, RequestSummaryInputs,
+    Value, Way,
 };
 use super::{Calls, Placed, filled, holds_parameter, relative, to_definition};
 use crate::position_rows::{FLAG_ANY, FLAG_DECLARATION_UNNAMED, Kind};
@@ -1202,10 +1203,10 @@ fn slot_pieces(placed: &Placed<'_>, name: &(usize, Option<String>)) -> Result<Ve
     let value = match (placed.call.args.get(*arg), key) {
         (None, _) => return Err(Prefix::Unstated),
         (Some(value), None) => value,
-        (Some(Value::Obj(object)), Some(key)) => match object.fields.get(key) {
-            Some(value) => value,
-            None if object.open => return Err(Prefix::Unread { text: None }),
-            None => return Err(Prefix::Unstated),
+        (Some(Value::Obj(object)), Some(key)) => match object.key(key) {
+            KeyState::Known(value) => value,
+            KeyState::Unread => return Err(Prefix::Unread { text: None }),
+            KeyState::Absent => return Err(Prefix::Unstated),
         },
         (Some(_), Some(_)) => return Err(Prefix::Unread { text: None }),
     };
