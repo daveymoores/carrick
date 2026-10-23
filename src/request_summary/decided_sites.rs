@@ -2277,6 +2277,62 @@ pub(crate) mod tests {
         );
     }
 
+    /// carrick#2674: a receive op's `request.body` member path is read from
+    /// both the settled claims and the store's raw answer, and written back
+    /// out; a request with no body path serialises as it did before.
+    #[test]
+    fn a_request_body_path_is_read_from_both_label_sources() {
+        let receive = |request: serde_json::Value| {
+            serde_json::json!({ "kind": "op", "op": "receive", "member": "post",
+              "name": { "arg": 0 }, "handler": { "arg": 1 }, "request": request })
+        };
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([{
+                "package": "@fixture/server",
+                "version": "1.0.0",
+                "specifier": "@fixture/server",
+                "export": "server",
+                "role": "server_framework",
+                "side": "server",
+                "claims": [
+                    receive(serde_json::json!({ "param": 0, "path": ["path"], "body": ["body"] })),
+                    receive(serde_json::json!({ "param": 0, "path": ["path"] }))
+                ]
+            }]))
+            .unwrap();
+        let from_claims = SiteLabel::from_exports(&exports);
+        let answer = serde_json::json!({ "library_claims": [{
+            "package": "@fixture/server",
+            "exports": [{
+                "export": "server", "role": "server_framework", "side": "server",
+                "ops": [
+                    { "op": "receive", "member": "post", "name": { "arg": 0 }, "handler": { "arg": 1 },
+                      "request": { "param": 0, "path": ["path"], "body": ["body"] } },
+                    { "op": "receive", "member": "post", "name": { "arg": 0 }, "handler": { "arg": 1 },
+                      "request": { "param": 0, "path": ["path"] } }
+                ]
+            }]
+        }]});
+        let from_answer = SiteLabel::from_store_answer(&answer);
+        for labels in [&from_claims, &from_answer] {
+            let bodies: Vec<_> = labels
+                .iter()
+                .map(|label| label.request.as_ref().unwrap().body.clone())
+                .collect();
+            assert_eq!(bodies, vec![Some(vec!["body".to_string()]), None]);
+        }
+        let written = serde_json::to_value(from_answer[0].request.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({ "param": 0, "path": ["path"], "body": ["body"] })
+        );
+        let unchanged = serde_json::to_value(from_answer[1].request.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            unchanged,
+            serde_json::json!({ "param": 0, "path": ["path"] })
+        );
+    }
+
     /// carrick#2515: a call on an export the store labels `graphql_client`
     /// with no op is a lead of its own reason and no site; a member the
     /// store left unlabelled on an export that has ops is neither.

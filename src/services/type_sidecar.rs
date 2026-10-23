@@ -906,7 +906,7 @@ pub struct Yields {
 /// contract amendment of 2026-10-22 on carrick#2434): the handler's parameter
 /// `param` is the request, and each of the others is a member path read off
 /// it, relative to that parameter (`["path"]`, `["raw", "url"]`). The
-/// verifier judges that `path` or `url` is present.
+/// verifier judges that `path` or `url` is present; `body` is optional beside them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestAt {
     pub param: u32,
@@ -916,6 +916,9 @@ pub struct RequestAt {
     pub url: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<Vec<String>>,
+    /// The member that holds the request's body (carrick#2674).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<Vec<String>>,
 }
 
 /// What an `op` claim does on the wire.
@@ -5373,6 +5376,7 @@ mod tests {
                             path: Some(vec!["path".into()]),
                             url: Some(vec!["raw".into(), "url".into()]),
                             method: Some(vec!["method".into()]),
+                            body: None,
                         })),
                     }),
                     library(LibraryClaim::Op {

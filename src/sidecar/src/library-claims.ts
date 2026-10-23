@@ -55,6 +55,9 @@ import type {
   SemanticsDeclaration,
   SemanticsResult,
   SurfaceExport,
+  SurfaceHandler,
+  SurfaceHandlerMember,
+  SurfaceHandlerParam,
   SurfaceKey,
   SurfaceMember,
   SurfaceParam,
@@ -1122,13 +1125,14 @@ function placementInvalid(claim: LibraryClaim): boolean {
 
 /**
  * Where a handler's request holds its path, method and body (#2474 R0,
- * carrick#2674) is read on a receive op with a handler, and names `path`,
- * `url` or `body`; every member path it gives is non-empty.
+ * carrick#2674) is read on a receive op with a handler, and names `path` or
+ * `url` (the body is optional beside them); every member path it gives is
+ * non-empty.
  */
 function requestAtValid(claim: OpClaim): boolean {
   const request = claim.request!;
   if (claim.op !== 'receive' || claim.handler === undefined) return false;
-  if (request.path === undefined && request.url === undefined && request.body === undefined) return false;
+  if (request.path === undefined && request.url === undefined) return false;
   return [request.path, request.url, request.method, request.body].every(
     members => members === undefined || members.length > 0
   );
@@ -3355,8 +3359,10 @@ class DeclarationReader {
       dropped += 1;
       return false;
     };
-    // Three passes: every export and receiver, then every member name, then signatures.
+    // Four passes: every export and receiver, then every member name, then the
+    // members of each handler's parameters (carrick#2674), then signatures.
     const names: Array<() => void> = [];
+    const handlers: Array<() => void> = [];
     const fills: Array<() => void> = [];
 
     // What the package's default export names: a maker also exported by name
@@ -3370,7 +3376,7 @@ class DeclarationReader {
       const receiverOf = (receiverName: string, receiverType: ts.Type): void => {
         if (!take()) return;
         const home = this.homeOf(pkg, [target, ...typeSymbols(receiverType)]);
-        entry.receivers.push(this.outlineReceiver(pkg, receiverName, receiverType, home, take, names, fills));
+        entry.receivers.push(this.outlineReceiver(pkg, receiverName, receiverType, home, take, names, handlers, fills));
       };
       receiverOf('export', type);
       for (const maker of this.makers(pkg, target, type)) {
@@ -3389,6 +3395,7 @@ class DeclarationReader {
       }
     }
     for (const run of names) run();
+    for (const run of handlers) run();
     for (const fill of fills) fill();
     surface.truncated = dropped;
     return surface;
@@ -3546,8 +3553,9 @@ class DeclarationReader {
 
   /**
    * A receiver, now; its member names later (`names`), once every export and
-   * receiver of the package is listed; its call, construct and member
-   * signatures last (`fills`), once every name is.
+   * receiver of the package is listed; the members of its handlers'
+   * parameters next (`handlers`), once every name is; its call, construct and
+   * member signatures last (`fills`), once every handler is.
    */
   private outlineReceiver(
     pkg: string,
@@ -3556,6 +3564,7 @@ class DeclarationReader {
     home: ReadonlySet<string>,
     take: () => boolean,
     names: Array<() => void>,
+    handlers: Array<() => void>,
     fills: Array<() => void>
   ): SurfaceReceiver {
     const receiver: SurfaceReceiver = { receiver: receiverName, members: [] };
@@ -3581,10 +3590,93 @@ class DeclarationReader {
         const own = 'signatures' in callee;
         const member: SurfaceMember = { name: property.getName(), own, signatures: [] };
         receiver.members.push(member);
+        handlers.push(() => {
+          const listed = this.listHandlers(own ? callee.signatures : library, take);
+          if (listed.length > 0) member.handlers = listed;
+        });
         fills.push(() => (member.signatures = this.listSignatures(own ? callee.signatures : library, holder.type, take)));
       }
     });
     return receiver;
+  }
+
+  /**
+   * The functions a member's signatures take, at a positional argument or at a
+   * key of an options object, with the members their parameters declare. A
+   * handler is listed once per place, from the first signature that states it.
+   * A parameter that declares no member lists nothing, and so does a handler
+   * none of whose parameters do.
+   */
+  private listHandlers(signatures: readonly ts.Signature[], take: () => boolean): SurfaceHandler[] {
+    const listed: SurfaceHandler[] = [];
+    const seen = new Set<string>();
+    const add = (arg: number, key: string | undefined, slot: ts.Type): void => {
+      const place = JSON.stringify([arg, key ?? null]);
+      if (seen.has(place)) return;
+      const params = this.listHandlerParams(slot, take);
+      if (params.length === 0) return;
+      seen.add(place);
+      listed.push(key === undefined ? { arg, params } : { arg, key, params });
+    };
+    for (const signature of signatures) {
+      const count = signature.getParameters().length;
+      for (let arg = 0; arg < count; arg++) {
+        const slot = this.keyParameterAt(signature, arg);
+        if (slot === undefined || slot === VARIADIC) continue;
+        if (this.handlerFailure(slot) === undefined) {
+          add(arg, undefined, slot);
+          continue;
+        }
+        if (!this.isObjectType(slot)) continue;
+        const keys = new Map<string, ts.Type>();
+        for (const view of this.keyViews(slot)) {
+          for (const property of this.namedProperties(view)) {
+            const type = this.checker.getTypeOfSymbol(property);
+            if (!keys.has(property.getName()) && this.handlerFailure(type) === undefined) keys.set(property.getName(), type);
+          }
+        }
+        for (const key of [...keys.keys()].sort(byName)) add(arg, key, keys.get(key)!);
+      }
+    }
+    return listed;
+  }
+
+  /** The parameters of a function type's first signature that declare members, each member counting against the cap. */
+  private listHandlerParams(handler: ts.Type, take: () => boolean): SurfaceHandlerParam[] {
+    const slot = this.throughConditional(this.throughConstraint(handler));
+    if (slot === VARIADIC) return [];
+    const signature = this.parts(slot)
+      .flatMap(part => part.getCallSignatures())
+      .find(each => each.getParameters().length > 0);
+    if (!signature) return [];
+    const listed: SurfaceHandlerParam[] = [];
+    signature.getParameters().forEach((parameter, index) => {
+      const type = this.checker.getTypeOfSymbol(parameter);
+      if (this.namedProperties(type).length === 0 || !take()) return;
+      const members: SurfaceHandlerMember[] = [];
+      this.listMembers(type, [], members, take);
+      listed.push({ param: index, name: parameter.getName(), type: this.printed(type), members });
+    });
+    return listed;
+  }
+
+  /** A type's declared members by path, parents before children, each level sorted by name, down to `HANDLER_MEMBER_DEPTH`. */
+  private listMembers(type: ts.Type, prefix: string[], into: SurfaceHandlerMember[], take: () => boolean): void {
+    for (const property of sortedByName(this.namedProperties(type))) {
+      if (!take()) continue;
+      const memberType = this.checker.getTypeOfSymbol(property);
+      const path = [...prefix, property.getName()];
+      const callable = this.librarySignatures(memberType, 'call').length > 0;
+      into.push({
+        path,
+        type: this.printed(memberType),
+        optional: (property.flags & ts.SymbolFlags.Optional) !== 0,
+        function: callable,
+      });
+      if (!callable && path.length < HANDLER_MEMBER_DEPTH && this.isObjectType(memberType)) {
+        this.listMembers(memberType, path, into, take);
+      }
+    }
   }
 
   private listSignatures(signatures: readonly ts.Signature[], holder: ts.Type, take: () => boolean): SurfaceSignature[] {
@@ -4170,6 +4262,9 @@ class DeclarationReader {
  * union the builder cuts short keeps the members it made first, so the
  * listing orders every union before its own cut (`truncate`).
  */
+/** The longest member path a handler parameter's members are listed to (`['raw', 'url']`). */
+const HANDLER_MEMBER_DEPTH = 2;
+
 const PRINT_FLAGS =
   ts.NodeBuilderFlags.AllowUniqueESSymbolType |
   ts.NodeBuilderFlags.UseAliasDefinedOutsideCurrentScope |
