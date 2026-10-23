@@ -1,5 +1,6 @@
 /**
- * The unwidened reading of a producer's response (carrick#1516).
+ * The unwidened reading of a producer's response (carrick#1516), and of a
+ * consumer's request body (carrick#2011).
  *
  * A handler that returns `{ scope: row.parentId ? 'specific' : 'all' }` sends
  * one of two strings, but its inferred return type says `scope: string`:
@@ -147,14 +148,22 @@ function hasDeclaredReturn(node: Node): boolean {
 /**
  * The insertions that mark every literal inside `fn` whose widening the
  * reading drops. Positions are original-file positions.
+ *
+ * `sent` is given for a request body a consumer sends (carrick#2011), and is
+ * the expression the inference read. A literal handed to any other call is
+ * then left alone: keeping `useState('open')` narrow narrows the state's
+ * setter too, and code elsewhere that calls the setter with another value
+ * sits in a file the reading's guard never checks. A response's reading
+ * passes no `sent`: what the handler hands its callees is part of what it
+ * returns.
  */
-export function literalInsertions(fn: Node): Insertion[] {
+export function literalInsertions(fn: Node, sent?: Node): Insertion[] {
   const out: Insertion[] = [];
   const visit = (node: Node): void => {
     // A type states no value, and a parameter's default decides what its
     // callers may pass, not what the function returns.
     if (Node.isTypeNode(node) || Node.isParameterDeclaration(node)) return;
-    if (isMarkableLiteral(node)) {
+    if (isMarkableLiteral(node) && (sent === undefined || !handedToAnotherCall(node, sent))) {
       out.push({ pos: node.getStart(), text: OPEN, closes: false });
       out.push({ pos: node.getEnd(), text: CLOSE, closes: true });
       return;
@@ -163,6 +172,47 @@ export function literalInsertions(fn: Node): Insertion[] {
   };
   visit(fn);
   return out;
+}
+
+/**
+ * Whether `literal` is an argument, at any depth, of a call that is not the
+ * send: walking up, a call or `new` holds it as an argument before the walk
+ * reaches `sent` (the expression the request inference read) or the send
+ * call `sent` is.
+ *
+ * A literal that initialises a `const` reaches a call through the const's
+ * name (`const initial = 'open'; useState(initial)`), so the walk follows
+ * every identifier of that name in the const's scope, and a name it cannot
+ * follow (a destructuring pattern) counts as handed on. Matching by name, not
+ * by symbol, can only skip more literals.
+ */
+function handedToAnotherCall(literal: Node, sent: Node, depth = 0): boolean {
+  if (depth > MAX_FOLLOW_DEPTH) return true;
+  let current: Node = literal;
+  for (let parent = current.getParent(); parent; parent = current.getParent()) {
+    if (current === sent) return false;
+    if (
+      (Node.isCallExpression(parent) || Node.isNewExpression(parent)) &&
+      (parent.getArguments() as Node[]).includes(current)
+    ) {
+      return parent !== sent;
+    }
+    if (Node.isVariableDeclaration(parent) && parent.getInitializer() === current) {
+      const name = parent.getNameNode();
+      if (!Node.isIdentifier(name)) return true;
+      const scope = parent.getFirstAncestor(isFunctionWithBody) ?? parent.getSourceFile();
+      return scope
+        .getDescendantsOfKind(SyntaxKind.Identifier)
+        .some(
+          (use) =>
+            use !== name &&
+            use.getText() === name.getText() &&
+            handedToAnotherCall(use, sent, depth + 1)
+        );
+    }
+    current = parent;
+  }
+  return false;
 }
 
 /** Whether `node` is a literal value the reading marks `as const`. */

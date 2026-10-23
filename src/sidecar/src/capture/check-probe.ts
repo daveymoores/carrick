@@ -211,17 +211,17 @@ export function decisiveAssignmentLine(plan: ProbePlan): number {
  * the classifier never depends on hard-coded offsets. `packageOf` maps a
  * service name to its workspace package specifier (e.g. `@carrick/orders`).
  *
- * `unwidenedAliasFor` answers, for a producer that is the sending side, the
- * surface export that carries its unwidened reading (carrick#1538), when its
- * stub ships one. The probe of an `http` response then ends with a second
- * assignment of that reading, in the wire form. Without an answer the
- * probe is what it always was, byte for byte. A consumer that sends (a request
- * body) is never asked: the reading is of a handler's return.
+ * `unwidenedAliasFor` answers, for the sending side, the surface export that
+ * carries its unwidened reading, when its stub ships one: a producer's
+ * response (carrick#1538) or a consumer's request body (carrick#2011). The
+ * probe of an `http` pair then ends with a second assignment of that reading,
+ * in the wire form. Without an answer the probe is what it always was, byte
+ * for byte.
  */
 export function buildProbe(
   spec: CheckPairSpec,
   packageOf: (serviceName: string) => string,
-  unwidenedAliasFor?: (sentProducer: CheckPairEndpoint) => string | undefined
+  unwidenedAliasFor?: (sent: CheckPairEndpoint) => string | undefined
 ): ProbePlan {
   const id = pairId(spec);
   const direction = directionFor(spec.protocol, spec.type_kind);
@@ -475,16 +475,15 @@ export function buildProbe(
   // type or a mismatch here says only that the second reading did not clear
   // the pair, and the verdict on the published type stands.
   //
-  // Only an `http` response gets one. It is the one pair a producer sends on
-  // whose decisive assignment a second reading can mirror, here in the wire
-  // form. A GraphQL pair compares an unwrapped comparand (above), which a
-  // plain assignment of the reading would not mirror, and on every other
-  // protocol the consumer is the sender (the direction table).
+  // Only an `http` pair gets one: a response the producer sends, or a request
+  // body the consumer sends (carrick#2011), each judged on a decisive
+  // assignment the second reading mirrors, here in the wire form. A GraphQL
+  // pair compares an unwrapped comparand (above), which a plain assignment of
+  // the reading would not mirror. Socket and pub/sub payloads are not read
+  // again.
   let unwidenedFromLine: number | undefined;
   const sentUnwidenedAlias =
-    direction.sent === 'producer' && spec.protocol === 'http'
-      ? unwidenedAliasFor?.(sentEndpoint)
-      : undefined;
+    spec.protocol === 'http' ? unwidenedAliasFor?.(sentEndpoint) : undefined;
   if (sentUnwidenedAlias !== undefined) {
     const local = UNWIDENED_LOCAL_NAME;
     unwidenedFromLine = push(

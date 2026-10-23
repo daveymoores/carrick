@@ -8,6 +8,12 @@
  * `JSON.stringify(...)` call and printed the call's own `string` result. A
  * serialised body is the JSON of its argument, so the capture reads the
  * argument, on one line or several.
+ *
+ * carrick#2010: when the locator's text does not match the source (written on
+ * one line, comments dropped), the anchor falls back to the line, and the first
+ * node it prefers there is the `body: JSON.stringify(...)` property, whose type
+ * is the call's `string`. A property whose value is the serialiser call reads
+ * the call's argument too.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -37,6 +43,17 @@ export function createLink(workspaceId: string, billId: string) {
     body: JSON.stringify({
       workspaceId,
       billId,
+    }),
+  });
+}
+
+export function searchRows(states: string[], limit: number) {
+  return send({
+    method: "POST",
+    body: JSON.stringify({
+      states,
+      // a comment the one-line locator text does not carry
+      limit,
     }),
   });
 }
@@ -91,6 +108,17 @@ describe('capture reads a serialised request body through JSON.stringify (#1162)
           line_number: lineOf('body: JSON.stringify({'),
           expression_text: 'JSON.stringify({\n      workspaceId,\n      billId,\n    })',
         },
+        // carrick#2010: the locator's text is the payload on one line without
+        // the comment, so it matches nothing in the source and the anchor falls
+        // back to the line, whose first preferred node is the `body:` property.
+        {
+          kind: 'infer',
+          alias: 'Endpoint_search_Request',
+          source_file: 'src/client.ts',
+          anchor_origin: 'deterministic-infer',
+          line_number: lineOf('body: JSON.stringify({\n      states'),
+          expression_text: 'JSON.stringify({ states, limit })',
+        },
       ],
     });
     assert.ok(result.success, `capture failed: ${JSON.stringify(result.errors)}`);
@@ -105,12 +133,13 @@ describe('capture reads a serialised request body through JSON.stringify (#1162)
         .replace(/\s+/g, ' ')
         .trim();
     };
-    for (const alias of ['Endpoint_group_Request', 'Endpoint_link_Request']) {
+    for (const alias of ['Endpoint_group_Request', 'Endpoint_link_Request', 'Endpoint_search_Request']) {
       const line = declared(alias);
       assert.ok(!/=\s*string;/.test(line), `a serialised body is not a string contract: ${line}`);
     }
     const group = declared('Endpoint_group_Request');
     assert.ok(/documentIds/.test(group) || /CreateGroup/.test(group), group);
     assert.match(declared('Endpoint_link_Request'), /billId: string/);
+    assert.match(declared('Endpoint_search_Request'), /limit: number/);
   });
 });

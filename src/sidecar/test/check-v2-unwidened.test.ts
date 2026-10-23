@@ -13,8 +13,12 @@
  * the second reading raises nothing. Every other outcome is the published
  * verdict, unchanged: a reading that still mismatches (a different literal, or
  * a member the handler may leave `undefined`), a reading that is or holds a
- * top type, a pair with no reading, a pair that agreed already, and a request,
- * where the sender is the consumer.
+ * top type, a pair with no reading, a pair that agreed already, and a GraphQL
+ * pair.
+ *
+ * carrick#2011: a request body is read again the same way, where the consumer
+ * sends. A consumer has no class of its own on the wire: the pair it clears is
+ * `compatible`, with a note that the published request is wider.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -29,7 +33,11 @@ import {
   decisiveAssignmentLine,
   unwidenedAliasOf,
 } from '../src/capture/check-probe.js';
-import { classifyPair, type RawDiagnostic } from '../src/capture/check-classify.js';
+import {
+  classifyPair,
+  CONSUMER_WIDER_NOTE,
+  type RawDiagnostic,
+} from '../src/capture/check-classify.js';
 
 function captureLiterals(
   root: string,
@@ -122,6 +130,8 @@ describe('check phase: a published mismatch is read again unwidened (carrick#153
     ),
     ...response('P_Gql', `{ id: string; scope: string }`, SCOPE_UNION),
     P_Request: SCOPE_UNION,
+    P_RequestNoReading: SCOPE_UNION,
+    P_RequestOther: SCOPE_UNION,
   };
   const consumed: Record<string, string> = {
     C_Scope: SCOPE_UNION,
@@ -135,9 +145,12 @@ describe('check phase: a published mismatch is read again unwidened (carrick#153
     C_ReadingAny: SCOPE_UNION,
     C_ReadingDeepAny: `{ id: string; scope: 'all' | 'specific'; meta: { tag: string } }`,
     C_Gql: SCOPE_UNION,
-    // A request body the consumer sends widened, with a reading beside it that
-    // is never asked for: the sender is the consumer.
-    ...response('C_Request', `{ id: string; scope: string }`, SCOPE_UNION),
+    // A request body the consumer sends widened, with its reading beside it
+    // (carrick#2011): the sender is the consumer.
+    ...response('C_Request', `{ id: string; scope: string }`, `{ id: string; scope: 'all' }`),
+    // A consumer that declares `string`: no reading.
+    ...response('C_RequestNoReading', `{ id: string; scope: string }`),
+    ...response('C_RequestOther', `{ id: string; scope: string }`, `{ id: string; scope: 'other' }`),
   };
   const pairs: CheckPairSpec[] = [
     pair('scope', 'P_Scope', 'C_Scope'),
@@ -152,6 +165,8 @@ describe('check phase: a published mismatch is read again unwidened (carrick#153
     pair('reading-deep-any', 'P_ReadingDeepAny', 'C_ReadingDeepAny'),
     pair('gql', 'P_Gql', 'C_Gql', { protocol: 'graphql' }),
     pair('request', 'P_Request', 'C_Request', { type_kind: 'request' }),
+    pair('request-no-reading', 'P_RequestNoReading', 'C_RequestNoReading', { type_kind: 'request' }),
+    pair('request-other', 'P_RequestOther', 'C_RequestOther', { type_kind: 'request' }),
   ];
 
   /** The same types with every `_Unwidened` export left out: today's check. */
@@ -252,10 +267,26 @@ describe('check phase: a published mismatch is read again unwidened (carrick#153
     }
   });
 
-  it('a request and a GraphQL pair get no second reading', () => {
-    for (const key of ['request', 'gql']) {
-      assert.strictEqual(verdicts.get(key)!.bucket, 'incompatible', key);
-      assert.deepStrictEqual(verdicts.get(key), control.get(key), key);
+  it('a GraphQL pair gets no second reading', () => {
+    assert.strictEqual(verdicts.get('gql')!.bucket, 'incompatible');
+    assert.deepStrictEqual(verdicts.get('gql'), control.get('gql'));
+  });
+
+  it('a request body the consumer sends widened reads compatible, with a note (carrick#2011)', () => {
+    assert.strictEqual(control.get('request')!.bucket, 'incompatible');
+    const v = verdicts.get('request')!;
+    assert.strictEqual(v.bucket, 'compatible', JSON.stringify(v));
+    assert.strictEqual(v.diagnostic, undefined);
+    assert.strictEqual(v.resolved, true);
+    assert.ok(v.notes?.includes(CONSUMER_WIDER_NOTE), JSON.stringify(v.notes));
+    assert.deepStrictEqual(v.codes, control.get('request')!.codes);
+  });
+
+  it('a request body the consumer declares, or sends another literal in, stays incompatible', () => {
+    for (const key of ['request-no-reading', 'request-other']) {
+      const v = verdicts.get(key)!;
+      assert.strictEqual(v.bucket, 'incompatible', `${key}: ${JSON.stringify(v)}`);
+      assert.deepStrictEqual(v, control.get(key), key);
     }
   });
 });
@@ -293,9 +324,17 @@ describe('the unwidened reading in the probe and the classifier (carrick#1538)',
     assert.deepStrictEqual(buildProbe(spec(), PKG, () => undefined), buildProbe(spec(), PKG));
   });
 
-  it('only an http response is read again', () => {
+  it('an http request reads the consumer, the side that sends it (carrick#2011)', () => {
+    const plan = buildProbe(spec({ type_kind: 'request' }), PKG, reading);
+    assert.ok(plan.unwidenedFromLine !== undefined);
+    assert.match(
+      plan.source,
+      /import type \{ Call_a_Response_Unwidened as SentUnwidened \} from '@carrick\/web';/
+    );
+  });
+
+  it('only an http pair is read again', () => {
     const others: Array<Partial<CheckPairSpec>> = [
-      { type_kind: 'request' },
       { protocol: 'graphql' },
       { protocol: 'socket', type_kind: 'both' },
       { protocol: 'pubsub', type_kind: 'both' },
