@@ -433,9 +433,39 @@ pub struct ObjValue {
     /// decided site's option key (its method) reads this; the body a request
     /// sends does not, so no body row moves.
     pub under_rest: Option<(u8, usize, BTreeSet<String>)>,
+    /// The keys whose value depends on which spread branch runs (carrick#2474
+    /// R5e): `open` is also set, for the readers that only ask whether
+    /// anything beyond `fields` may be in the object.
+    pub unsettled: BTreeSet<String>,
+    /// Something the source does not state is in the object: a spread of a
+    /// value, a computed key, or a method, getter or setter. Any key not in
+    /// `fields` may be set by it.
+    pub wide: bool,
+}
+
+/// What an object states about one key ([`ObjValue::key`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeyState<'a> {
+    /// The source states the key's value.
+    Known(&'a Value),
+    /// No spread or computed key can set the key: it is not there.
+    Absent,
+    /// A spread or a computed key may set the key; the source does not say
+    /// to what.
+    Unread,
 }
 
 impl ObjValue {
+    /// What this object states about `key`. Only a prefix slot reads this
+    /// (carrick#2474 R5e); body and name readers keep `open`.
+    pub fn key(&self, key: &str) -> KeyState<'_> {
+        match self.fields.get(key) {
+            Some(value) => KeyState::Known(value),
+            None if self.wide || self.unsettled.contains(key) => KeyState::Unread,
+            None => KeyState::Absent,
+        }
+    }
+
     /// Put a spread in place whose possible objects are `branches`: a key it
     /// sets to the same value on every branch holds that value; a key only
     /// some branches set, or set to different values, holds nothing the
@@ -457,6 +487,7 @@ impl ObjValue {
                 }
                 _ => {
                     self.fields.remove(key);
+                    self.unsettled.insert(key.clone());
                     self.open = true;
                 }
             }
@@ -499,6 +530,8 @@ impl Value {
                     .map(|(key, value)| (key.clone(), value.enclosed()))
                     .collect(),
                 open: obj.open,
+                unsettled: obj.unsettled.clone(),
+                wide: obj.wide,
                 // A closure's object reads as it always did.
                 under_param: None,
                 under_rest: None,
@@ -5318,6 +5351,8 @@ impl Reader<'_> {
                             open: true,
                             under_param: None,
                             under_rest: None,
+                            unsettled: BTreeSet::new(),
+                            wide: true,
                         });
                     }
                     return value.clone();
@@ -5630,6 +5665,7 @@ impl Reader<'_> {
                             }
                             value.fields.clear();
                             value.open = true;
+                            value.wide = true;
                         }
                     }
                     continue;
@@ -5644,6 +5680,7 @@ impl Reader<'_> {
                     None => {
                         value.fields.clear();
                         value.open = true;
+                        value.wide = true;
                         value.under_param = None;
                         value.under_rest = None;
                     }
@@ -5669,6 +5706,7 @@ impl Reader<'_> {
                         _ => {}
                     }
                     value.open = true;
+                    value.wide = true;
                     value.under_param = None;
                     value.under_rest = None;
                 }
@@ -9709,6 +9747,8 @@ mod tests {
             open,
             under_param: None,
             under_rest: None,
+            unsettled: BTreeSet::new(),
+            wide: open,
         })
     }
 
@@ -9863,6 +9903,8 @@ mod tests {
             open: false,
             under_param: None,
             under_rest: None,
+            unsettled: BTreeSet::new(),
+            wide: false,
         });
         assert_eq!(
             wrapper.instantiate(&[nested], &[]).url,
