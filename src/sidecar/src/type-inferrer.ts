@@ -33,6 +33,7 @@ import {
   type CallExpression,
   type ObjectLiteralExpression,
   type ParameterDeclaration,
+  type ConditionalExpression,
   type PropertyAssignment,
   type StringLiteral,
   type Type,
@@ -8405,6 +8406,9 @@ export class TypeInferrer {
     let passedThrough = false;
     const built: Node[] = [];
     for (const use of uses) {
+      // carrick#2668: `data ? JSON.stringify(data) : undefined` tests the
+      // argument before it sends it; the test is no body.
+      if (this.inSendNothingTest(use, body)) continue;
       const value = this.bodyValueAround(use, body);
       if (value === use) {
         passedThrough = true;
@@ -8432,7 +8436,7 @@ export class TypeInferrer {
     if (callee.getTypeParameters().length > 0) {
       return { kind: 'abstain', why: `the called function is generic, so the body it builds may be typed by its type parameters (${from})` };
     }
-    const types = built.map((value) => this.unwrapJsonStringifyArg(this.unwrapExpressionNode(value)));
+    const types = built.map((value) => this.sentValue(value));
     const texts = new Set(types.map((value) => typeText(value.getType(), value)));
     if (texts.size !== 1) {
       return { kind: 'abstain', why: `the called function builds more than one body from the argument (${from})` };
@@ -8481,14 +8485,83 @@ export class TypeInferrer {
     return undefined;
   }
 
-  /** `value` is `use` behind parentheses, casts, `await` or a `JSON.stringify`. */
+  /** `value` is `use` behind what `sentValue` sees through. */
   private isSameValue(value: Node, use: Node): boolean {
+    return this.sentValue(value) === use;
+  }
+
+  /**
+   * The value a body slot sends when it sends anything, behind parentheses,
+   * casts, `await`, a `JSON.stringify`, and (carrick#2668) a choice whose
+   * other side sends nothing: `x ? JSON.stringify(x) : undefined`,
+   * `x || null`, `x ?? undefined`. A `?? {}` sends `{}`, so it is a body the
+   * function builds and is not seen through.
+   */
+  private sentValue(value: Node): Node {
     let current = value;
     for (;;) {
-      const inner = this.unwrapJsonStringifyArg(this.unwrapExpressionNode(current));
-      if (inner === current) return current === use;
+      let inner = this.unwrapJsonStringifyArg(this.unwrapExpressionNode(current));
+      if (Node.isConditionalExpression(inner)) {
+        inner = this.sendingBranch(inner) ?? inner;
+      } else if (Node.isBinaryExpression(inner)) {
+        const operator = inner.getOperatorToken().getKind();
+        if (
+          (operator === SyntaxKind.BarBarToken || operator === SyntaxKind.QuestionQuestionToken) &&
+          this.sendsNothing(inner.getRight(), false)
+        ) {
+          inner = inner.getLeft();
+        }
+      }
+      if (inner === current) return current;
       current = inner;
     }
+  }
+
+  /**
+   * The branch of `choice` that sends something, when its other branch sends
+   * nothing (`undefined`, `null`, `void 0`, or `{}` spread into a request).
+   */
+  private sendingBranch(choice: ConditionalExpression): Node | undefined {
+    const whenTrue = choice.getWhenTrue();
+    const whenFalse = choice.getWhenFalse();
+    if (this.sendsNothing(whenFalse, true) && !this.sendsNothing(whenTrue, true)) return whenTrue;
+    if (this.sendsNothing(whenTrue, true) && !this.sendsNothing(whenFalse, true)) return whenFalse;
+    return undefined;
+  }
+
+  /** `undefined`, `null`, `void 0`, or (where `emptyObject`) `{}`. */
+  private sendsNothing(node: Node, emptyObject: boolean): boolean {
+    const value = this.unwrapExpressionNode(node);
+    if (Node.isNullLiteral(value) || Node.isVoidExpression(value)) return true;
+    if (Node.isIdentifier(value) && value.getText() === 'undefined') return true;
+    return (
+      emptyObject &&
+      Node.isObjectLiteralExpression(value) &&
+      value.getProperties().length === 0
+    );
+  }
+
+  /**
+   * carrick#2668, #2664: `use` sits in the test of a choice whose other side
+   * sends nothing (`body ? JSON.stringify(body) : null`,
+   * `...(body === undefined ? {} : { body: JSON.stringify(body) })`). The
+   * test only decides whether the argument is sent.
+   */
+  private inSendNothingTest(use: Node, scope: Node): boolean {
+    let current: Node = use;
+    while (current !== scope) {
+      const parent = current.getParent();
+      if (!parent) return false;
+      if (
+        Node.isConditionalExpression(parent) &&
+        parent.getCondition() === current &&
+        this.sendingBranch(parent)
+      ) {
+        return true;
+      }
+      current = parent;
+    }
+    return false;
   }
 
   /** A string, a string literal, a template literal, or a union of strings. */
