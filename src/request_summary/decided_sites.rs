@@ -1785,7 +1785,7 @@ fn decide(
             }
             mounts
         }
-        _ => Vec::new(),
+        _ => composed::Mounts::default(),
     };
     walked.sort();
     walked.dedup();

@@ -55,10 +55,105 @@ pub(super) struct MountEdge {
     parents: Vec<InstanceEnd>,
 }
 
-/// Every mount edge of the service: each call of a member a `mounts` label
-/// names, made on an instance the label applies to, with each maker's
-/// result it is handed.
+/// What a service's instances are mounted under (carrick#2474 R3 S0).
+#[derive(Debug, Default)]
+pub(super) struct Mounts {
+    /// Every verified mount edge.
+    edges: Vec<MountEdge>,
+    /// The maker calls (`file`, `line`) whose result is handed to a member
+    /// call of an instance of the same package that no verified edge
+    /// reads: a `mounts` claim that did not verify, a member no label
+    /// names, or an argument the label does not name. Such an instance is
+    /// served somewhere the trace cannot say, so it is not "the top".
+    unverified: Vec<(String, u32)>,
+}
+
+/// The service's mounts: the verified edges, and the instances handed to a
+/// member call no verified edge reads.
 pub(super) fn mount_edges<'a>(
+    calls: &Calls<'a>,
+    inputs: &RequestSummaryInputs,
+    root: &Path,
+    makers: &[MakerLabel],
+    scopes: &[ScopeLabel],
+    index: &WalkIndex<'a>,
+) -> Mounts {
+    let edges = verified_edges(calls, inputs, root, makers, scopes, index);
+    let unverified = unverified_roots(calls, inputs, root, makers, scopes, index, &edges);
+    Mounts { edges, unverified }
+}
+
+/// Every instance handed, at any argument, to a library call made on an
+/// instance of the same package, that no verified edge in `edges` reads
+/// (that call and that instance).
+fn unverified_roots<'a>(
+    calls: &Calls<'a>,
+    inputs: &RequestSummaryInputs,
+    root: &Path,
+    makers: &[MakerLabel],
+    scopes: &[ScopeLabel],
+    index: &WalkIndex<'a>,
+    edges: &[MountEdge],
+) -> Vec<(String, u32)> {
+    let mut placed: Vec<Placed<'a>> = calls
+        .by_span
+        .values()
+        .filter(|placed| !placed.call.args.is_empty() || !placed.call.instance.args.is_empty())
+        .copied()
+        .collect();
+    placed.sort_by(|a, b| {
+        (a.file, a.call.site.span_start, a.call.site.span_end).cmp(&(
+            b.file,
+            b.call.site.span_start,
+            b.call.site.span_end,
+        ))
+    });
+    let walk = || InstanceWalk::new(calls, inputs, root, makers, scopes, index);
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for placed in placed {
+        if !walk().library_call(placed.file, placed.call) {
+            continue;
+        }
+        let receivers = walk().of(&[placed]);
+        let packages: Vec<&str> = receivers
+            .iter()
+            .filter_map(|end| match &end.end {
+                InstanceAt::Root { package, .. } | InstanceAt::Scope { package, .. } => {
+                    Some(package.as_str())
+                }
+                InstanceAt::Hole { .. } => None,
+            })
+            .collect();
+        if packages.is_empty() {
+            continue;
+        }
+        let at = format!("{}:{}", relative(root, placed.file), placed.call.site.line);
+        for arg in 0..placed.call.args.len().max(placed.call.instance.args.len()) {
+            for child in walk().of_arg(placed, arg, None) {
+                let InstanceAt::Root {
+                    file,
+                    line,
+                    package,
+                    ..
+                } = &child.end
+                else {
+                    continue;
+                };
+                let here = (file.clone(), *line);
+                let read = edges.iter().any(|edge| edge.child == here && edge.at == at);
+                if packages.contains(&package.as_str()) && !read && !out.contains(&here) {
+                    out.push(here);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every verified mount edge of the service: each call of a member a
+/// `mounts` label names, made on an instance the label applies to, with
+/// each maker's result it is handed.
+fn verified_edges<'a>(
     calls: &Calls<'a>,
     inputs: &RequestSummaryInputs,
     root: &Path,
@@ -177,7 +272,7 @@ impl Budget {
 /// taking one of `budget`.
 fn chains(
     end: &InstanceEnd,
-    mounts: &[MountEdge],
+    mounts: &Mounts,
     seen: &mut Vec<(String, u32)>,
     budget: &mut Budget,
 ) -> Vec<Chain> {
@@ -213,12 +308,29 @@ fn chains(
             if seen.contains(&here) {
                 return ended("cycle".to_string(), None, budget);
             }
-            let served: Vec<&MountEdge> = mounts.iter().filter(|edge| edge.child == here).collect();
+            let served: Vec<&MountEdge> = mounts
+                .edges
+                .iter()
+                .filter(|edge| edge.child == here)
+                .collect();
+            // Handed to a call no verified edge reads: served somewhere the
+            // trace cannot say, so its paths are relative (carrick#2474
+            // R3 S0).
+            let unverified = mounts.unverified.contains(&here);
             if served.is_empty() {
-                return ended("top".to_string(), None, budget);
+                let end = if unverified {
+                    "mount_unverified"
+                } else {
+                    "top"
+                };
+                return ended(end.to_string(), None, budget);
             }
-            seen.push(here);
-            let mut out = Vec::new();
+            seen.push(here.clone());
+            let mut out = if unverified {
+                ended("mount_unverified".to_string(), None, budget)
+            } else {
+                Vec::new()
+            };
             for edge in served {
                 for parent in &edge.parents {
                     for mut chain in chains(parent, mounts, seen, budget) {
@@ -266,7 +378,7 @@ fn join_path(parts: &[&str]) -> String {
 /// Each chain up `ends`, at most [`MAX_COMPOSED`], as a boundary record
 /// holds it (carrick#2474 R5a): its edges and prefixes from where it ends
 /// down, and that end.
-pub(super) fn aboves(ends: &[InstanceEnd], mounts: &[MountEdge]) -> Vec<Above> {
+pub(super) fn aboves(ends: &[InstanceEnd], mounts: &Mounts) -> Vec<Above> {
     let mut budget = Budget {
         left: MAX_COMPOSED,
         trimmed: false,
@@ -303,7 +415,7 @@ pub(super) fn aboves(ends: &[InstanceEnd], mounts: &[MountEdge]) -> Vec<Above> {
 pub(super) fn compose(
     ends: &[InstanceEnd],
     route: Option<&str>,
-    mounts: &[MountEdge],
+    mounts: &Mounts,
 ) -> (Vec<Composed>, bool) {
     let mut out: Vec<Composed> = Vec::new();
     let mut budget = Budget {
@@ -409,11 +521,13 @@ mod tests {
     #[test]
     fn the_composed_paths_of_one_site_stop_at_the_cap() {
         let values: Vec<String> = (0..100).map(|n| format!("/v{n}")).collect();
-        let (paths, trimmed) = compose(&[scope(values, vec![root(1)])], Some("/x"), &[]);
+        let none = Mounts::default();
+        let (paths, trimmed) = compose(&[scope(values, vec![root(1)])], Some("/x"), &none);
         assert_eq!(paths.len(), MAX_COMPOSED);
         assert!(trimmed);
         let parents: Vec<InstanceEnd> = (1..=100).map(root).collect();
-        let (paths, trimmed) = compose(&[scope(vec!["/a".to_string()], parents)], Some("/x"), &[]);
+        let (paths, trimmed) =
+            compose(&[scope(vec!["/a".to_string()], parents)], Some("/x"), &none);
         assert!(paths.len() <= MAX_COMPOSED, "{}", paths.len());
         assert!(trimmed);
         let (paths, trimmed) = compose(
@@ -422,7 +536,7 @@ mod tests {
                 vec![root(1)],
             )],
             Some("/x"),
-            &[],
+            &none,
         );
         assert_eq!(
             paths

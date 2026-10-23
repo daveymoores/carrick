@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::RequestSummaryInputs;
 use super::super::values::ValueAt;
-use super::composed::MountEdge;
+use super::composed::Mounts;
 use super::instances::{
     InstanceEnd, InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, WalkIndex,
 };
@@ -184,7 +184,7 @@ pub(super) struct Collect<'c, 'a> {
     pub(super) makers: &'c [MakerLabel],
     pub(super) scopes: &'c [ScopeLabel],
     pub(super) index: &'c WalkIndex<'a>,
-    pub(super) mounts: &'c [MountEdge],
+    pub(super) mounts: &'c Mounts,
 }
 
 /// Whether a declaration's file, as the rows name it, is a file of the

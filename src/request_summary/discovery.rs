@@ -3571,6 +3571,10 @@ mod tests {
             "src/index.ts:26 <- /in/inline",
             "src/index.ts:37 <- /v2/x",
             "src/index.ts:38 <- /v3/y",
+            // Handed to a member no scope claim names (`attach`): the trace
+            // cannot say where it is served, so the path is relative
+            // (carrick#2474 R3 S0).
+            "src/index.ts:46 <- /s (mount_unverified)",
             "src/items.ts:12 <- /api/items",
             "src/items.ts:8 <- /api/deep/leaf",
             // Waits on carrick#2432's injected-callee step.
@@ -3591,7 +3595,9 @@ mod tests {
         ]);
         assert_eq!(got, want, "{got:#?}");
         // No scope claim verified: no scope or mount edge, every plugin's
-        // route a hole and every router's at its own path.
+        // route a hole and every router the app is handed (`route`) served
+        // somewhere the trace cannot say, not at the top (carrick#2474 R3
+        // S0).
         let (_, unverified) = decided_traced(
             &on,
             &exports,
@@ -3600,7 +3606,9 @@ mod tests {
         );
         let bare = composed_lines(&unverified, false);
         for kept in [
-            "src/users.ts:8 <- /",
+            "src/users.ts:8 <- / (mount_unverified)",
+            "src/index.ts:46 <- /s (mount_unverified)",
+            "src/index.ts:19 <- /health",
             "src/index.ts:14 <- /bare (runs_by_library)",
             "src/index.ts:37 <- /x (unread)",
         ] {
