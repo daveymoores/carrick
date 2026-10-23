@@ -65,6 +65,48 @@ declare const server: Server;
 export default server;
 `;
 
+// A generic server package whose default export is a factory (carrick#2663):
+// calling it makes an instance, which a plugin member hands to the plugin it
+// runs. The plugin's parameter names the instance interface, with the
+// member's own type parameter threaded into a nested conditional argument; no
+// export is named for the factory's result. `use` runs a function handed
+// another type, `fork` one handed the instance with another request type.
+const PLUGIN_SERVER = `export interface RawServer {
+  listen(port: number): void;
+}
+export interface IncomingRequest {
+  url: string;
+}
+export interface SecureRequest {
+  url: string;
+  secure: true;
+}
+export type RequestOf<S> = S extends RawServer ? IncomingRequest : SecureRequest;
+export interface Other {
+  close(): void;
+}
+export interface RegisterOptions {
+  prefix?: string;
+}
+export type Plugin<Options, S> = (instance: Instance<S, RequestOf<S>>, options: Options, done: (error?: Error) => void) => void;
+export type PluginOptions = Record<string, any>;
+export interface Register<T, S> {
+  <Options extends PluginOptions, S2 = S>(plugin: Plugin<Options, S2>, options: Options & RegisterOptions): T;
+}
+export interface Instance<S = RawServer, Q = RequestOf<S>> {
+  get(path: string, handler: (request: Q) => void): this;
+  register: Register<Instance<S, Q> & PromiseLike<undefined>, S>;
+  use(plugin: (other: Other, options: object) => void, options?: RegisterOptions): this;
+  fork<S2 = S>(plugin: (instance: Instance<S2, number>, options: object) => void, options: RegisterOptions): this;
+}
+export interface Factory {
+  <S = RawServer>(options?: { logger?: boolean }): Instance<S> & PromiseLike<Instance<S>>;
+}
+declare const factory: Factory;
+export default factory;
+export declare function helper(): void;
+`;
+
 function writeTree(root: string, files: Record<string, string>): void {
   for (const [rel, text] of Object.entries(files)) {
     const file = path.join(root, rel);
@@ -142,6 +184,12 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
       'src/index.ts': 'export const service = 1;\n',
       'node_modules/fixture-server/package.json': JSON.stringify({ name: P, version: '1.0.0', types: 'index.d.ts' }),
       'node_modules/fixture-server/index.d.ts': SERVER,
+      'node_modules/fixture-plugin-server/package.json': JSON.stringify({
+        name: 'fixture-plugin-server',
+        version: '1.0.0',
+        types: 'index.d.ts',
+      }),
+      'node_modules/fixture-plugin-server/index.d.ts': PLUGIN_SERVER,
     });
     client = new SidecarClient();
     await client.start();
@@ -192,6 +240,44 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
       ]),
       ['verified', 'failed runs_not_function', 'failed yields_not_export']
     );
+  });
+
+  it('yields naming the factory: the plugin is handed the instance the factory makes (carrick#2663)', async () => {
+    const onInstance = (claim: Claim, receiver = 'instance:()'): Check => ({
+      ...check(receiver, { ...claim, of: receiver }),
+      package: 'fixture-plugin-server',
+    });
+    const factoryMaker: Check = { ...check('export', { kind: 'make', form: 'call', member: null }), package: 'fixture-plugin-server' };
+    const plugin = (member: string, exported: string) =>
+      onInstance(scope(member, { name: { arg: 1, key: 'prefix' }, runs: { arg: 0 }, yields: { param: 0, export: exported, side: 'server' } }));
+    const response = await client.send<Response>(
+      {
+        request_id: `routes-${requestId++}`,
+        action: 'verify_library_claims',
+        from_dir: root,
+        checks: [
+          factoryMaker,
+          plugin('register', 'default'),
+          // The instance interface named directly: today's reading.
+          plugin('register', 'Instance'),
+          // Invalid: the plugin is handed another type, not the instance.
+          plugin('use', 'default'),
+          // Invalid: a function export that makes nothing.
+          plugin('register', 'helper'),
+          // Invalid: the instance's declaration, with a request type the made instance does not have.
+          plugin('fork', 'default'),
+        ],
+      },
+      60_000
+    );
+    assert.deepStrictEqual(verdicts(response), [
+      'verified',
+      'verified',
+      'verified',
+      'failed yields_not_export',
+      'failed yields_not_export',
+      'failed yields_not_export',
+    ]);
   });
 
   it('a verified scope names the declarations its member resolves to (carrick#2636)', async () => {

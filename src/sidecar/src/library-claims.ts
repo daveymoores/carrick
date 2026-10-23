@@ -314,6 +314,12 @@ interface MessageReceiver extends Holder {
   scoped: boolean;
   /** The maker overloads this instance is read through: what `runs: { bound: 'maker' }` reads. */
   makerHolding?: readonly ts.Signature[];
+  /**
+   * The export whose own call or construction made this instance
+   * (`instance:()`, `instance:new`, with no scope step): a `yields` naming it
+   * names this instance (carrick#2663).
+   */
+  madeBy?: string;
 }
 
 /** A check's outcome, and for a maker or scope claim the overloads it holds on. */
@@ -656,6 +662,7 @@ export class LibraryClaimsVerifier {
             makerBindsName,
             scoped: receiverPath.scope !== undefined,
             makerHolding,
+            madeBy: receiverPath.maker?.member === null && receiverPath.scope === undefined ? check.export : undefined,
           })),
         };
       };
@@ -1999,6 +2006,14 @@ class DeclarationReader {
     if (type === parameter) return true;
     if (depth > 6) return true;
     if (type.isUnionOrIntersection()) return type.types.some(part => this.mentions(part, parameter, depth + 1));
+    // A deferred conditional (`Server extends X ? A : B`) or an alias
+    // instance names its parameter in its check type or its alias arguments
+    // (carrick#2663).
+    if (type.aliasTypeArguments?.some(argument => this.mentions(argument, parameter, depth + 1))) return true;
+    if (type.flags & ts.TypeFlags.Conditional) {
+      const conditional = type as ts.ConditionalType;
+      return [conditional.checkType, conditional.extendsType].some(part => this.mentions(part, parameter, depth + 1));
+    }
     const reference = this.referenceOf(type);
     if (reference !== undefined) {
       return this.checker.getTypeArguments(reference).some(argument => this.mentions(argument, parameter, depth + 1));
@@ -2180,17 +2195,23 @@ class DeclarationReader {
   }
 
   /**
-   * `yields: { param, export, side }` on a receive op: some signature of the
-   * handler this overload takes declares a parameter at `param` whose type
-   * is the package's own export named `export` (a class, or the interface
-   * an instance has), declared in the receiver's home packages. `side` is
-   * `client` or `server` (`yields_side_invalid`). Undefined when it holds.
+   * `yields: { param, export, side }` on a receive op or a scope: some
+   * signature of the function this overload takes declares a parameter at
+   * `param` whose type is either
+   * - the package's own export named `export` (a class, or the interface an
+   *   instance has), declared in the receiver's home packages; or
+   * - when `export` is the maker whose own call made the instance the claim
+   *   is read on (`madeBy`, carrick#2663): that instance, compared by
+   *   declaration (`handsInstance`), since a factory's result has no export
+   *   name of its own.
+   * `side` is `client` or `server` (`yields_side_invalid`). Undefined when it
+   * holds.
    */
   private yieldsOutcome(
     signature: ts.Signature,
     handler: ClaimSlot,
     yields: { param: number; export: string; side: string },
-    receiver: Holder
+    receiver: MessageReceiver
   ): Outcome | undefined {
     if (yields.side !== 'client' && yields.side !== 'server') return failed('yields_side_invalid');
     let declared = this.keyParameterAt(signature, handler.arg);
@@ -2211,9 +2232,49 @@ class DeclarationReader {
             (symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), receiver.home))
         );
         if (named) return undefined;
+        if (yields.export === receiver.madeBy && this.handsInstance(given, receiver, signature.typeParameters ?? [])) {
+          return undefined;
+        }
       }
     }
     return failed('yields_not_export');
+  }
+
+  /**
+   * `given` (each part, nullish dropped) is the instance `receiver` holds:
+   * some part of its intersection is a class or interface the receiver's
+   * home packages declare, and the same declaration (the same symbol, never
+   * the same name) as a part of the instance's own intersection. A generic
+   * instance is built at its defaults while `given` threads the overload's
+   * own type parameters (`own`) through its arguments, so the arguments are
+   * read as `fitsErased` reads a mounted instance (carrick#2652): a
+   * definite mismatch refuses, an argument it cannot read leaves the
+   * declaration to decide.
+   */
+  private handsInstance(given: ts.Type, receiver: Holder, own: readonly ts.TypeParameter[]): boolean {
+    const declared = (type: ts.Type): ts.Symbol | undefined => {
+      const symbol = type.getSymbol();
+      if (!symbol || !(symbol.flags & (ts.SymbolFlags.Class | ts.SymbolFlags.Interface))) return undefined;
+      const home = (symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), receiver.home));
+      return home ? symbol : undefined;
+    };
+    const intersected = (type: ts.Type): readonly ts.Type[] => (type.isIntersection() ? type.types : [type]);
+    const instances = this.parts(receiver.type)
+      .flatMap(intersected)
+      .filter(part => declared(part) !== undefined);
+    const parts = this.parts(given);
+    return (
+      parts.length > 0 &&
+      parts.every(part =>
+        intersected(part).some(handed => {
+          const symbol = declared(handed);
+          return (
+            symbol !== undefined &&
+            instances.some(instance => declared(instance) === symbol && this.fitsErased(instance, handed, own) !== false)
+          );
+        })
+      )
+    );
   }
 
   /**
