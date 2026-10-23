@@ -161,6 +161,7 @@ fn a_class_client_reads_what_its_constructions_pass() {
         ("3 constructions that disagree", "/east/ping"),
         ("3 constructions that disagree", "/west/ping"),
         ("4 a class extended anywhere", "/feed/recent"),
+        ("9 a class handed on as a value", "/hooks/hook"),
     ] {
         assert!(
             !rows.iter().any(|row| row.ends_with(&format!(" {path}"))),

@@ -984,6 +984,11 @@ struct Walker<'a> {
     ambiguous: std::cell::Cell<usize>,
     /// How many own factories' returns the value being read is inside.
     returns_depth: usize,
+    /// The fields being read through their constructions (carrick#2452): a
+    /// construction that passes a field of a class whose field is being
+    /// read (`new Fork({ send: this.send })` in a method of `Fork`) adds
+    /// nothing.
+    fields_reading: HashSet<(&'a Path, u32, String)>,
 }
 
 impl<'a> Walker<'a> {
@@ -1916,6 +1921,10 @@ impl<'a> Walker<'a> {
         invoke: Invoke<'a>,
     ) -> Option<Vec<Held<'a>>> {
         let (origin, from, built) = self.field_origin(file, class, field)?;
+        let reading = (file, class, field.to_string());
+        if !self.fields_reading.insert(reading.clone()) {
+            return Some(Vec::new());
+        }
         let defaults: Defaults<'a> = (file, origin.defaults.as_slice());
         let mut out = Vec::new();
         for value in &from.values {
@@ -1951,6 +1960,7 @@ impl<'a> Walker<'a> {
                 other => out.extend(self.read_value(file, other, invoke, false)),
             }
         }
+        self.fields_reading.remove(&reading);
         Some(out)
     }
 
@@ -2291,6 +2301,7 @@ pub fn discover_with(
         reading: HashMap::new(),
         ambiguous: std::cell::Cell::new(0),
         returns_depth: 0,
+        fields_reading: HashSet::new(),
     };
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
     paths.sort();

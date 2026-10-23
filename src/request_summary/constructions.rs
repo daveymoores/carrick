@@ -11,7 +11,9 @@
 //! service names the class it builds ([`constructed`]). A class is read
 //! through its constructions only when every `new` naming it is a
 //! construction the reader read, none spreads its arguments, at least one
-//! exists, and no class anywhere in the service extends one of its name.
+//! exists, no class anywhere in the service extends one of its name, and no
+//! module reads its name as a value (`register(Api)`, `[Api]`): a class
+//! handed on may be built where no `new` names it.
 //!
 //! - Text ([`RequestSummaryInputs::read_fields`]): a field's piece
 //!   (`this.base`) takes the value every construction passes there when they
@@ -77,12 +79,15 @@ pub(super) struct NewAt {
     callee: Option<String>,
 }
 
-/// Every `new` a file writes, wherever it is, and the name of every class
-/// any class it declares extends.
+/// Every `new` a file writes, wherever it is, the name of every class any
+/// class it declares extends, and every name it reads as a value.
 #[derive(Debug, Clone, Default)]
 pub(super) struct NewsAndBases {
     news: Vec<NewAt>,
     bases: HashSet<String>,
+    /// Each identifier read as a value: anywhere but a `new`'s callee, a
+    /// class's base and the object of a member (`Api.create()`).
+    handed: HashSet<String>,
 }
 
 /// The name an expression reads a class through: an identifier, or a
@@ -106,6 +111,19 @@ impl NewsAndBases {
     }
 }
 
+impl NewsAndBases {
+    /// `expr` read as a class's name (a `new`'s callee, a base): its
+    /// identifier is not handed; any other part of it is read.
+    fn visit_named(&mut self, expr: &Expr) {
+        if !matches!(
+            crate::graphql_document_sites::unwrap_expression(expr),
+            Expr::Ident(_)
+        ) {
+            expr.visit_with(self);
+        }
+    }
+}
+
 impl Visit for NewsAndBases {
     fn visit_new_expr(&mut self, new: &NewExpr) {
         self.news.push(NewAt {
@@ -113,14 +131,42 @@ impl Visit for NewsAndBases {
             hi: new.span.hi.0,
             callee: class_name(&new.callee),
         });
-        new.visit_children_with(self);
+        self.visit_named(&new.callee);
+        new.args.visit_with(self);
     }
 
     fn visit_class(&mut self, class: &Class) {
-        if let Some(base) = class.super_class.as_deref().and_then(class_name) {
-            self.bases.insert(base);
+        if let Some(base) = class.super_class.as_deref() {
+            if let Some(name) = class_name(base) {
+                self.bases.insert(name);
+            }
+            self.visit_named(base);
         }
-        class.visit_children_with(self);
+        class.decorators.visit_with(self);
+        class.body.visit_with(self);
+    }
+
+    fn visit_member_expr(&mut self, member: &MemberExpr) {
+        // `Api.create()`: the class's own member, not the class handed on.
+        if !matches!(&*member.obj, Expr::Ident(_)) {
+            member.obj.visit_with(self);
+        }
+        member.prop.visit_with(self);
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        if let Expr::Ident(ident) = expr {
+            self.handed.insert(ident.sym.to_string());
+        }
+        expr.visit_children_with(self);
+    }
+
+    fn visit_prop(&mut self, prop: &Prop) {
+        // `{ Api }`.
+        if let Prop::Shorthand(ident) = prop {
+            self.handed.insert(ident.sym.to_string());
+        }
+        prop.visit_children_with(self);
     }
 }
 
@@ -430,6 +476,11 @@ pub(super) fn constructed(inputs: &RequestSummaryInputs) -> HashMap<(&Path, u32)
         .values()
         .flat_map(|file| file.news.bases.iter().map(String::as_str))
         .collect();
+    let handed: HashSet<&str> = inputs
+        .files
+        .values()
+        .flat_map(|file| file.news.handed.iter().map(String::as_str))
+        .collect();
     let mut found: HashMap<(&Path, u32), Vec<Placed<'_>>> = HashMap::new();
     let mut refused: HashSet<(&Path, u32)> = HashSet::new();
     let mut refused_names: HashSet<&str> = HashSet::new();
@@ -484,6 +535,7 @@ pub(super) fn constructed(inputs: &RequestSummaryInputs) -> HashMap<(&Path, u32)
         !refused.contains(&(*file, *class))
             && !refused_names.contains(name)
             && !bases.contains(name)
+            && !handed.contains(name)
             && built.iter().all(|placed| placed.call.site_args.is_some())
     });
     found
@@ -572,10 +624,11 @@ mod tests {
 
     /// carrick#2452 slice 2: a field set from a constructor parameter reads
     /// as the text every construction in the service passes, from another
-    /// module: a parameter property (case 1) and a key of an options object
-    /// (case 2). Constructions that disagree (3), a class extended anywhere
-    /// (4) and a construction that hands on its own parameter (5) keep the
-    /// field's own name.
+    /// module: a parameter property (case 1), a key of an options object
+    /// (case 2) and a construction in the class's own static factory, called
+    /// through the class (case 10). Constructions that disagree (3), a class
+    /// extended anywhere (4), a construction that hands on its own parameter
+    /// (5) and a class handed on as a value (9) keep the field's own name.
     #[test]
     fn a_field_reads_as_every_construction_in_the_service_passes_it() {
         let Some(on) = modules() else {
@@ -585,6 +638,7 @@ mod tests {
         for (case, file, key, callee, text) in [
             ("1", "src/api.ts", "Api.users", "fetch", "/api/v1/users"),
             ("2", "src/items.ts", "Items.list", "send", "/v2/items"),
+            ("10", "src/hosts.ts", "Hosts.list", "fetch", "/local/hosts"),
         ] {
             let pieces = first_argument(&on, file, key, callee);
             if pieces != vec![Piece::Lit(text.to_string())] {
@@ -595,6 +649,7 @@ mod tests {
             ("3", "src/region.ts", "Region.ping"),
             ("4", "src/feed.ts", "Feed.recent"),
             ("5", "src/reports.ts", "Reports.all"),
+            ("9", "src/hooks.ts", "Hooks.hook"),
         ] {
             let pieces = first_argument(&on, file, key, "fetch");
             if opaque(&pieces) != vec!["this.base"] {
@@ -644,5 +699,48 @@ mod tests {
             Some("lib:lib.dom.d.ts fetch"),
             "case 6: {found:#?}"
         );
+    }
+
+    /// A construction that passes a field of a class whose field is being
+    /// read adds nothing, so the read ends: a method that constructs its own
+    /// class with its own field (case 7) and two classes that construct each
+    /// other with their own fields (case 8) are sites on the `??` right
+    /// side, `fetch`.
+    #[test]
+    fn a_field_passed_back_into_its_own_construction_ends() {
+        let Some(on) = modules() else {
+            return;
+        };
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "tests/fixtures/class-client-modules/repo/__llm__/library-claims/default.json",
+            ))
+            .unwrap(),
+        );
+        let labels = super::super::discovery::Labels::of_answer(&answer);
+        let found = super::super::discovery::discover(&on.inputs, &labels, &on.repo);
+        let at = |file: &str, line: u32| {
+            found
+                .sites
+                .iter()
+                .find(|site| site.file == file && site.line == line)
+                .map(|site| {
+                    site.end
+                        .as_ref()
+                        .map(|end| format!("{} {}", end.package, end.export))
+                        .unwrap_or_else(|| format!("stop {:?}", site.stop))
+                })
+        };
+        for (case, file, line) in [
+            ("7", "src/fork.ts", 20),
+            ("8 Ping", "src/ping-pong.ts", 20),
+            ("8 Pong", "src/ping-pong.ts", 36),
+        ] {
+            assert_eq!(
+                at(file, line).as_deref(),
+                Some("lib:lib.dom.d.ts fetch"),
+                "case {case}: {found:#?}"
+            );
+        }
     }
 }
