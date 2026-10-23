@@ -23,6 +23,7 @@ const COMMANDS: &str = "packages/cli/src/commands.ts";
 const HOOKS: &str = "apps/web/src/hooks.ts";
 const REQUESTS: &str = "packages/client/src/requests.ts";
 const TOOLS: &str = "packages/cli/src/tools.ts";
+const MAIN: &str = "packages/cli/src/main.ts";
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/call-through-client")
@@ -857,6 +858,9 @@ fn no_row_is_stated_a_hop_above_the_client_or_where_no_function_crosses_for_the_
     let blobs = unanswered();
     let mut stated = Vec::new();
     for (service, file, line) in [
+        // A command of another file, which calls the client itself: the
+        // command's own call is the row.
+        ("cli", MAIN, 5),
         // A command of the same file, and a helper of the same file.
         ("cli", COMMANDS, 15),
         ("cli", COMMANDS, 46),

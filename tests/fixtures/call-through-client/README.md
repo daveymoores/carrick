@@ -98,8 +98,9 @@ own modules' imports. Every call into the
 client class then states its row from the source alone (`commands.ts` lines
 9, 21, 28, 34, 40, 53, 64, 101, 121 and 164), and so does `tools.ts:9`, whose
 `client` parameter only the compiler types (the table's type gives it one).
-None is stated at a call one hop further up (`commands.ts:15` and `:46` call
-a command of the same file, `:57` a helper of the same file that reaches two
+None is stated at a call one hop further up (`main.ts:5` calls a command of
+another file, which calls the client; `commands.ts:15` and `:46` call a
+command of the same file, `:57` a helper of the same file that reaches two
 operations), at a call nothing resolves (`commands.ts:70`), or in
 `hooks.ts`: the hooks call the client package directly, and `withSpinner`
 (`:19`) only runs the callback it is handed, so no function of the web's own
