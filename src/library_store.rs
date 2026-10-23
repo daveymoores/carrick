@@ -1138,6 +1138,9 @@ pub struct FirstAnswer {
     /// reason, answered `skipped` with `build_failed`, and every package
     /// asked when the ask itself failed.
     pub unanswered: BTreeSet<String>,
+    /// Every package the answer holds as answered, with or without an export
+    /// ([`LibraryAnswer::answered_packages`]).
+    pub answered: BTreeSet<String>,
     /// The ask itself got no answer (a refusal, an error, a timeout).
     pub ask_failed: bool,
 }
@@ -1177,6 +1180,7 @@ where
                     .iter()
                     .map(|package| package.package.clone())
                     .collect(),
+                answered: BTreeSet::new(),
                 ask_failed: true,
             });
         }
@@ -1189,6 +1193,7 @@ where
         let _ = early.send(FirstAnswer {
             exports: asked.claims(first.exports.clone()),
             unanswered: first.pending.union(&first.build_failed).cloned().collect(),
+            answered: first.answered_packages.clone(),
             ask_failed: false,
         });
     }

@@ -623,6 +623,14 @@ pub struct ProcessingStats {
     /// analyze-file prompt (e.g. raw WebSocket constructors). Skipped instead
     /// of being fed to the HTTP prompt, which couldn't classify them.
     pub files_skipped_unrouted_protocol: usize,
+    /// Files sent to the reader because the fact layer found a site, a lead
+    /// or an unanswered-package call in them and no signal raised a
+    /// candidate there (carrick#2613, `CARRICK_FACT_FILES=1`).
+    pub fact_layer_files: usize,
+    /// Register-signal candidates kept for the reader at a call discovery
+    /// could not follow, by signal (`C1`-`C4`): the old path's selection
+    /// fallback, stated on the scan's fallbacks line (carrick#2613, D4).
+    pub fallback_selection: BTreeMap<&'static str, usize>,
     pub total_mounts: usize,
     pub total_endpoints: usize,
     /// Rows the deterministic layer stated for itself, per source. Counted
@@ -1490,6 +1498,40 @@ pub enum FactFileSource {
     ),
 }
 
+/// What phase 1 does with a file that raises no HTTP candidate, read once
+/// from the file and again when the fact layer drops every candidate it
+/// raised (carrick#2613).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhenEmpty {
+    /// Its routes are structural, stated with no reader.
+    Structural,
+    /// Read all the same: a GraphQL resolver, schema-builder or consumer
+    /// file, or one that imports a messaging client.
+    Read,
+    /// Deferred to the rescues after phase 1.
+    Deferred,
+    /// Its only candidates are of a protocol no reader prompt takes: skipped.
+    Unrouted,
+}
+
+/// `candidates` less the ones listed for the reader alone (`reader_only`,
+/// carrick#2613): what the passes over a file's candidates read.
+fn signal_candidates<'a>(
+    candidates: &'a HashMap<String, CandidateTarget>,
+    reader_only: &HashSet<String>,
+) -> std::borrow::Cow<'a, HashMap<String, CandidateTarget>> {
+    if reader_only.is_empty() {
+        return std::borrow::Cow::Borrowed(candidates);
+    }
+    std::borrow::Cow::Owned(
+        candidates
+            .iter()
+            .filter(|(id, _)| !reader_only.contains(*id))
+            .map(|(id, candidate)| (id.clone(), candidate.clone()))
+            .collect(),
+    )
+}
+
 /// The register signals that raised each call span of one file.
 type RegisterTags = std::collections::BTreeMap<
     (u32, u32),
@@ -1542,7 +1584,7 @@ fn log_fact_files<'a>(
         }
     );
     for signal in RegisterSignal::ALL {
-        let (mut at_site, mut stopped, mut no_record) = (0usize, 0usize, 0usize);
+        let (mut at_site, mut short, mut finished, mut no_record) = (0usize, 0, 0, 0);
         for (file, calls) in tagged {
             for (span, signals) in calls {
                 if !signals.contains(&signal) {
@@ -1550,13 +1592,14 @@ fn log_fact_files<'a>(
                 }
                 match facts.followed(file, *span) {
                     Some(Followed::Site) => at_site += 1,
-                    Some(Followed::Stopped) => stopped += 1,
+                    Some(Followed::Stopped(_) | Followed::Unfollowed(_)) => short += 1,
+                    Some(Followed::Finished) => finished += 1,
                     None => no_record += 1,
                 }
             }
         }
         debug!(
-            "fact files: {} candidates: at a site {at_site}, at a stopped walk {stopped}, with no record {no_record}",
+            "fact files: {} candidates: at a site {at_site}, at a call discovery could not follow {short}, at a finished walk {finished}, with no record {no_record}",
             signal.label()
         );
     }
@@ -2460,9 +2503,66 @@ impl FileOrchestrator {
             /// Calls in this file that hand an inline function the instance
             /// it registers routes on (carrick#2092).
             registration_sites: Vec<crate::registration_scope::RegistrationSite>,
+            /// The file's import specifiers, for when the fact layer leaves
+            /// it no candidate and it is deferred after all (carrick#2613).
+            import_sources: Vec<String>,
+            /// What the file comes to when it is left no HTTP candidate.
+            when_empty: WhenEmpty,
+            /// How many candidates of an unrouted protocol it raised.
+            unrouted: usize,
+            /// The candidates only register signals raised (C1-C4), by span,
+            /// with those signals. Filled only when the fact layer chooses
+            /// the reader's files (carrick#2613, D4).
+            held: BTreeMap<(u32, u32), BTreeSet<crate::swc_scanner::RegisterSignal>>,
+            /// Candidates listed for the reader alone: register-signal
+            /// candidates kept at a call discovery could not follow (D4). No
+            /// wrapper pass and no receiver role reads them.
+            reader_only: HashSet<String>,
         }
 
         impl PendingFile {
+            /// The candidates the passes over candidates read: every one
+            /// but the ones listed for the reader alone.
+            fn signal_candidates(&self) -> std::borrow::Cow<'_, HashMap<String, CandidateTarget>> {
+                signal_candidates(&self.candidate_map, &self.reader_only)
+            }
+
+            /// Drop the listed candidates at `spans`, keeping the prompt's
+            /// lines in step with `listed`.
+            fn unlist(&mut self, spans: &BTreeSet<(u32, u32)>) {
+                let keep: Vec<bool> = self
+                    .listed
+                    .iter()
+                    .map(|listed| !spans.contains(&(listed.span_start, listed.span_end)))
+                    .collect();
+                let mut kept = keep.iter();
+                self.candidate_hints
+                    .retain(|_| *kept.next().unwrap_or(&true));
+                let mut kept = keep.iter();
+                self.candidate_contexts
+                    .retain(|_| *kept.next().unwrap_or(&true));
+                self.candidate_map.retain(|_, candidate| {
+                    !spans.contains(&(candidate.span_start, candidate.span_end))
+                });
+                self.listed
+                    .retain(|listed| !spans.contains(&(listed.span_start, listed.span_end)));
+            }
+
+            /// List `candidates` after the ones already listed.
+            fn list(&mut self, candidates: Vec<CandidateTarget>) {
+                for candidate in candidates {
+                    self.candidate_hints.push(candidate.format_hint());
+                    self.candidate_contexts
+                        .push(serde_json::to_string(&candidate).unwrap_or_default());
+                    self.listed.push(ListedCandidate {
+                        candidate_id: candidate.candidate_id.clone(),
+                        span_start: candidate.span_start,
+                        span_end: candidate.span_end,
+                    });
+                    self.candidate_map
+                        .insert(candidate.candidate_id.clone(), candidate);
+                }
+            }
             /// What asking the file, whole or in parts, reads of it.
             fn parted(&self) -> PartedFile<'_> {
                 PartedFile {
@@ -2676,6 +2776,89 @@ impl FileOrchestrator {
             }
         }
 
+        /// A file whose routes are all structural: its rows are stated with
+        /// no reader. `endpoints` are its file-based, route-descriptor and
+        /// decorator routes.
+        fn emit_structural(
+            path_str: String,
+            file_path: &Path,
+            endpoints: [&[EndpointResult]; 3],
+            stats: &mut ProcessingStats,
+            late_summary_files: &mut Vec<LateSummaryFile>,
+            file_results: &mut HashMap<String, FileAnalysisResult>,
+        ) {
+            let [route_endpoints, descriptor_endpoints, decorator_endpoints] = endpoints;
+            debug!(
+                "Structural route(s) (no call-site candidates): {} [{} file-based, {} route-descriptor, {} decorator]",
+                path_str,
+                route_endpoints.len(),
+                descriptor_endpoints.len(),
+                decorator_endpoints.len()
+            );
+            // The same emission every other deterministic row goes
+            // through; this file simply never reaches a model to join.
+            let mut result = FileAnalysisResult::default();
+            let _ = FileOrchestrator::emit_resolved_rows(
+                &mut result,
+                FileOrchestrator::resolve_candidates(
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &[],
+                    &EnvAliasMap::new(),
+                    &WholeUrlFallbackMap::new(),
+                    &EnvFallbackMap::new(),
+                    &LiteralBaseMap::new(),
+                    route_endpoints,
+                    descriptor_endpoints,
+                    decorator_endpoints,
+                    // No call-site candidates here by construction, so
+                    // no receiver to ask about.
+                    &HashMap::new(),
+                    // Its request summaries are emitted once they are
+                    // composed ([`LateSummaryFile`]).
+                    &BTreeMap::new(),
+                    &EnvSchemaIndex::default(),
+                    false,
+                ),
+                &mut stats.deterministic_rows_emitted,
+            );
+            stats.total_endpoints += result.endpoints.len();
+            late_summary_files.push(LateSummaryFile {
+                path_str: path_str.clone(),
+                file_path: file_path.to_path_buf(),
+                counts_data_calls: false,
+            });
+            file_results.insert(path_str, result);
+            // No cache entry: the model was never asked, and the routes
+            // above are re-derived from the file layout on every scan.
+        }
+
+        /// A file whose only candidates are of a protocol no reader prompt
+        /// takes: skipped.
+        fn skip_unrouted(
+            path_str: String,
+            unrouted: usize,
+            stats: &mut ProcessingStats,
+            file_results: &mut HashMap<String, FileAnalysisResult>,
+        ) {
+            debug!(
+                "Skipped (only unrouted-protocol candidates): {} [{} candidate(s)]",
+                path_str, unrouted
+            );
+            stats.files_skipped += 1;
+            stats.files_skipped_unrouted_protocol += 1;
+            // Joined-map key only: routing a protocol that has no LLM
+            // pass today is a scanner change, and it must reach this
+            // file without a cache bump.
+            file_results.insert(path_str, FileAnalysisResult::default());
+        }
+
+        // Whether the fact layer chooses the reader's files (carrick#2613,
+        // ticket T3): the switch is on and the engine sends the fact layer's
+        // files. Without them the gate below is today's.
+        let choosing_files = crate::request_summary::fact_files::enabled()
+            && !matches!(self.fact_files, FactFileSource::None);
+
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
         // work list of files that actually need an LLM call. Zero-cost skips are recorded here.
         let mut pending: Vec<PendingFile> = Vec::new();
@@ -2813,6 +2996,27 @@ impl FileOrchestrator {
             // prompt (raw WebSocket/EventSource constructors today) are set
             // aside; a file with only those is skipped, not sent to a prompt
             // that has no instructions for them.
+            //
+            // The candidates the register signals alone raised (carrick#2613,
+            // D4), decided once the fact layer's files are in.
+            let held: BTreeMap<(u32, u32), BTreeSet<crate::swc_scanner::RegisterSignal>> =
+                if choosing_files {
+                    scan_result
+                        .candidates
+                        .iter()
+                        .filter(|candidate| candidate.protocol == Protocol::Http)
+                        .map(|candidate| (candidate.span_start, candidate.span_end))
+                        .filter(|span| !scan_result.kept_spans.contains(span))
+                        .filter_map(|span| {
+                            scan_result
+                                .register_signals
+                                .get(&span)
+                                .map(|signals| (span, signals.clone()))
+                        })
+                        .collect()
+                } else {
+                    BTreeMap::new()
+                };
             if !scan_result.register_signals.is_empty() {
                 register_tagged.push((
                     crate::utils::repo_relative_source_path(&path_str, &repo_root_str).to_string(),
@@ -2968,54 +3172,36 @@ impl FileOrchestrator {
             // protocol, SKIP the (expensive) LLM call. File-based route and
             // route-descriptor endpoints are still recorded: they're derived
             // structurally and need no LLM.
+            let when_empty = if !route_endpoints.is_empty()
+                || !descriptor_endpoints.is_empty()
+                || !decorator_endpoints.is_empty()
+            {
+                WhenEmpty::Structural
+            } else if is_graphql_resolver_file
+                || is_graphql_schema_builder_file
+                || is_graphql_consumer_file
+                || imports_messaging_client
+            {
+                WhenEmpty::Read
+            } else if unrouted_candidates.is_empty() {
+                WhenEmpty::Deferred
+            } else {
+                WhenEmpty::Unrouted
+            };
             if http_candidates.is_empty() {
-                if !route_endpoints.is_empty()
-                    || !descriptor_endpoints.is_empty()
-                    || !decorator_endpoints.is_empty()
-                {
-                    debug!(
-                        "Structural route(s) (no call-site candidates): {} [{} file-based, {} route-descriptor, {} decorator]",
+                if when_empty == WhenEmpty::Structural {
+                    emit_structural(
                         path_str,
-                        route_endpoints.len(),
-                        descriptor_endpoints.len(),
-                        decorator_endpoints.len()
-                    );
-                    // The same emission every other deterministic row goes
-                    // through; this file simply never reaches a model to join.
-                    let mut result = FileAnalysisResult::default();
-                    let _ = Self::emit_resolved_rows(
-                        &mut result,
-                        Self::resolve_candidates(
-                            &HashMap::new(),
-                            &HashMap::new(),
-                            &[],
-                            &EnvAliasMap::new(),
-                            &WholeUrlFallbackMap::new(),
-                            &EnvFallbackMap::new(),
-                            &LiteralBaseMap::new(),
+                        file_path,
+                        [
                             &route_endpoints,
                             &descriptor_endpoints,
                             &decorator_endpoints,
-                            // No call-site candidates here by construction, so
-                            // no receiver to ask about.
-                            &HashMap::new(),
-                            // Its request summaries are emitted once they are
-                            // composed ([`LateSummaryFile`]).
-                            &BTreeMap::new(),
-                            &EnvSchemaIndex::default(),
-                            false,
-                        ),
-                        &mut stats.deterministic_rows_emitted,
+                        ],
+                        &mut stats,
+                        &mut late_summary_files,
+                        &mut file_results,
                     );
-                    stats.total_endpoints += result.endpoints.len();
-                    late_summary_files.push(LateSummaryFile {
-                        path_str: path_str.clone(),
-                        file_path: file_path.clone(),
-                        counts_data_calls: false,
-                    });
-                    file_results.insert(path_str, result);
-                    // No cache entry: the model was never asked, and the routes
-                    // above are re-derived from the file layout on every scan.
                     continue;
                 } else if is_graphql_resolver_file {
                     // Fall through to the LLM pass with empty HTTP candidates:
@@ -3051,7 +3237,7 @@ impl FileOrchestrator {
                         "Force-analyzing messaging-client file (no HTTP candidates): {}",
                         path_str
                     );
-                } else if unrouted_candidates.is_empty() {
+                } else if when_empty == WhenEmpty::Deferred {
                     // Defer the skip decision (#369): if this file imports a
                     // same-repo module that performs HTTP (a request wrapper),
                     // it is rescued into the LLM pass after the wrapper map is
@@ -3064,27 +3250,27 @@ impl FileOrchestrator {
                     });
                     continue;
                 } else {
-                    debug!(
-                        "Skipped (only unrouted-protocol candidates): {} [{} candidate(s)]",
+                    skip_unrouted(
                         path_str,
-                        unrouted_candidates.len()
+                        unrouted_candidates.len(),
+                        &mut stats,
+                        &mut file_results,
                     );
-                    stats.files_skipped += 1;
-                    stats.files_skipped_unrouted_protocol += 1;
-                    // Joined-map key only: routing a protocol that has no LLM
-                    // pass today is a scanner change, and it must reach this
-                    // file without a cache bump.
-                    file_results.insert(path_str, FileAnalysisResult::default());
                     continue;
                 }
             }
 
-            debug!(
-                "Analyzing: {} [{} HTTP candidate(s), {} unrouted]",
-                path_str,
-                http_candidates.len(),
-                unrouted_candidates.len()
-            );
+            // With the fact layer choosing the reader's files, a file whose
+            // candidates it may drop says so once they are decided
+            // (carrick#2613).
+            if held.is_empty() {
+                debug!(
+                    "Analyzing: {} [{} HTTP candidate(s), {} unrouted]",
+                    path_str,
+                    http_candidates.len(),
+                    unrouted_candidates.len()
+                );
+            }
 
             // STEP 3: Prepare Candidate Targets as hints for the LLM
             let candidate_hints: Vec<String> =
@@ -3144,7 +3330,199 @@ impl FileOrchestrator {
                 unresolved_member_sites: Vec::new(),
                 resolved: Vec::new(),
                 silent_sites: BTreeSet::new(),
+                import_sources: scan_result.import_sources,
+                when_empty,
+                unrouted: unrouted_candidates.len(),
+                held,
+                reader_only: HashSet::new(),
             });
+        }
+
+        // The files the fact layer sends the reader, from the store's first
+        // answer (carrick#2613). Awaited here, after the serial scan above
+        // has run beside the ask, and before the passes below read the
+        // candidates. Without the switch it is only logged, after the rescue.
+        let fact_files = self.fact_files.take().await;
+        if let Some(facts) = fact_files.as_ref().filter(|_| choosing_files) {
+            use crate::request_summary::fact_files::Followed;
+            // D4: a candidate only the register signals raised is kept where
+            // discovery could not follow its call, listed for the reader
+            // alone, and dropped where the walk finished. At a site it stays:
+            // that is the fact layer's own call, under the same id.
+            let mut chosen: Vec<PendingFile> = Vec::with_capacity(pending.len());
+            for mut pf in pending.drain(..) {
+                if pf.held.is_empty() {
+                    chosen.push(pf);
+                    continue;
+                }
+                let mut dropped: BTreeSet<(u32, u32)> = BTreeSet::new();
+                for (span, signals) in std::mem::take(&mut pf.held) {
+                    match facts.followed(&pf.prompt_path, span) {
+                        Some(Followed::Site) => {}
+                        Some(Followed::Finished) => {
+                            dropped.insert(span);
+                        }
+                        Some(Followed::Stopped(_) | Followed::Unfollowed(_)) | None => {
+                            if let Some(listed) = pf
+                                .listed
+                                .iter()
+                                .find(|listed| (listed.span_start, listed.span_end) == span)
+                            {
+                                pf.reader_only.insert(listed.candidate_id.clone());
+                            }
+                            for signal in signals {
+                                *stats.fallback_selection.entry(signal.label()).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+                pf.unlist(&dropped);
+                if !pf.listed.is_empty() || pf.when_empty == WhenEmpty::Read {
+                    debug!(
+                        "Analyzing: {} [{} HTTP candidate(s), {} unrouted]",
+                        pf.path_str,
+                        pf.listed.len(),
+                        pf.unrouted
+                    );
+                    chosen.push(pf);
+                    continue;
+                }
+                debug!(
+                    "Fact layer finished the walk at every candidate: {} [{} dropped]",
+                    pf.path_str,
+                    dropped.len()
+                );
+                match pf.when_empty {
+                    WhenEmpty::Structural => emit_structural(
+                        pf.path_str.clone(),
+                        Path::new(&pf.path_str),
+                        [
+                            &pf.route_endpoints,
+                            &pf.descriptor_endpoints,
+                            &pf.decorator_endpoints,
+                        ],
+                        &mut stats,
+                        &mut late_summary_files,
+                        &mut file_results,
+                    ),
+                    WhenEmpty::Unrouted => {
+                        skip_unrouted(pf.path_str, pf.unrouted, &mut stats, &mut file_results)
+                    }
+                    WhenEmpty::Deferred | WhenEmpty::Read => {
+                        deferred_zero_candidates.push(DeferredZeroCandidate {
+                            file_path: PathBuf::from(&pf.path_str),
+                            path_str: pf.path_str,
+                            import_sources: pf.import_sources,
+                            route_module_claimed: pf.route_module_claimed,
+                        })
+                    }
+                }
+            }
+            pending = chosen;
+            // D3: in a file already read, the fact layer's calls are listed
+            // at the spans no signal listed.
+            for pf in &mut pending {
+                let mut spans = facts.listed_in(&pf.prompt_path);
+                spans.retain(|span| {
+                    !pf.listed
+                        .iter()
+                        .any(|listed| (listed.span_start, listed.span_end) == *span)
+                });
+                if spans.is_empty() {
+                    continue;
+                }
+                let sites =
+                    self.swc_scanner
+                        .scan_sites(Path::new(&pf.path_str), &pf.content, &spans);
+                debug!(
+                    "Fact-layer site(s) listed: {} [{} of {}]",
+                    pf.path_str,
+                    sites.candidates.len(),
+                    spans.len()
+                );
+                pf.list(sites.candidates);
+            }
+            // Rules 2-4: a file no signal raised a candidate in is read when
+            // the fact layer found a site, a lead or an unanswered-package
+            // call in it, with those calls listed.
+            let mut still_deferred: Vec<DeferredZeroCandidate> = Vec::new();
+            for deferred in deferred_zero_candidates.drain(..) {
+                let prompt_path =
+                    crate::utils::repo_relative_source_path(&deferred.path_str, &repo_root_str)
+                        .to_string();
+                if !facts.files.contains_key(&prompt_path) {
+                    still_deferred.push(deferred);
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&deferred.file_path) else {
+                    still_deferred.push(deferred);
+                    continue;
+                };
+                let sites = self.swc_scanner.scan_sites(
+                    &deferred.file_path,
+                    &content,
+                    &facts.listed_in(&prompt_path),
+                );
+                debug!(
+                    "Fact-layer file (no HTTP candidates): {} [{} site(s)]",
+                    deferred.path_str,
+                    sites.candidates.len()
+                );
+                stats.fact_layer_files += 1;
+                let symbols = Self::extract_symbol_table(&deferred.file_path, &cm, &handler);
+                let mut pf = PendingFile {
+                    prompt_path,
+                    path_str: deferred.path_str,
+                    content,
+                    route_module_claimed: deferred.route_module_claimed,
+                    candidate_hints: Vec::new(),
+                    candidate_contexts: Vec::new(),
+                    listed: Vec::new(),
+                    candidate_map: HashMap::new(),
+                    symbol_table: symbols.table,
+                    env_alias_map: symbols.env_aliases,
+                    whole_url_fallbacks: symbols.whole_url_fallbacks,
+                    env_fallbacks: symbols.env_fallbacks,
+                    literal_bases: symbols.literal_bases,
+                    route_endpoints: Vec::new(),
+                    descriptor_endpoints: Vec::new(),
+                    decorator_endpoints: Vec::new(),
+                    graphql_producer_hints: graphql_producer_hints.lines.clone(),
+                    graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
+                    wrapper_context: Vec::new(),
+                    wrapper_imports: BTreeMap::new(),
+                    wrapper_request_shape: None,
+                    pubsub_anchor_ops: Vec::new(),
+                    local_wrapper_calls: sites.local_wrapper_calls,
+                    request_members: symbols.request_members,
+                    receiver_origins: symbols.receiver_origins,
+                    registration_sites: symbols.registration_sites,
+                    resolved_members: HashMap::new(),
+                    unresolved_member_sites: Vec::new(),
+                    resolved: Vec::new(),
+                    silent_sites: BTreeSet::new(),
+                    import_sources: deferred.import_sources,
+                    when_empty: WhenEmpty::Deferred,
+                    unrouted: 0,
+                    held: BTreeMap::new(),
+                    reader_only: HashSet::new(),
+                };
+                pf.list(sites.candidates);
+                pending.push(pf);
+            }
+            deferred_zero_candidates = still_deferred;
+        } else {
+            // The engine sent no fact files (site questions off, nothing
+            // asked, no rows): every candidate stays, and the files whose
+            // line phase 1 held back are read as today.
+            for pf in pending.iter().filter(|pf| !pf.held.is_empty()) {
+                debug!(
+                    "Analyzing: {} [{} HTTP candidate(s), {} unrouted]",
+                    pf.path_str,
+                    pf.listed.len(),
+                    pf.unrouted
+                );
+            }
         }
 
         // PHASE 1b (#369 — cross-file wrapper-site resolution). Wrapper map:
@@ -3156,8 +3534,10 @@ impl FileOrchestrator {
         let mut wrapper_map: HashMap<PathBuf, WrapperModule> = HashMap::new();
         for pf in &pending {
             // Rescued files (graphql/messaging fall-throughs) carry no HTTP
-            // candidates and are not wrapper material.
-            if pf.candidate_hints.is_empty() {
+            // candidates and are not wrapper material. Nor is a file whose
+            // only candidates are listed for the reader alone (carrick#2613).
+            let candidates = pf.signal_candidates();
+            if candidates.is_empty() {
                 continue;
             }
             let path = Path::new(&pf.path_str);
@@ -3187,9 +3567,8 @@ impl FileOrchestrator {
             // (carrick-cloud#386). `None` whenever the module parameterizes its
             // method or its requests disagree, in which case the delegating
             // site keeps whatever extraction gave it.
-            let request_shape = wrapper_request_shape::fold_module(
-                pf.candidate_map.values().map(|c| &c.request_shape),
-            );
+            let request_shape =
+                wrapper_request_shape::fold_module(candidates.values().map(|c| &c.request_shape));
             wrapper_map.insert(
                 canonical,
                 WrapperModule {
@@ -3329,8 +3708,10 @@ impl FileOrchestrator {
                 // client is two hops away and the nearer ring declares no
                 // member for the site. Only a file with candidates can have a
                 // site to resolve, so a rescued or candidate-less file
-                // triggers no parse.
-                if !pf.candidate_map.is_empty() {
+                // triggers no parse. A candidate listed for the reader alone
+                // is no site of this join's (carrick#2613).
+                let joinable = signal_candidates(&pf.candidate_map, &pf.reader_only);
+                if !joinable.is_empty() {
                     let nearest: BTreeSet<PathBuf> =
                         seen.iter().chain(matched.iter()).cloned().collect();
                     let mut further: BTreeSet<PathBuf> = BTreeSet::new();
@@ -3373,7 +3754,7 @@ impl FileOrchestrator {
                     // the module a declined site named is only known there.
                     (pf.resolved_members, pf.unresolved_member_sites) =
                         Self::resolve_imported_members(
-                            &pf.candidate_map,
+                            &joinable,
                             rings,
                             &import_owners,
                             &receiver_imports,
@@ -3381,11 +3762,9 @@ impl FileOrchestrator {
                     // A call through an imported object constant's member
                     // (carrick#1733) names its module and its object, so it
                     // answers ahead of the name join at the same site.
-                    for (span, member) in Self::resolve_object_members(
-                        &pf.candidate_map,
-                        &object_receivers,
-                        &member_cache,
-                    ) {
+                    for (span, member) in
+                        Self::resolve_object_members(&joinable, &object_receivers, &member_cache)
+                    {
                         pf.unresolved_member_sites.retain(|(site, _)| *site != span);
                         pf.resolved_members.insert(span, member);
                     }
@@ -3444,7 +3823,7 @@ impl FileOrchestrator {
                                 .insert(specifier.clone(), fold_indexes_with_conflicts(indexes));
                         }
                         let through_packages = Self::resolve_package_surface_members(
-                            &pf.candidate_map,
+                            &joinable,
                             &surfaces,
                             &pf.receiver_origins,
                         );
@@ -3455,12 +3834,6 @@ impl FileOrchestrator {
                 }
             }
         }
-
-        // The files the fact layer would send, from the store's first answer
-        // (carrick#2613). Awaited here, after the serial scan above has run
-        // beside the ask and before the rescue below, where a selection by
-        // the fact layer would act. Record-only: nothing reads it but the log.
-        let fact_files = self.fact_files.take().await;
 
         // Rescue or finalize the deferred zero-candidate skips: a file that
         // imports a wrapper module is force-analyzed with the wrapper's source
@@ -3585,6 +3958,11 @@ impl FileOrchestrator {
                 unresolved_member_sites: Vec::new(),
                 resolved: Vec::new(),
                 silent_sites: BTreeSet::new(),
+                import_sources: deferred.import_sources,
+                when_empty: WhenEmpty::Deferred,
+                unrouted: 0,
+                held: BTreeMap::new(),
+                reader_only: HashSet::new(),
             });
         }
 
@@ -3672,14 +4050,26 @@ impl FileOrchestrator {
         // role is a property of the RECEIVER's type (carrick#695). One batched
         // sidecar request for the whole service, resolved into a per-file
         // span -> role map that the arm below reads like any other input.
+        // A candidate listed for the reader alone has no receiver asked
+        // about (carrick#2613).
+        let asked_candidates: Vec<std::borrow::Cow<'_, HashMap<String, CandidateTarget>>> =
+            pending.iter().map(PendingFile::signal_candidates).collect();
         let receiver_roles = Self::resolve_receiver_roles(
             sidecar,
             pending
                 .iter()
-                .map(|pf| (pf.path_str.as_str(), pf.content.as_str(), &pf.candidate_map)),
+                .zip(&asked_candidates)
+                .map(|(pf, candidates)| {
+                    (
+                        pf.path_str.as_str(),
+                        pf.content.as_str(),
+                        candidates.as_ref(),
+                    )
+                }),
             framework_detection,
             &mut stats,
         );
+        drop(asked_candidates);
         //
         // The rest of this layer reads the request summaries, which may still
         // be waiting on library semantics the scan is asking about again

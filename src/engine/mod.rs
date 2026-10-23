@@ -3917,7 +3917,7 @@ async fn analyze_current_repo_incremental(
             let file_orchestrator = file_orchestrator.with_fact_files(
                 crate::agents::file_orchestrator::FactFileSource::later(fact_files),
             );
-            let (analysis, (settled, placements), library_answer, first_discovery) = tokio::join!(
+            let (analysis, (settled, placements, fallbacks), library_answer, first_discovery) = tokio::join!(
                 file_orchestrator.analyze_files(
                     &files,
                     &cached_model_results,
@@ -3948,6 +3948,7 @@ async fn analyze_current_repo_incremental(
                     fact_sender,
                 ),
             );
+            report_fallbacks(fallbacks, analysis.as_ref().ok().map(|done| &done.stats));
             let analysis = analysis?;
             setup.detection.client_semantics = settled;
             crate::phase_timing::mark(crate::phase_timing::Phase::Model);
@@ -4931,7 +4932,11 @@ fn first_discovery(
     crate::request_summary::fact_files::FactFiles,
     FirstDiscovery,
 ) {
-    let labels = crate::request_summary::discovery::Labels::of(&answer.exports);
+    // With the packages answered, so a call into one the store has not
+    // answered is told apart (`unanswered_package`) from a call it answered
+    // with nothing to label.
+    let labels =
+        crate::request_summary::discovery::Labels::of_answered(&answer.exports, &answer.answered);
     let discovery = crate::request_summary::discovery::discover(inputs, &labels, root);
     let decided = crate::request_summary::decided_sites::decided_sites(
         inputs,
@@ -8647,12 +8652,25 @@ fn summarize_requests(
         summaries.unfollowed_count(),
         serde_json::to_string(summaries.unfollowed()).unwrap_or_default()
     );
-    crate::fallback_tally::report(&crate::fallback_tally::ServiceFallbacks::of(
-        crate::current_service::name(),
-        inputs,
-        &summaries,
-    ));
     summaries
+}
+
+/// State the service's fallbacks to the old path (`fallback_tally`), once its
+/// analysis is done: the summaries' own, and, when the fact layer chooses the
+/// reader's files, each register signal's candidates kept where discovery
+/// could not follow the call (`fallback_selection_<signal>`, carrick#2613).
+fn report_fallbacks(
+    mut fallbacks: crate::fallback_tally::ServiceFallbacks,
+    stats: Option<&crate::agents::file_orchestrator::ProcessingStats>,
+) {
+    if let Some(stats) = stats {
+        for (signal, count) in &stats.fallback_selection {
+            fallbacks
+                .counts
+                .insert(format!("fallback_selection_{signal}"), *count);
+        }
+    }
+    crate::fallback_tally::report(&fallbacks);
 }
 
 /// A service's library semantics while the in-scan schedule settles them
@@ -8817,14 +8835,19 @@ async fn compose_summaries(
 ) -> (
     Option<Vec<crate::client_semantics::ClientSemanticsEntry>>,
     crate::request_summary::decided_sites::SummaryPlacements,
+    crate::fallback_tally::ServiceFallbacks,
 ) {
     let settled = settling.settled().await;
     let index = summarize_requests(inputs, settled.as_deref(), sidecar, service_root);
     let placements = index.placements();
+    // Stated once the analysis is done ([`report_fallbacks`]), with what the
+    // reader's file selection fell back on.
+    let fallbacks =
+        crate::fallback_tally::ServiceFallbacks::of(crate::current_service::name(), inputs, &index);
     if summaries.send(index).is_err() {
         debug!("The analysis ended before its request summaries were composed");
     }
-    (settled, placements)
+    (settled, placements, fallbacks)
 }
 
 /// The library semantics one in-scan re-ask gives: what `ask` answered, when
@@ -10309,7 +10332,7 @@ async fn analyze_current_repo(
     );
     let (early_answer, first_answer) = tokio::sync::oneshot::channel();
     let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
-    let (analysis_result, (settled, placements), library_answer, first_discovery) = tokio::join!(
+    let (analysis_result, (settled, placements, fallbacks), library_answer, first_discovery) = tokio::join!(
         orchestrator.run_complete_analysis(
             files.clone(),
             packages,
@@ -10339,6 +10362,10 @@ async fn analyze_current_repo(
             Path::new(repo_path),
             fact_sender,
         ),
+    );
+    report_fallbacks(
+        fallbacks,
+        analysis_result.as_ref().ok().map(|done| &done.stats),
     );
     let analysis_result = analysis_result?;
     setup.detection.client_semantics = settled;
