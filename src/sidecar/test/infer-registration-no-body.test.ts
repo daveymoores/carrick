@@ -39,7 +39,7 @@ interface Incoming {
   pipe<T extends { write(chunk: unknown): void }>(destination: T): T;
   on(event: string, listener: (chunk: unknown) => void): Incoming;
 }
-interface Outgoing { json(value: unknown): void; status(code: number): Outgoing; send(value?: unknown): void }
+interface Outgoing { clearCookie(name: string): void; json(value: unknown): void; status(code: number): Outgoing; send(value?: unknown): void }
 declare const app: {
   post(path: string, handler: (request: Incoming, reply: Outgoing) => unknown): void;
 };
@@ -50,6 +50,11 @@ declare const result: Result;
 
 app.post('/sends-only', (request, reply) => {
   reply.json(result);
+});
+
+app.post('/clears-a-cookie', (request, reply) => {
+  reply.clearCookie('session');
+  reply.status(204).send();
 });
 
 app.post('/returns-a-send', (request, reply) => reply.status(201).send(result));
@@ -179,9 +184,9 @@ describe('carrick#827: a registration whose handler reads nothing takes no reque
   });
 
   /** The request-body answer for a route located at its registration call. */
-  const requestBody = async (route: string) => {
+  const requestBody = async (route: string, lineOnly = false) => {
     const span = registration(route);
-    const alias = `Request_${route.replace(/\W/g, '_')}`;
+    const alias = `Request_${route.replace(/\W/g, '_')}${lineOnly ? '_line' : ''}`;
     const response = await client.send<InferShape>({
       action: 'infer',
       request_id: `infer-${alias}`,
@@ -189,8 +194,7 @@ describe('carrick#827: a registration whose handler reads nothing takes no reque
         {
           file_path: routesPath,
           line_number: span.line,
-          span_start: span.start,
-          span_end: span.end,
+          ...(lineOnly ? {} : { span_start: span.start, span_end: span.end }),
           infer_kind: 'request_body',
           alias,
         },
@@ -199,8 +203,8 @@ describe('carrick#827: a registration whose handler reads nothing takes no reque
     return response.inferred_types?.find((t) => t.alias === alias);
   };
 
-  const decidedNoBody = async (route: string): Promise<void> => {
-    const inferred = await requestBody(route);
+  const decidedNoBody = async (route: string, lineOnly = false): Promise<void> => {
+    const inferred = await requestBody(route, lineOnly);
     assert.ok(inferred, `${route}: the decision must ride the row, or the capture re-reads the call`);
     assert.strictEqual(inferred.type_string.trim(), 'unknown');
     assert.deepStrictEqual(
@@ -247,6 +251,26 @@ describe('carrick#827: a registration whose handler reads nothing takes no reque
 
   it('still publishes the type a read states', async () => {
     const inferred = await requestBody('/typed-read');
+    assert.strictEqual(inferred?.type_string.replace(/\s+/g, ' ').trim(), '{ name: string; }');
+  });
+
+  // P3-2a: the scanner may point the request at the registration line alone,
+  // with no span. The handler is followed from the line, and a handler that
+  // reads nothing is the same decision, not a null that lets the capture
+  // re-read the line and publish the server instance's type.
+  it('decides no body for a line-only request at a handler that reads nothing', async () => {
+    await decidedNoBody('/clears-a-cookie', true);
+    await decidedNoBody('/sends-only', true);
+  });
+
+  for (const route of ['/reads-a-property', '/reads-by-a-call', '/hands-the-request-on', '/no-parameters']) {
+    it(`leaves a line-only request undecided where the handler may read the body (${route})`, async () => {
+      assert.strictEqual(await requestBody(route, true), undefined);
+    });
+  }
+
+  it('still publishes the type a line-only request states', async () => {
+    const inferred = await requestBody('/typed-read', true);
     assert.strictEqual(inferred?.type_string.replace(/\s+/g, ' ').trim(), '{ name: string; }');
   });
 });

@@ -5316,6 +5316,39 @@ mod tests {
         }
     }
 
+    /// carrick#2472 P3-2a: a request located at a registration line whose
+    /// handler reads nothing from its parameters is answered `unknown` with
+    /// `no_request_body`. That is a decision: the capture's raw line re-run
+    /// would publish the server instance's type as the request.
+    #[test]
+    fn derive_anchors_keeps_a_line_only_no_request_body_decision() {
+        let mut decided = inferred("Endpoint_remove_Request", "unknown", None, None);
+        decided.infer_kind = InferKind::RequestBody;
+        decided.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "no_request_body".to_string(),
+            detail: None,
+        }];
+        assert!(inference_decided_no_contract(&decided));
+
+        let mut request = response_body_infer("Endpoint_remove_Request");
+        request.infer_kind = InferKind::RequestBody;
+
+        let anchors = derive_capture_anchors(&[], &[request], &[], &[decided], &[], "/repo");
+
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        match &anchors[0] {
+            CaptureAnchor::Literal {
+                alias, type_text, ..
+            } => {
+                assert_eq!(alias, "Endpoint_remove_Request");
+                assert_eq!(type_text, "unknown");
+            }
+            other => panic!("a no-body decision must stay a literal unknown, got {other:?}"),
+        }
+    }
+
     /// carrick#1841: a consumer call whose result carries a library's own
     /// response object is answered `unknown` with `machinery_envelope` at the
     /// root. That is a decision: the capture's raw locator re-run would resolve

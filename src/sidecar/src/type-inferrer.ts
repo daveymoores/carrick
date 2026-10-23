@@ -3192,13 +3192,28 @@ export class TypeInferrer {
       // The first typed read anywhere in the handler is a looser reading, and
       // is kept only where a registration already had it.
       const typedRead = atLine ? this.inferRequestReadFromHandler(atLine.handler) : null;
-      return typedRead
-        ? this.declaredRequestInferredType(
-            request,
-            { text: typedRead },
-            this.getNodeLocation(handler)
-          )
-        : null;
+      if (typedRead) {
+        return this.declaredRequestInferredType(
+          request,
+          { text: typedRead },
+          this.getNodeLocation(handler)
+        );
+      }
+      // A registration whose handler reads nothing from its parameters takes
+      // no request body, the decision the located branch below gives. Left
+      // as null, the capture re-reads the line and publishes the server
+      // instance's type as the request.
+      if (atLine && this.handlerReadsNothingFromItsParameters(atLine.handler)) {
+        return this.decidedAbstain(request, this.getNodeLocation(atLine.handler), {
+          path: '',
+          kind: 'unknown',
+          reason: 'no_request_body',
+          detail:
+            "the route's handler reads nothing from its parameters (each use of one is a call " +
+            'whose value it discards or returns), so the route takes no request body',
+        });
+      }
+      return null;
     }
 
     // Inline-handler registration (`app.post('/x', async (c) => { … })`) or a
