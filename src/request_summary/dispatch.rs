@@ -1,64 +1,47 @@
-//! The routes a hand-written dispatch states (carrick#2474 R4a): a request's
-//! path compared with a literal (`url.pathname === "/orders"`, `case
-//! "/health":`, `ROUTES[pathname]`), each read as one route at the line it is
-//! compared on, with the method compared beside it or around it.
+//! How a hand-written dispatch reaches the request (carrick#2474 R4a, R4b):
+//! a request's path compared with a literal (`url.pathname === "/orders"`,
+//! `case "/health":`, `ROUTES[pathname]`), and the method compared beside it
+//! or around it.
 //!
-//! A path comparison is a route when its chain ([`super::guards`]) reaches
-//! the request through one of two arms:
+//! A path comparison's chain ([`super::guards`]) reaches the request through
+//! one of two arms:
 //!
 //! - **label**: the first call the comparing function is handed to is a
 //!   labelled call discovery found, whose op is `receive`, and the store's
 //!   label for it names the handler slot the function sits in, the
 //!   parameter that is the request, and the member path the comparison
 //!   reads (`request.path`, `request.url`, or the URL's `pathname`). The
-//!   route's kind is forced.
+//!   path is forced.
 //! - **entry point**: the chain ends at a function the module offers that
-//!   nothing in the repository calls, and is handed to no call. Its kind is
-//!   asked later (R4b): no label names the request's members.
+//!   nothing in the repository calls, and is handed to no call. Whether the
+//!   comparison chooses a route is asked: no label names the request's
+//!   members.
 //!
 //! The method is a method literal compared, not negated, on the same
 //! request: a top-level `&&` operand of the same test, or a guard (an `if`
 //! test operand or a `case`) whose branch holds the path comparison. For a
 //! predicate the comparison is first looked for in the predicate, then at
 //! the caller's call that tests it. A `startsWith` literal states a scope,
-//! never a route. Every comparison that states no route is counted by a
+//! never a route. Every comparison that reaches no handler is counted by a
 //! reason from a closed list.
 //!
-//! Record-only: a scan with the receiver trace on logs the routes and drops
-//! them. Nothing reaches the blob.
-//!
-//! [`handler_records`] (carrick#2474 R4b, in `dispatch/records.rs`) groups
-//! the same comparisons by the request handler they sit in, as the record a
-//! model is asked about.
+//! [`handler_records`] (in `dispatch/records.rs`) groups the comparisons by
+//! the request handler they sit in, as the record a model is asked about;
+//! [`crate::site_rows::dispatch`] reads the answers into rows.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 
 use serde::Serialize;
 
-use super::RequestSummaryInputs;
 use super::Site;
 use super::decided_sites::{ArgSlot, DiscoverySite, LabelledEnd, SiteLabel};
 use super::guards::{
-    Branch, ChainEnd, ChainFacts, Chains, GuardBranch, GuardChain, GuardIr, GuardPosition,
-    GuardShape, Handoff, Step,
+    ChainEnd, ChainFacts, Chains, GuardBranch, GuardChain, GuardIr, GuardPosition, Handoff, Step,
 };
 use crate::services::type_sidecar::RequestAt;
-use crate::type_manifest::is_http_method;
 
 mod records;
-pub use records::{HoleReach, handler_records};
-
-/// Where a route's method comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MethodFrom {
-    /// A top-level `&&` operand of the same test.
-    Conjunct,
-    /// A guard whose branch holds the path comparison.
-    Enclosing,
-    None,
-}
+pub use records::{ComparisonPlace, HandlerRecords, HoleReach, LineRange, handler_records};
 
 /// What makes a comparison a route.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -75,78 +58,11 @@ pub enum Evidence {
     EntryPoint { function: String, at: String },
 }
 
-impl Evidence {
-    /// `label` or `entry_point`.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Label { .. } => "label",
-            Self::EntryPoint { .. } => "entry_point",
-        }
-    }
-}
-
-/// Whether the route's kind is settled by its label or asked later.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum KindSlot {
-    Forced,
-    Asked,
-}
-
-/// The request parameter a route reads, and the accesses down from it.
+/// The request parameter a comparison reads, and the accesses down from it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RequestRead {
     pub param: usize,
     pub steps: Vec<String>,
-}
-
-/// The handed or entry function: what R4b types the response from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct HandlerAt {
-    pub file: String,
-    pub line: u32,
-    pub function: Option<String>,
-}
-
-/// One route a dispatch states.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DispatchRoute {
-    pub file: String,
-    pub line: u32,
-    pub path: String,
-    pub method: Option<String>,
-    pub method_from: MethodFrom,
-    pub position: GuardPosition,
-    pub evidence: Evidence,
-    pub kind_slot: KindSlot,
-    pub request: RequestRead,
-    pub handler: HandlerAt,
-    pub branch: Vec<Branch>,
-}
-
-/// A `startsWith` path literal on the request: a scope, never a route. Its
-/// prefix composes onto nothing here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DispatchScope {
-    pub file: String,
-    pub line: u32,
-    pub prefix: String,
-    pub evidence: Evidence,
-    /// The calls its branch makes.
-    pub delegates: Vec<Branch>,
-}
-
-/// A service's dispatch routes, sorted, and what states none.
-#[derive(Debug, Default, Serialize)]
-pub struct Dispatch {
-    pub routes: Vec<DispatchRoute>,
-    pub scopes: Vec<DispatchScope>,
-    /// Chains (per guard for `unresolved_constant`) that state no route, by
-    /// reason.
-    pub not_routes: BTreeMap<String, usize>,
-    /// What was read: `path_guards`, `table_keys`, `starts_with`, and
-    /// `method_conflict` (routes whose qualifying methods disagree).
-    pub counts: BTreeMap<String, usize>,
 }
 
 /// What a route or a method reaches the request through: the handoff call
@@ -163,9 +79,7 @@ enum Anchor {
 struct Reached {
     anchor: Anchor,
     evidence: Evidence,
-    kind_slot: KindSlot,
     request: RequestRead,
-    handler: HandlerAt,
     /// The label's method member path, as steps (label arm only).
     method_steps: Option<Vec<Step>>,
 }
@@ -185,140 +99,6 @@ struct Decision {
     span: (u32, u32),
     branch: Option<(u32, u32)>,
     conjunct: bool,
-}
-
-/// Every route the guards in `inputs` state, read against discovery's
-/// `discovered` sites and the store's `labels`, files relative to `root`.
-pub fn dispatch_routes(
-    inputs: &RequestSummaryInputs,
-    discovered: &[DiscoverySite],
-    labels: &[SiteLabel],
-    root: &Path,
-) -> Dispatch {
-    let chains = Chains::new(inputs, root);
-    let reader = Reader {
-        chains: &chains,
-        discovered,
-        labels,
-    };
-    let mut dispatch = Dispatch::default();
-    let mut methods: HashMap<usize, Vec<MethodGuard<'_>>> = HashMap::new();
-    let mut paths: Vec<(usize, &GuardIr, String)> = Vec::new();
-    for (node, at) in chains.nodes.iter().enumerate() {
-        for guard in &at.ir.guards {
-            let (text, shape, _) = chains.literal(node, &guard.literal);
-            match shape {
-                GuardShape::Unresolved => count(&mut dispatch.not_routes, "unresolved_constant"),
-                GuardShape::Path => paths.push((node, guard, text)),
-                GuardShape::Name if is_http_method(&text) => {
-                    methods.entry(node).or_default().push(MethodGuard {
-                        guard,
-                        method: text.trim().to_uppercase(),
-                        chains: chains.traced(node, guard),
-                    })
-                }
-                GuardShape::Name => {}
-            }
-        }
-    }
-    let mut routes: Vec<DispatchRoute> = Vec::new();
-    let mut scopes: Vec<DispatchScope> = Vec::new();
-    for (node, guard, text) in paths {
-        let read = match guard.position {
-            GuardPosition::TableKey => "table_keys",
-            GuardPosition::StartsWith => "starts_with",
-            GuardPosition::Equality | GuardPosition::Case => "path_guards",
-        };
-        count(&mut dispatch.counts, read);
-        for (chain, facts) in chains.traced(node, guard) {
-            if chain.negated {
-                count(&mut dispatch.not_routes, "negated");
-                continue;
-            }
-            let reached = match reader.reached(&chain, &facts) {
-                Ok(reached) => reached,
-                Err(reason) => {
-                    count(&mut dispatch.not_routes, &reason);
-                    continue;
-                }
-            };
-            if text.contains('?') || text.contains('#') {
-                count(&mut dispatch.not_routes, "literal_has_query");
-                continue;
-            }
-            let file = chains.rel(chains.nodes[node].file);
-            if guard.position == GuardPosition::StartsWith {
-                scopes.push(DispatchScope {
-                    file,
-                    line: guard.site.line,
-                    prefix: text.clone(),
-                    evidence: reached.evidence,
-                    delegates: chain
-                        .branch
-                        .iter()
-                        .filter(|branch| matches!(branch, Branch::Call { .. }))
-                        .cloned()
-                        .collect(),
-                });
-                continue;
-            }
-            let (stated, from) = method_of(node, guard, &facts, &reached, &methods);
-            if matches!(stated, Methods::Conflict) {
-                count(&mut dispatch.counts, "method_conflict");
-            }
-            let line = guard.literal_line.unwrap_or(guard.site.line);
-            for method in stated.each() {
-                routes.push(DispatchRoute {
-                    file: file.clone(),
-                    line,
-                    path: text.clone(),
-                    method_from: if method.is_some() {
-                        from
-                    } else {
-                        MethodFrom::None
-                    },
-                    method,
-                    position: guard.position,
-                    evidence: reached.evidence.clone(),
-                    kind_slot: reached.kind_slot,
-                    request: reached.request.clone(),
-                    handler: reached.handler.clone(),
-                    branch: chain.branch.clone(),
-                });
-            }
-        }
-    }
-    // One route per (file, line, path, method): a label's over an entry
-    // point's, then the first by its serialised form.
-    routes.sort_by_cached_key(|route| {
-        (
-            (
-                route.file.clone(),
-                route.line,
-                route.path.clone(),
-                route.method.clone(),
-            ),
-            route.evidence.kind() != "label",
-            serde_json::to_string(route).unwrap_or_default(),
-        )
-    });
-    routes.dedup_by(|later, kept| {
-        (&later.file, later.line, &later.path, &later.method)
-            == (&kept.file, kept.line, &kept.path, &kept.method)
-    });
-    scopes.sort_by_cached_key(|scope| {
-        (
-            (scope.file.clone(), scope.line, scope.prefix.clone()),
-            scope.evidence.kind() != "label",
-            serde_json::to_string(scope).unwrap_or_default(),
-        )
-    });
-    scopes.dedup_by(|later, kept| {
-        (&later.file, later.line, &later.prefix) == (&kept.file, kept.line, &kept.prefix)
-    });
-    dispatch.routes = routes;
-    dispatch.scopes = scopes;
-    dispatch
 }
 
 fn count(counts: &mut BTreeMap<String, usize>, key: &str) {
@@ -413,15 +193,9 @@ impl Reader<'_, '_> {
                         function: function.clone(),
                         at: format!("{file}:{line}"),
                     },
-                    kind_slot: KindSlot::Asked,
                     request: RequestRead {
                         param: entry.param,
                         steps: entry.steps.iter().map(Step::render).collect(),
-                    },
-                    handler: HandlerAt {
-                        file,
-                        line,
-                        function: node.key.clone(),
                     },
                     method_steps: None,
                 })
@@ -519,7 +293,6 @@ impl Reader<'_, '_> {
         if !reads_path(&handoff.steps, request) {
             return Err("steps_not_path".to_string());
         }
-        let handed = &chains.nodes[handoff.handed];
         Ok(Reached {
             anchor: Anchor::Call(
                 handoff.caller,
@@ -533,39 +306,22 @@ impl Reader<'_, '_> {
                 member: end.member.clone(),
                 at: end.at(),
             },
-            kind_slot: KindSlot::Forced,
             request: RequestRead {
                 param: handoff.param,
                 steps: handoff.steps.iter().map(Step::render).collect(),
-            },
-            handler: HandlerAt {
-                file: chains.rel(handed.file),
-                line: chains.line_of(handoff.handed),
-                function: handed.key.clone(),
             },
             method_steps: request.method.as_deref().map(key_steps),
         })
     }
 }
 
-/// The methods a route states.
+/// The methods a path comparison qualifies: the code chooses one, or it
+/// does not (none, or several, such as `case "GET": case "HEAD":` sharing
+/// one branch or methods that disagree).
 enum Methods {
     None,
     One(String),
-    /// `case "GET": case "HEAD":` sharing one branch.
-    Each(Vec<String>),
-    /// Qualifying methods that disagree otherwise.
-    Conflict,
-}
-
-impl Methods {
-    fn each(&self) -> Vec<Option<String>> {
-        match self {
-            Self::None | Self::Conflict => vec![None],
-            Self::One(method) => vec![Some(method.clone())],
-            Self::Each(methods) => methods.iter().cloned().map(Some).collect(),
-        }
-    }
+    Several,
 }
 
 /// The method a path guard's route states: looked for at the comparison,
@@ -576,7 +332,7 @@ fn method_of(
     facts: &ChainFacts,
     reached: &Reached,
     methods: &HashMap<usize, Vec<MethodGuard<'_>>>,
-) -> (Methods, MethodFrom) {
+) -> Methods {
     method_reaching(node, guard, facts, methods, &|candidate| {
         candidate
             .chains
@@ -594,7 +350,7 @@ fn method_reaching(
     facts: &ChainFacts,
     methods: &HashMap<usize, Vec<MethodGuard<'_>>>,
     reaches: &dyn Fn(&MethodGuard<'_>) -> bool,
-) -> (Methods, MethodFrom) {
+) -> Methods {
     let own = Decision {
         node,
         span: (guard.site.lo, guard.site.hi),
@@ -618,41 +374,23 @@ fn method_reaching(
         ),
         _ => found,
     };
-    if found.is_empty() {
-        return (Methods::None, MethodFrom::None);
-    }
-    let from = if found
-        .iter()
-        .any(|(_, from, _)| *from == MethodFrom::Conjunct)
-    {
-        MethodFrom::Conjunct
-    } else {
-        MethodFrom::Enclosing
-    };
-    let mut each: Vec<String> = found.iter().map(|(method, _, _)| method.clone()).collect();
+    let mut each = found;
     each.sort();
     each.dedup();
-    if each.len() == 1 {
-        return (Methods::One(each.remove(0)), from);
-    }
-    let first = &found[0].2;
-    let one_case_branch = found
-        .iter()
-        .all(|(_, _, guard)| guard.position == GuardPosition::Case && guard.branch == first.branch);
-    if one_case_branch {
-        (Methods::Each(each), from)
-    } else {
-        (Methods::Conflict, MethodFrom::None)
+    match each.len() {
+        0 => Methods::None,
+        1 => Methods::One(each.remove(0)),
+        _ => Methods::Several,
     }
 }
 
-/// The method guards of `at`'s node that qualify for it, each with its
-/// method, how it qualifies and the guard.
-fn qualifying<'g>(
+/// The methods of the method guards of `at`'s node that qualify for it: an
+/// operand of the same `&&` test, or a guard whose branch encloses it.
+fn qualifying(
     at: &Decision,
     reaches: &dyn Fn(&MethodGuard<'_>) -> bool,
-    methods: &'g HashMap<usize, Vec<MethodGuard<'g>>>,
-) -> Vec<(String, MethodFrom, &'g GuardIr)> {
+    methods: &HashMap<usize, Vec<MethodGuard<'_>>>,
+) -> Vec<String> {
     let mut found = Vec::new();
     for candidate in methods.get(&at.node).into_iter().flatten() {
         let guard = candidate.guard;
@@ -667,17 +405,10 @@ fn qualifying<'g>(
         let encloses = (guard.conjunct || guard.position == GuardPosition::Case)
             && matches!(guard.branch, GuardBranch::Span(lo, hi)
                 if lo <= at.span.0 && at.span.1 <= hi);
-        let from = if same_test {
-            MethodFrom::Conjunct
-        } else if encloses {
-            MethodFrom::Enclosing
-        } else {
-            continue;
-        };
-        if !reaches(candidate) {
+        if !(same_test || encloses) || !reaches(candidate) {
             continue;
         }
-        found.push((candidate.method.clone(), from, guard));
+        found.push(candidate.method.clone());
     }
     found
 }
@@ -709,6 +440,8 @@ fn reaches_same(facts: &ChainFacts, reached: &Reached) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::super::discovery::{Labels, discover};
     use super::super::fixture_walk::{Walked, walked};
     use super::*;
@@ -741,167 +474,21 @@ mod tests {
             .collect()
     }
 
-    fn dispatch_of(walked: &Walked, exports: &[ExportClaims]) -> serde_json::Value {
-        let labels = SiteLabel::from_exports(exports);
-        let dispatch = dispatch_routes(
-            &walked.inputs,
-            &discovered(walked, exports),
-            &labels,
-            &walked.repo,
-        );
-        serde_json::to_value(&dispatch).unwrap()
-    }
-
     fn the_fixture() -> Option<Walked> {
         walked("dispatch-routes", ".", "web", &[], true)
     }
 
-    fn key() -> serde_json::Value {
-        serde_json::from_str(
-            &std::fs::read_to_string(fixture("dispatch.expected.json")).expect("the key reads"),
-        )
-        .expect("the key is JSON")
-    }
-
-    /// `file:line METHOD path method_from evidence` for each route.
-    fn route_lines(dispatch: &serde_json::Value) -> Vec<String> {
-        dispatch["routes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|route| {
-                format!(
-                    "{}:{} {} {} {} {}",
-                    route["file"].as_str().unwrap(),
-                    route["line"],
-                    route["method"].as_str().unwrap_or("-"),
-                    route["path"].as_str().unwrap(),
-                    route["method_from"].as_str().unwrap(),
-                    route["evidence"]["kind"].as_str().unwrap()
-                )
-            })
-            .collect()
-    }
-
-    /// carrick#2474 R4a: each route a dispatch states sits on the line its
-    /// literal is compared on (a table key at its key's line, a predicate's
-    /// in the predicate's file), reached through the labelled `receive` call
-    /// its handler is handed to or through the entry point nothing calls;
-    /// every comparison that states no route is counted by its reason. Two
-    /// routes in one closure sit on their own lines (carrick#2139).
+    /// Two reads of one tree state the same records.
     #[test]
-    fn each_route_is_stated_at_its_comparison() {
-        let Some(on) = the_fixture() else {
-            return;
-        };
-        let got = dispatch_of(&on, &claims(|_| {}));
-        assert_eq!(
-            got,
-            key(),
-            "dispatch:\n{}",
-            serde_json::to_string_pretty(&got).unwrap()
-        );
-    }
-
-    /// The method is a method literal on the same request: an operand of
-    /// the same `&&` test, or a guard whose branch holds the comparison (an
-    /// `if` on the method, a `case` of a switch on it, falling through to
-    /// one route per method). A predicate's comparison takes the method
-    /// beside its caller's call. A method on another value, or under `||`,
-    /// states none.
-    #[test]
-    fn a_method_comes_from_its_test_or_an_enclosing_guard() {
-        let Some(on) = the_fixture() else {
-            return;
-        };
-        let got = route_lines(&dispatch_of(&on, &claims(|_| {})));
-        for want in [
-            "src/server.ts:11 GET /orders conjunct label",
-            "src/server.ts:13 POST /orders conjunct label",
-            "src/server.ts:35 DELETE /cache enclosing label",
-            "src/server.ts:42 GET /feed enclosing label",
-            "src/server.ts:42 HEAD /feed enclosing label",
-            "src/routes.ts:1 POST /orders/export conjunct label",
-            "src/api.ts:5 GET /api/items conjunct label",
-            "src/worker.ts:13 GET /home conjunct entry_point",
-            "src/middleware.ts:12 GET /api/one conjunct entry_point",
-            "src/middleware.ts:20 POST /api/two conjunct entry_point",
-            "src/negatives.ts:20 - /mixed none label",
-            "src/negatives.ts:23 - /both none label",
-            "src/negatives.ts:26 - /either none label",
-        ] {
-            assert!(got.contains(&want.to_string()), "{want} in {got:#?}");
-        }
-    }
-
-    /// A label that names no `request` states no route: every label route
-    /// goes and is counted `label_without_request`; entry routes stay.
-    #[test]
-    fn a_label_that_names_no_request_states_no_route() {
-        let Some(on) = the_fixture() else {
-            return;
-        };
-        let without = dispatch_of(
-            &on,
-            &claims(|answer| {
-                for package in answer["library_claims"].as_array_mut().unwrap() {
-                    for export in package["exports"].as_array_mut().unwrap() {
-                        for op in export["ops"].as_array_mut().unwrap() {
-                            op.as_object_mut().unwrap().remove("request");
-                        }
-                    }
-                }
-            }),
-        );
-        let with = key();
-        let entry = |dispatch: &serde_json::Value| -> Vec<String> {
-            route_lines(dispatch)
-                .into_iter()
-                .filter(|line| line.ends_with(" entry_point"))
-                .collect()
-        };
-        assert!(
-            route_lines(&without)
-                .iter()
-                .all(|line| line.ends_with(" entry_point")),
-            "no label route: {:#?}",
-            route_lines(&without)
-        );
-        assert_eq!(entry(&without), entry(&with), "entry routes stay");
-        assert!(without["scopes"].as_array().unwrap().is_empty());
-        assert!(
-            without["not_routes"]["label_without_request"].as_u64()
-                > with["not_routes"]["label_without_request"].as_u64()
-        );
-    }
-
-    /// Two reads of one tree state the same routes, in `(file, line, path,
-    /// method)` order.
-    #[test]
-    fn two_reads_of_one_tree_state_the_same_routes() {
+    fn two_reads_of_one_tree_state_the_same_records() {
         let (Some(first), Some(second)) = (the_fixture(), the_fixture()) else {
             return;
         };
         let exports = claims(|_| {});
-        let a = serde_json::to_string(&dispatch_of(&first, &exports)).unwrap();
-        let b = serde_json::to_string(&dispatch_of(&second, &exports)).unwrap();
-        assert_eq!(a, b);
-        let labels = SiteLabel::from_exports(&exports);
-        let dispatch = dispatch_routes(
-            &first.inputs,
-            &discovered(&first, &exports),
-            &labels,
-            &first.repo,
+        assert_eq!(
+            records_of(&first, &exports, HoleReach::Nested),
+            records_of(&second, &exports, HoleReach::Nested)
         );
-        let keys: Vec<_> = dispatch
-            .routes
-            .iter()
-            .map(|r| (r.file.clone(), r.line, r.path.clone(), r.method.clone()))
-            .collect();
-        let mut sorted = keys.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(keys, sorted, "routes are sorted, one per key");
     }
 
     fn records_of(
@@ -965,46 +552,6 @@ mod tests {
                 "{}",
                 typed.subject.at
             );
-        }
-    }
-
-    /// Every route R4a states is a comparison of a record, at its line: a
-    /// label route's path forced, an entry route's asked.
-    #[test]
-    fn every_dispatch_route_is_a_comparison_of_a_record() {
-        let Some(on) = the_fixture() else {
-            return;
-        };
-        let exports = claims(|_| {});
-        let routes = dispatch_of(&on, &exports);
-        let records = records_of(&on, &exports, HoleReach::Nested);
-        for route in routes["routes"].as_array().unwrap() {
-            let at = format!("{}:{}", route["file"].as_str().unwrap(), route["line"]);
-            let path = route["path"].as_str().unwrap();
-            let found = records["records"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .enumerate()
-                .find_map(|(index, record)| {
-                    let comparison = record["comparisons"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|c| c["at"] == at.as_str() && c["literal"] == path)?;
-                    Some((index, record, comparison["id"].to_string()))
-                });
-            let Some((index, record, id)) = found else {
-                panic!("{at} {path} is in no record");
-            };
-            // Asked: on the wire's `forced`; asked nothing: settled beside it.
-            let forced_path = record["forced"][&id]["path"]
-                .as_str()
-                .or(records["settled"][index][&id]["path"].as_str());
-            match route["evidence"]["kind"].as_str().unwrap() {
-                "label" => assert_eq!(forced_path, Some(path), "{at} {path}"),
-                _ => assert_eq!(forced_path, None, "{at} {path}"),
-            }
         }
     }
 
@@ -1074,7 +621,7 @@ mod tests {
     /// What the answer key is written against: today's chains and
     /// discovery's sites on the fixture, and this pass's output.
     #[test]
-    #[ignore = "prints the fixture's chains, sites and routes"]
+    #[ignore = "prints the fixture's chains, sites and records"]
     fn probe() {
         let Some(on) = the_fixture() else {
             return;
@@ -1088,30 +635,30 @@ mod tests {
         );
         crate::outln!(
             "{}",
-            serde_json::to_string_pretty(&dispatch_of(&on, &exports)).unwrap()
-        );
-        crate::outln!(
-            "{}",
             serde_json::to_string_pretty(&records_of(&on, &exports, HoleReach::Nested)).unwrap()
         );
     }
 }
 
-/// The dispatch routes on real repos (carrick#2474 R4a): offline and
-/// model-free. Each repo needs a flag-on scan's rows (`<blobs>/positions`),
+/// The handler records and dispatch rows on real repos (carrick#2474 R4b):
+/// offline. Each repo needs a flag-on scan's rows (`<blobs>/positions`),
 /// discovery's sites for it written by `discovery_census` with
 /// `CARRICK_RECEIVER_TRACE=1`, the store's answer for its packages, and the
 /// scan's blobs:
 ///
 /// `CARRICK_DISPATCH_CENSUS='<label>=<repo>=<positions dir>=<sites.json>=<store answer>=<blobs dir>[;…]'
 /// [CARRICK_DISPATCH_CENSUS_OUT=<file>] [CARRICK_DISPATCH_CENSUS_RECORDS_DIR=<dir>]
+/// [CARRICK_DISPATCH_CENSUS_ANSWERS_DIR=<dir>]
 /// cargo test --lib dispatch_census -- --ignored --nocapture`
 ///
-/// With a records dir, each repository's asked handler records (carrick#2474
-/// R4b) are written to `<dir>/<label>.json` as the site-questions pack runner
-/// reads them, and the what-if arm's added records to
-/// `<dir>/<label>.what-if.json`. The out file carries other repositories'
-/// paths and the records their code: both stay private.
+/// With a records dir, each repository's asked handler records are written
+/// to `<dir>/<label>.json` as the site-questions pack runner reads them
+/// (each site under its scan id), and the what-if arm's added records to
+/// `<dir>/<label>.what-if.json`. With an answers dir holding
+/// `<label>.json`, a `/site-questions` response body for those records,
+/// the census reads them into dispatch rows and possible calls, and sets
+/// the rows beside the blob's endpoint rows. The out file carries other
+/// repositories' paths and the records their code: both stay private.
 #[cfg(test)]
 mod census {
     use std::collections::{BTreeMap, HashSet};
@@ -1120,37 +667,31 @@ mod census {
     use serde::Serialize;
 
     use super::super::decided_sites::{DiscoveryFile, SiteLabel, relative};
-    use super::{Dispatch, HoleReach, dispatch_routes, handler_records};
+    use super::{HoleReach, handler_records};
     use crate::config::Config;
     use crate::position_rows::PositionIndex;
+    use crate::site_questions::{HandlerAnswers, HandlerQuestion};
+    use crate::site_rows::dispatch::{dispatch_rows, handler_questions};
 
     #[derive(Debug, Default, Serialize)]
     struct RepoCensus {
-        path_guards: usize,
-        table_keys: usize,
-        starts_with: usize,
-        routes: usize,
-        routes_by_evidence: BTreeMap<String, usize>,
-        routes_by_method_from: BTreeMap<String, usize>,
-        /// Routes whose path is `/`, apart: most are separator checks.
-        slash_routes: usize,
-        scopes: usize,
-        not_routes: BTreeMap<String, usize>,
-        method_conflicts: usize,
-        /// Per file, each route as `line METHOD path evidence`.
-        per_file: BTreeMap<String, Vec<String>>,
-        /// The blob's HTTP endpoint rows in files that hold a route.
+        /// With answers: each dispatch row as `file:line METHOD path source
+        /// confidence`, and each possible call as `file:line reason`.
+        rows: Vec<String>,
+        leads: Vec<String>,
+        leads_by_reason: BTreeMap<String, usize>,
+        not_a_route: usize,
+        /// The blob's HTTP endpoint rows in files that hold a dispatch row.
         endpoint_rows: usize,
-        /// Rows a route states: same method, the row's path ends with the
-        /// route's, same line.
+        /// Dispatch rows a blob row states: same method, the row's path ends
+        /// with the dispatch row's, same line.
         same_line: Vec<String>,
         /// Same method and path, another line (the #2139 shape).
         other_line: Vec<String>,
-        /// Routes no row states.
+        /// Dispatch rows no blob row states.
         extras: Vec<String>,
-        /// Rows in those files no route states.
+        /// Rows in those files no dispatch row states.
         unstated_rows: Vec<String>,
-        ms: u128,
         /// The handler records (carrick#2474 R4b): their counts, what
         /// attaches to no handler, and per record `at kind key asked/all`.
         records: BTreeMap<String, usize>,
@@ -1161,21 +702,11 @@ mod census {
         records_ms: u128,
     }
 
-    /// One service's asked records, as the site-questions request's `sites`.
-    fn sites_of(
-        service: &str,
-        records: &[crate::site_questions::HandlerRecord],
-    ) -> Vec<serde_json::Value> {
-        records
-            .iter()
-            .filter(|record| !record.asked.is_empty())
-            .enumerate()
-            .map(|(index, record)| {
-                serde_json::json!({
-                    "site_id": format!("{service}#{index:04}"),
-                    "handler": record,
-                })
-            })
+    /// Questions as the site-questions request's `sites`.
+    fn sites_of(questions: Vec<HandlerQuestion>) -> Vec<serde_json::Value> {
+        questions
+            .into_iter()
+            .map(|question| serde_json::to_value(question).expect("a question serialises"))
             .collect()
     }
 
@@ -1226,6 +757,7 @@ mod census {
         sites: &Path,
         claims: &Path,
         blobs: &Path,
+        answers: Option<&HandlerAnswers>,
     ) -> (RepoCensus, Vec<serde_json::Value>, Vec<serde_json::Value>) {
         let root = std::fs::canonicalize(root).expect("the repo exists");
         let config = root.join("carrick.json");
@@ -1254,7 +786,8 @@ mod census {
             }
         }
         let mut census = RepoCensus::default();
-        let mut all = Dispatch::default();
+        // Each dispatch row: (method, path, file, line).
+        let mut stated_rows: Vec<(String, String, String, u32)> = Vec::new();
         let mut asked_sites: Vec<serde_json::Value> = Vec::new();
         let mut what_if_sites: Vec<serde_json::Value> = Vec::new();
         for service in &services {
@@ -1280,15 +813,6 @@ mod census {
                 .filter(|site| files.contains(&site.file))
                 .cloned()
                 .collect();
-            let started = std::time::Instant::now();
-            let dispatch = dispatch_routes(&inputs, &mine, &labels, &root);
-            census.ms += started.elapsed().as_millis();
-            let again = dispatch_routes(&inputs, &mine, &labels, &root);
-            assert_eq!(
-                serde_json::to_string(&dispatch).unwrap(),
-                serde_json::to_string(&again).unwrap(),
-                "two reads of {label} state the same routes"
-            );
             let started = std::time::Instant::now();
             let records = handler_records(&inputs, &mine, &labels, &root, HoleReach::Nested);
             census.records_ms += started.elapsed().as_millis();
@@ -1318,7 +842,7 @@ mod census {
                     record.comparisons.len()
                 ));
             }
-            asked_sites.extend(sites_of(&label, &records.records));
+            asked_sites.extend(sites_of(handler_questions(&records)));
             let base: Vec<serde_json::Value> = records
                 .records
                 .iter()
@@ -1329,77 +853,66 @@ mod census {
                 .into_iter()
                 .filter(|record| !base.contains(&serde_json::to_value(record).unwrap()))
                 .collect();
-            what_if_sites.extend(sites_of(&format!("{label}+w"), &added));
-            all.routes.extend(dispatch.routes);
-            all.scopes.extend(dispatch.scopes);
-            for (reason, n) in dispatch.not_routes {
-                *all.not_routes.entry(reason).or_default() += n;
-            }
-            for (what, n) in dispatch.counts {
-                *all.counts.entry(what).or_default() += n;
-            }
-        }
-        let read = |what: &str| all.counts.get(what).copied().unwrap_or_default();
-        census.path_guards = read("path_guards");
-        census.table_keys = read("table_keys");
-        census.starts_with = read("starts_with");
-        census.method_conflicts = read("method_conflict");
-        census.routes = all.routes.len();
-        census.scopes = all.scopes.len();
-        census.not_routes = all.not_routes;
-        let word = |value: serde_json::Value| value.as_str().unwrap_or_default().to_string();
-        for route in &all.routes {
-            *census
-                .routes_by_evidence
-                .entry(route.evidence.kind().to_string())
-                .or_default() += 1;
-            *census
-                .routes_by_method_from
-                .entry(word(serde_json::to_value(route.method_from).unwrap()))
-                .or_default() += 1;
-            if route.path == "/" {
-                census.slash_routes += 1;
-            }
-            census
-                .per_file
-                .entry(route.file.clone())
-                .or_default()
-                .push(format!(
-                    "{} {} {} {}",
-                    route.line,
-                    route.method.as_deref().unwrap_or("-"),
-                    route.path,
-                    route.evidence.kind()
+            what_if_sites.extend(sites_of(handler_questions(&super::HandlerRecords {
+                records: added,
+                ..Default::default()
+            })));
+            let Some(answers) = answers else {
+                continue;
+            };
+            let dispatch = dispatch_rows(&records, answers);
+            census.not_a_route += dispatch.counts.get("not_a_route").copied().unwrap_or(0);
+            for row in &dispatch.rows {
+                let crate::operation::OperationKey::Http { method, path } = &row.key else {
+                    continue;
+                };
+                census.rows.push(format!(
+                    "{}:{} {method} {path} {:?} {}",
+                    row.file,
+                    row.line,
+                    row.source,
+                    row.inference
+                        .as_ref()
+                        .map_or("fact".to_string(), |answer| format!(
+                            "{}{}",
+                            answer.confidence,
+                            if answer.orders_agree {
+                                ""
+                            } else {
+                                " orders-disagree"
+                            }
+                        ))
                 ));
+                stated_rows.push((method.clone(), path.clone(), row.file.clone(), row.line));
+            }
+            for lead in &dispatch.leads {
+                let reason = serde_json::to_value(lead.unread.reason)
+                    .ok()
+                    .and_then(|reason| reason.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                census
+                    .leads
+                    .push(format!("{}:{} {reason}", lead.file_path, lead.line_number));
+                *census.leads_by_reason.entry(reason).or_default() += 1;
+            }
         }
         let rows = endpoint_rows(blobs);
-        let route_files: HashSet<&str> = all.routes.iter().map(|r| r.file.as_str()).collect();
+        let route_files: HashSet<&str> = stated_rows.iter().map(|r| r.2.as_str()).collect();
         let in_files: Vec<_> = rows
             .iter()
             .filter(|(_, _, file, _)| route_files.contains(file.as_str()))
             .collect();
         census.endpoint_rows = in_files.len();
-        let same = |method: &Option<String>, row_method: &str| {
-            method.as_deref().is_none_or(|method| method == row_method)
-        };
         let mut stated: HashSet<usize> = HashSet::new();
-        for route in &all.routes {
-            let at = format!(
-                "{}:{} {} {}",
-                route.file,
-                route.line,
-                route.method.as_deref().unwrap_or("-"),
-                route.path
-            );
+        for (route_method, route_path, route_file, route_line) in &stated_rows {
+            let at = format!("{route_file}:{route_line} {route_method} {route_path}");
             let matching: Vec<(usize, bool)> = in_files
                 .iter()
                 .enumerate()
                 .filter(|(_, (method, path, file, _))| {
-                    *file == route.file
-                        && same(&route.method, method)
-                        && path.ends_with(&route.path)
+                    file == route_file && method == route_method && path.ends_with(route_path)
                 })
-                .map(|(index, (_, _, _, line))| (index, *line == route.line))
+                .map(|(index, (_, _, _, line))| (index, line == route_line))
                 .collect();
             if let Some((index, _)) = matching.iter().find(|(_, on_line)| *on_line) {
                 stated.insert(*index);
@@ -1446,12 +959,19 @@ mod census {
             let [label, root, positions, sites, claims, blobs] = parts.as_slice() else {
                 panic!("expected <label>=<repo>=<positions>=<sites>=<answer>=<blobs>, got {repo}");
             };
+            let answers = std::env::var("CARRICK_DISPATCH_CENSUS_ANSWERS_DIR")
+                .ok()
+                .and_then(|dir| {
+                    std::fs::read_to_string(Path::new(&dir).join(format!("{label}.json"))).ok()
+                })
+                .map(|text| crate::site_questions::answers_of::<HandlerQuestion>(&text));
             let (census, asked, what_if) = census_repo(
                 Path::new(root),
                 Path::new(positions),
                 Path::new(sites),
                 Path::new(claims),
                 Path::new(blobs),
+                answers.as_ref(),
             );
             // The records are the repository's code: private files only.
             if let Ok(dir) = std::env::var("CARRICK_DISPATCH_CENSUS_RECORDS_DIR") {

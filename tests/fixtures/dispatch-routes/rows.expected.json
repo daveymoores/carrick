@@ -1,0 +1,35 @@
+{
+  "rows": [
+    "src/api.ts:5 GET /api/items library_claim",
+    "src/api.ts:7 PUT /api/items library_claim",
+    "src/edge.ts:7 GET /reports model",
+    "src/middleware.ts:12 GET /api/one model",
+    "src/middleware.ts:20 POST /api/two model",
+    "src/routes.ts:1 POST /orders/export library_claim",
+    "src/server.ts:11 GET /orders library_claim",
+    "src/server.ts:13 POST /orders library_claim",
+    "src/server.ts:15 GET /status library_claim",
+    "src/server.ts:35 DELETE /cache library_claim",
+    "src/worker.ts:13 GET /home model",
+    "src/worker.ts:15 POST /orders model"
+  ],
+  "possible_calls": [
+    "src/fake.ts:10 owner_unknown",
+    "src/mounted.ts:20 owner_unknown",
+    "src/mounted.ts:5 owner_unknown",
+    "src/negatives.ts:20 no_method",
+    "src/negatives.ts:23 no_method",
+    "src/negatives.ts:26 no_method",
+    "src/negatives.ts:42 no_method",
+    "src/nested.ts:3 below_band",
+    "src/report.ts:1 below_band",
+    "src/server.ts:30 no_method",
+    "src/server.ts:42 no_method",
+    "src/session.ts:2 below_band",
+    "src/worker.ts:19 no_method",
+    "src/worker.ts:2 no_method",
+    "src/worker.ts:20 no_method",
+    "src/worker.ts:22 no_method",
+    "src/worker.ts:3 no_method"
+  ]
+}

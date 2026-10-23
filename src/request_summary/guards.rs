@@ -397,9 +397,10 @@ pub(super) struct GuardIr {
     /// under `||` or `!`): what pairs a method with a path (carrick#2474
     /// R4a). Never serialised.
     pub(super) conjunct: bool,
-    /// For a table key, the line the key is written on: where its route
-    /// stands (carrick#2474 R4a). Never serialised.
-    pub(super) literal_line: Option<u32>,
+    /// For a table key, the key as written: where its route stands, on a
+    /// span of its own (two keys of one table are two places; carrick#2474
+    /// R4a, R4b). Never serialised.
+    pub(super) literal_at: Option<Site>,
 }
 
 /// A call an `if`, a ternary or a `&&` tests: the branch its result guards.
@@ -458,7 +459,8 @@ pub(super) struct ArgName {
 #[derive(Debug, Clone)]
 struct TableEntry {
     key: String,
-    key_line: u32,
+    /// The key as written: where its route stands.
+    key_site: Site,
     value_text: String,
     value_line: u32,
 }
@@ -514,7 +516,7 @@ impl ModuleGuards {
                         PropOrSpread::Prop(prop) => match &**prop {
                             Prop::KeyValue(kv) => Some(TableEntry {
                                 key: prop_name(&kv.key)?,
-                                key_line: reader.line(kv.key.span()),
+                                key_site: reader.site(kv.key.span()),
                                 value_text: reader.text(kv.value.span()),
                                 value_line: reader.line(kv.value.span()),
                             }),
@@ -1504,7 +1506,7 @@ impl CallWalker<'_, '_, '_> {
         span: Span,
         negated: bool,
         branch: Option<GuardBranch>,
-        literal_line: Option<u32>,
+        literal_at: Option<Site>,
     ) {
         // `typeof x === "string"` compares a type tag the language names,
         // never a value the code was handed.
@@ -1539,7 +1541,7 @@ impl CallWalker<'_, '_, '_> {
                 .test
                 .as_ref()
                 .is_some_and(|test| test.is_conjunct(span)),
-            literal_line,
+            literal_at,
         };
         self.ir.guards.push(guard);
     }
@@ -1659,7 +1661,7 @@ impl CallWalker<'_, '_, '_> {
                     text: entry.value_text,
                     line: entry.value_line,
                 }),
-                Some(entry.key_line),
+                Some(entry.key_site),
             );
         }
     }

@@ -1,14 +1,14 @@
 {
   "counts": {
-    "asked": 21,
+    "asked": 16,
     "comparisons": 29,
     "forced": 7,
     "handlers": 15,
     "holes": 4,
     "methods_in_branch": 2,
-    "no_method": 1,
+    "no_method": 6,
     "records": 13,
-    "records_asked": 11,
+    "records_asked": 9,
     "records_shared": 1
   },
   "not_attached": {
@@ -18,6 +18,598 @@
     "negated": 1,
     "steps_not_path": 1
   },
+  "places": [
+    [
+      {
+        "file": "src/report.ts",
+        "id": 0,
+        "label": null,
+        "line": 1,
+        "served": true,
+        "span_end": 70,
+        "span_start": 52,
+        "within": [
+          {
+            "file": "src/check.ts",
+            "first": 7,
+            "last": 10
+          },
+          {
+            "file": "src/report.ts",
+            "first": 1,
+            "last": 1
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/edge.ts",
+        "id": 0,
+        "label": null,
+        "line": 7,
+        "served": true,
+        "span_end": 252,
+        "span_start": 233,
+        "within": [
+          {
+            "file": "src/edge.ts",
+            "first": 5,
+            "last": 9
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/fake.ts",
+        "id": 0,
+        "label": null,
+        "line": 10,
+        "served": false,
+        "span_end": 244,
+        "span_start": 227,
+        "within": [
+          {
+            "file": "src/fake.ts",
+            "first": 7,
+            "last": 14
+          },
+          {
+            "file": "src/fake.ts",
+            "first": 8,
+            "last": 13
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/middleware.ts",
+        "id": 0,
+        "label": null,
+        "line": 12,
+        "served": true,
+        "span_end": 328,
+        "span_start": 306,
+        "within": [
+          {
+            "file": "src/middleware.ts",
+            "first": 10,
+            "last": 25
+          }
+        ]
+      },
+      {
+        "file": "src/middleware.ts",
+        "id": 1,
+        "label": null,
+        "line": 20,
+        "served": true,
+        "span_end": 459,
+        "span_start": 437,
+        "within": [
+          {
+            "file": "src/middleware.ts",
+            "first": 10,
+            "last": 25
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/mounted.ts",
+        "id": 0,
+        "label": {
+          "export": "route",
+          "member": null,
+          "package": "fixture-router"
+        },
+        "line": 5,
+        "served": false,
+        "span_end": 217,
+        "span_start": 196,
+        "within": [
+          {
+            "file": "src/mounted.ts",
+            "first": 4,
+            "last": 6
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/mounted.ts",
+        "id": 0,
+        "label": {
+          "export": "route",
+          "member": null,
+          "package": "fixture-router"
+        },
+        "line": 20,
+        "served": false,
+        "span_end": 575,
+        "span_start": 555,
+        "within": [
+          {
+            "file": "src/mounted.ts",
+            "first": 18,
+            "last": 21
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/negatives.ts",
+        "id": 0,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 20,
+        "served": true,
+        "span_end": 585,
+        "span_start": 565,
+        "within": [
+          {
+            "file": "src/negatives.ts",
+            "first": 8,
+            "last": 29
+          }
+        ]
+      },
+      {
+        "file": "src/negatives.ts",
+        "id": 1,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 23,
+        "served": true,
+        "span_end": 691,
+        "span_start": 672,
+        "within": [
+          {
+            "file": "src/negatives.ts",
+            "first": 8,
+            "last": 29
+          }
+        ]
+      },
+      {
+        "file": "src/negatives.ts",
+        "id": 2,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 26,
+        "served": true,
+        "span_end": 810,
+        "span_start": 789,
+        "within": [
+          {
+            "file": "src/negatives.ts",
+            "first": 8,
+            "last": 29
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/negatives.ts",
+        "id": 0,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "fixture-legacy-server"
+        },
+        "line": 42,
+        "served": true,
+        "span_end": 1121,
+        "span_start": 1100,
+        "within": [
+          {
+            "file": "src/negatives.ts",
+            "first": 41,
+            "last": 45
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/nested.ts",
+        "id": 0,
+        "label": null,
+        "line": 3,
+        "served": true,
+        "span_end": 120,
+        "span_start": 95,
+        "within": [
+          {
+            "file": "src/nested.ts",
+            "first": 1,
+            "last": 8
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/server.ts",
+        "id": 0,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 11,
+        "served": true,
+        "span_end": 338,
+        "span_start": 317,
+        "within": [
+          {
+            "file": "src/server.ts",
+            "first": 10,
+            "last": 18
+          }
+        ]
+      },
+      {
+        "file": "src/server.ts",
+        "id": 1,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 13,
+        "served": true,
+        "span_end": 424,
+        "span_start": 403,
+        "within": [
+          {
+            "file": "src/server.ts",
+            "first": 10,
+            "last": 18
+          }
+        ]
+      },
+      {
+        "file": "src/server.ts",
+        "id": 2,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 15,
+        "served": true,
+        "span_end": 512,
+        "span_start": 491,
+        "within": [
+          {
+            "file": "src/server.ts",
+            "first": 10,
+            "last": 18
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/api.ts",
+        "id": 0,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 5,
+        "served": true,
+        "span_end": 262,
+        "span_start": 237,
+        "within": [
+          {
+            "file": "src/api.ts",
+            "first": 3,
+            "last": 10
+          },
+          {
+            "file": "src/server.ts",
+            "first": 20,
+            "last": 46
+          }
+        ]
+      },
+      {
+        "file": "src/api.ts",
+        "id": 1,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 7,
+        "served": true,
+        "span_end": 350,
+        "span_start": 325,
+        "within": [
+          {
+            "file": "src/api.ts",
+            "first": 3,
+            "last": 10
+          },
+          {
+            "file": "src/server.ts",
+            "first": 20,
+            "last": 46
+          }
+        ]
+      },
+      {
+        "file": "src/routes.ts",
+        "id": 2,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 1,
+        "served": true,
+        "span_end": 86,
+        "span_start": 53,
+        "within": [
+          {
+            "file": "src/routes.ts",
+            "first": 1,
+            "last": 1
+          },
+          {
+            "file": "src/server.ts",
+            "first": 20,
+            "last": 46
+          }
+        ]
+      },
+      {
+        "file": "src/server.ts",
+        "id": 3,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 30,
+        "served": true,
+        "span_end": 947,
+        "span_start": 889,
+        "within": [
+          {
+            "file": "src/server.ts",
+            "first": 20,
+            "last": 46
+          }
+        ]
+      },
+      {
+        "file": "src/server.ts",
+        "id": 4,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 35,
+        "served": true,
+        "span_end": 1014,
+        "span_start": 993,
+        "within": [
+          {
+            "file": "src/server.ts",
+            "first": 20,
+            "last": 46
+          }
+        ]
+      },
+      {
+        "file": "src/server.ts",
+        "id": 5,
+        "label": {
+          "export": "createServer",
+          "member": null,
+          "package": "node:http"
+        },
+        "line": 42,
+        "served": true,
+        "span_end": 1143,
+        "span_start": 1123,
+        "within": [
+          {
+            "file": "src/server.ts",
+            "first": 20,
+            "last": 46
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/session.ts",
+        "id": 0,
+        "label": null,
+        "line": 2,
+        "served": true,
+        "span_end": 113,
+        "span_start": 70,
+        "within": [
+          {
+            "file": "src/pages.ts",
+            "first": 3,
+            "last": 6
+          },
+          {
+            "file": "src/pages.ts",
+            "first": 8,
+            "last": 11
+          },
+          {
+            "file": "src/pages.ts",
+            "first": 13,
+            "last": 16
+          },
+          {
+            "file": "src/session.ts",
+            "first": 1,
+            "last": 4
+          }
+        ]
+      }
+    ],
+    [
+      {
+        "file": "src/worker.ts",
+        "id": 0,
+        "label": null,
+        "line": 2,
+        "served": true,
+        "span_end": 34,
+        "span_start": 20,
+        "within": [
+          {
+            "file": "src/worker.ts",
+            "first": 11,
+            "last": 30
+          }
+        ]
+      },
+      {
+        "file": "src/worker.ts",
+        "id": 1,
+        "label": null,
+        "line": 3,
+        "served": true,
+        "span_end": 60,
+        "span_start": 46,
+        "within": [
+          {
+            "file": "src/worker.ts",
+            "first": 11,
+            "last": 30
+          }
+        ]
+      },
+      {
+        "file": "src/worker.ts",
+        "id": 2,
+        "label": null,
+        "line": 13,
+        "served": true,
+        "span_end": 315,
+        "span_start": 291,
+        "within": [
+          {
+            "file": "src/worker.ts",
+            "first": 11,
+            "last": 30
+          }
+        ]
+      },
+      {
+        "file": "src/worker.ts",
+        "id": 3,
+        "label": null,
+        "line": 15,
+        "served": true,
+        "span_end": 417,
+        "span_start": 391,
+        "within": [
+          {
+            "file": "src/worker.ts",
+            "first": 11,
+            "last": 30
+          }
+        ]
+      },
+      {
+        "file": "src/worker.ts",
+        "id": 4,
+        "label": null,
+        "line": 19,
+        "served": true,
+        "span_end": 507,
+        "span_start": 492,
+        "within": [
+          {
+            "file": "src/worker.ts",
+            "first": 11,
+            "last": 30
+          }
+        ]
+      },
+      {
+        "file": "src/worker.ts",
+        "id": 5,
+        "label": null,
+        "line": 20,
+        "served": true,
+        "span_end": 556,
+        "span_start": 514,
+        "within": [
+          {
+            "file": "src/worker.ts",
+            "first": 11,
+            "last": 30
+          }
+        ]
+      },
+      {
+        "file": "src/worker.ts",
+        "id": 6,
+        "label": null,
+        "line": 22,
+        "served": true,
+        "span_end": 606,
+        "span_start": 563,
+        "within": [
+          {
+            "file": "src/worker.ts",
+            "first": 11,
+            "last": 30
+          }
+        ]
+      }
+    ]
+  ],
   "records": [
     {
       "asked": [
@@ -271,11 +863,7 @@
       }
     },
     {
-      "asked": [
-        0,
-        1,
-        2
-      ],
+      "asked": [],
       "code": [],
       "comparisons": [
         {
@@ -321,17 +909,7 @@
           }
         }
       ],
-      "forced": {
-        "0": {
-          "path": "/mixed"
-        },
-        "1": {
-          "path": "/both"
-        },
-        "2": {
-          "path": "/either"
-        }
-      },
+      "forced": {},
       "methods": [
         {
           "at": "src/negatives.ts:20",
@@ -527,10 +1105,7 @@
       }
     },
     {
-      "asked": [
-        3,
-        5
-      ],
+      "asked": [],
       "code": [
         {
           "at": "src/api.ts:3",
@@ -639,14 +1214,7 @@
           }
         }
       ],
-      "forced": {
-        "3": {
-          "path": "/profile"
-        },
-        "5": {
-          "path": "/feed"
-        }
-      },
+      "forced": {},
       "methods": [
         {
           "at": "src/api.ts:5",
@@ -915,7 +1483,17 @@
       }
     },
     {},
-    {},
+    {
+      "0": {
+        "path": "/mixed"
+      },
+      "1": {
+        "path": "/both"
+      },
+      "2": {
+        "path": "/either"
+      }
+    },
     {},
     {},
     {
@@ -945,9 +1523,15 @@
         "method": "POST",
         "path": "/orders/export"
       },
+      "3": {
+        "path": "/profile"
+      },
       "4": {
         "method": "DELETE",
         "path": "/cache"
+      },
+      "5": {
+        "path": "/feed"
       }
     },
     {},

@@ -146,6 +146,10 @@ pub struct SiteRow {
     /// does not state its name (carrick#2520): it stands only where a reader
     /// row at its line agrees on the key.
     pub needs_reader: bool,
+    /// A dispatch row's handler (carrick#2474 R4b, [`dispatch`]): the
+    /// functions in which a reader endpoint row agreeing on its key is the
+    /// same route read again, at another line. Empty for a site's row.
+    pub within: Vec<crate::request_summary::dispatch::LineRange>,
 }
 
 impl SiteRow {
@@ -508,6 +512,7 @@ pub fn of(
             anchors: record.anchors.clone(),
             lead: lead(UnreadReason::BelowBand),
             needs_reader: needs_reader(record),
+            within: Vec::new(),
         });
     }
     out
@@ -667,6 +672,25 @@ pub fn fold_rows(
             out.withdrawn
                 .push((row.file.clone(), row.line, gone.key, row.side));
         }
+        // A dispatch row: a reader row in its handler that agrees on its key
+        // is the same route read again at another line (carrick#2474 R4b).
+        let mut index = 0;
+        while !row.within.is_empty() && index < rows.len() {
+            let inside = place(root, &rows[index]).filter(|(file, line)| {
+                row.within
+                    .iter()
+                    .any(|range| range.file == *file && range.first <= *line && *line <= range.last)
+            });
+            match inside {
+                Some((file, line))
+                    if is_reader(&rows[index]) && agrees(&rows[index].key, &row.key) =>
+                {
+                    let gone = rows.remove(index);
+                    out.withdrawn.push((file, line, gone.key, row.side));
+                }
+                _ => index += 1,
+            }
+        }
         let mut stated = make(row.key.clone(), Path::new(&row.file), row.line, row.side);
         stated.resolution_source = Some(row.source);
         stated.name_scope = row.name_scope.clone();
@@ -715,6 +739,8 @@ pub fn fold_rows(
 fn is_reader(row: &ApiEndpointDetails) -> bool {
     row.resolution_source == Some(ResolutionSource::Model) && row.inference.is_none()
 }
+
+pub mod dispatch;
 
 #[cfg(test)]
 mod tests;

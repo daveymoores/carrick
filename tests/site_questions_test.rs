@@ -501,6 +501,55 @@ fn the_handler_response_reads_as_a_route_a_none_a_cant_tell_and_a_retriable_fail
     }
 }
 
+/// R4b: handler records go through the same client as site records, in
+/// requests of their own: the contract's response read per record, and
+/// only the record the cloud called retriable asked again, once.
+#[tokio::test]
+async fn handler_records_are_asked_through_the_same_client() {
+    let request: HandlerQuestionsRequest = serde_json::from_value(handler_request()).unwrap();
+    let retried = request.sites[3].site_id.clone();
+    let sent: Arc<Mutex<Vec<HandlerQuestionsRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&sent);
+    let first = serde_json::to_string(&contract()["handler"]["response"]).unwrap();
+    let again = json!({
+        "question_set": "qs-h",
+        "answers": [{ "site_id": retried, "ok": true, "routes": [] }]
+    })
+    .to_string();
+    let send = move |request: HandlerQuestionsRequest| {
+        let mut log = log.lock().unwrap();
+        let reply = if log.is_empty() {
+            first.clone()
+        } else {
+            again.clone()
+        };
+        log.push(request);
+        std::future::ready(Ok::<String, AgentCallError>(reply))
+    };
+    let out = ask(
+        &request.repo,
+        request.service.as_deref(),
+        request.sites.clone(),
+        send,
+    )
+    .await;
+    let sent = sent.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].sites.len(), 1);
+    assert_eq!(sent[1].sites[0].site_id, retried);
+    assert_eq!(out.answered.len(), request.sites.len());
+    assert!(out.unanswered.is_empty());
+    let site = &request.sites[0];
+    assert_eq!(
+        out.answered[&site.site_id]
+            .routes
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        site.handler.asked
+    );
+}
+
 #[test]
 fn an_unreadable_routes_answer_is_not_a_shape() {
     let bad = json!({"site_id": "h-1", "ok": true, "routes": [{"id": 0, "choice": "maybe"}]});

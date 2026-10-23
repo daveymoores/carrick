@@ -7,7 +7,7 @@
 //!   hands on), or a *label* handler (the function handed in the handler
 //!   slot of a call discovery labels with op `receive`).
 //! - **Its comparisons** are the path comparisons whose chain reaches it
-//!   (the label arm or the entry arm of [`super::dispatch_routes`]), a label
+//!   (the label arm or the entry arm, as [`super`] reads them), a label
 //!   that names no request member, and those whose chain stops at a hole in
 //!   the handler or in a function written inside it. Callers are not
 //!   followed: a hole in a function the handler calls has no handler (the
@@ -16,8 +16,14 @@
 //!   record of the function it is written in, listing those handlers.
 //! - **The slot rule:** a value the code proves is forced (the path on a
 //!   proven label read, the method when exactly one qualifies); the rest is
-//!   asked. A path forced with no method literal anywhere in the record is
-//!   asked nothing: a `no_method` lead later (T3b).
+//!   asked. The method is the code's fact, never the model's choice
+//!   (carrick#2474, ruling of 2026-10-23 on the live test): a comparison no
+//!   one method qualifies for is `no_method`, so a forced path with no
+//!   forced method is asked nothing (a `no_method` lead), and an asked one
+//!   is asked only whether it is a route.
+//! - **Where a route stands** ([`ComparisonPlace`]): its comparison's line,
+//!   and whether a row may be written there (every handler reaching it
+//!   serves the compared path itself).
 //!
 //! Every position sits under a key named `at`, and code is numbered as a
 //! site's `point.code` is: the cloud's cache key drops both, so an edit
@@ -75,6 +81,9 @@ pub struct HandlerRecords {
     /// forced with no method stated): the fact rows and `no_method` leads
     /// of T3b. The wire's `forced` names asked comparisons only.
     pub settled: Vec<BTreeMap<String, ForcedRoute>>,
+    /// Per record, in the same order, where each comparison's route would
+    /// stand (T3b), by id.
+    pub places: Vec<Vec<ComparisonPlace>>,
     /// Chains (per guard for `unresolved_constant`) of path comparisons
     /// that attach to no handler, by reason: R4a's closed list, plus
     /// `hole_outside_handler`.
@@ -88,12 +97,56 @@ pub struct HandlerRecords {
     pub counts: BTreeMap<String, usize>,
 }
 
+/// A function's lines in its file, repo-relative.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct LineRange {
+    pub file: String,
+    pub first: u32,
+    pub last: u32,
+}
+
+/// Where one comparison's route stands (carrick#2474 R4b T3b), beside the
+/// record: nothing here is on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ComparisonPlace {
+    pub id: u32,
+    /// Repo-relative, `/`-separated.
+    pub file: String,
+    /// The compared literal's line (a table key's own line).
+    pub line: u32,
+    /// The comparison's span, in SWC's numbering.
+    pub span_start: u32,
+    pub span_end: u32,
+    /// Whether the compared path is the path served: every handler that
+    /// reaches the comparison is an entry, or the handler of a labelled
+    /// `receive` with no `name` (path) slot; and a hole attached through
+    /// nesting sits in no function that is handed to a call. Otherwise a
+    /// route here needs a prefix the code does not compose: a lead.
+    pub served: bool,
+    /// The labelled `receive` the one handler is handed to, if it is one.
+    pub label: Option<SubjectLabel>,
+    /// The functions a reader row agreeing with the route folds within:
+    /// each handler's, and the comparison's own.
+    pub within: Vec<LineRange>,
+}
+
 /// What a handler is.
 #[derive(Debug, Clone)]
 enum Handler {
     Entry,
-    /// The labelled `receive` call it is handed to.
-    Label(SubjectLabel),
+    /// The labelled `receive` call it is handed to, and whether a label of
+    /// it names a path slot (the call registers the handler under a path).
+    Label(SubjectLabel, bool),
+}
+
+impl Handler {
+    /// Whether the handler sees the request's whole path.
+    fn serves_whole_path(&self) -> bool {
+        match self {
+            Self::Entry => true,
+            Self::Label(_, path_slot) => !path_slot,
+        }
+    }
 }
 
 /// How one chain of a comparison reaches its handler, best first.
@@ -105,11 +158,15 @@ enum Arm {
     Entry(Reached, ChainFacts),
     /// The label arm, where the label names no request member.
     Unread(ChainFacts),
-    /// A hole in the handler or in a function written inside it.
+    /// A hole in the handler or in a function written inside it. `handed`:
+    /// the hole sits in a function between it and the handler that is
+    /// handed to a call (or attaches one call below), so nothing proves how
+    /// that function is registered.
     Hole {
         reason: String,
         text: Option<String>,
         facts: ChainFacts,
+        handed: bool,
     },
 }
 
@@ -295,18 +352,15 @@ pub fn handler_records(
         chains: &chains,
         methods: &methods,
         method_handlers: &method_handlers,
+        handlers: &handlers,
         texts: std::cell::RefCell::new(HashMap::new()),
     };
-    let mut records: Vec<(Order, HandlerRecord)> = Vec::new();
+    let mut records: Vec<(Order, HandlerRecord, Vec<ComparisonPlace>)> = Vec::new();
     for (handler, comparisons) in &own {
         let reached = BTreeSet::from([*handler]);
-        let kind = match &handlers[handler] {
-            Handler::Entry => SubjectKind::Entry,
-            Handler::Label(_) => SubjectKind::Label,
-        };
-        let label = match &handlers[handler] {
-            Handler::Label(label) => Some(label.clone()),
-            Handler::Entry => None,
+        let (kind, label) = match &handlers[handler] {
+            Handler::Entry => (SubjectKind::Entry, None),
+            Handler::Label(label, _) => (SubjectKind::Label, Some(label.clone())),
         };
         let keep = |item: &Stated<'_>| item.handlers.contains(handler);
         records.push(builder.build(
@@ -338,11 +392,12 @@ pub fn handler_records(
             &mut out.counts,
         ));
     }
-    records.sort_by(|(a, _), (b, _)| a.cmp(b));
+    records.sort_by(|(a, ..), (b, ..)| a.cmp(b));
     count_records(&mut out.counts, &records);
     // The wire's `forced` names asked comparisons only; the values of one
     // nothing is asked of stay beside the record.
-    for (_, mut record) in records {
+    for (_, mut record, places) in records {
+        out.places.push(places);
         let (forced, settled): (BTreeMap<_, _>, BTreeMap<_, _>) =
             std::mem::take(&mut record.forced)
                 .into_iter()
@@ -397,9 +452,12 @@ fn address(guard: &GuardIr) -> usize {
 }
 
 /// The record counts, and the handlers the records name.
-fn count_records(counts: &mut BTreeMap<String, usize>, records: &[(Order, HandlerRecord)]) {
+fn count_records(
+    counts: &mut BTreeMap<String, usize>,
+    records: &[(Order, HandlerRecord, Vec<ComparisonPlace>)],
+) {
     let mut reached: BTreeSet<String> = BTreeSet::new();
-    for (_, record) in records {
+    for (_, record, _) in records {
         count(counts, "records");
         if record.subject.kind == SubjectKind::Shared {
             count(counts, "records_shared");
@@ -448,7 +506,7 @@ impl Attacher<'_, '_> {
                         Evidence::EntryPoint { .. } => unreachable!("the label arm"),
                     };
                     Ok(Attached {
-                        to: vec![(handoff.handed, Handler::Label(label))],
+                        to: vec![(handoff.handed, self.label_handler(label))],
                         arm: Arm::Proven(reached, facts.clone()),
                         below: false,
                     })
@@ -462,7 +520,7 @@ impl Attacher<'_, '_> {
                     &handoff.path,
                 ) {
                     Some(end) => Ok(Attached {
-                        to: vec![(handoff.handed, Handler::Label(subject_label(end)))],
+                        to: vec![(handoff.handed, self.label_handler(subject_label(end)))],
                         arm: Arm::Unread(facts.clone()),
                         below: false,
                     }),
@@ -482,16 +540,18 @@ impl Attacher<'_, '_> {
         let ChainEnd::Hole { text, .. } = &chain.end else {
             return Err(format!("end:{}", end_kind(&chain.end)));
         };
-        let arm = Arm::Hole {
+        let arm = |handed: bool| Arm::Hole {
             reason: end_kind(&chain.end),
             text: text.clone(),
             facts: facts.clone(),
+            handed,
         };
         let stopped = facts.stopped.unwrap_or(node);
         if let Some(found) = self.enclosing(stopped) {
+            let handed = self.handed_between(stopped, found.0);
             return Ok(Attached {
                 to: vec![found],
-                arm,
+                arm: arm(handed),
                 below: false,
             });
         }
@@ -507,7 +567,7 @@ impl Attacher<'_, '_> {
             if !to.is_empty() {
                 return Ok(Attached {
                     to,
-                    arm,
+                    arm: arm(true),
                     below: true,
                 });
             }
@@ -527,7 +587,7 @@ impl Attacher<'_, '_> {
             return self
                 .reader
                 .receive_at(handoff.caller, &handoff.site, handoff.arg, &handoff.path)
-                .map(|end| vec![(handoff.handed, Handler::Label(subject_label(end)))])
+                .map(|end| vec![(handoff.handed, self.label_handler(subject_label(end)))])
                 .unwrap_or_default();
         }
         self.attach(node, chain, facts)
@@ -545,12 +605,42 @@ impl Attacher<'_, '_> {
             }
             for (caller, site, arg, path) in self.chains.handed_calls(current) {
                 if let Some(end) = self.reader.receive_at(caller, &site, arg, &path) {
-                    return Some((current, Handler::Label(subject_label(end))));
+                    return Some((current, self.label_handler(subject_label(end))));
                 }
             }
             at = self.chains.nodes[current].parent;
         }
         None
+    }
+
+    /// The handler of a labelled `receive` call: with a path slot when any
+    /// `receive` label of that member names one (the call takes the path
+    /// the handler is registered under).
+    fn label_handler(&self, label: SubjectLabel) -> Handler {
+        let path_slot = self.reader.labels.iter().any(|known| {
+            known.op.as_deref() == Some("receive")
+                && known.package == label.package
+                && known.export == label.export
+                && known.member == label.member
+                && known.name.is_some()
+        });
+        Handler::Label(label, path_slot)
+    }
+
+    /// Whether a function from `stopped` up to `handler` (not the handler
+    /// itself) is handed to a call: a function written inside a handler and
+    /// handed on is registered somewhere the code does not show.
+    fn handed_between(&self, stopped: usize, handler: usize) -> bool {
+        let mut at = Some(stopped);
+        while let Some(current) = at
+            && current != handler
+        {
+            if !self.chains.handed_calls(current).is_empty() {
+                return true;
+            }
+            at = self.chains.nodes[current].parent;
+        }
+        false
     }
 }
 
@@ -569,6 +659,7 @@ struct Builder<'b, 'a> {
     chains: &'b Chains<'a>,
     methods: &'b HashMap<usize, Vec<MethodGuard<'b>>>,
     method_handlers: &'b HashMap<usize, BTreeSet<usize>>,
+    handlers: &'b BTreeMap<usize, Handler>,
     /// Each file's text, read once.
     texts: std::cell::RefCell<HashMap<std::path::PathBuf, String>>,
 }
@@ -654,8 +745,7 @@ impl Builder<'_, '_> {
                         .get(&address(candidate.guard))
                         .is_some_and(|reached| reached.contains(&handler))
                 },
-            )
-            .0)
+            ))
         };
         match arm {
             Arm::Proven(reached, facts) => (
@@ -666,8 +756,7 @@ impl Builder<'_, '_> {
                     facts,
                     reached,
                     self.methods,
-                )
-                .0),
+                )),
             ),
             Arm::Entry(reached, facts) => (
                 None,
@@ -677,8 +766,7 @@ impl Builder<'_, '_> {
                     facts,
                     reached,
                     self.methods,
-                )
-                .0),
+                )),
             ),
             Arm::Unread(facts) | Arm::Hole { facts, .. } => (None, by_handler(facts)),
         }
@@ -695,8 +783,8 @@ impl Builder<'_, '_> {
         methods: &[(usize, &GuardIr, String)],
         scopes: &[(usize, &GuardIr, String)],
         counts: &mut BTreeMap<String, usize>,
-    ) -> (Order, HandlerRecord) {
-        let line_of = |guard: &GuardIr| guard.literal_line.unwrap_or(guard.site.line);
+    ) -> (Order, HandlerRecord, Vec<ComparisonPlace>) {
+        let line_of = |guard: &GuardIr| guard.literal_at.unwrap_or(guard.site).line;
         let mut ordered: Vec<&Compared<'_>> = comparisons.to_vec();
         ordered.sort_by_cached_key(|comparison| {
             (
@@ -718,6 +806,7 @@ impl Builder<'_, '_> {
             marks.entry(*node).or_default().insert(guard.site.line);
         }
         let mut entries: Vec<HandlerComparison> = Vec::new();
+        let mut places: Vec<ComparisonPlace> = Vec::new();
         let mut forced: BTreeMap<String, ForcedRoute> = BTreeMap::new();
         let mut asked: Vec<u32> = Vec::new();
         for (id, comparison) in ordered.iter().enumerate() {
@@ -767,17 +856,21 @@ impl Builder<'_, '_> {
                 count(counts, "holes");
             }
             count(counts, "comparisons");
+            // The method is the code's fact (ruling of 2026-10-23): a path
+            // the code forces with no one method qualifying is asked
+            // nothing, whatever methods the record states elsewhere.
             let is_asked = match (&path, &method) {
                 (Some(_), Some(_)) => {
                     count(counts, "forced");
                     false
                 }
-                (Some(_), None) if methods.is_empty() => {
+                (Some(_), None) => {
                     count(counts, "no_method");
                     false
                 }
                 _ => true,
             };
+            places.push(self.place(id, comparison));
             if is_asked {
                 count(counts, "asked");
                 asked.push(id);
@@ -922,7 +1015,54 @@ impl Builder<'_, '_> {
             asked,
             forced,
         };
-        (order, record)
+        (order, record, places)
+    }
+
+    /// The lines of `node`'s function.
+    fn range(&self, node: usize) -> LineRange {
+        let (first, last) = self.lines(node, &self.text(node));
+        LineRange {
+            file: self.chains.rel(self.chains.nodes[node].file),
+            first,
+            last,
+        }
+    }
+
+    /// Where comparison `id`'s route stands ([`ComparisonPlace`]).
+    fn place(&self, id: u32, comparison: &Compared<'_>) -> ComparisonPlace {
+        let guard = comparison.guard;
+        let served = comparison.arms.iter().all(|(handler, arm)| {
+            self.handlers[handler].serves_whole_path()
+                && !matches!(arm, Arm::Hole { handed: true, .. })
+        });
+        let label = match comparison.arms.keys().collect::<Vec<_>>()[..] {
+            [only] => match &self.handlers[only] {
+                Handler::Label(label, _) => Some(label.clone()),
+                Handler::Entry => None,
+            },
+            _ => None,
+        };
+        let mut within: Vec<LineRange> = comparison
+            .arms
+            .keys()
+            .chain([&comparison.node])
+            .map(|node| self.range(*node))
+            .collect();
+        within.sort();
+        within.dedup();
+        // A table key stands on its own span: two keys of one lookup are two
+        // places, never one possible call.
+        let at = guard.literal_at.unwrap_or(guard.site);
+        ComparisonPlace {
+            id,
+            file: self.chains.rel(self.chains.nodes[comparison.node].file),
+            line: at.line,
+            span_start: at.span_start,
+            span_end: at.span_end,
+            served,
+            label,
+            within,
+        }
     }
 
     /// Whether `node` is written inside `outer`, at any depth.

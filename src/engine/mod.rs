@@ -5018,6 +5018,7 @@ async fn site_rows_of(
         decided,
         records,
         labels: site_labels,
+        handlers,
     } = site_records_of(inputs, root, claims, context);
     let answers = crate::site_questions::ask_service(
         &crate::site_questions::agent(),
@@ -5027,6 +5028,13 @@ async fn site_rows_of(
     )
     .await;
     let mut rows = crate::site_rows::of(&decided, &records, &site_labels, &answers);
+    // With the receiver trace on, the routes hand-written dispatch chooses
+    // (carrick#2474 R4b) join the site rows before the fold.
+    if let Some((handlers, built)) = &handlers {
+        let dispatch = dispatch_rows_of(handlers, *built, repo_path, service).await;
+        rows.rows.extend(dispatch.rows);
+        rows.leads.extend(dispatch.leads);
+    }
     rows.rows.retain(|row| {
         !protocol_producer_provenance(&root.join(&row.file), repo_path, service).is_mock()
     });
@@ -5161,6 +5169,12 @@ struct SiteRecordsOf {
     decided: crate::request_summary::decided_sites::Decided,
     records: Vec<crate::request_summary::site_record::SiteRecord>,
     labels: Vec<crate::request_summary::decided_sites::SiteLabel>,
+    /// With the receiver trace on: the handler records (carrick#2474 R4b)
+    /// and how long building them took.
+    handlers: Option<(
+        crate::request_summary::dispatch::HandlerRecords,
+        std::time::Duration,
+    )>,
 }
 
 /// `discovery`'s sites as the decided-sites pass reads them.
@@ -5213,9 +5227,20 @@ fn site_records_of(
         .count();
     let discovered = discovered_sites(discovery);
     let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
-    if context.declarations.is_some() {
-        log_dispatch_routes(inputs, &discovered, &labels, root);
-    }
+    // With the receiver trace on, each request handler's path and method
+    // comparisons, as the records the handler questions ask (carrick#2474
+    // R4b).
+    let handlers = context.declarations.map(|_| {
+        let started = std::time::Instant::now();
+        let records = crate::request_summary::dispatch::handler_records(
+            inputs,
+            &discovered,
+            &labels,
+            root,
+            crate::request_summary::dispatch::HoleReach::Nested,
+        );
+        (records, started.elapsed())
+    });
     // With the receiver trace on, each site also names its instance
     // (carrick#2474 R2a) and the full path it is served at under the scope
     // members the trace's own request verified (R2b): read by nothing.
@@ -5256,48 +5281,40 @@ fn site_records_of(
         decided,
         records,
         labels,
+        handlers,
     }
 }
 
-/// The routes a hand-written dispatch states (carrick#2474 R4a), with the
-/// receiver trace on: one run-log line per route and one summary, then
-/// dropped. Nothing reaches the blob.
-fn log_dispatch_routes(
-    inputs: &crate::request_summary::RequestSummaryInputs,
-    discovered: &[crate::request_summary::decided_sites::DiscoverySite],
-    labels: &[crate::request_summary::decided_sites::SiteLabel],
-    root: &Path,
-) {
+/// The dispatch rows of a service's handler records (carrick#2474 R4b): the
+/// records that ask a comparison asked in requests of their own, and the
+/// answers and the code's settled values read into rows and possible calls
+/// ([`crate::site_rows::dispatch`]). One run-log summary line per service.
+async fn dispatch_rows_of(
+    records: &crate::request_summary::dispatch::HandlerRecords,
+    built: std::time::Duration,
+    repo_path: &str,
+    service: &Config,
+) -> crate::site_rows::dispatch::DispatchRows {
     let started = std::time::Instant::now();
-    let dispatch =
-        crate::request_summary::dispatch::dispatch_routes(inputs, discovered, labels, root);
-    for route in &dispatch.routes {
-        debug!(
-            file = %route.file,
-            line = route.line,
-            method = %route.method.as_deref().unwrap_or("-"),
-            path = %route.path,
-            evidence = %route.evidence.kind(),
-            "receiver trace: dispatch route"
-        );
-    }
-    debug!(
-        routes = dispatch.routes.len(),
-        scopes = dispatch.scopes.len(),
-        not_routes = dispatch.not_routes.values().sum::<usize>(),
-        ms = started.elapsed().as_millis() as u64,
-        "receiver trace: dispatch routes"
-    );
-    // The handler records (carrick#2474 R4b T3a): counted, then dropped.
-    let started = std::time::Instant::now();
-    let records = crate::request_summary::dispatch::handler_records(
-        inputs,
-        discovered,
-        labels,
-        root,
-        crate::request_summary::dispatch::HoleReach::Nested,
-    );
+    let answers = crate::site_questions::ask_handlers_service(
+        &crate::site_questions::agent(),
+        &get_repository_name(repo_path),
+        service.service_name.as_deref(),
+        crate::site_rows::dispatch::handler_questions(records),
+    )
+    .await;
+    let rows = crate::site_rows::dispatch::dispatch_rows(records, &answers);
     let read = |what: &str| records.counts.get(what).copied().unwrap_or_default() as u64;
+    let made = |what: &str| rows.counts.get(what).copied().unwrap_or_default() as u64;
+    let mut leads_by_reason: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for lead in &rows.leads {
+        let reason = serde_json::to_value(lead.unread.reason)
+            .ok()
+            .and_then(|reason| reason.as_str().map(str::to_string))
+            .unwrap_or_default();
+        *leads_by_reason.entry(reason).or_default() += 1;
+    }
     debug!(
         records = read("records"),
         shared = read("records_shared"),
@@ -5307,9 +5324,17 @@ fn log_dispatch_routes(
         no_method = read("no_method"),
         holes = read("holes"),
         not_attached = records.not_attached.values().sum::<usize>() as u64,
-        ms = started.elapsed().as_millis() as u64,
+        requests = answers.requests as u64,
+        unanswered_records = made("records_unanswered"),
+        rows_fact = made("rows_fact"),
+        rows_model = made("rows_model"),
+        not_a_route = made("not_a_route"),
+        leads = rows.leads.len() as u64,
+        leads_by_reason = ?leads_by_reason,
+        ms = (built + started.elapsed()).as_millis() as u64,
         "receiver trace: handler records"
     );
+    rows
 }
 
 /// `sites` read through `claims`, each verified by the sidecar against the
@@ -22116,6 +22141,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 trace_depth: 0,
             },
             needs_reader: false,
+            within: Vec::new(),
         }
     }
 
