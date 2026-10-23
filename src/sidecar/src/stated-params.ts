@@ -26,6 +26,7 @@ import {
   type FunctionExpression,
   type MethodDeclaration,
   type ParameterDeclaration,
+  type PropertyAccessExpression,
   type Symbol as TsSymbol,
   type Type,
 } from 'ts-morph';
@@ -48,6 +49,29 @@ export interface StatedReply {
 
 /** The status a send's own chain states, as the inferrer reads it. */
 export type ChainStatus = (call: CallExpression) => 'success' | 'error' | 'redirect' | 'variable' | 'undecided' | undefined;
+
+/** Type flags of a value that cannot hold a request body: a string, number, boolean and the like. */
+const PLAIN_VALUE_FLAGS =
+  ts.TypeFlags.StringLike |
+  ts.TypeFlags.NumberLike |
+  ts.TypeFlags.BigIntLike |
+  ts.TypeFlags.BooleanLike |
+  ts.TypeFlags.EnumLike |
+  ts.TypeFlags.Undefined |
+  ts.TypeFlags.Null |
+  ts.TypeFlags.Void;
+
+/** The expression's type is a plain value, or a union of plain values. */
+function holdsPlainValue(node: Node): boolean {
+  let type: Type;
+  try {
+    type = node.getType();
+  } catch {
+    return false;
+  }
+  const parts = type.isUnion() ? type.getUnionTypes() : [type];
+  return parts.every((part) => (part.getFlags() & PLAIN_VALUE_FLAGS) !== 0);
+}
 
 /** How many repo functions the request may be handed through before a read is unprovable. */
 const REACH_DEPTH = 2;
@@ -77,9 +101,11 @@ export class StatedParams {
   /**
    * The request body the handler's parameters state, the first parameter
    * whose type has a labelled body member deciding. Undefined when no
-   * parameter has one, or the one that does states nothing decidable.
+   * parameter has one, or the one that does states nothing decidable. A
+   * route whose `registration` hands in another function beside the handler
+   * (a middleware, which can read the body first) decides no "no body".
    */
-  request(handler: HandlerFunction): StatedRequest | undefined {
+  request(handler: HandlerFunction, registration?: Node): StatedRequest | undefined {
     if (this.labels.bodies.size === 0) return undefined;
     const parameters = handler.getParameters();
     for (const parameter of parameters) {
@@ -94,8 +120,9 @@ export class StatedParams {
       if (body.isAny()) return undefined;
       if (!body.isUnknown() && !body.isNever()) return { kind: 'body', type: body, at: parameter };
       if (body.isUnknown() && !this.writesTypeArgument(handler, parameter)) return undefined;
+      if (registration && this.handsInAnotherFunction(registration, handler)) return undefined;
       const declarations = new Set((member.getDeclarations() ?? []).map((d) => declarationKey(d.compilerNode)));
-      if (!this.bodyIsUnread(handler, parameters.indexOf(parameter), declarations, 0, new Set())) {
+      if (!this.bodyIsUnread(handler, parameters.indexOf(parameter), declarations, 0, new Map())) {
         return undefined;
       }
       return {
@@ -107,6 +134,47 @@ export class StatedParams {
       };
     }
     return undefined;
+  }
+
+  /**
+   * The route hands in a function besides the handler: a callable argument
+   * (or list of them) beside the handler on any call it is passed through
+   * up to the registration, or, where the registration names the handler by
+   * reference, a second callable argument or property there. What such a
+   * function (a middleware) does with the request is not read here.
+   */
+  private handsInAnotherFunction(registration: Node, handler: HandlerFunction): boolean {
+    const callable = (node: Node): boolean => {
+      let type: Type;
+      try {
+        type = node.getType();
+      } catch {
+        return true;
+      }
+      const element = type.getArrayElementType() ?? type.getTupleElements()[0];
+      return type.getCallSignatures().length > 0 || (element !== undefined && element.getCallSignatures().length > 0);
+    };
+    let node: Node = handler;
+    let parent = node.getParent();
+    while (parent && Node.isCallExpression(parent) && parent.getArguments().includes(node)) {
+      const passed = node;
+      if (parent.getArguments().some((argument) => argument !== passed && callable(argument))) return true;
+      node = parent;
+      parent = node.getParent();
+    }
+    const holdsHandler = registration === handler || handler.getAncestors().includes(registration);
+    if (holdsHandler) {
+      if (!Node.isObjectLiteralExpression(registration)) return false;
+      return registration
+        .getProperties()
+        .some((property) => !handler.getAncestors().includes(property) && callable(property));
+    }
+    const siblings: Node[] = Node.isCallExpression(registration)
+      ? registration.getArguments()
+      : Node.isObjectLiteralExpression(registration)
+        ? registration.getProperties()
+        : [];
+    return siblings.filter(callable).length > 1;
   }
 
   /**
@@ -144,10 +212,12 @@ export class StatedParams {
     index: number,
     bodyKeys: ReadonlySet<string>,
     depth: number,
-    seen: Set<Node>
+    seen: Map<Node, Set<number>>
   ): boolean {
-    if (seen.has(func)) return true;
-    seen.add(func);
+    const visited = seen.get(func) ?? new Set<number>();
+    if (visited.has(index)) return true;
+    visited.add(index);
+    seen.set(func, visited);
     const parameter = func.getParameters()[index];
     if (!parameter) return true;
     if (parameter.isRestParameter()) return false;
@@ -163,8 +233,7 @@ export class StatedParams {
       if (Node.isPropertyAccessExpression(parent) && parent.getExpression() === use) {
         const declarations = parent.getNameNode().getSymbol()?.getDeclarations() ?? [];
         if (declarations.some((d) => bodyKeys.has(declarationKey(d.compilerNode)))) return false;
-        const outer = parent.getParent();
-        if (outer && Node.isCallExpression(outer) && outer.getExpression() === parent) return false;
+        if (!this.memberReadStaysPut(parent)) return false;
         continue;
       }
       if (Node.isCallExpression(parent) && parent.getArguments().includes(use)) {
@@ -184,6 +253,41 @@ export class StatedParams {
       return false;
     }
     return true;
+  }
+
+  /**
+   * A read of a request member (`req.headers`, `req.headers.host`) whose
+   * value goes nowhere a body could be read from. Along its member chain, a
+   * method called on anything but a plain value (`req.raw.pipe(...)`, or a
+   * framework's own body reader `req.file()`) is a read, and so is a
+   * non-plain value handed to a function (`getRawBody(req.raw)`). A plain
+   * value (a header string) holds no body, whatever is done with it.
+   */
+  private memberReadStaysPut(read: PropertyAccessExpression): boolean {
+    let node: Node = read;
+    for (;;) {
+      const outer = node.getParent();
+      if (!outer) return true;
+      if ((Node.isCallExpression(outer) || Node.isNewExpression(outer)) && outer.getExpression() === node) {
+        const receiver = Node.isPropertyAccessExpression(node) || Node.isElementAccessExpression(node) ? node.getExpression() : undefined;
+        return receiver !== undefined && receiver !== read.getExpression() && holdsPlainValue(receiver);
+      }
+      if (Node.isCallExpression(outer) || Node.isNewExpression(outer)) {
+        return holdsPlainValue(node);
+      }
+      if (
+        (Node.isPropertyAccessExpression(outer) || Node.isElementAccessExpression(outer)) &&
+        outer.getExpression() === node
+      ) {
+        node = outer;
+        continue;
+      }
+      if (Node.isNonNullExpression(outer) || Node.isParenthesizedExpression(outer)) {
+        node = outer;
+        continue;
+      }
+      return true;
+    }
   }
 
   /** The function a callee names, where the repo declares it; undefined otherwise. */
@@ -231,7 +335,11 @@ export class StatedParams {
       if (stated.isAny() || stated.isUnknown() || stated.isNever()) return undefined;
       const variants = stated.isUnion() ? stated.getUnionTypes().filter((t) => !t.isNull() && !t.isUndefined()) : [stated];
       const literalUnion = stated.isBoolean() || variants.every((t) => t.isLiteral() || t.isBooleanLiteral());
-      if (variants.length <= 1 || literalUnion) return { variants: [stated], at: parameter };
+      if (variants.length <= 1 || literalUnion) {
+        // An optional payload slot adds `undefined`: no body sent, not a body.
+        const defined = stated.isUnion() ? stated.getUnionTypes().filter((t) => !t.isUndefined()) : [stated];
+        return defined.length > 0 ? { variants: defined, at: parameter } : undefined;
+      }
       const carried = this.successPayloads(sends);
       const kept = variants.filter((variant) => carried.some((sent) => sent.isAssignableTo(variant)));
       return kept.length > 0 ? { variants: kept, at: parameter } : undefined;

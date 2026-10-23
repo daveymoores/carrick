@@ -1123,9 +1123,6 @@ mod tests {
         read(sites, exports, verifier(&asked, verified)).rows
     }
 
-    /// A declaration found in a type-only package stands for the package
-    /// whose answer lists it; an `@types/*` name keeps its convention; any
-    /// other name is itself (carrick#2434).
     /// carrick#2674: the checks an `infer` request reads a route handler's
     /// parameters through: a server export's makers and scopes, its send ops
     /// that carry a payload slot, and its receive ops that say where the
@@ -1200,6 +1197,9 @@ mod tests {
         );
     }
 
+    /// A declaration found in a type-only package stands for the package
+    /// whose answer lists it; an `@types/*` name keeps its convention; any
+    /// other name is itself (carrick#2434).
     #[test]
     fn a_type_only_package_is_keyed_to_the_package_that_lists_it() {
         let mut core = export(json!({

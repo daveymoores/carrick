@@ -264,7 +264,11 @@ export interface ServerClaims {
   /** The service root module resolution starts from, as on `verify_library_claims`. */
   from_dir: string;
   scan_root?: string;
-  checks: LibraryCheck[];
+  /**
+   * As the client sends them: each is read through the library-check schema
+   * on its own, and a refused one is dropped (`settledServerChecks`).
+   */
+  checks: unknown[];
   /**
    * Per package specifier, the type-only packages the store says its surface
    * re-exports (the store's `type_packages`): a reply member declared in one

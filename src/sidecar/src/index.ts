@@ -32,6 +32,7 @@ import {
 } from './capture/index.js';
 import { Retyper, type TopTypeWalk } from './retype.js';
 import { LibraryClaimsVerifier, httpCheck, type LabelledMembers } from './library-claims.js';
+import { readServerLabels } from './server-labels.js';
 import { PROGRESS_INTERVAL_MS, atMostEvery } from './progress.js';
 import { mergeInferTimings } from './infer-timing.js';
 import { addProgramFiles, listProgramFiles } from './program-files.js';
@@ -60,6 +61,7 @@ import type {
   ImplementationsResponse,
   ErrorResponse,
   ServerClaims,
+  InferRequestItem,
 } from './types.js';
 
 // ===========================================================================
@@ -80,10 +82,8 @@ interface ProjectComponents {
   retyper: Retyper;
   claimsVerifier: LibraryClaimsVerifier;
   /**
-   * carrick#2674: the members a set of server claims names in this program,
-   * by the claims' text. Read once: a scan sends its claims with every
-   * `infer` batch, and each reading adds a probe file, so the program is
-   * built again.
+   * carrick#2674: the members a set of server claims names for this program,
+   * by the claims' text. Read once: each reading builds a program of its own.
    */
   labelledMembers: Map<string, LabelledMembers>;
 }
@@ -437,7 +437,7 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
             report();
           },
           request.model_symbols,
-          labelledMembersFor(built, request.server_claims)
+          labelledMembersFor(built, key, items, request.server_claims)
         );
       }
     );
@@ -477,37 +477,46 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
 
 /**
  * How long reading one program's server-framework labels may take: as
- * long as a verify_library_claims request, since the first reading pays the
- * program build. Labels it does not reach are not read.
+ * long as a verify_library_claims request, since the reading builds a
+ * program of its own. Labels it does not reach are not read.
  */
 const SERVER_CLAIMS_BUDGET_MS = 600_000;
 
+/** The infer kinds a route row asks: only these read a handler's parameters (carrick#2674). */
+const ROUTE_ROW_KINDS: ReadonlySet<string> = new Set(['response_body', 'request_body']);
+
 /**
  * carrick#2674: the members an `infer` request's server-framework claims
- * name, verified again in this program. Undefined when the request carries
- * none, so the inferrer reads nothing new.
+ * name, verified again in a program of their own beside the inferrer's for
+ * `key` (`readServerLabels`). Undefined when the request carries none, or
+ * the group asks no route row, so the inferrer reads nothing new. Read once
+ * per program and claims.
  */
 function labelledMembersFor(
   built: ProjectComponents,
+  key: string,
+  items: readonly InferRequestItem[],
   claims: ServerClaims | undefined
 ): LabelledMembers | undefined {
   if (!claims || claims.checks.length === 0) return undefined;
-  const key = JSON.stringify(claims);
-  let labels = built.labelledMembers.get(key);
+  if (!items.some((item) => ROUTE_ROW_KINDS.has(item.infer_kind))) return undefined;
+  const cacheKey = JSON.stringify(claims);
+  let labels = built.labelledMembers.get(cacheKey);
   if (!labels) {
-    const fromDir = path.resolve(projectLoader!.getRepoRoot(), claims.from_dir);
-    labels = built.claimsVerifier.labelledMembers(
-      fromDir,
-      claims.checks,
+    const loader = initializedLoader();
+    labels = readServerLabels(
+      {
+        getRepoRoot: () => loader.getRepoRoot(),
+        scriptProjectFor: (owner) => loader.scriptProjectFor(owner),
+        packageDirectoryOf: (file) => loader.packageDirectoryOf(file),
+        resolveModule: (name, from, options) => loader.resolveThroughGraph(name, from, options),
+      },
+      key,
+      claims,
       SERVER_CLAIMS_BUDGET_MS,
-      claims.scan_root,
-      claims.type_packages
+      log
     );
-    log(
-      `Read ${labels.sends.size} labelled send and ${labels.bodies.size} body member(s) for handler parameters ` +
-        `from ${claims.checks.length} claim(s) in ${fromDir}: ${JSON.stringify(labels.outcomes ?? {})}`
-    );
-    built.labelledMembers.set(key, labels);
+    built.labelledMembers.set(cacheKey, labels);
   }
   return labels;
 }

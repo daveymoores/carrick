@@ -9124,7 +9124,7 @@ export class TypeInferrer {
     // carrick#2674: the body member a verified label names, read at the
     // handler's parameter, comes first. Where no label answers, the old rule
     // that reads a member by its name stands.
-    const stated = this.statedParams.request(handler);
+    const stated = this.statedParams.request(handler, registration);
     if (stated?.kind === 'body') {
       const text = this.structuralTextFromType(stated.type, stated.at);
       if (text) {
@@ -9184,7 +9184,10 @@ export class TypeInferrer {
     const texts: string[] = [];
     for (const variant of stated.variants) {
       const text = this.structuralTextFromType(variant, stated.at);
-      if (!text) return today;
+      // A variant holding `any` or `unknown` is one the check refuses as an
+      // anchor (`usable_inferred_text`): publishing it would fall back to the
+      // raw anchor under an explicit flag, so today's reading stands.
+      if (!text || printedTypeHoldsTopType(text)) return today;
       texts.push(text);
     }
     this.log(

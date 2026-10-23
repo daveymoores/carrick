@@ -44,6 +44,7 @@ export interface Req<P extends Parts = Parts> {
   body: Part<P, 'Body'>;
   params: Part<P, 'Params'>;
   headers: Record<string, string>;
+  raw: { pipe(to: unknown): void };
   file(): Promise<unknown>;
 }
 export interface Rep<P extends Parts = Parts> {
@@ -81,6 +82,7 @@ interface Err { error: string; code: number }
 interface NewOrder { lines: string[] }
 interface OrderContract { Params: { shop: string }; Reply: Ok | Err; Body: NewOrder }
 interface Legacy { Params: {}; Body: never; Reply: Item }
+interface Bare { Params: { id: string }; Body: never; Reply: Item }
 
 declare function save(item: NewItem): Item;
 declare function create(order: NewOrder): Promise<Ok>;
@@ -107,6 +109,12 @@ export function wrap<T extends { Params?: unknown; Reply?: unknown; Body?: unkno
 function auth(req: Request2, res: Response2, next: () => void): void {
   next();
 }
+function pair(first: Req, second: Req): void {
+  console.log(first.headers['x-actor'], second.body);
+}
+declare function getRawBody(source: unknown): Promise<string>;
+declare function guard(): (req: Request2, res: Response2, next: () => void) => void;
+declare const sink: unknown;
 
 const app = make();
 const r = router();
@@ -135,6 +143,20 @@ r.post('/forward', wrap<Legacy>(async (req, res) => { forward(req.body); res.jso
 app.post<{ Params: { id: string } }>('/items/:id/loose', async (req, rep) => { parseLoosely(req); rep.send(); });
 // L
 r.post('/orders-loose', auth, createOrderLoosely);
+// M
+app.post<{ Params: { id: string }; Reply: { id: string; meta: any } }>('/meta', async (req, rep) => { rep.send(); });
+// O
+app.delete<{ Params: { id: string } }>('/items/:id/stream', async (req, rep) => { req.raw.pipe(sink); rep.send(); });
+// P
+app.delete<{ Params: { id: string } }>('/items/:id/raw', async (req, rep) => { await getRawBody(req.raw); rep.send(); });
+// Q
+app.delete<{ Params: { id: string } }>('/items/:id/pair', async (req, rep) => { pair(req, req); rep.send(); });
+// S
+r.post('/bare', guard(), wrap<Bare>(async (req, res) => { res.json(save({ name: 'x' })); }));
+// T
+r.post('/bare-open', wrap<Bare>(async (req, res) => { res.json(save({ name: 'x' })); }));
+// U
+app.get<{ Reply: 'on' | 'off' }>('/state', async (req, rep) => { rep.send('on'); });
 
 declare function forward(body: unknown): void;
 interface OwnRequest { body: NewItem; headers: Record<string, string> }
@@ -274,15 +296,16 @@ describe('carrick#2674: bodies a route handler’s parameters state', () => {
     label: string,
     kind: 'request_body' | 'response_body',
     labels = true,
-    typePackages: Record<string, string[]> = { [PKG]: [CORE_PKG] }
+    typePackages: Record<string, string[]> = { [PKG]: [CORE_PKG] },
+    checks: unknown[] = LABELS
   ): Promise<Inferred | undefined> => {
-    const alias = `${label}_${kind}_${labels}_${Object.keys(typePackages).length}`;
+    const alias = `${label}_${kind}_${labels}_${Object.keys(typePackages).length}_${id}`;
     const response = await client.send<{ inferred_types?: Inferred[] }>(
       {
         action: 'infer',
         request_id: `infer-${id++}`,
         requests: [{ file_path: appPath, line_number: lineOf(label), infer_kind: kind, alias }],
-        ...(labels ? { server_claims: { from_dir: root, checks: LABELS, type_packages: typePackages } } : {}),
+        ...(labels ? { server_claims: { from_dir: root, checks, type_packages: typePackages } } : {}),
       },
       60_000
     );
@@ -350,6 +373,33 @@ describe('carrick#2674: bodies a route handler’s parameters state', () => {
     const request = await infer('H', 'request_body');
     assert.notStrictEqual(reason(request), 'no_request_body');
     await unchanged('H', 'response_body');
+  });
+
+  it('M: a stated reply holding any or unknown is not published; the reading without labels stands', async () => {
+    await unchanged('M', 'response_body');
+  });
+
+  it('O, P and Q: a method called on a request member, a member handed to a function, or the request handed at a second position decide nothing', async () => {
+    for (const label of ['O', 'P', 'Q']) {
+      assert.notStrictEqual(reason(await infer(label, 'request_body')), 'no_request_body', label);
+    }
+  });
+
+  it('S and T: a route with another function handed in beside its handler decides nothing; without one it takes no body', async () => {
+    assert.notStrictEqual(reason(await infer('S', 'request_body')), 'no_request_body');
+    assert.strictEqual(reason(await infer('T', 'request_body')), 'no_request_body');
+  });
+
+  it('U: a stated reply through an optional payload slot does not publish undefined', async () => {
+    const reply = await infer('U', 'response_body');
+    assert.match(reply?.type_string ?? '', /"on"/);
+    assert.doesNotMatch(reply?.type_string ?? '', /undefined/);
+  });
+
+  it('a claim the schema refuses is dropped; the others still read', async () => {
+    const refused = { ...LABELS[0], claim: { kind: 'op', op: 'teleport' } };
+    assert.match((await infer('D', 'request_body', true, { [PKG]: [CORE_PKG] }, [refused, ...LABELS]))?.type_string ?? '', /name: string/);
+    assert.match((await infer('D', 'response_body', true, { [PKG]: [CORE_PKG] }, [refused, ...LABELS]))?.type_string ?? '', /id: string/);
   });
 
   it('with no labels in the request, nothing reads a stated parameter', async () => {
