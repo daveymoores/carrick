@@ -18,24 +18,60 @@
 //! See `tests/fixtures/wrapper-dispatch/README.md` for the shape and the
 //! answer key.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 fn calls(fixture_dir: &str) -> Vec<serde_json::Value> {
+    scan_calls(fixture_dir, false)
+}
+
+/// Whether the live sidecar can run. CI builds it before the Rust tests, so
+/// a skip there would make a green tick mean nothing.
+fn sidecar_available() -> bool {
+    let node = Command::new("node").arg("--version").output().is_ok();
+    let built = std::env::var_os("CARRICK_SIDECAR_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"))
+        .join("dist/src/index.js")
+        .exists();
+    assert!(
+        (node && built) || std::env::var("CI").is_err(),
+        "node or the built sidecar is missing in CI, so these tests would silently not run"
+    );
+    node && built
+}
+
+/// The scan's call rows with the compiler's position rows walked, as the
+/// cloud runner scans: what a receiver a call initialised is, is the `call`
+/// row's to say (carrick#2615). `None` where the sidecar cannot run.
+fn calls_with_rows(fixture_dir: &str) -> Option<Vec<serde_json::Value>> {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return None;
+    }
+    Some(scan_calls(fixture_dir, true))
+}
+
+fn scan_calls(fixture_dir: &str, rows: bool) -> Vec<serde_json::Value> {
     let repo = env!("CARGO_MANIFEST_DIR");
     let fixture = format!("{repo}/tests/fixtures/{fixture_dir}");
     let mock_dir = format!("{fixture}/__llm__/");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
-        .arg(&fixture)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    cmd.arg(&fixture)
         .env("CARRICK_MOCK_ALL", "1")
         .env("CARRICK_MOCK_FIXTURE_DIR", &mock_dir)
         .env("CARRICK_OUTPUT_JSON", "1")
         .env("CARRICK_SKIP_INTENTS", "1")
         .env_remove("GITHUB_REPOSITORY")
         .env_remove("GITHUB_ACTIONS")
-        .env_remove("CI")
-        .output()
-        .expect("failed to spawn carrick binary");
+        .env_remove("CI");
+    if rows {
+        cmd.env("CARRICK_POSITION_ROWS", "1");
+    } else {
+        cmd.env_remove("CARRICK_POSITION_ROWS");
+    }
+    let output = cmd.output().expect("failed to spawn carrick binary");
 
     assert!(
         output.status.success(),
@@ -132,10 +168,13 @@ fn a_site_calling_a_member_that_issues_two_requests_states_one_row_per_request()
 
 /// carrick#2201: `factory.ts` holds the client a function-typed factory
 /// returns. Its cassette states a value at every site, as the model does when
-/// it guesses one from a method name.
+/// it guesses one from a method name. What `make` returns is the compiler's
+/// to say, so these scan with the position rows walked (carrick#2615).
 #[test]
 fn a_guessed_site_value_takes_the_wrapper_s_value() {
-    let calls = calls("wrapper-dispatch");
+    let Some(calls) = calls_with_rows("wrapper-dispatch") else {
+        return;
+    };
     assert_eq!(
         dispatch_value(call_at(&calls, "factory.ts", 7)),
         Some("get-cross-repo-data"),
@@ -147,7 +186,9 @@ fn a_guessed_site_value_takes_the_wrapper_s_value() {
 fn a_guessed_site_value_on_a_member_that_issues_two_requests_becomes_one_row_per_request() {
     // The same answer as `refresh.ts:4`: the guessed `refresh-everything` is
     // gone and the site states both requests the member sends.
-    let calls = calls("wrapper-dispatch");
+    let Some(calls) = calls_with_rows("wrapper-dispatch") else {
+        return;
+    };
     let mut values: Vec<Option<&str>> = calls
         .iter()
         .filter(|call| {
@@ -167,7 +208,9 @@ fn a_guessed_site_value_on_a_member_that_issues_two_requests_becomes_one_row_per
 
 #[test]
 fn a_site_value_its_file_writes_is_kept() {
-    let calls = calls("wrapper-dispatch");
+    let Some(calls) = calls_with_rows("wrapper-dispatch") else {
+        return;
+    };
     assert_eq!(
         dispatch_value(call_at(&calls, "factory.ts", 9)),
         Some("purge-cache"),

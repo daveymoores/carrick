@@ -115,6 +115,8 @@ fn a_member_call_on_a_call_bound_receiver_takes_its_edge_from_the_call_row() {
         // `{ make }: Deps`: an interface member, through a destructured
         // parameter, which no annotation at the binding names.
         edge("removeThrough", "ApiClient.remove", 5),
+        // `open: OpenClient` returns a promise of the client, awaited.
+        edge("listAwaited", "ApiClient.list", 5),
     ] {
         assert!(
             edges.contains(&wanted),
@@ -124,5 +126,9 @@ fn a_member_call_on_a_call_bound_receiver_takes_its_edge_from_the_call_row() {
     assert!(
         !edges.iter().any(|(caller, ..)| caller == "listUntyped"),
         "a receiver the compiler types `any` states no edge: {edges:#?}"
+    );
+    assert!(
+        !edges.iter().any(|(caller, ..)| caller == "listUnawaited"),
+        "a promise of the client is not the client until it is awaited: {edges:#?}"
     );
 }
