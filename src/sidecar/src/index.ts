@@ -503,7 +503,10 @@ function labelledMembersFor(
       claims.scan_root,
       claims.type_packages
     );
-    log(`Read ${labels.sends.size} labelled send and ${labels.bodies.size} body member(s) for handler parameters`);
+    log(
+      `Read ${labels.sends.size} labelled send and ${labels.bodies.size} body member(s) for handler parameters ` +
+        `from ${claims.checks.length} claim(s) in ${fromDir}: ${JSON.stringify(labels.outcomes ?? {})}`
+    );
     built.labelledMembers.set(key, labels);
   }
   return labels;

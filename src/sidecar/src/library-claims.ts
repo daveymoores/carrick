@@ -893,15 +893,19 @@ export class LibraryClaimsVerifier {
       check => check.role === 'server_framework' && (check.claim.kind === 'make' || check.claim.kind === 'scope')
     );
     if (wanted.length === 0) return { sends, bodies };
+    const outcomes: Record<string, number> = {};
     const observe = (check: LibraryCheck, outcome: Outcome): void => {
-      if (outcome.verdict !== 'verified' || check.claim.kind !== 'op') return;
+      if (check.claim.kind !== 'op') return;
+      const read = outcome.verdict === 'verified' ? 'verified' : `${outcome.verdict} ${outcome.reason}`;
+      outcomes[read] = (outcomes[read] ?? 0) + 1;
+      if (outcome.verdict !== 'verified') return;
       if (check.claim.op === 'send' && check.claim.payload !== undefined) {
         for (const member of outcome.members ?? []) sends.set(declarationKey(member), check.claim.payload);
       }
       for (const member of outcome.bodyMembers ?? []) bodies.add(declarationKey(member));
     };
     this.run(fromDir, [...context, ...wanted], budgetMs, scanRoot, { observe, readReplies: true, typePackages });
-    return { sends, bodies };
+    return { sends, bodies, outcomes };
   }
 
   /**
@@ -1169,6 +1173,8 @@ export function declarationKey(declaration: ts.Node): string {
 export interface LabelledMembers {
   sends: ReadonlyMap<string, ClaimSlot>;
   bodies: ReadonlySet<string>;
+  /** How each label read came out (`verified`, or the reason it was not), for the log. */
+  outcomes?: Readonly<Record<string, number>>;
 }
 
 /**
