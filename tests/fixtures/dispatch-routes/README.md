@@ -67,3 +67,15 @@ The files added for the handler records (R4b):
 - `report.ts` + `check.ts`: a predicate called from an entry handler with
   an unread argument (`resolve(request)`): the chain stops in the handler,
   so the predicate's comparison is the handler's.
+
+The file added for carrick#2693:
+
+- `action.ts`: a method literal compared with something other than the
+  request's method member (a body's `action`, a header) beside a path
+  comparison: on the entry arm with a member read off the request
+  (`req.body.action` in `patch`) and off another value (`body.action` in
+  `act`), on a hole in an entry handler (`clean(request.url)`) and on a
+  hole in a label handler (`clean(req.url)`). Each is asked and answered `route` in band
+  (`handler-answers.json`, written for this file, not a live repeat), and
+  each ends `no_method`: the literal chooses no method, and the record
+  lists no method to the model (nor `other.method` in `negatives.ts`).

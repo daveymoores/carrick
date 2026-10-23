@@ -45,9 +45,7 @@ use super::super::guards::{
     GuardShape,
 };
 use super::super::site_record::numbered;
-use super::{
-    Evidence, MethodGuard, Methods, Reached, Reader, count, end_kind, method_of, method_reaching,
-};
+use super::{MethodGuard, Reached, Reader, count, end_kind, method_of, method_reaching};
 use crate::site_questions::{
     CodeWindow, ComparisonHole, ComparisonPosition, ComparisonRead, ForcedRoute, HandlerComparison,
     HandlerRecord, HandlerRef, HandlerSubject, MAX_SHARED_HANDLERS, MethodLiteral, ScopePrefix,
@@ -247,21 +245,26 @@ pub fn handler_records(
         }
     }
     let mut handlers: BTreeMap<usize, Handler> = BTreeMap::new();
-    // Each method guard (by address) and the handlers its chains reach.
+    // Each method guard (by address) and the handlers its chains reach
+    // reading the request's method member: only those decide a method for a
+    // comparison that has no anchor of its own (carrick#2693).
     let mut method_handlers: HashMap<usize, BTreeSet<usize>> = HashMap::new();
     let mut stated_methods: Vec<Stated<'_>> = Vec::new();
     let mut nodes: Vec<&usize> = methods.keys().collect();
     nodes.sort();
     for node in nodes {
         for candidate in &methods[node] {
-            let mut reached = BTreeSet::new();
+            let mut decides = BTreeSet::new();
             for (chain, facts) in &candidate.chains {
                 if chain.negated {
                     continue;
                 }
+                let reads_method = reader.reads_method(chain, facts);
                 for (handler, kind) in attacher.attach_method(*node, chain, facts) {
                     handlers.entry(handler).or_insert(kind);
-                    reached.insert(handler);
+                    if reads_method {
+                        decides.insert(handler);
+                    }
                 }
             }
             if paths.iter().any(|(at, path, _)| {
@@ -272,15 +275,17 @@ pub fn handler_records(
             }) {
                 count(&mut out.counts, "methods_in_branch");
             }
-            method_handlers.insert(address(candidate.guard), reached.clone());
-            if !reached.is_empty() {
+            // A record shows the model only the methods the code states: a
+            // literal compared with another value is no method (carrick#2693).
+            if !decides.is_empty() {
                 stated_methods.push(Stated {
                     node: *node,
                     guard: candidate.guard,
                     literal: candidate.method.clone(),
-                    handlers: reached,
+                    handlers: decides.clone(),
                 });
             }
+            method_handlers.insert(address(candidate.guard), decides);
         }
     }
     let mut compared: Vec<Compared<'_>> = Vec::new();
@@ -492,19 +497,7 @@ impl Attacher<'_, '_> {
         if let Some(handoff) = &facts.handoff {
             return match self.reader.labelled(chain, handoff) {
                 Ok(reached) => {
-                    let label = match &reached.evidence {
-                        Evidence::Label {
-                            package,
-                            export,
-                            member,
-                            ..
-                        } => SubjectLabel {
-                            package: package.clone(),
-                            export: export.clone(),
-                            member: member.clone(),
-                        },
-                        Evidence::EntryPoint { .. } => unreachable!("the label arm"),
-                    };
+                    let label = reached.label.clone().expect("the label arm");
                     Ok(Attached {
                         to: vec![(handoff.handed, self.label_handler(label))],
                         arm: Arm::Proven(reached, facts.clone()),
@@ -576,7 +569,9 @@ impl Attacher<'_, '_> {
     }
 
     /// The handlers a method literal's `chain` reaches: a path read is not
-    /// asked of it, so on the label arm the handler slot is enough.
+    /// asked of it, so on the label arm the handler slot is enough. The
+    /// literal decides a method only where the chain also reads the
+    /// request's method member ([`Reader::reads_method`]).
     fn attach_method(
         &self,
         node: usize,
@@ -730,12 +725,8 @@ impl Builder<'_, '_> {
         handler: usize,
         arm: &Arm,
     ) -> (Option<String>, Option<String>) {
-        let one = |methods: Methods| match methods {
-            Methods::One(method) => Some(method),
-            _ => None,
-        };
         let by_handler = |facts: &ChainFacts| {
-            one(method_reaching(
+            method_reaching(
                 comparison.node,
                 comparison.guard,
                 facts,
@@ -745,28 +736,28 @@ impl Builder<'_, '_> {
                         .get(&address(candidate.guard))
                         .is_some_and(|reached| reached.contains(&handler))
                 },
-            ))
+            )
         };
         match arm {
             Arm::Proven(reached, facts) => (
                 Some(comparison.literal.clone()),
-                one(method_of(
+                method_of(
                     comparison.node,
                     comparison.guard,
                     facts,
                     reached,
                     self.methods,
-                )),
+                ),
             ),
             Arm::Entry(reached, facts) => (
                 None,
-                one(method_of(
+                method_of(
                     comparison.node,
                     comparison.guard,
                     facts,
                     reached,
                     self.methods,
-                )),
+                ),
             ),
             Arm::Unread(facts) | Arm::Hole { facts, .. } => (None, by_handler(facts)),
         }

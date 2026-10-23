@@ -2,6 +2,42 @@
   "question_set": "57923ce53f90f7c0",
   "answers": [
     {
+      "site_id": "handler:entry:src/action.ts:7:act",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "route",
+          "method": "PUT",
+          "path": "/drafts",
+          "confidence": 0.96,
+          "orders_agree": true
+        },
+        {
+          "id": 1,
+          "choice": "route",
+          "method": "DELETE",
+          "path": "/drafts/all",
+          "confidence": 0.96,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
+      "site_id": "handler:entry:src/action.ts:19:patch",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "route",
+          "method": "PATCH",
+          "path": "/drafts/one",
+          "confidence": 0.96,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
       "site_id": "handler:entry:src/check.ts:7:check",
       "ok": true,
       "routes": [
@@ -137,6 +173,20 @@
           "method": null,
           "path": "/version",
           "confidence": 1,
+          "orders_agree": true
+        }
+      ]
+    },
+    {
+      "site_id": "handler:label:src/action.ts:26:createServer_handler",
+      "ok": true,
+      "routes": [
+        {
+          "id": 0,
+          "choice": "route",
+          "method": "DELETE",
+          "path": "/purge",
+          "confidence": 0.96,
           "orders_agree": true
         }
       ]

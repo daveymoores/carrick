@@ -11,9 +11,9 @@
 use carrick::agent_service::{AgentCallError, AgentService};
 use carrick::site_questions::{
     self, Answered, HandlerQuestionsRequest, MAX_ASKED_COMPARISONS, MAX_REQUEST_BYTES,
-    MAX_SITES_PER_REQUEST, NO_ANSWER_CODE, ROUTE, RouteChoice, SiteAnswer, SiteQuestion,
-    SiteQuestionsRequest, SlotAnswer, SlotValue, TOO_LARGE_CODE, Unanswered, ask, ask_service,
-    ask_within, batches, enabled_from, parse_response, parse_routes_answer,
+    MAX_SITES_PER_REQUEST, NO_ANSWER_CODE, ROUTE, RouteChoice, SiteQuestion, SiteQuestionsRequest,
+    SlotAnswer, SlotValue, TOO_LARGE_CODE, Unanswered, ask, ask_service, ask_within, batches,
+    enabled_from, parse_routes_answer, read_response,
 };
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -78,38 +78,38 @@ fn slot(value: Option<SlotValue>, confidence: f64, orders_agree: bool) -> Option
 
 #[test]
 fn the_response_reads_as_two_answers_a_retriable_failure_and_a_final_one() {
-    let (question_set, answers) = parse_response(&response_text("qs-1"));
+    let (question_set, answers) = read_response::<SiteQuestion>(&response_text("qs-1"));
     assert_eq!(question_set.as_deref(), Some("qs-1"));
     assert_eq!(
         answers["s-0001"],
-        SiteAnswer::Answered(Box::new(Answered {
+        Ok(Answered {
             name: slot(Some(SlotValue::Text("/v1/orders".into())), 0.58, true),
             name_argument: slot(Some(SlotValue::Index(0)), 0.97, true),
             payload_argument: slot(None, 0.88, true),
             ..Answered::default()
-        }))
+        })
     );
     assert_eq!(
         answers["s-0002"],
-        SiteAnswer::Answered(Box::new(Answered {
+        Ok(Answered {
             kind: slot(Some(SlotValue::Text("topic".into())), 0.93, true),
             role: slot(Some(SlotValue::Text("sends".into())), 0.98, true),
             name: slot(Some(SlotValue::Text("order.paid".into())), 0.47, false),
             name_argument: slot(Some(SlotValue::Index(0)), 0.95, true),
             payload_argument: slot(Some(SlotValue::Index(1)), 0.96, true),
             ..Answered::default()
-        }))
+        })
     );
     assert_eq!(
         answers["s-0003"],
-        SiteAnswer::Failed(Unanswered {
+        Err(Unanswered {
             code: "model_error".into(),
             retriable: true
         })
     );
     assert_eq!(
         answers["s-0004"],
-        SiteAnswer::Failed(Unanswered {
+        Err(Unanswered {
             code: "answer_malformed".into(),
             retriable: false
         })
@@ -120,10 +120,10 @@ fn the_response_reads_as_two_answers_a_retriable_failure_and_a_final_one() {
 fn an_unreadable_answer_costs_only_its_site() {
     let mut response = contract()["response"].clone();
     response["answers"][1]["kind"] = json!("not a slot");
-    let (_, answers) = parse_response(&response.to_string());
+    let (_, answers) = read_response::<SiteQuestion>(&response.to_string());
     assert!(answers.contains_key("s-0001"));
     assert!(!answers.contains_key("s-0002"));
-    assert_eq!(parse_response("not json").1.len(), 0);
+    assert_eq!(read_response::<SiteQuestion>("not json").1.len(), 0);
 }
 
 /// Every request a fake transport was handed.

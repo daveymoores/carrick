@@ -15,7 +15,7 @@ use crate::request_summary::site_record::{
     AnchorAt, Basis, Bucket, HandlerAnchor, SiteRecord, TypeAnchors,
 };
 use crate::site_questions::{
-    Answered, SiteAnswer, SiteAnswers, SiteState, Slot, SlotAnswer, SlotValue, parse_response,
+    Answered, SiteAnswers, SiteQuestion, SiteState, Slot, SlotAnswer, SlotValue, read_response,
 };
 
 const LINE: u32 = 7;
@@ -26,17 +26,17 @@ fn cassette() -> SiteAnswers {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site_rows/answers.json"),
     )
     .unwrap();
-    let (question_set, answers) = parse_response(&text);
+    let (question_set, answers) = read_response::<SiteQuestion>(&text);
     let mut out = SiteAnswers {
         question_set,
         ..SiteAnswers::default()
     };
     for (id, answer) in answers {
         match answer {
-            SiteAnswer::Answered(answered) => {
-                out.answered.insert(id, *answered);
+            Ok(answered) => {
+                out.answered.insert(id, answered);
             }
-            SiteAnswer::Failed(failed) => {
+            Err(failed) => {
                 out.unanswered.insert(id, failed);
             }
         }

@@ -14,6 +14,10 @@
     "src/worker.ts:15 POST /orders model"
   ],
   "possible_calls": [
+    "src/action.ts:10 no_method",
+    "src/action.ts:13 no_method",
+    "src/action.ts:20 no_method",
+    "src/action.ts:27 no_method",
     "src/fake.ts:10 owner_unknown",
     "src/mounted.ts:20 owner_unknown",
     "src/mounted.ts:5 owner_unknown",
