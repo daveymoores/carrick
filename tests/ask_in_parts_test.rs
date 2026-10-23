@@ -31,7 +31,7 @@ use carrick::agents::file_analyzer_agent::{FileAnalysisResult, FileAnalyzerAgent
 use carrick::agents::file_orchestrator::{
     FILE_TOO_LARGE_CODE, FileCentricAnalysisResult, FileOrchestrator, ListedCandidate,
     MAX_PART_CANDIDATES, PART_CONTEXT_BYTES, PART_WINDOW_BYTES, PartAnswer, WHOLE_PROMPT_MAX_BYTES,
-    merge_part_answers,
+    WRAPPER_SNIPPET_MAX, merge_part_answers,
 };
 use carrick::agents::framework_guidance_agent::{
     FrameworkGuidance, PatternExample, ProtocolGuidance,
@@ -1845,6 +1845,114 @@ async fn a_candidate_inside_an_item_that_cannot_be_cut_names_the_file() {
             .any(|lost| lost.path == fx.table),
         "and is not owed (carrick#2488)"
     );
+}
+
+/// How many plugin modules the wiring module registers: enough that their
+/// attached sources, each at the cap, are over the line together.
+const PLUGINS: usize = 70;
+
+/// A plugin module: one route, then a comment that runs the module past the
+/// cap its source is attached under.
+fn plugin_source(tag: &str, n: usize) -> String {
+    format!(
+        "export async function plugin{n}(app: any) {{\n  app.get(\"/{tag}/p/{n}\", async () => ({{ plugin: {n} }}));\n}}\n// {}\n",
+        "pad ".repeat(WRAPPER_SNIPPET_MAX / 4)
+    )
+}
+
+/// A wiring module: an import per plugin, a data table longer than a window,
+/// and one registration whose inline callback registers every plugin.
+fn wiring_source(tag: &str) -> String {
+    let mut out = String::new();
+    for n in 0..PLUGINS {
+        writeln!(out, "import {{ plugin{n} }} from \"./plugins/plugin{n}\";").unwrap();
+    }
+    out.push_str("export const notes = [\n");
+    for i in 0..(PART_WINDOW_BYTES / 60 + 100) {
+        writeln!(
+            out,
+            "  \"note {i:05}: a line of data that runs nothing at all\","
+        )
+        .unwrap();
+    }
+    out.push_str("];\n");
+    out.push_str("export async function wire(server: any) {\n");
+    out.push_str("  await server.register(async (api: any) => {\n");
+    out.push_str("    const settings = { ready: true };\n");
+    for n in 0..PLUGINS {
+        writeln!(out, "    await api.register(plugin{n});").unwrap();
+    }
+    writeln!(out, "  }}, {{ prefix: \"/{tag}\" }});").unwrap();
+    out.push_str("}\n");
+    out
+}
+
+/// carrick#2486: a registration whose inline callback holds the rest of the
+/// file names, inside its call, every module the callback registers. The
+/// part that lists it carries only the modules named on the lines it shows,
+/// so the file is asked in parts under the line rather than lost.
+#[tokio::test]
+#[serial]
+async fn a_registration_whose_callback_holds_the_file_carries_only_the_modules_its_part_shows() {
+    offline();
+    let tag = "wiring";
+    let mut modules: Vec<(String, String)> = (0..PLUGINS)
+        .map(|n| (format!("src/plugins/plugin{n}.ts"), plugin_source(tag, n)))
+        .collect();
+    let subject = format!("src/{tag}.ts");
+    let source = wiring_source(tag);
+    modules.push((subject.clone(), source.clone()));
+    let fx = Fixture::of(&modules, &subject);
+
+    let (dumps, sent) = fx.dumped_run().await;
+    assert_eq!(lost_reason(&fx.table), None, "the file is asked, not lost");
+    assert!(dumps.whole.is_none(), "the file is over the line");
+    assert_eq!(sent, PLUGINS + dumps.parts.len());
+    for (label, prompt) in &dumps.parts {
+        assert!(
+            prompt.len() <= WHOLE_PROMPT_MAX_BYTES,
+            "part {label} is {} bytes",
+            prompt.len()
+        );
+    }
+    let listed = listed_in_parts(&dumps.parts);
+    assert_eq!(
+        listed.len(),
+        PLUGINS + 1,
+        "every registration is asked once"
+    );
+
+    // The part that lists the outer registration attaches the plugins its
+    // shown lines register, and no other.
+    let outer_line = source
+        .lines()
+        .position(|line| line.contains("server.register("))
+        .unwrap() as i64
+        + 1;
+    let outer: Vec<&String> = dumps
+        .parts
+        .values()
+        .filter(|prompt| listed_in(prompt).iter().any(|c| c.line == outer_line))
+        .collect();
+    let [prompt] = outer[..] else {
+        panic!("one part lists the outer registration: {}", outer.len());
+    };
+    let shown: Vec<usize> = file_section(prompt)
+        .fence
+        .iter()
+        .filter(|line| line_number(line).is_some())
+        .filter_map(|line| {
+            let rest = line.split_once("api.register(plugin")?.1;
+            rest.split(')').next()?.parse().ok()
+        })
+        .collect();
+    let mut expected: Vec<String> = shown
+        .iter()
+        .map(|n| format!("src/plugins/plugin{n}.ts"))
+        .collect();
+    expected.sort();
+    assert!(!expected.is_empty() && expected.len() < PLUGINS);
+    assert_eq!(attached_modules(prompt), expected);
 }
 
 /// `count` interfaces, each a declaration that runs nothing.

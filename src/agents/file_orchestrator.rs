@@ -2180,7 +2180,13 @@ impl FileOrchestrator {
     /// file's own prompt, showing the part's window and what the window uses
     /// in place of the file, listing only the part's candidates and only the
     /// imports its shown lines name, and carrying only the modules its
-    /// candidates name through an import.
+    /// candidates name through an import on a line the part shows.
+    ///
+    /// A candidate's call can run far past the part's window: a registration
+    /// whose inline callback holds the rest of the file names every module
+    /// registered inside it. A module named only on lines the part does not
+    /// show is nothing the part's prompt can be read against, and attaching
+    /// it can push a part of a few lines over the line (carrick#2486).
     ///
     /// A part that lists no candidate carries the modules its window names
     /// through an import, and every part of a file with no candidate at all
@@ -2224,10 +2230,17 @@ impl FileOrchestrator {
                     .collect(),
             )
         } else {
+            let shown_modules: BTreeSet<usize> = file
+                .wrapper_imports
+                .iter()
+                .filter(|(name, _)| shown_names.contains(name.as_str()))
+                .flat_map(|(_, modules)| modules.iter().copied())
+                .collect();
             named.map(|named| {
                 positions
                     .iter()
                     .flat_map(|position| named[*position].iter().copied())
+                    .filter(|place| shown_modules.contains(place))
                     .collect()
             })
         };
