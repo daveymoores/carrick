@@ -164,6 +164,13 @@ pub struct TypeManifestEntry {
     /// `None` unless it differs from `expanded_definition`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unwidened_definition: Option<String>,
+    /// carrick#2100, a producer response only: the response was owed an
+    /// unwidened reading and the sidecar ran out of time before making it, so
+    /// `unwidened_definition` is absent for want of time. A pair judged
+    /// incompatible against `expanded_definition` alone is then published
+    /// unverifiable: the mismatch may be a literal the compiler widened.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unwidened_out_of_budget: bool,
     /// A producer response whose union the handler chooses by a field of the
     /// incoming message (carrick#2054): which fields it reads, and the type
     /// each stated value of one placed field receives. The published type is
@@ -2207,6 +2214,7 @@ mod tests {
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
             v1_state_before_demotion: None,

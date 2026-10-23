@@ -6912,6 +6912,7 @@ fn add_graphql_request_entry(
         defined_in: None,
         any_provenance: Vec::new(),
         unwidened_definition: None,
+        unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
         v1_state_before_demotion: None,
@@ -7159,6 +7160,7 @@ fn add_protocol_manifest_entry(
         defined_in: None,
         any_provenance: Vec::new(),
         unwidened_definition: None,
+        unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
         v1_state_before_demotion: None,
@@ -7998,6 +8000,17 @@ fn run_capture_for_service(
     }
     if let Some(manifest) = cloud_data.type_manifest.as_mut() {
         stamp_response_modes(manifest, &type_resolution.inferred_types);
+        let out_of_budget =
+            stamp_unwidened_out_of_budget(manifest, &type_resolution.inferred_types);
+        if out_of_budget > 0 {
+            debug!(
+                "Unwidened reading ran out of its budget: {out_of_budget} producer response(s) judged without it"
+            );
+        }
+        crate::scan_health::record_time_limit(
+            crate::time_limits::TimeLimit::UnwidenedReading,
+            out_of_budget,
+        );
     }
 
     // Literal texts for the last-resort backfill re-anchor: when capture
@@ -9532,6 +9545,25 @@ fn stamp_response_modes(
     }
 }
 
+/// Mark each producer response entry whose published inference was owed an
+/// unwidened reading the sidecar ran out of time to make (carrick#2100), and
+/// return how many were marked. The check reads the mark to keep a mismatch
+/// judged on the widened type alone off the index.
+fn stamp_unwidened_out_of_budget(
+    manifest: &mut [TypeManifestEntry],
+    inferred: &[crate::services::type_sidecar::InferredType],
+) -> usize {
+    let spent = type_compat_v2::unwidened_out_of_budget_aliases(inferred);
+    let mut marked = 0;
+    for entry in manifest.iter_mut() {
+        entry.unwidened_out_of_budget = entry.role == ManifestRole::Producer
+            && entry.type_kind == ManifestTypeKind::Response
+            && spent.contains(entry.type_alias.as_str());
+        marked += usize::from(entry.unwidened_out_of_budget);
+    }
+    marked
+}
+
 /// The literal `key=value` pairs of a call target's query string
 /// (carrick#2054). A key written twice, a value built from an
 /// interpolation, or one carrying an escape (`%`, `+`) states nothing.
@@ -10117,6 +10149,7 @@ fn add_manifest_pair(
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
             v1_state_before_demotion: None,
@@ -13642,6 +13675,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 defined_in: None,
                 any_provenance: Vec::new(),
                 unwidened_definition: None,
+                unwidened_out_of_budget: false,
                 response_modes: None,
                 stated_values: Default::default(),
                 v1_state_before_demotion: None,
@@ -19546,6 +19580,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
             v1_state_before_demotion: None,
@@ -19667,6 +19702,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             member_return_type: None,
             any_provenance: Vec::new(),
             unwidened_type_string: None,
+            unwidened_out_of_budget: false,
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
@@ -19705,6 +19741,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             member_return_type: None,
             any_provenance: Vec::new(),
             unwidened_type_string: None,
+            unwidened_out_of_budget: false,
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
@@ -19743,6 +19780,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             member_return_type: None,
             any_provenance: Vec::new(),
             unwidened_type_string: None,
+            unwidened_out_of_budget: false,
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,

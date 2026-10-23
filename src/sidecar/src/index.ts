@@ -104,6 +104,18 @@ function initializedLoader(): ProjectLoader {
 }
 
 /**
+ * carrick#2100: the unwidened reading's budget in milliseconds, when
+ * `CARRICK_UNWIDENED_BUDGET_MS` sets one. A switch for tests that drive the
+ * scanner's binary: it forces the budget to run out on any machine. Unset or
+ * not a whole number of milliseconds, the inferrer's default stands.
+ */
+function unwidenedBudgetFromEnv(): number | undefined {
+  const value = process.env.CARRICK_UNWIDENED_BUDGET_MS;
+  if (value === undefined || !/^\d+$/.test(value.trim())) return undefined;
+  return Number(value.trim());
+}
+
+/**
  * Get the project-backed components, building the project if this is the
  * first request that needs it.
  *
@@ -125,6 +137,7 @@ function projectComponents(key = ''): ProjectComponents {
       project,
       repoRoot,
       packageOf: (filePath) => loader.packageOf(filePath),
+      unwidenedBudgetMs: unwidenedBudgetFromEnv(),
     });
     built = {
       typeBundler: new TypeBundler({ project, repoRoot }),
