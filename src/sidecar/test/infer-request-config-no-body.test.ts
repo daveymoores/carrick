@@ -2,8 +2,8 @@
  * The `request_config` infer kind: a request call's options object literal,
  * and the member that carries its body. Where the literal writes nothing that
  * can be that member (no spread, no computed key, no member of that name in
- * any form), the call sends no request body, and the inferrer decides it with
- * the reason `no_request_body`. Anything else is not decided here.
+ * any form, and no other body-named member), the call sends no request body,
+ * and the inferrer decides it with the reason `no_request_body`. Anything else is not decided here.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -30,6 +30,10 @@ send('/method', { method() { return 1; }, body() { return 2; } });
 send('/getter', { get body() { return 1; } });
 send('/variable', options);
 send('/other-member', { method: 'POST', payload: 1 });
+send('/json', { method: 'POST', json: note });
+send('/form', { method: 'POST', form: { a: '1' } });
+send('/data', { method: 'POST', data: note });
+send('/quoted-json', { method: 'POST', 'json': note });
 declare const body: string;
 `;
 
@@ -117,6 +121,22 @@ describe('request_config infer kind', () => {
     const other = await configAnswer('/other-member', 'data');
     assert.match(other?.any_provenance?.[0]?.detail ?? '', /'data'/);
   });
+
+  // A client labelled with one body member may take its body through another
+  // (`json`, `form`, `data`), so a literal that writes any body-named key is
+  // not decided, whichever member the locator names.
+  for (const [route, member] of [
+    ['/json', 'body'],
+    ['/form', 'body'],
+    ['/data', 'body'],
+    ['/quoted-json', 'body'],
+    ['/writes', 'data'],
+    ['/json', 'payload'],
+  ] as const) {
+    it(`does not decide where the literal writes another body member (${route}, ${member})`, async () => {
+      assert.strictEqual(await configAnswer(route, member), undefined);
+    });
+  }
 
   for (const route of [
     '/writes',

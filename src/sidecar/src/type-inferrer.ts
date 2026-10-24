@@ -6635,7 +6635,8 @@ export class TypeInferrer {
    * and the member that carries the call's body. The call sends no request
    * body when the literal can write no such member: no spread, no computed
    * key, and no member of that name in any form (assignment, shorthand,
-   * method, accessor, quoted key). Anything else is not decided here, so the
+   * method, accessor, quoted key), nor any other body-named member
+   * (`BODY_MEMBER_NAMES`, `REQUEST_BODY_PARTS`). Anything else is not decided here, so the
    * answer is null. `configArgumentBody` stays the reader of the member
    * itself; the checks above it are this kind's own.
    */
@@ -6661,7 +6662,12 @@ export class TypeInferrer {
         Node.isStringLiteral(nameNode) || Node.isNoSubstitutionTemplateLiteral(nameNode)
           ? nameNode.getLiteralText()
           : nameNode.getText();
-      if (name === member) return null;
+      // A client may take its body through a member other than the one the
+      // locator names (`json`, `form`, `data`), so any body-named key refuses,
+      // the same rule `requestObjectBody` keeps.
+      if (name === member || BODY_MEMBER_NAMES.has(name) || REQUEST_BODY_PARTS.has(name)) {
+        return null;
+      }
     }
     const read = this.configArgumentBody(literal, member, "the call's request config");
     if (read.kind !== 'no_body') return null;
