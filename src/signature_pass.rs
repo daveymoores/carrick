@@ -520,6 +520,7 @@ fn build_infer_requests(
             let alias = format!("__sig{counter}");
             counter += 1;
             requests.push(InferRequestItem {
+                member: None,
                 file_path: file_path.clone(),
                 line_number: def.line_number,
                 span_start: None,
@@ -546,6 +547,7 @@ fn build_infer_requests(
             let alias = format!("__sig{counter}");
             counter += 1;
             requests.push(InferRequestItem {
+                member: None,
                 file_path: file_path.clone(),
                 line_number: def.line_number,
                 span_start: None,

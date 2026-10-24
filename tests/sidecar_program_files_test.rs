@@ -86,6 +86,7 @@ fn ask(sidecar: &TypeSidecar, root: &Path, modules: &[(&str, &str)]) -> Vec<Stri
                 .expect("a function")
                 + 1;
             let item = InferRequestItem {
+                member: None,
                 file_path: root.join(file).to_string_lossy().into_owned(),
                 line_number: line as u32,
                 span_start: None,

@@ -450,8 +450,9 @@ pub struct ObjValue {
     /// holds: the parameter's position and the keys the destructuring takes
     /// out, with how many functions out the parameter is (0: this one's;
     /// a closure reads its enclosing function's, carrick#1949). Only a
-    /// decided site's option key (its method) reads this; the body a request
-    /// sends does not, so no body row moves.
+    /// decided site's option keys (its method, and its payload slot's key,
+    /// carrick#2674) read this; the body a request sends does not, so no body
+    /// row moves.
     pub under_rest: Option<(u8, usize, BTreeSet<String>)>,
     /// The keys whose value depends on which spread branch runs (carrick#2474
     /// R5e): `open` is also set, for the readers that only ask whether
@@ -476,8 +477,9 @@ pub enum KeyState<'a> {
 }
 
 impl ObjValue {
-    /// What this object states about `key`. Only a prefix slot reads this
-    /// (carrick#2474 R5e); body and name readers keep `open`.
+    /// What this object states about `key`. Only a prefix slot and a payload
+    /// slot's key read this (carrick#2474 R5e, carrick#2674); body and name
+    /// readers keep `open`.
     pub fn key(&self, key: &str) -> KeyState<'_> {
         match self.fields.get(key) {
             Some(value) => KeyState::Known(value),
@@ -4164,12 +4166,13 @@ struct Scope<'a> {
     /// The rest element of a parameter the body unpacks (`const { path,
     /// ...rest } = config`, or `= init ?? {}`), with the parameter's
     /// position and every key the pattern takes out (carrick#2519): it holds
-    /// the caller's other keys. Never a binding declared twice or assigned
-    /// again.
+    /// the caller's other keys. Never a binding declared twice, assigned
+    /// again or written through ([`guards::WrittenThrough`], carrick#2674).
     rest_of: HashMap<BindingKey, (u8, usize, BTreeSet<String>)>,
     /// The plain parameters whose keys the body may read as the caller wrote
     /// them (`options.url`, `const { url } = options`): never one the body
-    /// assigns again, nor one whose name the file writes through.
+    /// assigns again, nor one whose name the file writes through, nor one the
+    /// function hands to `Object.assign` as its target (carrick#2674).
     key_objects: HashSet<BindingKey>,
     /// [`Captured::objects`]: an enclosing function's parameter whose keys
     /// this body reads (`props.endpoint` in a closure), read as
@@ -4288,6 +4291,7 @@ impl<'a> Scope<'a> {
             if let Some(key) = &key
                 && settled(key)
                 && !module.written_through(&key.0)
+                && !self.written_through.contains(&key.0)
             {
                 self.key_objects.insert(key.clone());
             }
@@ -5202,9 +5206,11 @@ impl Reader<'_> {
     fn body(&self, stmts: &[Stmt], scope: &mut Scope<'_>, ir: &mut FnIr) {
         let mut reassigned = Reassigned::default();
         let mut declared = Declarations::default();
+        let mut written_through = HashSet::new();
         for stmt in stmts {
             stmt.visit_with(&mut reassigned);
             stmt.visit_with(&mut declared);
+            written_through.extend(guards::WrittenThrough::of(stmt));
         }
         // A parameter the body assigns again may hold anything.
         scope
@@ -5266,13 +5272,15 @@ impl Reader<'_> {
                     // the body declares the name once and never assigns it
                     // again.
                     // `const { path, ...rest } = config` (or `= init ?? {}`):
-                    // the rest holds the caller's other keys (carrick#2519).
+                    // the rest holds the caller's other keys (carrick#2519),
+                    // unless the body writes a key onto it (carrick#2674).
                     if let (Pat::Object(object), Some(init)) = (&declarator.name, &declarator.init)
                         && let Some(source) = param_or_empty(init)
                         && scope.key_objects.contains(&ident_key(source))
                         && let Some(index) = scope.param_index(source)
                         && let Some((rest, taken)) = rest_and_taken(object)
                         && !reassigned.names.contains(&rest.0)
+                        && !written_through.contains(&rest.0)
                         && declared.binding_count(&rest) == 1
                     {
                         scope.rest_of.insert(rest, (0, index, taken));

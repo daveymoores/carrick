@@ -81,8 +81,13 @@ fn scan(repo: &Path, env: &[(&str, &str)]) -> serde_json::Value {
     blobs.remove(0)
 }
 
-/// The alias of the consumer `kind` entry at `src/orders.ts:14`.
-fn alias(blob: &serde_json::Value, kind: &str) -> String {
+/// The consumer `kind` entry at `file:line`.
+fn entry_at<'a>(
+    blob: &'a serde_json::Value,
+    kind: &str,
+    file: &str,
+    line: u64,
+) -> &'a serde_json::Value {
     let entries: Vec<&serde_json::Value> = blob["type_manifest"]
         .as_array()
         .expect("type_manifest")
@@ -90,12 +95,24 @@ fn alias(blob: &serde_json::Value, kind: &str) -> String {
         .filter(|entry| {
             entry["role"] == "consumer"
                 && entry["type_kind"] == kind
-                && entry["file_path"] == "src/orders.ts"
-                && entry["line_number"] == 14
+                && entry["file_path"] == file
+                && entry["line_number"] == line
         })
         .collect();
     assert_eq!(entries.len(), 1, "one consumer {kind} entry: {entries:#?}");
-    entries[0]["type_alias"].as_str().unwrap().to_string()
+    entries[0]
+}
+
+/// The alias of the consumer `kind` entry at `src/orders.ts:14`.
+fn alias(blob: &serde_json::Value, kind: &str) -> String {
+    alias_at(blob, kind, "src/orders.ts", 14)
+}
+
+fn alias_at(blob: &serde_json::Value, kind: &str, file: &str, line: u64) -> String {
+    entry_at(blob, kind, file, line)["type_alias"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 /// What the capture stub says `alias` is: the right-hand side of its
@@ -167,4 +184,52 @@ fn with_the_switch_at_anything_but_one_the_blob_is_unchanged() {
     assert_eq!(captured(&not_one, &response), captured(&off, &response));
     assert_eq!(off["type_manifest"], not_one["type_manifest"]);
     assert_eq!(off["capture_stub"], not_one["capture_stub"]);
+}
+
+/// carrick#2674 P3-1a: a wrapper hands its caller's options on through the
+/// rest of a destructured parameter (`src/notes.ts`). Switch on, the caller
+/// whose literal writes no `body` is decided "no body": its request entry
+/// names the root reason `no_request_body` and the capture prints `unknown`,
+/// not the options literal's own type. The caller that writes a body is typed
+/// at the body's value. Switch off, neither is read.
+#[test]
+fn a_caller_that_writes_no_body_through_a_wrapper_is_decided_no_body() {
+    // The global `fetch` is a decided site only with the site questions on,
+    // as the Action runs them.
+    let off = scan(&fixture_dir(), &[("CARRICK_SITE_QUESTIONS", "1")]);
+    let on = scan(
+        &fixture_dir(),
+        &[
+            ("CARRICK_SITE_QUESTIONS", "1"),
+            ("CARRICK_SITE_PAYLOADS", "1"),
+        ],
+    );
+    let (note, ping) = (14_u64, 18_u64);
+
+    let ping_entry = entry_at(&on, "request", "src/notes.ts", ping);
+    let reasons: Vec<&str> = ping_entry["any_provenance"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row["path"] == "")
+                .filter_map(|row| row["reason"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(reasons, vec!["no_request_body"], "{ping_entry:#?}");
+    let ping_type = captured(&on, ping_entry["type_alias"].as_str().unwrap());
+    assert_eq!(ping_type.trim_end_matches(';'), "unknown", "{ping_type}");
+
+    let note_alias = alias_at(&on, "request", "src/notes.ts", note);
+    let note_type = captured_block(&on, &note_alias);
+    assert!(note_type.contains("text: string"), "request: {note_type}");
+
+    // Off, the options literal's own type is not read as a decision.
+    let off_entry = entry_at(&off, "request", "src/notes.ts", ping);
+    assert!(
+        off_entry["any_provenance"]
+            .as_array()
+            .is_none_or(|rows| rows.iter().all(|row| row["reason"] != "no_request_body")),
+        "{off_entry:#?}"
+    );
 }

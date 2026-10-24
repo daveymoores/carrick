@@ -805,6 +805,7 @@ export async function getOrderCount(): Promise<number> {
     }];
     // The LLM's compact single-line locator for the multi-line call.
     let infer = vec![InferRequestItem {
+        member: None,
         file_path: repo.join("src/api.ts").to_string_lossy().to_string(),
         line_number: 7,
         span_start: None,
@@ -1008,6 +1009,7 @@ notificationRouter.get('/status', async () => {
     }];
     // Span locator only — the live data_call carried no expression text.
     let infer = vec![InferRequestItem {
+        member: None,
         file_path: repo.join("src/api.ts").to_string_lossy().to_string(),
         line_number,
         span_start: Some(span_start),
@@ -1184,6 +1186,7 @@ notificationRouter.get('/status', async () => {
         consumer_response: false,
     }];
     let infer = vec![InferRequestItem {
+        member: None,
         file_path: repo.join("src/api.ts").to_string_lossy().to_string(),
         line_number,
         span_start: Some(span_start),
@@ -1415,6 +1418,7 @@ export function onOrderPlaced(evt: OrderPlaced): void {
         },
     ];
     let infer_item = |alias: &str| InferRequestItem {
+        member: None,
         file_path: subscriber_file.clone(),
         line_number: 4,
         span_start: None,
