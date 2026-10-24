@@ -37,29 +37,42 @@ pub(super) struct Composed {
     pub(super) scope_files: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// The repo-relative directory of a service, from its serialized
-/// `carrick.json` entry: `None` for the repository root, which owns every
-/// file.
-fn directory(service: &ServiceRoutes<'_>) -> Option<String> {
+/// The directory of a service as path segments, from its serialized
+/// `carrick.json` entry: empty for the repository root, `None` for a
+/// service whose entry is missing or unreadable (it owns no file).
+fn directory(service: &ServiceRoutes<'_>) -> Option<Vec<String>> {
     let json: serde_json::Value =
         serde_json::from_str(service.data.config_json.as_deref()?).ok()?;
-    let directory = json.get("directory")?.as_str()?;
-    let directory = directory.trim_start_matches("./").trim_end_matches('/');
-    (!directory.is_empty() && directory != ".").then(|| directory.to_string())
+    let directory = json.get("directory").and_then(serde_json::Value::as_str);
+    Some(
+        crate::config::directory_segments(directory)
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
-/// The file and line of a graph row's `file_location`, repo-relative.
-fn place(location: &str, repo_path: &str) -> Option<(String, u32)> {
-    let (file, line) = super::file_and_line(location)?;
-    let normal = super::super::normalize_protocol_file(Path::new(file));
-    let root = super::super::normalize_protocol_file(Path::new(repo_path));
-    let relative = normal.strip_prefix(&root).unwrap_or(&normal);
-    let relative = relative
-        .components()
-        .map(|part| part.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
-    Some((relative, line))
+/// Whether the service at `service` owns the repo-relative `file`: the
+/// file sits under its directory and under no other service's directory
+/// that is strictly longer, the rule `Config::resolve_nested` gives a
+/// nested service's files (carrick#553).
+fn owns(directories: &[Option<Vec<String>>], service: usize, file: &str) -> bool {
+    let Some(own) = &directories[service] else {
+        return false;
+    };
+    let file = crate::config::directory_segments(Some(file));
+    let under = |directory: &Vec<String>| {
+        file.len() >= directory.len()
+            && directory
+                .iter()
+                .zip(&file)
+                .all(|(segment, part)| segment == part)
+    };
+    under(own)
+        && !directories
+            .iter()
+            .flatten()
+            .any(|other| other.len() > own.len() && under(other))
 }
 
 /// Where one documentation row's fold goes: the service and graph row of
@@ -82,11 +95,9 @@ pub(super) fn fold(
     if routes.is_empty() {
         return;
     }
-    let roots: Vec<Option<String>> = services.iter().map(directory).collect();
-    let owns = |service: usize, file: &str| match &roots[service] {
-        None => true,
-        Some(root) => Path::new(file).starts_with(root),
-    };
+    let directories: Vec<Option<Vec<String>>> = services.iter().map(directory).collect();
+    let owns = |service: usize, file: &str| owns(&directories, service, file);
+    let repo_root = super::super::normalize_protocol_file(Path::new(repo_path));
     let mut taken: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mut folds: Vec<(usize, usize, Fold)> = Vec::new();
     for (x, documenting) in services.iter().enumerate() {
@@ -106,11 +117,6 @@ pub(super) fn fold(
                     && MountGraph::paths_equal_modulo_param_names(&row.full_path, &doc.full_path)
                     && row.dispatch == doc.dispatch
             };
-            // Another row of its own service serving the operation is the
-            // in-service fold's to settle.
-            if graph.endpoints.iter().any(same_operation) {
-                continue;
-            }
             // The routes another service resolved to this operation through
             // a call written in this service's files.
             let composed: Vec<&Composed> = routes
@@ -125,6 +131,13 @@ pub(super) fn fold(
                 })
                 .collect();
             if composed.is_empty() {
+                continue;
+            }
+            // Another row of its own service serving the operation is the
+            // in-service fold's to settle: the documentation row stays here,
+            // and counts.
+            if graph.endpoints.iter().any(same_operation) {
+                folds.push((x, index, Fold::Refused));
                 continue;
             }
             let partners: Vec<(usize, usize)> = services
@@ -144,7 +157,8 @@ pub(super) fn fold(
             let fold = match partners.as_slice() {
                 [(y, row)] if !taken.contains(&(*y, *row)) && services[*y].writable => {
                     let partner = &services[*y].data.mount_graph.as_ref().unwrap().endpoints[*row];
-                    let at = place(&partner.file_location, repo_path);
+                    let at = super::super::row_place(&partner.file_location, &repo_root)
+                        .map(|(_, relative, line)| (relative, line));
                     let at_route = composed.iter().any(|route| {
                         route.service == *y && at == Some((route.file.clone(), route.line))
                     });
@@ -241,5 +255,204 @@ fn parts<'d>(service: &'d mut ServiceRoutes<'_>) -> CloudRepoDataParts<'d> {
             .expect("a service folded into or from has a graph"),
         endpoints: &mut data.endpoints,
         manifest: &mut data.type_manifest,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloud_storage::{
+        CloudRepoData, ManifestRole, ManifestTypeKind, ManifestTypeState, TypeEvidence,
+        TypeManifestEntry,
+    };
+    use crate::request_summary::decided_sites::RouteBoundaries;
+    use crate::services::type_sidecar::InferKind;
+
+    fn row(location: &str, handler: &str, source: Option<ResolutionSource>) -> ResolvedEndpoint {
+        ResolvedEndpoint {
+            view_module: false,
+            method: "GET".to_string(),
+            path: "/users".to_string(),
+            full_path: "/api/users".to_string(),
+            handler: Some(handler.to_string()),
+            owner: "router".to_string(),
+            file_location: location.to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: source,
+            dispatch: None,
+            handler_span: None,
+        }
+    }
+
+    fn producer_entry(file: &str, line: u32) -> TypeManifestEntry {
+        TypeManifestEntry {
+            key: OperationKey::http("GET", "/api/users"),
+            role: ManifestRole::Producer,
+            type_kind: ManifestTypeKind::Response,
+            type_alias: "Users".to_string(),
+            file_path: file.to_string(),
+            line_number: line,
+            is_explicit: true,
+            type_state: ManifestTypeState::Explicit,
+            evidence: TypeEvidence {
+                file_path: file.to_string(),
+                span_start: None,
+                span_end: None,
+                expression_text: None,
+                expression_line: None,
+                line_number: line,
+                infer_kind: InferKind::FunctionReturn,
+                is_explicit: true,
+                type_state: ManifestTypeState::Explicit,
+            },
+            resolved_definition: Some("User[]".to_string()),
+            expanded_definition: Some("User[]".to_string()),
+            primary_type_symbol: None,
+            defined_in: None,
+            any_provenance: Vec::new(),
+            unwidened_definition: None,
+            unwidened_out_of_budget: false,
+            response_modes: None,
+            stated_values: Default::default(),
+            v1_state_before_demotion: None,
+        }
+    }
+
+    fn data(
+        config_json: &str,
+        rows: Vec<ResolvedEndpoint>,
+        manifest: Vec<TypeManifestEntry>,
+    ) -> CloudRepoData {
+        let mut graph = MountGraph::new();
+        graph.endpoints = rows;
+        let mut data: CloudRepoData = serde_json::from_value(serde_json::json!({
+            "repo_name": "repo",
+            "endpoints": [],
+            "calls": [],
+            "mounts": [],
+            "apps": {},
+            "imported_handlers": [],
+            "function_definitions": {},
+            "config_json": config_json,
+            "package_json": null,
+            "packages": null,
+            "last_updated": "2026-10-24T00:00:00Z",
+            "commit_hash": "c0ffee",
+        }))
+        .expect("a minimal blob");
+        data.mount_graph = Some(graph);
+        data.type_manifest = Some(manifest);
+        data
+    }
+
+    /// Fold a repository-root service's documentation row of `GET
+    /// /api/users` against the `services/api` service's typed handler row,
+    /// composed through a scope call in `scope_file`, with `services/web`
+    /// beside them. Whether the documentation row folded.
+    fn root_folds_through(scope_file: &str) -> bool {
+        let (folded, unfolded) = fold_root(scope_file, false);
+        assert_eq!(unfolded, 0, "no handler row composed through its files");
+        folded
+    }
+
+    /// [`root_folds_through`], with the root serving the operation itself
+    /// at `src/users.ts` when `root_serves_it`: whether the documentation
+    /// row folded, and the root's `routes_documented_across_unfolded`.
+    fn fold_root(scope_file: &str, root_serves_it: bool) -> (bool, usize) {
+        let boundaries = RouteBoundaries::default();
+        let mut root_rows = vec![row(
+            "src/docs.ts:3",
+            "__route_descriptor__",
+            Some(ResolutionSource::DescriptorRoute),
+        )];
+        if root_serves_it {
+            root_rows.push(row("src/users.ts:7", "list", None));
+        }
+        let mut root = data(r#"{"serviceName":"root"}"#, root_rows, vec![]);
+        let mut api = data(
+            r#"{"serviceName":"api","directory":"./services/api"}"#,
+            vec![row("services/api/routes.ts:10", "list", None)],
+            vec![producer_entry("services/api/routes.ts", 10)],
+        );
+        let mut web = data(
+            r#"{"serviceName":"web","directory":"services/web/"}"#,
+            vec![],
+            vec![],
+        );
+        let routes = vec![Composed {
+            service: 1,
+            file: "services/api/routes.ts".to_string(),
+            line: 10,
+            method: "GET".to_string(),
+            scope_files: BTreeMap::from([(
+                "/api/users".to_string(),
+                BTreeSet::from([scope_file.to_string()]),
+            )]),
+        }];
+        let mut services = vec![
+            ServiceRoutes {
+                data: &mut root,
+                boundaries: &boundaries,
+                writable: true,
+            },
+            ServiceRoutes {
+                data: &mut api,
+                boundaries: &boundaries,
+                writable: true,
+            },
+            ServiceRoutes {
+                data: &mut web,
+                boundaries: &boundaries,
+                writable: true,
+            },
+        ];
+        let mut counts = vec![BTreeMap::new(); 3];
+        fold(&mut services, &routes, "/repo", &mut counts);
+        let documentation_left = root
+            .mount_graph
+            .as_ref()
+            .unwrap()
+            .endpoints
+            .iter()
+            .filter(|row| FileOrchestrator::is_documentation_row(row))
+            .count();
+        let handler = &api.mount_graph.as_ref().unwrap().endpoints[0];
+        let relabelled = handler.resolution_source == Some(ResolutionSource::DescriptorRoute);
+        assert_eq!(
+            documentation_left == 0,
+            relabelled,
+            "the documentation row goes exactly when its handler row is relabelled"
+        );
+        let unfolded = counts[0]
+            .get("routes_documented_across_unfolded")
+            .copied()
+            .unwrap_or_default();
+        (relabelled, unfolded)
+    }
+
+    /// PR #2750 review: a documentation row whose own service also serves
+    /// the operation is the in-service fold's, and stays; where another
+    /// service's handler row was composed through its files it counts as
+    /// unfolded rather than leaving silently.
+    #[test]
+    fn a_documentation_row_its_own_service_serves_counts_as_unfolded() {
+        assert_eq!(fold_root("src/plugin.ts", true), (false, 1));
+        assert_eq!(fold_root("services/api/plugin.ts", true), (false, 0));
+    }
+
+    /// PR #2750 review: the repository root does not own the files under a
+    /// nested service's directory (`Config::resolve_nested`, carrick#553),
+    /// so a scope call written in the partner's files, or a third
+    /// service's, is no evidence the root's code composed the route. A
+    /// call in the root's own files is.
+    #[test]
+    fn a_root_service_folds_only_through_a_call_in_its_own_files() {
+        assert!(root_folds_through("src/plugin.ts"));
+        assert!(!root_folds_through("services/api/plugin.ts"));
+        assert!(!root_folds_through("services/web/scope.ts"));
     }
 }
