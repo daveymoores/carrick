@@ -8658,9 +8658,11 @@ impl FileOrchestrator {
     /// makes and found no request. A model row there is the model reading a
     /// request into a name.
     ///
-    /// A model row with no span (its id joined no candidate) is placed by its
-    /// line (carrick#2281): at the one outermost call that opens there, when
-    /// the row's own text writes that call ([`crate::call_through::FileCalls`]).
+    /// A model row with no span (its id joined no candidate) is placed at the
+    /// call its id names, when the id is a span of one of the file's calls
+    /// (carrick#2726); otherwise by its line (carrick#2281): at the one
+    /// outermost call that opens there, when the row's own text writes that
+    /// call ([`crate::call_through::FileCalls`]).
     /// `content` is the file the candidates' spans were read from; it is
     /// parsed only when such a row is in the file.
     pub(crate) fn withdraw_silent_sites(
@@ -8685,9 +8687,13 @@ impl FileOrchestrator {
             if !is_model(call) {
                 return true;
             }
-            let start = call
-                .call_expression_span_start
-                .or_else(|| calls.as_ref().and_then(|calls| calls.written_at(call)));
+            // The id's span before the text: it is the call the row was
+            // recorded at, where the text may write only an argument's call.
+            let start = call.call_expression_span_start.or_else(|| {
+                calls
+                    .as_ref()
+                    .and_then(|calls| calls.named_by_id(call).or_else(|| calls.written_at(call)))
+            });
             !start.is_some_and(|start| silent.contains(&start))
         });
         before - result.data_calls.len()

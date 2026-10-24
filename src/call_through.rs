@@ -803,6 +803,31 @@ impl FileCalls {
             .any(|other| other.lo == call.lo && other.span() != call.span());
         (!chained && text.contains(&format!("{callee}("))).then_some(call.lo)
     }
+
+    /// The span start of the call a model row with no span names by its id
+    /// (carrick#2726): an id `span:<lo>-<hi>` minted from a candidate's span
+    /// ([`crate::swc_scanner`]'s `candidate_id`, the units [`CallExtent`]
+    /// counts in), when this file holds a call at exactly that span and the
+    /// row's line is one the call covers.
+    ///
+    /// A cached answer keeps the ids of the candidates it was asked about. A
+    /// file read again with none of those candidates offered joins none of
+    /// them, so the row reaches the withdrawal with no span; its id still
+    /// names the call it was recorded at, and the silent-site rule reads it
+    /// as it reads a joined span: by its start, chain or not. An id naming no
+    /// call of the file at exactly that span names none.
+    pub(crate) fn named_by_id(&self, row: &DataCallResult) -> Option<u32> {
+        if row.call_expression_span_start.is_some() {
+            return None;
+        }
+        let (lo, hi) = row.candidate_id.strip_prefix("span:")?.split_once('-')?;
+        let span = (lo.parse::<u32>().ok()?, hi.parse::<u32>().ok()?);
+        let line = u32::try_from(row.line_number).ok()?;
+        self.calls
+            .iter()
+            .find(|call| call.span() == span && (call.line..=call.last_line).contains(&line))
+            .map(|call| call.lo)
+    }
 }
 
 /// `text` with every whitespace character removed.
