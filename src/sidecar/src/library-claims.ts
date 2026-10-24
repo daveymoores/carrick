@@ -1129,14 +1129,13 @@ function placementInvalid(claim: LibraryClaim): boolean {
 
 /**
  * Where a handler's request holds its path, method and body (#2474 R0,
- * carrick#2674) is read on a receive op with a handler, and names `path` or
- * `url` (the body is optional beside them); every member path it gives is
- * non-empty.
+ * carrick#2674) is read on a receive op with a handler, and names `path`,
+ * `url` or `body`; every member path it gives is non-empty.
  */
 function requestAtValid(claim: OpClaim): boolean {
   const request = claim.request!;
   if (claim.op !== 'receive' || claim.handler === undefined) return false;
-  if (request.path === undefined && request.url === undefined) return false;
+  if (request.path === undefined && request.url === undefined && request.body === undefined) return false;
   return [request.path, request.url, request.method, request.body].every(
     members => members === undefined || members.length > 0
   );

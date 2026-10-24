@@ -351,7 +351,7 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
     );
   });
 
-  it('request: a body member path resolves beside a path or a URL, and never stands alone (carrick#2674)', async () => {
+  it('request: a body member path resolves beside a path or a URL, or alone (carrick#2674)', async () => {
     assert.deepStrictEqual(
       await send([
         onApp(route('post', { request: { param: 0, path: ['path'], body: ['body'] } })),
@@ -362,7 +362,7 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
         onApp(route('post', { request: { param: 1, path: ['path'], body: ['body'] } })),
         // Invalid: an empty member path.
         onApp(route('post', { request: { param: 0, path: ['path'], body: [] } })),
-        // Invalid: a body alone says nothing the dispatch can route on.
+        // A body alone is read too: a server label names the body and nothing else.
         onApp(route('post', { request: { param: 0, body: ['body'] } })),
       ]),
       [
@@ -371,7 +371,7 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
         'failed request_member_missing',
         'failed request_member_missing',
         'unchecked claim_invalid',
-        'unchecked claim_invalid',
+        'verified',
       ]
     );
   });
