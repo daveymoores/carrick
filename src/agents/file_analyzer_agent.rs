@@ -263,11 +263,10 @@ pub enum ResolutionSource {
     /// A route a class declares with decorators: a prefix on the class, a verb
     /// and a path on the method (carrick#732).
     DecoratorRoute,
-    /// The compiler's answer for what the RECEIVER of a bare
-    /// `x.verb("/lit", arg)` site IS (carrick#695): an instance of a detected
-    /// server framework registers a route, an instance of a detected data
-    /// fetcher issues a request. The path and verb are the site's own
-    /// literals; only the ROLE comes from the type.
+    /// A row an older scanner stated from the type of a bare
+    /// `x.verb("/lit", arg)` site's receiver (carrick#695). No scanner states
+    /// it any more; it stays so an index written by one still reads (a stored
+    /// index with this value fails to load without it).
     ReceiverType,
     /// The candidate's own route-shaped first-argument literal. The one source
     /// that states no row of its own: a bare `x.verb("/lit", arg)` carries no
@@ -1809,6 +1808,14 @@ mod tests {
     use super::*;
     use crate::agents::framework_guidance_agent::PatternExample;
     use std::collections::HashMap;
+
+    /// An index an older scanner wrote can carry `receiver_type`; no scanner
+    /// states it now, and reading that index must still work.
+    #[test]
+    fn a_stored_receiver_type_source_still_reads() {
+        let source: ResolutionSource = serde_json::from_str("\"receiver_type\"").unwrap();
+        assert_eq!(source, ResolutionSource::ReceiverType);
+    }
 
     fn endpoint_json(extra_fields: &str) -> String {
         format!(

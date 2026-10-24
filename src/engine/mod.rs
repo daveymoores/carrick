@@ -3972,7 +3972,6 @@ async fn analyze_current_repo_incremental(
                     &graphql_consumer_hints,
                     &normalizer,
                     &service_modules,
-                    sidecar,
                 ),
                 compose_summaries(
                     &request_inputs,
@@ -11018,7 +11017,6 @@ async fn analyze_current_repo(
             &graphql_consumer_hints,
             &normalizer,
             &service_modules,
-            sidecar,
             crate::agents::file_orchestrator::SummarySource::later(summaries),
             crate::agents::file_orchestrator::FactFileSource::later(fact_files),
         ),
@@ -24438,7 +24436,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 "POST",
                 "/:userId",
                 "/v1/users/:userId",
-                ResolutionSource::ReceiverType,
+                ResolutionSource::InlineLiteral,
             ),
             traced_row(
                 "src/users.ts:9",
