@@ -229,6 +229,13 @@ pub struct TracedRoutes {
 /// reader's reading, counted by reason.
 pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
     let mut out = TracedRoutes::default();
+    // Where the procedure walk stopped with no procedure to count it on:
+    // counted apart from a procedure nothing serves.
+    if decided.procedure_stops > 0 {
+        *out.untraced
+            .entry("procedure_walk_stopped".to_string())
+            .or_default() += decided.procedure_stops;
+    }
     for record in records {
         if record.bucket == Bucket::Lead || !label_states_a_route(record) {
             continue;

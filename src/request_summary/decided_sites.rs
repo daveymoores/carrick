@@ -722,6 +722,10 @@ pub struct Decided {
     /// it (carrick#2474 R5a). Read by nothing yet; never part of a record's
     /// state.
     pub boundaries: RouteBoundaries,
+    /// With the receiver trace on, each value the procedure pass stopped
+    /// at with no procedure to count it on (carrick#2474 R6c), once per
+    /// adapter.
+    pub procedure_stops: usize,
 }
 
 /// A discovered call whose request is decided lower down its chain

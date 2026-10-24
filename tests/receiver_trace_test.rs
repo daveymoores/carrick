@@ -1024,17 +1024,21 @@ fn a_carried_blob_without_boundaries_reads_as_one_with_none() {
 
 /// carrick#2474 R6c: a procedure router's operations are named by the keys
 /// they sit under, and served under each adapter's mount. With the switch
-/// on, every procedure the three adapters serve is a row at its op call's
+/// on, every procedure the four adapters serve is a row at its op call's
 /// line, at the endpoint the fetch adapter is handed (`/rpc`), under the
-/// root the middleware is mounted at (`/`), and under the catch-all route
-/// the other middleware handles (`/api/rpc/*`): an inline procedure, one a
-/// local function returns, a nested router's (imported, keys joined with
-/// the label's `.`) and the key written after a spread and a computed key.
-/// None is written for the key a later spread may set again, the computed
-/// key, the spread's own procedure, or the router no adapter serves: each
-/// is counted and stays a possible call. The member the label states no
-/// method for is no site (the verifier refuses a key-named op with no
-/// method). With the switch off, or with the fact layer off, nothing moves.
+/// root the middleware is mounted at (`/`), under the catch-all route the
+/// other middleware handles (`/api/rpc/*`), and under the catch-all mount
+/// (`/x/(.*)`) without its catch-all: an inline procedure, one a local
+/// function returns, a nested router's (imported by name, under an alias
+/// and as a default, keys joined with the label's `.`, owned by the name
+/// the router is declared under) and the key written after a spread or a
+/// computed key. None is written for a key a later spread or computed key
+/// may set again, the computed key, the spread's own procedure, the router
+/// no adapter serves, or a router the walk stops at (a `let` binding, a
+/// destructured one): each is counted, the stops apart from the unserved,
+/// and stays a possible call. The member the label states no method for is
+/// no site (the verifier refuses a key-named op with no method). With the
+/// switch off, or with the fact layer off, nothing moves.
 #[test]
 fn procedure_routes_take_their_key_paths() {
     let off = scan_fixture("procedure-router", true, None);
@@ -1045,12 +1049,26 @@ fn procedure_routes_take_their_key_paths() {
     let (on, fallbacks) = scan_fixture_reading("procedure-router", true, Some("1"));
     let (graph, flat) = endpoint_rows(&on);
     let served = |file_line: &str, method: &str, key_path: &str, owner: &str| -> Vec<String> {
-        ["/api/rpc", "", "/rpc"]
+        ["/api/rpc", "", "/rpc", "/x"]
             .iter()
             .map(|mount| format!("{file_line} {method} {mount}/{key_path} library_claim {owner}"))
             .collect()
     };
     let mut expected: Vec<String> = [
+        // A nested router imported under an alias: owned by its own name.
+        served(
+            "src/accounts.ts:5",
+            "GET",
+            "accounts.show",
+            "accountsRouter",
+        ),
+        // Written after a computed key, with no spread.
+        served(
+            "src/computed.ts:10",
+            "GET",
+            "computed.last",
+            "computedRouter",
+        ),
         // Returned by a local function, under the key its call sits at.
         served("src/health.ts:5", "GET", "health", "appRouter"),
         // Written after the spread and the computed key.
@@ -1060,7 +1078,9 @@ fn procedure_routes_take_their_key_paths() {
         // The outermost call of a builder chain.
         served("src/orders.ts:8", "POST", "orders.create", "ordersRouter"),
         // Inline.
-        served("src/router.ts:7", "GET", "ping", "appRouter"),
+        served("src/router.ts:11", "GET", "ping", "appRouter"),
+        // A nested router imported as the module's default.
+        served("src/users.ts:5", "GET", "users.me", "usersRouter"),
     ]
     .concat();
     expected.sort();
@@ -1084,16 +1104,23 @@ fn procedure_routes_take_their_key_paths() {
         vec![
             // The two catch-all routes: their label states no method.
             "routes_untraced_method_unstated=2",
-            // `kept`, the computed key and the spread's `hidden`, once per
-            // adapter.
-            "routes_untraced_procedure_unread_key=9",
-            // `idle`.
-            "routes_untraced_procedure_unserved=1",
+            // `kept`, the two computed keys, the spread's `hidden` and
+            // `before`, once per adapter.
+            "routes_untraced_procedure_unread_key=20",
+            // `idle`, and `picked`, below the destructured binding.
+            "routes_untraced_procedure_unserved=2",
+            // `old`, below the `let` binding, and the destructured binding
+            // the walk stops at, once per adapter.
+            "routes_untraced_procedure_walk_stopped=8",
         ]
     );
     assert_eq!(
         possible_calls(&on),
         vec![
+            "src/computed.ts:8 query",
+            "src/computed.ts:9 query",
+            "src/legacy.ts:11 query",
+            "src/legacy.ts:5 query",
             "src/loose.ts:11 query",
             "src/loose.ts:13 query",
             "src/loose.ts:19 query",

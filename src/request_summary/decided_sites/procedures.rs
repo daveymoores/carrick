@@ -20,12 +20,19 @@
 //! - **A key is unread** when it is computed, or written before a spread or
 //!   a computed key that may set it again; a spread's own keys are unread.
 //!   A procedure under an unread key is counted, never named.
+//! - **The walk stops** at a binding that may be set again (not `const`):
+//!   a procedure below it is counted (`walk_stopped`), never named. A name
+//!   whose binding it cannot read (a destructured one), a function whose
+//!   returns it cannot read, and the depth cap are counted on the pass
+//!   ([`super::Decided::procedure_stops`]), apart from a procedure no
+//!   adapter serves.
 //! - **The adapter's mount**: every value its `prefix` slot states; with
 //!   none, the host call the adapter's result is handed to: a verified
 //!   `mounts` member at its mounted slot, under its prefix and the scopes
 //!   above it ([`super::composed::compose`]), or a `receive` op's handler
 //!   slot whose path ends in a catch-all segment, at that route's composed
-//!   paths without the segment. Anything else is unread.
+//!   paths. A catch-all segment at the end of either is dropped
+//!   ([`carrick_match::is_catch_all_path`]). Anything else is unread.
 //!
 //! A procedure's full path is the mount, `/`, and its key path, one per
 //! mount and per key path that reach it (#2474 Q2). The served paths ride
@@ -201,7 +208,7 @@ pub struct Procedure {
     /// The binding of the innermost router that collects it, where one
     /// holds it.
     pub owner: Option<String>,
-    /// `unread_key`, `unread_mount`, `mount_hole`: one per adapter and key
+    /// `unread_key`, `walk_stopped`, `unread_mount`, `mount_hole`: one per adapter and key
     /// path that reached the site and named no path.
     pub unread: BTreeMap<String, usize>,
 }
@@ -227,6 +234,9 @@ struct Above {
     owner: Option<String>,
     /// The binding whose initialiser the value is.
     bound: Option<String>,
+    /// The value is read through a binding that may be set again: a
+    /// procedure below it is counted, never named.
+    stopped: bool,
 }
 
 /// The deepest a value is followed before the walk gives up on it.
@@ -244,10 +254,22 @@ pub(super) struct Pass<'w, 'a> {
     pub(super) site_labels: &'w [SiteLabel],
 }
 
-/// What the walk down one adapter's collection reached: each procedure
-/// site (by its labelled call's file and span) with the key path that
-/// names it (`None`: unread) and its owner.
-type Reached = Vec<((String, u32, u32), Option<String>, Option<String>)>;
+/// What the walk down one adapter's collection reached.
+#[derive(Default)]
+struct Reached {
+    /// Each procedure site (by its labelled call's file and span) with the
+    /// key path that names it, or why none does (`unread_key`,
+    /// `walk_stopped`), and its owner.
+    leaves: Vec<(
+        (String, u32, u32),
+        Result<String, &'static str>,
+        Option<String>,
+    )>,
+    /// Each value the walk stopped at with no procedure to count it on: a
+    /// name of this service it could not read the binding of, a function
+    /// of this service whose returns it could not read, or the depth cap.
+    stops: usize,
+}
 
 impl Pass<'_, '_> {
     /// Name every procedure route site of `out` (carrick#2474 R6c), read
@@ -296,12 +318,13 @@ impl Pass<'_, '_> {
             let Some(collection) = slot_expr(&args, &adapter.runs) else {
                 continue;
             };
-            let mut reached: Reached = Vec::new();
+            let mut reached = Reached::default();
             let above = Above {
                 path: Some(String::new()),
                 join: None,
                 owner: None,
                 bound: None,
+                stopped: false,
             };
             self.walk(
                 &mut modules,
@@ -312,31 +335,26 @@ impl Pass<'_, '_> {
                 &mut Vec::new(),
                 &mut reached,
             );
-            if reached.is_empty() {
+            out.procedure_stops += reached.stops;
+            if reached.leaves.is_empty() {
                 continue;
             }
             let mounts = self.mounts_of(&mut modules, &file, end, adapter, &out.sites);
-            for (leaf, path, owner) in reached {
+            for (leaf, path, owner) in reached.leaves {
                 let procedure = served.entry(leaf).or_default();
                 if procedure.owner.is_none() {
                     procedure.owner = owner;
                 }
                 for mount in &mounts {
                     match (mount, &path) {
-                        (Ok(mount), Some(path)) => {
+                        (Ok(mount), Ok(path)) => {
                             procedure
                                 .full_paths
                                 .push(crate::utils::join_prefix_and_path(mount, path));
                             procedure.key_paths.push(path.clone());
                         }
-                        (Err(reason), _) => {
+                        (Err(reason), _) | (Ok(_), Err(reason)) => {
                             *procedure.unread.entry(reason.to_string()).or_default() += 1
-                        }
-                        (Ok(_), None) => {
-                            *procedure
-                                .unread
-                                .entry("unread_key".to_string())
-                                .or_default() += 1
                         }
                     }
                 }
@@ -382,24 +400,26 @@ impl Pass<'_, '_> {
     }
 
     /// The declaration the compiler's row of `kind` at `span` in `file`
-    /// names, as this service's file and line; `None` for one outside the
-    /// service.
+    /// names, as this service's file and line, with the name it declares
+    /// (an import's alias resolved: `import { a as b }` names `a`); `None`
+    /// for one outside the service.
     fn own_declaration(
         &self,
         file: &Path,
         span: swc_common::Span,
         kind: Kind,
-    ) -> Option<(PathBuf, u32)> {
+    ) -> Option<(PathBuf, u32, Option<String>)> {
         let positions = self.inputs.positions.as_ref()?;
         let row = positions.lookup(file, span.lo.0, span.hi.0, kind).ok()?;
         if !super::super::discovery::in_repo(row) {
             return None;
         }
         let declared = positions.path_of(row.decl_file()?);
+        let line = row.decl_line()?;
         self.inputs
             .files
             .contains_key(&declared)
-            .then_some((declared, row.decl_line()?))
+            .then(|| (declared, line, row.symbol().map(str::to_string)))
     }
 
     /// The verified router member the call at `span` in `file` resolves
@@ -437,7 +457,11 @@ impl Pass<'_, '_> {
         let expr = super::super::unwrap_value(expr);
         let span = expr.span();
         let here = (file.to_path_buf(), span.lo.0, span.hi.0);
-        if stack.len() >= MAX_DEPTH || stack.contains(&here) {
+        if stack.contains(&here) {
+            return;
+        }
+        if stack.len() >= MAX_DEPTH {
+            reached.stops += 1;
             return;
         }
         stack.push(here);
@@ -445,9 +469,18 @@ impl Pass<'_, '_> {
             Expr::Call(call) => {
                 let leaf = (relative(self.root, file), span.lo.0, span.hi.0);
                 if leaves.contains(&leaf) {
-                    // A procedure is named by its keys only under a router.
-                    let path = above.join.as_ref().and(above.path.clone());
-                    reached.push((leaf, path, above.owner.clone()));
+                    // A procedure is named by its keys only under a router,
+                    // and never below a binding that may be set again.
+                    let path = if above.stopped {
+                        Err("walk_stopped")
+                    } else {
+                        above
+                            .join
+                            .as_ref()
+                            .and(above.path.clone())
+                            .ok_or("unread_key")
+                    };
+                    reached.leaves.push((leaf, path, above.owner.clone()));
                 } else if let Some(label) = self.collects_of(file, span) {
                     let collected = slot_expr(&call.args, &(label.arg, label.key.clone()));
                     if let Some(collected) = collected {
@@ -456,13 +489,21 @@ impl Pass<'_, '_> {
                             join: Some(label.join.clone()),
                             owner: above.bound.clone().or(above.owner.clone()),
                             bound: None,
+                            stopped: above.stopped,
                         };
                         self.walk(modules, file, &collected, below, leaves, stack, reached);
                     }
-                } else if let Some((declared, line)) = self.own_declaration(file, span, Kind::Call)
-                    && let Some(parsed) = self.parsed(modules, &declared)
+                } else if let Some((declared, line, _)) =
+                    self.own_declaration(file, span, Kind::Call)
                 {
-                    for value in returned_values(&parsed, line) {
+                    let values = self
+                        .parsed(modules, &declared)
+                        .map(|parsed| returned_values(&parsed, line))
+                        .unwrap_or_default();
+                    if values.is_empty() {
+                        reached.stops += 1;
+                    }
+                    for value in values {
                         let below = Above {
                             bound: None,
                             ..above.clone()
@@ -471,16 +512,28 @@ impl Pass<'_, '_> {
                     }
                 }
             }
-            Expr::Ident(name) => {
-                if let Some((declared, line)) = self.own_declaration(file, span, Kind::Ident)
-                    && let Some(parsed) = self.parsed(modules, &declared)
-                    && let Some(init) = binding_init(&parsed, name.sym.as_str(), line)
+            Expr::Ident(_) => {
+                if let Some((declared, line, symbol)) =
+                    self.own_declaration(file, span, Kind::Ident)
                 {
-                    let below = Above {
-                        bound: Some(name.sym.to_string()),
-                        ..above
-                    };
-                    self.walk(modules, &declared, &init, below, leaves, stack, reached);
+                    // The binding the compiler resolves the name to, by the
+                    // name it declares: a use under an import alias reads
+                    // the declaration's own name.
+                    let binding = symbol.and_then(|symbol| {
+                        let parsed = self.parsed(modules, &declared)?;
+                        binding_init(&parsed, &symbol, line).map(|binding| (symbol, binding))
+                    });
+                    match binding {
+                        Some((symbol, (init, constant))) => {
+                            let below = Above {
+                                bound: Some(symbol),
+                                stopped: above.stopped || !constant,
+                                ..above
+                            };
+                            self.walk(modules, &declared, &init, below, leaves, stack, reached);
+                        }
+                        None => reached.stops += 1,
+                    }
                 }
             }
             Expr::Object(object) => {
@@ -598,10 +651,14 @@ impl Pass<'_, '_> {
                         continue;
                     }
                 };
+                // A mount that ends in a catch-all serves the paths below
+                // it, as one written without the segment does.
                 for value in values {
-                    out.extend(served_at(
-                        &compose(&applying, Some(value.as_str()), self.mounts).0,
-                    ));
+                    out.extend(
+                        served_at(&compose(&applying, Some(value.as_str()), self.mounts).0)
+                            .into_iter()
+                            .map(|path| path.map(|path| below_catch_all(&path).unwrap_or(path))),
+                    );
                 }
             }
             if !out.is_empty() {
@@ -651,15 +708,22 @@ fn served_at(composed: &[super::Composed]) -> Vec<Result<String, &'static str>> 
 }
 
 /// `path` without its last segment, when that segment is a catch-all
-/// (`*`, `**`): what serves every path below it.
+/// ([`carrick_match::is_catch_all_path`]: `*`, `**`, `(.*)`): what serves
+/// every path below it.
 fn below_catch_all(path: &str) -> Option<String> {
-    let (above, last) = path.rsplit_once('/').unwrap_or(("", path));
-    matches!(last, "*" | "**").then(|| {
-        if above.is_empty() {
-            "/".to_string()
-        } else {
-            above.to_string()
-        }
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    if !carrick_match::is_catch_all_path(&path) {
+        return None;
+    }
+    let (above, _) = path.rsplit_once('/')?;
+    Some(if above.is_empty() {
+        "/".to_string()
+    } else {
+        above.to_string()
     })
 }
 
@@ -743,25 +807,24 @@ fn host_of(module: &Module, lo: u32, hi: u32) -> Option<(u32, u32, usize)> {
     find.found
 }
 
-/// The initialiser of the `const` binding `name` declared on `line`.
-fn binding_init(parsed: &Parsed, name: &str, line: u32) -> Option<Expr> {
+/// The initialiser of the binding `name` declared on `line`, and whether
+/// the binding is `const` (one that is not may be set again).
+fn binding_init(parsed: &Parsed, name: &str, line: u32) -> Option<(Expr, bool)> {
     struct Find<'p> {
         parsed: &'p Parsed,
         name: &'p str,
         line: u32,
-        found: Option<Expr>,
+        found: Option<(Expr, bool)>,
     }
     impl Visit for Find<'_> {
         fn visit_var_decl(&mut self, var: &VarDecl) {
-            if var.kind == VarDeclKind::Const {
-                for declarator in &var.decls {
-                    if let Pat::Ident(binding) = &declarator.name
-                        && binding.id.sym == *self.name
-                        && self.parsed.line(binding.id.span) == self.line
-                        && let Some(init) = &declarator.init
-                    {
-                        self.found = Some((**init).clone());
-                    }
+            for declarator in &var.decls {
+                if let Pat::Ident(binding) = &declarator.name
+                    && binding.id.sym == *self.name
+                    && self.parsed.line(binding.id.span) == self.line
+                    && let Some(init) = &declarator.init
+                {
+                    self.found = Some(((**init).clone(), var.kind == VarDeclKind::Const));
                 }
             }
             var.visit_children_with(self);
@@ -838,6 +901,12 @@ mod tests {
         assert_eq!(below_catch_all("/api/rpc/*"), Some("/api/rpc".to_string()));
         assert_eq!(below_catch_all("/*"), Some("/".to_string()));
         assert_eq!(below_catch_all("*"), Some("/".to_string()));
+        assert_eq!(below_catch_all("/api/**"), Some("/api".to_string()));
+        assert_eq!(
+            below_catch_all("/api/rpc/(.*)"),
+            Some("/api/rpc".to_string())
+        );
+        assert_eq!(below_catch_all("/(.*)"), Some("/".to_string()));
         assert_eq!(below_catch_all("/api/rpc"), None);
         assert_eq!(below_catch_all("/api/:rest"), None);
     }

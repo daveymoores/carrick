@@ -17,3 +17,6 @@ app.use("/", rpcMiddleware({ router: appRouter }));
 
 // A middleware adapter handed to a route whose path ends in a catch-all.
 app.all("/api/rpc/*", rpcMiddleware({ router: appRouter }));
+
+// A middleware adapter mounted under a prefix that ends in a catch-all.
+app.use("/x/(.*)", rpcMiddleware({ router: appRouter }));
