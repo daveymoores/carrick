@@ -252,7 +252,7 @@ mod rows_census;
 pub use guards::{
     Branch, CallChain, CallFunction, CallName, CallStart, ChainEnd, ChainSite, Conjoined, Constant,
     GuardChain, GuardPosition, GuardShape, HoleReason, Hop, HopArg, LibraryReceiver, NameFrom,
-    NamedCall, Root, Within, guard_chains, named_calls,
+    NamedCall, Root, Within, compared_methods, guard_chains, named_calls,
 };
 
 #[allow(unused_imports)]
@@ -1598,6 +1598,15 @@ const INERT_GLOBALS: &[&str] = &[
     "Reflect",
 ];
 
+/// The module-scope reading of one file's source, for a reader that has the
+/// text and no scan around it (carrick#2740: a file route's compared
+/// methods). `None` when the file does not parse. The empty key set names
+/// class static members only, which that reader does not look up.
+pub fn file_ir_of(file_path: &Path, content: &str) -> Option<FileIr> {
+    let (source_map, module) = crate::swc_scanner::parse_standalone_module(file_path, content)?;
+    Some(extract_file_ir(&module, &source_map, &HashSet::new()))
+}
+
 /// Read one parsed file. `definition_keys` is the extractor's key set for the
 /// same file, used to name a static member the way the extractor does when a
 /// static and an instance member share a name.
@@ -1779,7 +1788,10 @@ pub fn extract_file_ir(
                         .object_lits
                         .insert(ident_key(&ident.id), object.clone());
                 }
-                if !matches!(&**init, Expr::Arrow(_) | Expr::Fn(_)) {
+                if !matches!(
+                    crate::graphql_document_sites::unwrap_expression(init),
+                    Expr::Arrow(_) | Expr::Fn(_)
+                ) {
                     let (value, client, text) = {
                         let scope = Scope::module(&module_scope);
                         (
@@ -1862,7 +1874,11 @@ pub fn extract_file_ir(
                 continue;
             };
             let name = ident.id.sym.as_ref();
-            if matches!(&**init, Expr::Arrow(_) | Expr::Fn(_)) || file.names.contains_key(name) {
+            if matches!(
+                crate::graphql_document_sites::unwrap_expression(init),
+                Expr::Arrow(_) | Expr::Fn(_)
+            ) || file.names.contains_key(name)
+            {
                 continue;
             }
             if let Some(value) = module_scope.consts.get(&ident_key(&ident.id))
@@ -1925,7 +1941,10 @@ pub fn extract_file_ir(
                     else {
                         continue;
                     };
-                    let ir = match &**init {
+                    // A wrapper that only states a type (`(async () => {})
+                    // satisfies ActionFunction`, `as`, `!`, parentheses) still
+                    // binds the function itself (carrick#2740).
+                    let ir = match crate::graphql_document_sites::unwrap_expression(init) {
                         Expr::Arrow(arrow) => reader.arrow(arrow, None, module_scope, &none),
                         Expr::Fn(fn_expr) => {
                             reader.function(&fn_expr.function, None, module_scope, &none)
@@ -2015,7 +2034,10 @@ pub fn extract_file_ir(
                     Some(Decl::Var(var)) => {
                         for declarator in &var.decls {
                             if let Some(init) = &declarator.init
-                                && !matches!(&**init, Expr::Arrow(_) | Expr::Fn(_))
+                                && !matches!(
+                                    crate::graphql_document_sites::unwrap_expression(init),
+                                    Expr::Arrow(_) | Expr::Fn(_)
+                                )
                             {
                                 reader.walk(&**init, &scope, &mut module_level);
                             }
@@ -10296,6 +10318,30 @@ export async function opened(op: string, rest: object, late: object) {
   return fetch(URL, { method: "POST", body: JSON.stringify({ ...rest.inner, op, ...late }) });
 }
 "#;
+
+    /// carrick#2740: a module-scope arrow under a wrapper that only states a
+    /// type is the binding's function, read once: its call is the function's,
+    /// and module scope does not read the same body again.
+    #[test]
+    fn a_type_wrapped_module_arrow_is_its_bindings_function_read_once() {
+        let source = r#"
+type Sender = () => Promise<Response>;
+export const send = (async () => {
+  return fetch("https://api.example.com/x", { method: "PUT" });
+}) satisfies Sender;
+"#;
+        let file = file_ir_of(source);
+        let send = file.functions.get("send").expect("send is a function");
+        assert_eq!(send.calls.len(), 1, "{:#?}", send.calls);
+        assert!(send.calls[0].request.is_some(), "{:#?}", send.calls);
+        assert!(
+            file.module_level.calls.is_empty()
+                && file.module_level.nested.is_empty()
+                && file.module_level.detached.is_empty(),
+            "module scope read the body again: {:#?}",
+            file.module_level
+        );
+    }
 
     /// carrick#2411: a spread of the function's own parameter holds the keys
     /// written before it; `fields` and `open` read as they always did.
