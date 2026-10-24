@@ -92,7 +92,7 @@ pub fn handler_questions(records: &HandlerRecords) -> Vec<HandlerQuestion> {
 pub struct DispatchRows {
     pub rows: Vec<SiteRow>,
     pub leads: Vec<PossibleCall>,
-    /// `rows_fact`, `rows_model`, `not_a_route`, `records_unanswered`.
+    /// `rows_fact`, `rows_model`, `rows_below_band`, `not_a_route`, `records_unanswered`.
     pub counts: BTreeMap<String, usize>,
 }
 
@@ -225,9 +225,12 @@ pub fn dispatch_rows(records: &HandlerRecords, answers: &HandlerAnswers) -> Disp
             match stated_row {
                 Ok(Some(site_row)) => {
                     if stated.insert((site_row.file.clone(), site_row.line, site_row.key.clone())) {
+                        // A row out of band ends as a possible call or an
+                        // alternative once folded, so it is not a model row.
                         let what = match site_row.inference {
                             None => "rows_fact",
-                            Some(_) => "rows_model",
+                            Some(_) if site_row.in_band => "rows_model",
+                            Some(_) => "rows_below_band",
                         };
                         count(&mut out.counts, what);
                         out.rows.push(site_row);
@@ -467,6 +470,8 @@ mod tests {
             ]
         );
         assert_eq!(rows.counts.get("not_a_route"), Some(&1));
+        assert_eq!(rows.counts.get("rows_model"), Some(&1));
+        assert_eq!(rows.counts.get("rows_below_band"), Some(&1));
         let lead = &rows.leads[0];
         assert_eq!(lead.kind.as_deref(), Some("http"));
         assert_eq!(lead.role.as_deref(), Some("producer"));
