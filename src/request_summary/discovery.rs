@@ -4080,12 +4080,12 @@ mod tests {
         // The callback routes, filled only by the main host, compose under
         // the plugin's own scope from the facts alone. The orders route takes
         // the paths the first two hosts state; the third's prefix is not read
-        // (Q5 (ii)).
+        // (Q5 (ii)). The package's own app serves it at its root as well.
         let resolved = resolved_under(FAN_OUT);
         let want_resolved = texts(&[
             "packages/routes/src/admin.ts:5 GET -> /api/v1/admin/users unread_hosts=0",
             "packages/routes/src/admin.ts:6 POST -> /api/v1/admin/users unread_hosts=0",
-            "packages/routes/src/orders.ts:4 GET -> /api/v1/orders unread_hosts=1",
+            "packages/routes/src/orders.ts:4 GET -> /api/v1/orders|/orders unread_hosts=1",
             "packages/server/src/audit.ts:6 GET -> /api/v1/audit/events unread_hosts=0",
             "packages/server/src/audit.ts:7 GET -> /api/v1/audit/events/:id unread_hosts=0",
         ]);
