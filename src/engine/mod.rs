@@ -47,6 +47,7 @@ use swc_common::{
 use swc_ecma_visit::VisitWith;
 
 pub mod durability;
+mod route_boundaries;
 pub(crate) mod served_paths;
 pub mod service_workers;
 pub mod setup_ahead;
@@ -1523,6 +1524,33 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             .collect();
         crate::call_through::settle(&mut services);
     }
+    // A route whose chain leaves its service is served under what another
+    // service hands it (carrick#2474 R5b): each service recorded its side
+    // during its own analysis, and here, with every service in hand, the
+    // records are matched and the routes they resolve are written. A
+    // held-back service's records are read and it is never written. A
+    // carried service is never written and records nothing until R5c (its
+    // boundaries are empty), so on `--changed-only` a route whose boundary
+    // only a carried service fills counts `unmatched_boundary`. Each
+    // service states its fallbacks once its counts are in.
+    {
+        let mut services: Vec<route_boundaries::ServiceRoutes<'_>> = runs
+            .iter_mut()
+            .map(|run| route_boundaries::ServiceRoutes {
+                writable: !run.carried && !run.held_back,
+                data: &mut run.data,
+                boundaries: &run.boundaries,
+            })
+            .collect();
+        let counts = route_boundaries::settle(&mut services, repo_path);
+        for (run, counts) in runs.iter_mut().zip(counts) {
+            if let Some(mut fallbacks) = run.fallbacks.take() {
+                for (key, count) in counts {
+                    *fallbacks.counts().entry(key).or_default() += count;
+                }
+            }
+        }
+    }
 
     // Whether this run leaves a service short of a complete index. A missing
     // function description alone does not: it never held an index back.
@@ -2274,6 +2302,13 @@ struct ServiceRun {
     /// The definitions each of its model call rows goes through, for the
     /// pass that settles them once every service is read (carrick#1146).
     call_through: crate::call_through::CallThroughSites,
+    /// Where its route chains leave it, for the pass that writes routes
+    /// across services once every service is read (carrick#2474 R5b).
+    boundaries: crate::request_summary::decided_sites::RouteBoundaries,
+    /// Its fallbacks, stated when dropped: after the routes across services
+    /// are counted in, or as the run ends early. `None` for a carried
+    /// service, which states none.
+    fallbacks: Option<crate::fallback_tally::Pending>,
 }
 
 impl ServiceRun {
@@ -2297,6 +2332,8 @@ impl ServiceRun {
             held_back: false,
             carried: true,
             call_through,
+            boundaries: Default::default(),
+            fallbacks: None,
         }
     }
 }
@@ -2578,6 +2615,8 @@ impl ServiceScan {
             held_back: false,
             carried: false,
             call_through: analysis.call_through,
+            boundaries: analysis.route_boundaries,
+            fallbacks: analysis.fallbacks,
         })
     }
 }
@@ -4061,7 +4100,8 @@ async fn analyze_current_repo_incremental(
                 &protocol_extractions.site.traced.routes,
                 repo_path,
             );
-            report_route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
+            let fallbacks = route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
+            let route_boundaries = std::mem::take(&mut protocol_extractions.site.boundaries);
             crate::phase_timing::mark(crate::phase_timing::Phase::Protocols);
 
             // Collect the intents started after discovery (body_source is
@@ -4325,6 +4365,8 @@ async fn analyze_current_repo_incremental(
                 data: cloud_data,
                 deferred: setup.deferred,
                 call_through,
+                route_boundaries,
+                fallbacks: Some(fallbacks),
             });
         } else {
             debug!("git could not compare the tree, falling back to full analysis");
@@ -5070,6 +5112,12 @@ async fn site_rows_of(
         rows.traced.routes.retain(|route| {
             !protocol_producer_provenance(&root.join(&route.file), repo_path, service).is_mock()
         });
+        // Where its route chains leave the service, settled across services
+        // at the join point (carrick#2474 R5b).
+        rows.boundaries = decided.boundaries.clone();
+        rows.boundaries.routes.retain(|segment| {
+            !protocol_producer_provenance(&root.join(&segment.file), repo_path, service).is_mock()
+        });
         debug!(
             traced = rows.traced.routes.len(),
             untraced = ?rows.traced.untraced,
@@ -5473,6 +5521,10 @@ struct TracedApplied {
     relabelled: usize,
     /// Rows written for a traced path no row at its line held.
     added: usize,
+    /// Rows at a traced route's line that state the route's own path with
+    /// no prefix, now at its traced full path, `library_claim` (carrick#2474
+    /// row 4).
+    corrected: usize,
     /// Route sites where a row at the line states a method or path the trace
     /// does not: nothing there is written.
     disagrees: usize,
@@ -5486,6 +5538,10 @@ struct TracedApplied {
     /// Traced routes with a path no row at the line held and none was
     /// written for: the registration's binding has no symbol to own a row.
     owner_unknown: usize,
+    /// Reader rows at a route's own path left as read: every traced full
+    /// path is held by another row at the line, so correcting it would make
+    /// a twin of that row.
+    twin: usize,
 }
 
 impl TracedApplied {
@@ -5505,6 +5561,7 @@ impl TracedApplied {
                     "routes_documented_conflict".to_string(),
                     self.documented_conflict,
                 ),
+                ("routes_trace_twin".to_string(), self.twin),
             ])
             .filter(|(_, count)| *count > 0)
             .collect()
@@ -5522,10 +5579,14 @@ impl TracedApplied {
 /// is written as a copy of an undeclared row there of the route's method.
 /// Where any row states another method or path, the site is counted and
 /// nothing is written: the reader and the trace disagree, and a compare
-/// replay decides (orchestrator's ruling, 2026-10-23). Where no row to copy
-/// stands, one row is written per path, owned by the binding the route is
-/// registered on, and none where that binding has no symbol. Then documentation
-/// rows fold onto the rows written ([`FileOrchestrator::fold_documented_operations`]).
+/// replay decides (orchestrator's ruling, 2026-10-23). The one exception is
+/// a reader row stating the route's method and its own path with no prefix
+/// (carrick#2474 row 4): the reader read the call and not its scopes, so
+/// the row takes the traced full path, keeping its owner and handler. Where
+/// no row to copy stands, one row is written per path, owned by the binding
+/// the route is registered on, and none where that binding has no symbol.
+/// Then documentation rows fold onto the rows written or corrected
+/// ([`FileOrchestrator::fold_documented_operations`]).
 ///
 /// `repo_path` places the graph's files as the withdraw does.
 fn apply_traced_routes(
@@ -5533,11 +5594,56 @@ fn apply_traced_routes(
     traced: &[crate::site_rows::TracedRoute],
     repo_path: &str,
 ) -> TracedApplied {
-    use crate::agents::file_analyzer_agent::ResolutionSource;
-    let mut applied = TracedApplied::default();
-    if traced.is_empty() {
-        return applied;
+    let mut write = write_traced_routes(mount_graph, traced, repo_path);
+    if write.applied.added > 0 || write.applied.corrected > 0 {
+        write.applied.folded = FileOrchestrator::fold_documented_operations(mount_graph);
     }
+    debug!(
+        relabelled = write.applied.relabelled,
+        added = write.applied.added,
+        corrected = write.applied.corrected,
+        disagrees = write.applied.disagrees,
+        documented_conflict = write.applied.documented_conflict,
+        refused = write.applied.refused,
+        folded = write.applied.folded,
+        owner_unknown = write.applied.owner_unknown,
+        twin = write.applied.twin,
+        "receiver trace: routes written into the mount graph"
+    );
+    write.applied
+}
+
+/// What [`write_traced_routes`] did, by the graph rows it touched: their
+/// indices hold until the graph's rows are next removed.
+#[derive(Debug, Default)]
+struct TracedWrite {
+    applied: TracedApplied,
+    /// Rows relabelled `library_claim`.
+    relabelled: Vec<usize>,
+    /// Rows corrected (row 4), with the full path each stated before.
+    corrected: Vec<(usize, String)>,
+    /// The rows written: the last `applied.added` of the graph.
+    added: std::ops::Range<usize>,
+}
+
+/// The rows a scope or a host decides, at every traced route's site: the
+/// writer [`apply_traced_routes`] (one service, before the payload is built)
+/// and [`crate::route_boundaries`] (across services, at the join point)
+/// share. It does not fold documentation.
+fn write_traced_routes(
+    mount_graph: &mut MountGraph,
+    traced: &[crate::site_rows::TracedRoute],
+    repo_path: &str,
+) -> TracedWrite {
+    use crate::agents::file_analyzer_agent::ResolutionSource;
+    let mut write = TracedWrite {
+        added: mount_graph.endpoints.len()..mount_graph.endpoints.len(),
+        ..TracedWrite::default()
+    };
+    if traced.is_empty() {
+        return write;
+    }
+    let applied = &mut write.applied;
     let repo_root = normalize_protocol_file(Path::new(repo_path));
     let place = |location: &str| -> Option<(String, String, u32)> {
         let (file, line) = location.rsplit_once(':')?;
@@ -5601,6 +5707,60 @@ fn apply_traced_routes(
                 !states(&row.method, &row.full_path)
             })
             .collect();
+        // Row 4: a reader row at the route's own path with no prefix read
+        // the call and not its scopes. It takes a traced full path no row
+        // here holds yet, keeping its owner and handler; where every one is
+        // held, it is left as read and counted (a twin).
+        let own_path = |index: usize| {
+            let row = &mount_graph.endpoints[index];
+            !matches!(
+                row.resolution_source,
+                Some(ResolutionSource::DescriptorRoute | ResolutionSource::DeclaredOperation)
+            ) && routes.iter().any(|route| {
+                route.method.eq_ignore_ascii_case(&row.method)
+                    && MountGraph::paths_equal_modulo_param_names(&route.path, &row.full_path)
+            })
+        };
+        let mut twins: Vec<usize> = Vec::new();
+        let disagreeing = if !disagreeing.is_empty()
+            && disagreeing.iter().all(|&index| own_path(index))
+        {
+            for index in disagreeing {
+                let method = mount_graph.endpoints[index].method.clone();
+                let path = mount_graph.endpoints[index].full_path.clone();
+                let Some(route) = routes.iter().find(|route| {
+                    route.method.eq_ignore_ascii_case(&method)
+                        && MountGraph::paths_equal_modulo_param_names(&route.path, &path)
+                }) else {
+                    continue;
+                };
+                let held = |full_path: &str| {
+                    here.iter().any(|&other| {
+                        let row = &mount_graph.endpoints[other];
+                        row.method.eq_ignore_ascii_case(&method)
+                            && MountGraph::paths_equal_modulo_param_names(&row.full_path, full_path)
+                    })
+                };
+                let Some(full_path) = route
+                    .full_paths
+                    .iter()
+                    .find(|full_path| !held(full_path))
+                    .cloned()
+                else {
+                    applied.twin += 1;
+                    twins.push(index);
+                    continue;
+                };
+                let row = &mut mount_graph.endpoints[index];
+                row.full_path = full_path;
+                row.resolution_source = Some(ResolutionSource::LibraryClaim);
+                applied.corrected += 1;
+                write.corrected.push((index, path));
+            }
+            Vec::new()
+        } else {
+            disagreeing
+        };
         if !disagreeing.is_empty() {
             applied.disagrees += 1;
             applied.documented_conflict += disagreeing
@@ -5638,10 +5798,21 @@ fn apply_traced_routes(
             )
         };
         for &index in &here {
+            // A corrected row took its label already; a twin left as read
+            // states a path the trace does not, and keeps its own.
+            if twins.contains(&index)
+                || write
+                    .corrected
+                    .iter()
+                    .any(|(corrected, _)| *corrected == index)
+            {
+                continue;
+            }
             let row = &mut mount_graph.endpoints[index];
             if !declared(row) {
                 row.resolution_source = Some(ResolutionSource::LibraryClaim);
                 applied.relabelled += 1;
+                write.relabelled.push(index);
             }
         }
         for route in &routes {
@@ -5720,21 +5891,10 @@ fn apply_traced_routes(
         }
     }
     applied.added = written.len();
-    if applied.added > 0 {
-        mount_graph.endpoints.extend(written);
-        applied.folded = FileOrchestrator::fold_documented_operations(mount_graph);
-    }
-    debug!(
-        relabelled = applied.relabelled,
-        added = applied.added,
-        disagrees = applied.disagrees,
-        documented_conflict = applied.documented_conflict,
-        refused = applied.refused,
-        folded = applied.folded,
-        owner_unknown = applied.owner_unknown,
-        "receiver trace: routes written into the mount graph"
-    );
-    applied
+    let start = mount_graph.endpoints.len();
+    mount_graph.endpoints.extend(written);
+    write.added = start..mount_graph.endpoints.len();
+    write
 }
 
 /// Attribute a service's GraphQL documents to schema identities, fold the
@@ -9090,8 +9250,8 @@ fn summarize_requests(
 /// reader's files, each register signal's candidates kept where discovery
 /// could not follow the call (`fallback_selection_<signal>`, carrick#2613).
 /// They are stated when the value is dropped: at once on a failed analysis,
-/// otherwise once the traced routes are written ([`report_route_fallbacks`])
-/// or the scan stops early.
+/// otherwise once the routes across services are written at the join point
+/// ([`route_fallbacks`], carrick#2474 R5b) or the scan stops early.
 fn analysis_fallbacks<T, E>(
     fallbacks: crate::fallback_tally::ServiceFallbacks,
     analysis: &Result<T, E>,
@@ -9108,16 +9268,19 @@ fn analysis_fallbacks<T, E>(
     pending
 }
 
-/// State the service's fallbacks, with the route sites the receiver trace
-/// left to the reader and where it disagreed with it (carrick#2474 R3 S1).
-fn report_route_fallbacks(
+/// The service's fallbacks, with the route sites the receiver trace left to
+/// the reader and where it disagreed with it (carrick#2474 R3 S1). They are
+/// stated once the routes across services are counted in too (carrick#2474
+/// R5b), when the run drops them.
+fn route_fallbacks(
     mut fallbacks: crate::fallback_tally::Pending,
     site: &crate::site_rows::SiteRows,
     applied: &TracedApplied,
-) {
+) -> crate::fallback_tally::Pending {
     fallbacks
         .counts()
         .extend(applied.tally(&site.traced.untraced));
+    fallbacks
 }
 
 /// A service's library semantics while the in-scan schedule settles them
@@ -10931,7 +11094,8 @@ async fn analyze_current_repo(
         &protocol_extractions.site.traced.routes,
         repo_path,
     );
-    report_route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
+    let fallbacks = route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
+    let route_boundaries = std::mem::take(&mut protocol_extractions.site.boundaries);
     // The repo's own statement of what a body-dispatching handler serves
     // (carrick#831), applied after every pass that reads the source: a
     // declaration replaces what inference produced for the same handler, so
@@ -11175,6 +11339,8 @@ async fn analyze_current_repo(
         data: cloud_data,
         deferred: setup.deferred,
         call_through,
+        route_boundaries,
+        fallbacks: Some(fallbacks),
     })
 }
 
@@ -24260,7 +24426,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     /// carrick#2474 R3 S1 (orchestrator's ruling, 2026-10-23): where a row
     /// at a traced route's line states another path or method, the site is
     /// counted and nothing there is written; a documentation row that
-    /// disagrees is counted apart.
+    /// disagrees is counted apart. The one exception (carrick#2474 row 4,
+    /// R5b): a row stating the route's method and its own path with no
+    /// prefix takes the traced full path, keeping its owner.
     #[test]
     fn a_row_that_disagrees_with_a_traced_route_is_kept_and_nothing_written() {
         use crate::agents::file_analyzer_agent::ResolutionSource;
@@ -24301,12 +24469,17 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(
             applied,
             TracedApplied {
-                disagrees: 3,
+                corrected: 1,
+                disagrees: 2,
                 documented_conflict: 1,
                 ..TracedApplied::default()
             }
         );
-        assert_eq!(traced_rows(&graph), before);
+        let mut after = before.clone();
+        after[0] = "src/items.ts:8 GET /api/deep/leaf library_claim".to_string();
+        assert_eq!(traced_rows(&graph), after);
+        assert_eq!(graph.endpoints[0].owner, "router");
+        assert_eq!(graph.endpoints[0].path, "/leaf");
         assert_eq!(
             applied.tally(&std::collections::BTreeMap::from([(
                 "mount_unverified".to_string(),
@@ -24314,7 +24487,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             )])),
             vec![
                 ("routes_untraced_mount_unverified".to_string(), 2),
-                ("routes_trace_disagrees".to_string(), 3),
+                ("routes_trace_disagrees".to_string(), 2),
                 ("routes_documented_conflict".to_string(), 1),
             ]
         );
@@ -24441,6 +24614,62 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(
             applied.tally(&std::collections::BTreeMap::new()),
             vec![("routes_untraced_owner_unknown".to_string(), 1)]
+        );
+    }
+
+    /// PR #2734 review: two reader rows at a route's own path and one
+    /// traced full path. The first takes it (row 4); the second is left as
+    /// read, with its own label, and counted: moving it too would make a
+    /// twin of the first under one key.
+    #[test]
+    fn a_second_own_path_row_with_no_free_full_path_is_left_and_counted() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![
+            traced_row(
+                "src/orders.ts:4",
+                "GET",
+                "/orders",
+                "/orders",
+                ResolutionSource::Model,
+            ),
+            traced_row(
+                "src/orders.ts:4",
+                "GET",
+                "/orders",
+                "/orders",
+                ResolutionSource::Model,
+            ),
+        ];
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[traced_route(
+                "src/orders.ts",
+                4,
+                "GET",
+                "/orders",
+                &["/api/v1/orders"],
+            )],
+            ".",
+        );
+        assert_eq!(
+            applied,
+            TracedApplied {
+                corrected: 1,
+                twin: 1,
+                ..TracedApplied::default()
+            }
+        );
+        assert_eq!(
+            traced_rows(&graph),
+            vec![
+                "src/orders.ts:4 GET /api/v1/orders library_claim",
+                "src/orders.ts:4 GET /orders model",
+            ]
+        );
+        assert_eq!(
+            applied.tally(&std::collections::BTreeMap::new()),
+            vec![("routes_trace_twin".to_string(), 1)]
         );
     }
 

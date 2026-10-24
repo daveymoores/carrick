@@ -179,6 +179,10 @@ pub struct SiteRows {
     /// (carrick#2474 R3 S1, [`traced`]): the engine writes them into the
     /// mount graph.
     pub traced: TracedRoutes,
+    /// With the receiver trace on, where the service's route chains leave
+    /// it (carrick#2474 R5a): settled across services at the engine's join
+    /// point (carrick#2474 R5b, [`crate::route_boundaries`]).
+    pub boundaries: crate::request_summary::decided_sites::RouteBoundaries,
 }
 
 /// A route the receiver trace serves at a full path it composed from the
@@ -553,6 +557,7 @@ pub fn of(
         routes: Vec::new(),
         through: decided.through.clone(),
         traced: TracedRoutes::default(),
+        boundaries: Default::default(),
     };
     for record in records {
         if record.bucket == Bucket::Lead {

@@ -3918,6 +3918,69 @@ mod tests {
         out
     }
 
+    /// carrick#2474 R5b: `receiver-scopes-callback` read across its two
+    /// services. Every host registers on `start(app, deps)`'s own parameter,
+    /// which nothing in the repository's services calls, so no route has a
+    /// top to compose from: each ends `unmatched_boundary`, and none is
+    /// written. A callback whose key a later computed key or spread may set
+    /// again is not read as the function written there (the host's call-in
+    /// ends `callback_option`, not at a boundary), and a callback in options
+    /// built elsewhere is a callback parameter.
+    #[test]
+    fn the_callback_tree_resolves_across_its_services() {
+        use super::super::decided_sites::ScopeLabel;
+        use super::super::decided_sites::boundaries::{FAN_OUT, resolve};
+        let mut facts = Vec::new();
+        for service in ["routes", "server"] {
+            let Some((on, exports, declarations)) = traced_fixture_in(
+                "receiver-scopes-callback",
+                &format!("packages/{service}"),
+                service,
+            ) else {
+                return;
+            };
+            let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+            let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+            facts.push((service, decided.boundaries));
+        }
+        let services: Vec<(&str, &super::super::decided_sites::RouteBoundaries)> =
+            facts.iter().map(|(name, facts)| (*name, facts)).collect();
+        let resolved: Vec<String> = resolve(&services, FAN_OUT)
+            .iter()
+            .map(|resolved| {
+                format!(
+                    "{}:{} {} -> {} unread_hosts={} {}",
+                    resolved.file,
+                    resolved.line,
+                    resolved.method,
+                    resolved.paths.join("|"),
+                    resolved.unread_hosts,
+                    resolved.untraced.as_deref().unwrap_or("")
+                )
+                .replace("->  ", "-> ")
+                .trim_end()
+                .to_string()
+            })
+            .collect();
+        let want: Vec<String> = texts(&[
+            "packages/routes/src/built-routes.ts:3 GET -> unread_hosts=2 hole_callback_parameter",
+            // A computed key after the written one.
+            "packages/routes/src/computed-routes.ts:3 GET -> unread_hosts=1 hole_callback_option",
+            "packages/routes/src/legacy.ts:3 GET -> unread_hosts=1 unmatched_boundary",
+            "packages/routes/src/notes.ts:7 GET -> unread_hosts=1 unmatched_boundary",
+            "packages/routes/src/orders.ts:3 GET -> unread_hosts=2 unmatched_boundary",
+            "packages/routes/src/root-routes.ts:3 GET -> unread_hosts=1 unmatched_boundary",
+            "packages/routes/src/shared.ts:5 GET -> unread_hosts=1 unmatched_boundary",
+            "packages/routes/src/shared.ts:9 GET -> unread_hosts=1 unmatched_boundary",
+            // A spread after the written key.
+            "packages/routes/src/spread-routes.ts:3 GET -> unread_hosts=1 hole_callback_option",
+            "packages/routes/src/tags.ts:3 GET -> unread_hosts=1 unmatched_boundary",
+            "packages/routes/src/twice-routes.ts:3 GET -> unread_hosts=2 unmatched_boundary",
+            "packages/server/src/extra.ts:7 GET -> unread_hosts=1 unmatched_boundary",
+        ]);
+        assert_eq!(resolved, want, "{resolved:#?}");
+    }
+
     /// carrick#2474 R5a: with the receiver trace on, each service records
     /// where its route chains leave it, without reading another service's
     /// code. The receiving package's routes end at its plugin's parameter
@@ -4023,12 +4086,12 @@ mod tests {
         // The callback routes, filled only by the main host, compose under
         // the plugin's own scope from the facts alone. The orders route takes
         // the paths the first two hosts state; the third's prefix is not read
-        // (Q5 (ii)).
+        // (Q5 (ii)). The package's own app serves it at its root as well.
         let resolved = resolved_under(FAN_OUT);
         let want_resolved = texts(&[
             "packages/routes/src/admin.ts:5 GET -> /api/v1/admin/users unread_hosts=0",
             "packages/routes/src/admin.ts:6 POST -> /api/v1/admin/users unread_hosts=0",
-            "packages/routes/src/orders.ts:4 GET -> /api/v1/orders unread_hosts=1",
+            "packages/routes/src/orders.ts:4 GET -> /api/v1/orders|/orders unread_hosts=1",
             "packages/server/src/audit.ts:6 GET -> /api/v1/audit/events unread_hosts=0",
             "packages/server/src/audit.ts:7 GET -> /api/v1/audit/events/:id unread_hosts=0",
         ]);

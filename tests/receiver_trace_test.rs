@@ -63,6 +63,16 @@ fn scan_fixture(name: &str, fact_layer: bool, trace: Option<&str>) -> Blobs {
     scan_runs(name, &[], fact_layer, trace, 1).remove(0)
 }
 
+/// Each service's fallbacks line, by service name (`(root)` for the
+/// unnamed one): every count it states.
+type Fallbacks = BTreeMap<String, BTreeMap<String, serde_json::Value>>;
+
+/// [`scan_fixture`], with the fallbacks lines the scan states to a parent
+/// that reads them (`CARRICK_PROGRESS=1`).
+fn scan_fixture_reading(name: &str, fact_layer: bool, trace: Option<&str>) -> (Blobs, Fallbacks) {
+    scan_runs_reading(name, &[], fact_layer, trace, 1, true).remove(0)
+}
+
 /// `runs` scans of one committed copy of the fixture `name`, with `extra`
 /// files written into it before the commit, sharing one store and cache:
 /// every scan after the first takes the incremental path. The blobs after
@@ -74,6 +84,21 @@ fn scan_runs(
     trace: Option<&str>,
     runs: usize,
 ) -> Vec<Blobs> {
+    scan_runs_reading(name, extra, fact_layer, trace, runs, false)
+        .into_iter()
+        .map(|(blobs, _)| blobs)
+        .collect()
+}
+
+/// [`scan_runs`], and, with `reading`, each scan's fallbacks lines.
+fn scan_runs_reading(
+    name: &str,
+    extra: &[(&str, &str)],
+    fact_layer: bool,
+    trace: Option<&str>,
+    runs: usize,
+    reading: bool,
+) -> Vec<(Blobs, Fallbacks)> {
     let tmp = tempfile::tempdir().expect("temp dir");
     let repo = tmp.path().join("workspace");
     copy_dir(&fixture_dir(name).join("repo"), &repo);
@@ -133,6 +158,11 @@ fn scan_runs(
     if let Some(trace) = trace {
         cmd.env("CARRICK_RECEIVER_TRACE", trace);
     }
+    if reading {
+        cmd.env("CARRICK_PROGRESS", "1");
+    } else {
+        cmd.env_remove("CARRICK_PROGRESS");
+    }
     let mut scans = vec![run_scan(&mut cmd, &storage)];
     // A later scan reads the store back, so it finds the first scan's blob.
     cmd.env_remove("CARRICK_LOCAL_STORAGE_ISOLATE");
@@ -152,8 +182,9 @@ fn scan_runs(
     scans
 }
 
-/// One scan by `cmd`, and the blobs it left in `storage`.
-fn run_scan(cmd: &mut Command, storage: &Path) -> Blobs {
+/// One scan by `cmd`, the blobs it left in `storage`, and the fallbacks
+/// lines it stated.
+fn run_scan(cmd: &mut Command, storage: &Path) -> (Blobs, Fallbacks) {
     let output = cmd.output().expect("spawn carrick");
     assert!(
         output.status.success(),
@@ -180,7 +211,21 @@ fn run_scan(cmd: &mut Command, storage: &Path) -> Blobs {
         );
     }
     assert!(!blobs.is_empty(), "the scan stored a blob");
-    blobs
+    // The runner keeps the last line each service states.
+    let mut fallbacks = Fallbacks::new();
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        let Some(payload) = line.trim_start().strip_prefix("@carrick-fallbacks ") else {
+            continue;
+        };
+        let mut line: BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(payload).expect("a fallbacks line is JSON");
+        let service = line
+            .remove("service")
+            .and_then(|service| service.as_str().map(str::to_string))
+            .unwrap_or_else(|| "(root)".to_string());
+        fallbacks.insert(service, line);
+    }
+    (blobs, fallbacks)
 }
 
 /// Every possible call the blobs hold, as `file:line member`.
@@ -285,10 +330,10 @@ fn endpoint_rows(blobs: &Blobs) -> (Vec<String>, Vec<String>) {
 /// a full path from the top (the answer key
 /// `each_route_is_composed_under_its_scopes_and_mounts`) is a mount-graph
 /// row at its line, `library_claim`, and so is the payload's flat row. The
-/// mock answer's rows that agree are kept and relabelled; the two whose
-/// path the trace disagrees with (`items.ts`, read without its plugin
-/// prefixes) are kept as they are and nothing is written there
-/// (orchestrator's ruling, 2026-10-23). No row is removed. A route the
+/// mock answer's rows that agree are kept and relabelled; the two read
+/// without their plugin prefixes (`items.ts`, the route's own path) take
+/// the traced path, keeping their owner (carrick#2474 row 4, R5b). No row
+/// is removed. A route the
 /// trace cannot place (a callback option, a plugin nothing calls, a mount
 /// it cannot verify) keeps today's reading, a possible call. With the
 /// switch off, or with the fact layer off, nothing moves.
@@ -333,10 +378,11 @@ fn traced_routes_take_their_composed_paths() {
             "src/index.ts:26 GET /in/inline library_claim scoped",
             "src/index.ts:37 GET /v2/x library_claim v2",
             "src/index.ts:38 GET /v3/y library_claim basePath",
-            // The trace serves these at `/api/items` and `/api/deep/leaf`:
-            // the rows disagree, so they stand and nothing is written.
-            "src/items.ts:12 GET /items model app",
-            "src/items.ts:8 GET /leaf model app",
+            // The trace serves these at `/api/items` and `/api/deep/leaf`;
+            // the mock rows state the route's own path with no prefix, so
+            // they take the traced path (carrick#2474 row 4, R5b).
+            "src/items.ts:12 GET /api/items library_claim app",
+            "src/items.ts:8 GET /api/deep/leaf library_claim app",
             "src/reports.ts:9 GET /r/daily library_claim made",
             "src/shared.ts:8 GET /a/ping library_claim shared",
             "src/shared.ts:8 GET /b/ping library_claim shared",
@@ -353,9 +399,10 @@ fn traced_routes_take_their_composed_paths() {
         rows
     };
     assert_eq!(flat, flat_of_graph);
-    // Every row the switch-off scan states is still there, at its path.
+    // Every row the switch-off scan states is still there, at its line and
+    // method.
     for row in &mock {
-        let (site, _) = row.rsplit_once(" model ").unwrap();
+        let (site, _) = row.rsplit_once(" /").unwrap();
         assert!(
             graph.iter().any(|kept| kept.starts_with(site)),
             "{site} was removed: {graph:#?}"
@@ -548,4 +595,191 @@ fn routes_a_loop_registers_from_a_table_are_not_written() {
             .collect()
     };
     assert_eq!(table_rows(Some("1")), table_rows(None));
+}
+
+/// Every HTTP producer manifest entry of the blobs, as `file:line METHOD
+/// path kind alias`.
+fn producer_manifest(blobs: &Blobs) -> Vec<String> {
+    let mut out = Vec::new();
+    for text in blobs.values() {
+        let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+        for entry in blob["type_manifest"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            if entry["role"] != "producer" || entry["protocol"] != "http" {
+                continue;
+            }
+            out.push(format!(
+                "{}:{} {} {} {} {}",
+                entry["file_path"].as_str().unwrap_or_default(),
+                entry["line_number"],
+                entry["method"].as_str().unwrap_or_default(),
+                entry["path"].as_str().unwrap_or_default(),
+                entry["type_kind"].as_str().unwrap_or_default(),
+                entry["type_alias"].as_str().unwrap_or_default(),
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// carrick#2474 R5b: routes whose chains leave their service are served
+/// under the scope another service hands them. `receiver-scopes-across` has a
+/// routes package whose plugin opens one scope under its own default prefix
+/// (`opts.basePrefix ?? '/api/v1'`, read in that package: nothing there calls
+/// the plugin) and hands it to `opts.extra`; the main host writes `extra` as
+/// a callback that registers the package's admin helper and its own audit
+/// routes; two more hosts register the plugin, one with a closed literal and
+/// one with a spread no reader states. The routes package also registers its
+/// order routes on an app of its own (`standalone.ts`), at the root. The
+/// mock answer states each route at its literal path.
+///
+/// With the trace on, at the join point: the audit rows (in the host's
+/// service) and the admin rows (in the routes package) take the scope's
+/// prefix, corrected in place (row 4). The orders route is served by three
+/// hosts, one of which states no prefix that can be read: under Q5 (ii)
+/// (David, 2026-10-23) it takes the path the other two state, and the unread
+/// host is counted; the package's own app serves it at `/orders` as well.
+/// No host's `basePrefix` value is ever read (2026-10-14
+/// ruling 1). Each corrected row's producer manifest entries take its new
+/// key and keep their alias. The routes package's documentation rows then
+/// fold onto the rows written in its own service; the two documenting the
+/// host's audit routes stay (the fold across services is R5d). With the
+/// switch off, or with the fact layer off, nothing moves.
+#[test]
+fn routes_across_services_take_the_receiving_scope() {
+    let off = scan_fixture("receiver-scopes-across", true, None);
+    let (off_graph, _) = endpoint_rows(&off);
+    // The mock answer's rows, each at its literal path, and the routes
+    // package's documentation.
+    let mock = vec![
+        "packages/routes/src/admin.ts:5 GET /admin/users model app",
+        "packages/routes/src/docs.ts:10 GET /api/v1/admin/users descriptor_route __route_descriptor__",
+        "packages/routes/src/docs.ts:16 POST /api/v1/admin/users descriptor_route __route_descriptor__",
+        "packages/routes/src/docs.ts:22 GET /api/v1/audit/events descriptor_route __route_descriptor__",
+        "packages/routes/src/docs.ts:28 GET /api/v1/audit/events/{id} descriptor_route __route_descriptor__",
+        "packages/routes/src/docs.ts:4 GET /api/v1/orders descriptor_route __route_descriptor__",
+        "packages/server/src/audit.ts:6 GET /audit/events model app",
+    ];
+    assert_eq!(off_graph, mock);
+
+    let (on, fallbacks) = scan_fixture_reading("receiver-scopes-across", true, Some("1"));
+    let (graph, flat) = endpoint_rows(&on);
+    assert_eq!(
+        graph,
+        vec![
+            // Corrected to the scope's path; the documentation of it folds
+            // onto it in its own service.
+            "packages/routes/src/admin.ts:5 GET /api/v1/admin/users descriptor_route app",
+            // Added: no row stood there. With no type anchor this scan, the
+            // documentation of the same operation keeps its row.
+            "packages/routes/src/admin.ts:6 POST /api/v1/admin/users library_claim app",
+            "packages/routes/src/docs.ts:16 POST /api/v1/admin/users descriptor_route __route_descriptor__",
+            // The host's audit routes are documented here, in another
+            // service: the fold across services is carrick#2474 R5d.
+            "packages/routes/src/docs.ts:22 GET /api/v1/audit/events descriptor_route __route_descriptor__",
+            "packages/routes/src/docs.ts:28 GET /api/v1/audit/events/{id} descriptor_route __route_descriptor__",
+            "packages/routes/src/docs.ts:4 GET /api/v1/orders descriptor_route __route_descriptor__",
+            // Q5 (ii): the path two hosts state; the third is counted.
+            "packages/routes/src/orders.ts:4 GET /api/v1/orders library_claim app",
+            // The package's own app serves the same routes at its root
+            // (PR #2734 review): that chain stays in the service, and its
+            // path stands beside the hosts'.
+            "packages/routes/src/orders.ts:4 GET /orders library_claim app",
+            "packages/server/src/audit.ts:6 GET /api/v1/audit/events library_claim app",
+            "packages/server/src/audit.ts:7 GET /api/v1/audit/events/:id library_claim app",
+        ]
+    );
+    let flat_of_graph: Vec<String> = {
+        let mut rows: Vec<String> = graph
+            .iter()
+            .map(|row| row.rsplit_once(' ').unwrap().0.to_string())
+            .collect();
+        rows.sort();
+        rows
+    };
+    assert_eq!(flat, flat_of_graph);
+    // Ruling 1: no host's own prefix option is ever read.
+    for row in graph.iter().chain(&flat) {
+        assert!(
+            !row.contains("${base}") && !row.contains("api/v1api"),
+            "{row}"
+        );
+    }
+    // A corrected row's producer entries take its new key, byte for byte,
+    // and keep their alias; the folded documentation's entries go with it.
+    assert_eq!(
+        producer_manifest(&off),
+        vec![
+            "packages/routes/src/admin.ts:5 GET /admin/users response Endpoint_decf5c62b6c61845_Response_At436386aec40a3379",
+            "packages/routes/src/docs.ts:10 GET /api/v1/admin/users response Endpoint_bb1a686f5e4c54d2_Response_Atf1e0cb5a9f7b748a",
+            "packages/routes/src/docs.ts:16 POST /api/v1/admin/users request Endpoint_e6205bbde80997f6_Request_At0138837ffadb39d2",
+            "packages/routes/src/docs.ts:16 POST /api/v1/admin/users response Endpoint_f23468c0fbf2a02a_Response_At0138837ffadb39d2",
+            "packages/routes/src/docs.ts:22 GET /api/v1/audit/events response Endpoint_e2d4eb6e1675c5c9_Response_Ate98fc63c17a3e34a",
+            "packages/routes/src/docs.ts:28 GET /api/v1/audit/events/{id} response Endpoint_096ab5a590512c13_Response_At811f38cb9a8a62a6",
+            "packages/routes/src/docs.ts:4 GET /api/v1/orders response Endpoint_8cc6f21213a20a01_Response_Atc7ccf7294327f4bc",
+            "packages/server/src/audit.ts:6 GET /audit/events response Endpoint_cf8ea45ffddd4018_Response_Atde8b764d1203983c",
+        ]
+    );
+    assert_eq!(
+        producer_manifest(&on),
+        vec![
+            "packages/routes/src/admin.ts:5 GET /api/v1/admin/users response Endpoint_decf5c62b6c61845_Response_At436386aec40a3379",
+            "packages/routes/src/docs.ts:16 POST /api/v1/admin/users request Endpoint_e6205bbde80997f6_Request_At0138837ffadb39d2",
+            "packages/routes/src/docs.ts:16 POST /api/v1/admin/users response Endpoint_f23468c0fbf2a02a_Response_At0138837ffadb39d2",
+            "packages/routes/src/docs.ts:22 GET /api/v1/audit/events response Endpoint_e2d4eb6e1675c5c9_Response_Ate98fc63c17a3e34a",
+            "packages/routes/src/docs.ts:28 GET /api/v1/audit/events/{id} response Endpoint_096ab5a590512c13_Response_At811f38cb9a8a62a6",
+            "packages/routes/src/docs.ts:4 GET /api/v1/orders response Endpoint_8cc6f21213a20a01_Response_Atc7ccf7294327f4bc",
+            "packages/server/src/audit.ts:6 GET /api/v1/audit/events response Endpoint_cf8ea45ffddd4018_Response_Atde8b764d1203983c",
+        ]
+    );
+    // Each row's endpoint key, flat key and manifest key are one string.
+    for entry in producer_manifest(&on) {
+        let (site, rest) = entry.split_once(' ').unwrap();
+        let (method, rest) = rest.split_once(' ').unwrap();
+        let path = rest.split(' ').next().unwrap();
+        assert!(
+            graph
+                .iter()
+                .any(|row| row.starts_with(&format!("{site} {method} {path} "))),
+            "{entry} has no row at its key: {graph:#?}"
+        );
+    }
+    let counts = |service: &str| -> Vec<String> {
+        fallbacks[service]
+            .iter()
+            .filter(|(key, _)| key.starts_with("routes_"))
+            .map(|(key, count)| format!("{key}={count}"))
+            .collect()
+    };
+    assert_eq!(
+        counts("routes"),
+        vec![
+            "routes_across_added_untyped=3",
+            "routes_across_corrected=1",
+            "routes_across_unread_host=1",
+            // The package's own sites end at the plugin's parameter: the
+            // reader keeps them inside the service, and the join point
+            // writes them.
+            "routes_untraced_hole_entry_point=3",
+        ]
+    );
+    assert_eq!(
+        counts("server"),
+        vec![
+            "routes_across_added_untyped=1",
+            "routes_across_corrected=1",
+            "routes_untraced_hole_callback_option=2",
+        ]
+    );
+    assert_eq!(counts("app"), Vec::<String>::new());
+    assert_eq!(counts("demo"), Vec::<String>::new());
+    // With the fact layer off the switch changes no byte.
+    assert_eq!(
+        scan_fixture("receiver-scopes-across", false, Some("1")),
+        scan_fixture("receiver-scopes-across", false, None)
+    );
 }

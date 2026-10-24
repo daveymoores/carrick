@@ -9,7 +9,8 @@
 //! (carrick#2474 R5b) without any service reading another's code:
 //!
 //! - **route segments** ([`RouteSegment`]): a route site whose chain ends at
-//!   a boundary, with the prefixes from that boundary down to the route;
+//!   a boundary, with the prefixes from that boundary down to the route,
+//!   and the site's chains that stay in the service ([`InService`]);
 //! - **call-ins** ([`CallIn`]): a call in this service that hands a value to
 //!   a function declared in another service, with the chains above the value
 //!   and, for a library member that runs the function, the prefix that
@@ -112,14 +113,27 @@ pub struct RouteSegment {
     pub method: String,
     /// The path the route's own call writes.
     pub path: String,
-    /// The handler's name where the call hands one by name. Not read on
-    /// this branch: carrick#2474 R3 S1 names it on `HandlerAt`.
+    /// The handler's name where the call hands one by name.
     pub handler: Option<String>,
     /// The symbol the receiver is read through.
     pub owner: Option<String>,
     /// The parts from the boundary down to the route.
     pub below: Vec<Part>,
     pub at: Boundary,
+    /// The site's chains that do not leave the service, as one more host
+    /// beside the boundary's: `None` on every segment of the site but the
+    /// first, so each is read once.
+    pub in_service: Option<InService>,
+}
+
+/// A route site's chains that end in its own service: the full paths its
+/// chains served at no mount compose, stated as a host, and why each other
+/// chain gives none (a hole, an unverified mount, a prefix not read), each
+/// an unread host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct InService {
+    pub paths: Vec<String>,
+    pub unread: Vec<String>,
 }
 
 /// A call in this service that hands a value to `function`, declared in
@@ -270,14 +284,17 @@ impl<'c, 'a> Collect<'c, 'a> {
     }
 
     /// 1. A route site whose label forces its method, one per chain that
-    ///    ends at a boundary.
+    ///    ends at a boundary. The first carries the site's other chains
+    ///    ([`InService`]): a site that also serves the route in its own
+    ///    service keeps those paths, and its holes are counted.
     fn routes(&self, decided: &Decided, labels: &[SiteLabel]) -> Vec<RouteSegment> {
+        let boundary_end = |end: &str| matches!(end, "entry_point" | "callback_option");
         let mut out = Vec::new();
         for site in &decided.sites {
             if !site
                 .composed
                 .iter()
-                .any(|composed| matches!(composed.end.as_str(), "entry_point" | "callback_option"))
+                .any(|composed| boundary_end(&composed.end))
             {
                 continue;
             }
@@ -285,6 +302,25 @@ impl<'c, 'a> Collect<'c, 'a> {
             else {
                 continue;
             };
+            let mut in_service = InService::default();
+            for composed in site
+                .composed
+                .iter()
+                .filter(|composed| !boundary_end(&composed.end))
+            {
+                match (composed.end.as_str(), &composed.path) {
+                    ("top", Some(full_path)) => in_service.paths.push(full_path.clone()),
+                    ("top", None) => in_service.unread.push("unread_prefix".to_string()),
+                    (end @ ("cycle" | "mount_unverified"), _) => {
+                        in_service.unread.push(end.to_string())
+                    }
+                    (reason, _) => in_service.unread.push(format!("hole_{reason}")),
+                }
+            }
+            in_service.paths.sort();
+            in_service.paths.dedup();
+            let mut in_service = (!in_service.paths.is_empty() || !in_service.unread.is_empty())
+                .then_some(in_service);
             for above in super::composed::aboves(&site.instances, self.mounts) {
                 let End::Boundary { boundary } = above.end else {
                     continue;
@@ -294,13 +330,17 @@ impl<'c, 'a> Collect<'c, 'a> {
                     line: site.line,
                     method: method.to_uppercase(),
                     path: path.clone(),
-                    handler: None,
+                    handler: site
+                        .handler
+                        .as_ref()
+                        .and_then(|handler| handler.name.clone()),
                     owner: site
                         .receiver
                         .as_ref()
                         .and_then(|receiver| receiver.symbol.clone()),
                     below: above.parts,
                     at: boundary,
+                    in_service: in_service.take(),
                 });
             }
         }
@@ -471,7 +511,7 @@ pub enum FanOut {
     StatedHosts,
 }
 
-/// carrick#2474 Q5, until David rules: (ii).
+/// carrick#2474 Q5, ruled (ii) by David on 2026-10-23.
 pub const FAN_OUT: FanOut = FanOut::StatedHosts;
 
 /// How one route segment resolves across services.
@@ -482,6 +522,15 @@ pub struct Resolved {
     pub file: String,
     pub line: u32,
     pub method: String,
+    /// The path the route's own call writes.
+    #[serde(skip)]
+    pub path: String,
+    /// The handler's name where the call hands one by name.
+    #[serde(skip)]
+    pub handler: Option<String>,
+    /// The symbol the receiver is read through.
+    #[serde(skip)]
+    pub owner: Option<String>,
     /// Every full path, sorted; empty where the segment does not resolve.
     pub paths: Vec<String>,
     /// Hosts whose path is not read, written around under (ii).
@@ -500,13 +549,64 @@ const MAX_RESOLVED: usize = super::composed::MAX_COMPOSED;
 /// down, or why a way does not resolve.
 type Ways = Vec<Result<Vec<Part>, String>>;
 
-/// Every service's facts, read across services.
+/// The ways `ways` gives, at most [`MAX_RESOLVED`]: past that, the one
+/// way left says `trimmed`.
+fn capped(ways: impl IntoIterator<Item = Result<Vec<Part>, String>>) -> Ways {
+    let mut out = Ways::new();
+    for way in ways {
+        if out.len() == MAX_RESOLVED {
+            return vec![Err("trimmed".to_string())];
+        }
+        out.push(way);
+    }
+    out
+}
+
+/// Every service's facts, read across services, by the function and
+/// parameter each fills or reads.
 struct Across<'b> {
-    call_ins: Vec<&'b CallIn>,
-    hand_outs: Vec<&'b HandOut>,
+    call_ins: BTreeMap<&'b FnAt, BTreeMap<u32, Vec<&'b CallIn>>>,
+    hand_outs: BTreeMap<&'b FnAt, BTreeMap<u32, Vec<&'b HandOut>>>,
 }
 
 impl<'b> Across<'b> {
+    fn of(services: &[(&str, &'b RouteBoundaries)]) -> Self {
+        let mut across = Across {
+            call_ins: BTreeMap::new(),
+            hand_outs: BTreeMap::new(),
+        };
+        for (_, facts) in services {
+            for call_in in &facts.call_ins {
+                across
+                    .call_ins
+                    .entry(&call_in.function)
+                    .or_default()
+                    .entry(call_in.param)
+                    .or_default()
+                    .push(call_in);
+            }
+            for hand_out in &facts.hand_outs {
+                across
+                    .hand_outs
+                    .entry(&hand_out.function)
+                    .or_default()
+                    .entry(hand_out.param)
+                    .or_default()
+                    .push(hand_out);
+            }
+        }
+        across
+    }
+
+    /// The call-ins that fill parameter `param` of `function`.
+    fn call_ins_of(&self, function: &FnAt, param: u32) -> &[&'b CallIn] {
+        self.call_ins
+            .get(function)
+            .and_then(|by_param| by_param.get(&param))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
     /// The ways the boundary `at` resolves, each its parts from the top
     /// down to the boundary. `only_at` narrows an entry parameter's call-ins
     /// to the call at that `file:line` (a callback option belongs to its
@@ -519,22 +619,23 @@ impl<'b> Across<'b> {
         seen.push(at.clone());
         let ways = match at {
             Boundary::EntryParam { function, param } => {
-                let call_ins: Vec<&&CallIn> = self
-                    .call_ins
+                let call_ins: Vec<&CallIn> = self
+                    .call_ins_of(function, *param)
                     .iter()
-                    .filter(|call_in| {
-                        call_in.function == *function
-                            && call_in.param == *param
-                            && only_at.is_none_or(|only| call_in.at == only)
-                    })
+                    .copied()
+                    .filter(|call_in| only_at.is_none_or(|only| call_in.at == only))
                     .collect();
                 if call_ins.is_empty() {
                     vec![Err("unmatched_boundary".to_string())]
                 } else {
-                    call_ins
-                        .into_iter()
-                        .flat_map(|call_in| self.call_in(call_in, seen))
-                        .collect()
+                    let mut ways = Ways::new();
+                    for call_in in call_ins {
+                        ways.extend(self.call_in(call_in, seen));
+                        if ways.len() > MAX_RESOLVED {
+                            break;
+                        }
+                    }
+                    capped(ways)
                 }
             }
             Boundary::CallbackOption {
@@ -568,8 +669,11 @@ impl<'b> Across<'b> {
                     parts
                 }));
             }
+            if out.len() > MAX_RESOLVED {
+                break;
+            }
         }
-        out
+        capped(out)
     }
 
     /// The ways one chain resolves, its own parts below whatever is above
@@ -609,24 +713,27 @@ impl<'b> Across<'b> {
         // runs it, the arguments after the function's are its parameters
         // after the one the member yields (`register(plugin, options)`
         // runs `plugin(instance, options)`).
-        let q: Vec<u32> = match runs_arg {
+        let mut q: Vec<u32> = match runs_arg {
             None => vec![arg],
             Some(runs_arg) => self
                 .call_ins
-                .iter()
-                .filter(|call_in| call_in.function == *runs && call_in.at == host_at)
+                .get(runs)
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .flatten()
+                .filter(|call_in| call_in.at == host_at)
                 .filter_map(|call_in| (arg + call_in.param).checked_sub(runs_arg))
                 .collect(),
         };
-        let hand_outs: Vec<&&HandOut> = self
-            .hand_outs
+        q.sort_unstable();
+        q.dedup();
+        let by_param = self.hand_outs.get(runs);
+        let hand_outs: Vec<&HandOut> = q
             .iter()
-            .filter(|hand_out| {
-                hand_out.function == *runs
-                    && q.contains(&hand_out.param)
-                    && hand_out.key == key
-                    && hand_out.arg == param
-            })
+            .filter_map(|q| by_param.and_then(|by_param| by_param.get(q)))
+            .flatten()
+            .copied()
+            .filter(|hand_out| hand_out.key == key && hand_out.arg == param)
             .collect();
         if hand_outs.is_empty() {
             return vec![Err("unmatched_boundary".to_string())];
@@ -635,9 +742,12 @@ impl<'b> Across<'b> {
         for hand_out in hand_outs {
             for above in &hand_out.instance {
                 out.extend(self.above(above, Some(host_at), seen));
+                if out.len() > MAX_RESOLVED {
+                    return capped(out);
+                }
             }
         }
-        out
+        capped(out)
     }
 }
 
@@ -690,17 +800,12 @@ fn full_paths(parts: &[Part], path: &str) -> Result<Vec<String>, String> {
 /// own boundary is one host: under [`FanOut::EveryHost`] a host whose path
 /// is not read leaves the whole route unresolved, under
 /// [`FanOut::StatedHosts`] the other hosts' paths stand and it is counted.
+/// The site's chains that stay in its own service ([`InService`]) are one
+/// more host: under (ii) a site whose boundary nothing fills still resolves
+/// at the paths it serves in its own service, with that boundary counted
+/// as an unread host rather than the route left `unmatched_boundary`.
 pub fn resolve(services: &[(&str, &RouteBoundaries)], fan_out: FanOut) -> Vec<Resolved> {
-    let across = Across {
-        call_ins: services
-            .iter()
-            .flat_map(|(_, facts)| &facts.call_ins)
-            .collect(),
-        hand_outs: services
-            .iter()
-            .flat_map(|(_, facts)| &facts.hand_outs)
-            .collect(),
-    };
+    let across = Across::of(services);
     let mut out = Vec::new();
     for (service, facts) in services {
         for segment in &facts.routes {
@@ -720,9 +825,8 @@ fn resolve_segment(
     let hosts: Vec<Ways> = match &segment.at {
         Boundary::EntryParam { function, param } => {
             let mut hosts: Vec<Ways> = across
-                .call_ins
+                .call_ins_of(function, *param)
                 .iter()
-                .filter(|call_in| call_in.function == *function && call_in.param == *param)
                 .map(|call_in| {
                     let mut seen = vec![segment.at.clone()];
                     across.call_in(call_in, &mut seen)
@@ -761,6 +865,16 @@ fn resolve_segment(
             None => paths.extend(host_paths),
         }
     }
+    // The site's own chains are one more host: the paths it serves the
+    // route at in its own service stand beside the boundary's, and each of
+    // its holes is a host not read.
+    if let Some(in_service) = &segment.in_service {
+        paths.extend(in_service.paths.iter().cloned());
+        for reason in &in_service.unread {
+            unread_hosts += 1;
+            *reasons.entry(reason.clone()).or_default() += 1;
+        }
+    }
     paths.sort();
     paths.dedup();
     let untraced = if paths.is_empty() {
@@ -780,6 +894,9 @@ fn resolve_segment(
         file: segment.file.clone(),
         line: segment.line,
         method: segment.method.clone(),
+        path: segment.path.clone(),
+        handler: segment.handler.clone(),
+        owner: segment.owner.clone(),
         paths,
         unread_hosts,
         untraced,
@@ -829,6 +946,7 @@ mod tests {
             owner: None,
             below,
             at: boundary,
+            in_service: None,
         }
     }
 
@@ -971,6 +1089,59 @@ mod tests {
         assert_eq!(resolved[0].untraced.as_deref(), Some("cycle"));
     }
 
+    /// carrick#2474 R5b: the ways one host resolves are capped at
+    /// [`MAX_RESOLVED`]: a host reached through more ways than that is
+    /// counted `trimmed`, even where every way would give the same path.
+    #[test]
+    fn a_host_reached_through_too_many_ways_is_trimmed() {
+        let f = at("packages/r/src/f.ts", 1);
+        let g = at("packages/s/src/g.ts", 1);
+        let r = RouteBoundaries {
+            routes: vec![segment(entry(&f), Vec::new())],
+            ..RouteBoundaries::default()
+        };
+        // `g` calls `f` with its own parameter; `g` is called from as many
+        // places as the cap allows, then one more, each under `/a`.
+        let mut call_ins = vec![call_in(
+            &f,
+            "packages/s/src/g.ts:3",
+            None,
+            Above {
+                parts: Vec::new(),
+                end: End::Boundary {
+                    boundary: entry(&g),
+                },
+            },
+        )];
+        let callers = |count: usize| -> Vec<CallIn> {
+            (0..count)
+                .map(|index| {
+                    call_in(
+                        &g,
+                        &format!("packages/t/src/main.ts:{index}"),
+                        None,
+                        top(vec![stated("/a")]),
+                    )
+                })
+                .collect()
+        };
+        call_ins.extend(callers(MAX_RESOLVED));
+        let s = RouteBoundaries {
+            call_ins: call_ins.clone(),
+            ..RouteBoundaries::default()
+        };
+        let resolved = resolve(&[("r", &r), ("s", &s)], FanOut::StatedHosts);
+        assert_eq!(resolved[0].paths, vec!["/a/x".to_string()]);
+        call_ins.extend(callers(MAX_RESOLVED + 1).into_iter().skip(MAX_RESOLVED));
+        let s = RouteBoundaries {
+            call_ins,
+            ..RouteBoundaries::default()
+        };
+        let resolved = resolve(&[("r", &r), ("s", &s)], FanOut::StatedHosts);
+        assert_eq!(resolved[0].paths, Vec::<String>::new());
+        assert_eq!(resolved[0].untraced.as_deref(), Some("trimmed"));
+    }
+
     /// carrick#2474 Q5: two hosts that agree give one path; a third whose
     /// prefix is not read is counted, and under (i) leaves the route
     /// unresolved while under (ii) the stated hosts' path stands.
@@ -1005,5 +1176,45 @@ mod tests {
         assert_eq!(stated[0].paths, vec!["/api/v1/x".to_string()]);
         assert_eq!(stated[0].unread_hosts, 1);
         assert_eq!(stated[0].untraced, None);
+    }
+
+    /// PR #2734 review: a site whose route is also served in its own
+    /// service keeps that path beside the boundary's, and each chain of its
+    /// own that gives no path is an unread host. With no call-in at the
+    /// boundary, the site's own path still stands.
+    #[test]
+    fn a_site_served_in_its_own_service_keeps_that_path_beside_the_boundarys() {
+        let plugin = at("packages/r/src/plugin.ts", 5);
+        let r = RouteBoundaries {
+            routes: vec![RouteSegment {
+                in_service: Some(InService {
+                    paths: vec!["/x".to_string()],
+                    unread: vec!["hole_unread".to_string()],
+                }),
+                ..segment(entry(&plugin), vec![stated("/api/v1")])
+            }],
+            ..RouteBoundaries::default()
+        };
+        let s = RouteBoundaries {
+            call_ins: vec![call_in(
+                &plugin,
+                "packages/s/src/main.ts:4",
+                Some(Prefix::Unstated),
+                top(Vec::new()),
+            )],
+            ..RouteBoundaries::default()
+        };
+        let resolved = resolve(&[("r", &r), ("s", &s)], FanOut::StatedHosts);
+        assert_eq!(
+            resolved[0].paths,
+            vec!["/api/v1/x".to_string(), "/x".to_string()]
+        );
+        assert_eq!(resolved[0].unread_hosts, 1);
+        assert_eq!(resolved[0].untraced, None);
+        let alone = resolve(&[("r", &r)], FanOut::StatedHosts);
+        assert_eq!(alone[0].paths, vec!["/x".to_string()]);
+        assert_eq!(alone[0].unread_hosts, 2);
+        let every = resolve(&[("r", &r), ("s", &s)], FanOut::EveryHost);
+        assert_eq!(every[0].untraced.as_deref(), Some("unread_host"));
     }
 }
