@@ -44,6 +44,7 @@ const SERVER = `export interface Request {
   path: string;
   method: string;
   raw: { url: string };
+  body: unknown;
 }
 export interface Reply {
   send(body: unknown): void;
@@ -347,6 +348,31 @@ describe('verify_library_claims: route fields (carrick#2474 R0)', () => {
         onApp(route('get', { request: { param: 1, path: ['path'] } })),
       ]),
       ['verified', 'verified', 'failed request_member_missing', 'failed request_member_missing', 'failed request_member_missing']
+    );
+  });
+
+  it('request: a body member path resolves beside a path or a URL, or alone (carrick#2674)', async () => {
+    assert.deepStrictEqual(
+      await send([
+        onApp(route('post', { request: { param: 0, path: ['path'], body: ['body'] } })),
+        onApp(route('post', { request: { param: 0, url: ['raw', 'url'], body: ['body'] } })),
+        // Invalid: the request declares no such member.
+        onApp(route('post', { request: { param: 0, path: ['path'], body: ['payload'] } })),
+        // Invalid: the handler's parameter there is the reply.
+        onApp(route('post', { request: { param: 1, path: ['path'], body: ['body'] } })),
+        // Invalid: an empty member path.
+        onApp(route('post', { request: { param: 0, path: ['path'], body: [] } })),
+        // A body alone is read too: a server label names the body and nothing else.
+        onApp(route('post', { request: { param: 0, body: ['body'] } })),
+      ]),
+      [
+        'verified',
+        'verified',
+        'failed request_member_missing',
+        'failed request_member_missing',
+        'unchecked claim_invalid',
+        'verified',
+      ]
     );
   });
 

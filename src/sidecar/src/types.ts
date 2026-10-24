@@ -1136,7 +1136,42 @@ export interface SurfaceMember {
   name: string;
   /** Declared by the receiver's home packages (not only inherited from another package). */
   own: boolean;
+  /**
+   * The members the parameters of a function this member takes declare
+   * (carrick#2674): what a receive op's `request` field names its member
+   * paths in. Under a cap of their own, apart from the main one.
+   */
+  handlers?: SurfaceHandler[];
   signatures: SurfaceSignature[];
+}
+
+/**
+ * A function a member takes at argument `arg`, or at `key` of the options
+ * object there, and the parameters of it that declare members. A handler the
+ * member's overloads state alike is listed once, from the first overload.
+ */
+export interface SurfaceHandler {
+  arg: number;
+  key?: string;
+  params: SurfaceHandlerParam[];
+}
+
+/** One parameter of a handler, with the members its type declares (none: not listed). */
+export interface SurfaceHandlerParam {
+  param: number;
+  name: string;
+  /** The parameter's type as the declarations print it, truncated. */
+  type: string;
+  members: SurfaceHandlerMember[];
+}
+
+/** A member of a handler's parameter, by path from the parameter, to two levels. */
+export interface SurfaceHandlerMember {
+  path: string[];
+  type: string;
+  optional: boolean;
+  /** Callable (a method or a function-typed property). */
+  function: boolean;
 }
 
 /** One receiver the verifier can read claims on, in its receiver grammar, with what it declares. */
