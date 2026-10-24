@@ -1139,7 +1139,7 @@ export interface SurfaceMember {
   /**
    * The members the parameters of a function this member takes declare
    * (carrick#2674): what a receive op's `request` field names its member
-   * paths in. Listed before any signature, so the cap keeps them.
+   * paths in. Under a cap of their own, apart from the main one.
    */
   handlers?: SurfaceHandler[];
   signatures: SurfaceSignature[];
