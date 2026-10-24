@@ -9278,6 +9278,12 @@ export class TypeInferrer {
     if (Node.isObjectLiteralExpression(unwrapped)) {
       const value = this.objectLiteralMemberValue(unwrapped, member);
       if (value) return { kind: 'body', node: value, from };
+      if (this.literalMemberNamed(unwrapped, member)) {
+        return {
+          kind: 'abstain',
+          why: `the request config writes its '${member}' member as a method or accessor, so its value is unread`,
+        };
+      }
       if (
         unwrapped
           .getProperties()
@@ -9315,30 +9321,61 @@ export class TypeInferrer {
   /**
    * A config literal that spreads another object, or writes a computed key,
    * names no `body` itself, so the literal's own type is read: the call sends
-   * no body only when that type declares no `body` member, or one typed
-   * `undefined` or `never`. Any other type, and a literal whose type is not
-   * known (a spread of an untyped object), abstains.
+   * no body only when every branch of that type declares no `body` member, or
+   * one typed `undefined` or `never`. The literal and each spread are first
+   * read for a type that rules nothing out: one not known (a spread of an
+   * untyped object), a generic one (a type parameter, or an intersection with
+   * one), or one with a string index signature (which the compiler drops
+   * from a spread's result). Any of those abstains.
    */
   private spreadLiteralBody(
     literal: ObjectLiteralExpression,
     member: string
   ): { kind: 'abstain'; why: string } | { kind: 'no_body'; member: string } {
     const literalType = literal.getType();
-    if (literalType.isAny() || literalType.isUnknown() || literalType.isTypeParameter()) {
+    const read = [
+      literalType,
+      ...literal
+        .getProperties()
+        .filter(Node.isSpreadAssignment)
+        .map((spread) => spread.getExpression().getType()),
+    ];
+    for (const type of read) {
+      const unread = this.spreadTypeUnread(type);
+      if (unread) {
+        return {
+          kind: 'abstain',
+          why: `the request config spreads an object whose type ${unread}, so its '${member}' member is unread`,
+        };
+      }
+    }
+    const branches = literalType.isUnion() ? literalType.getUnionTypes() : [literalType];
+    for (const branch of branches) {
+      const property = branch.getProperty(member);
+      if (!property) continue;
+      const type = property.getTypeAtLocation(literal);
+      const bare = type.isAny() || type.isUnknown() ? type : type.getNonNullableType();
+      if (bare.isNever() || bare.isUndefined() || bare.isVoid()) continue;
       return {
         kind: 'abstain',
-        why: `the request config spreads an object whose type is not known, so its '${member}' member is unread`,
+        why: `the request config spreads an object whose '${member}' member may carry a body`,
       };
     }
-    const property = literalType.getProperty(member);
-    if (!property) return { kind: 'no_body', member };
-    const type = property.getTypeAtLocation(literal);
-    const bare = type.isAny() || type.isUnknown() ? type : type.getNonNullableType();
-    if (bare.isNever() || bare.isUndefined() || bare.isVoid()) return { kind: 'no_body', member };
-    return {
-      kind: 'abstain',
-      why: `the request config spreads an object whose '${member}' member may carry a body`,
-    };
+    return { kind: 'no_body', member };
+  }
+
+  /** Why a spread-side type rules out no member, or undefined when it can be read. */
+  private spreadTypeUnread(type: Type): string | undefined {
+    const branches = type.isUnion() ? type.getUnionTypes() : [type];
+    for (const branch of branches) {
+      const parts = branch.isIntersection() ? branch.getIntersectionTypes() : [branch];
+      for (const part of parts) {
+        if (part.isAny() || part.isUnknown()) return 'is not known';
+        if ((part.compilerType.flags & ts.TypeFlags.Instantiable) !== 0) return 'is generic';
+      }
+      if (branch.getStringIndexType()) return 'has an index signature';
+    }
+    return undefined;
   }
 
   /**
@@ -9431,11 +9468,33 @@ export class TypeInferrer {
     literal: ObjectLiteralExpression,
     name: string
   ): Node | undefined {
-    const property = literal.getProperty(name);
+    const property = this.literalMemberNamed(literal, name);
     if (!property) return undefined;
     if (Node.isPropertyAssignment(property)) return property.getInitializer();
     if (Node.isShorthandPropertyAssignment(property)) return property.getNameNode();
     return undefined;
+  }
+
+  /**
+   * The last member an object literal writes under `name`, in any form
+   * (assignment, shorthand, method, accessor), with a quoted or numeric key
+   * read by its text. Spreads and computed keys name nothing here.
+   */
+  private literalMemberNamed(literal: ObjectLiteralExpression, name: string): Node | undefined {
+    let found: Node | undefined;
+    for (const property of literal.getProperties()) {
+      if (Node.isSpreadAssignment(property)) continue;
+      const nameNode = property.getNameNode();
+      if (Node.isComputedPropertyName(nameNode)) continue;
+      const text =
+        Node.isStringLiteral(nameNode) ||
+        Node.isNoSubstitutionTemplateLiteral(nameNode) ||
+        Node.isNumericLiteral(nameNode)
+          ? nameNode.getLiteralText()
+          : nameNode.getText();
+      if (text === name) found = property;
+    }
+    return found;
   }
 
   /**
