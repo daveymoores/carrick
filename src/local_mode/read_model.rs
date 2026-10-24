@@ -615,6 +615,7 @@ mod tests {
             DescriptorRoute,
             ClassController,
             DecoratorRoute,
+            ReceiverType,
             InlineLiteral,
             LibraryClaim,
             Model,
@@ -624,8 +625,8 @@ mod tests {
             match source {
                 RequestSpec | SameFileWrapper | ImportedMember | RequestSummary | WholeUrlEnv
                 | EnvBasePath | LiteralBasePath | NewUrl | FileBasedRoute | DescriptorRoute
-                | ClassController | DecoratorRoute | InlineLiteral | LibraryClaim | Model
-                | DeclaredOperation => {}
+                | ClassController | DecoratorRoute | ReceiverType | InlineLiteral
+                | LibraryClaim | Model | DeclaredOperation => {}
             }
         }
         all

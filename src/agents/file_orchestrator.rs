@@ -1777,7 +1777,8 @@ impl ResolutionSource {
             Self::FileBasedRoute
             | Self::DescriptorRoute
             | Self::ClassController
-            | Self::DecoratorRoute => 1,
+            | Self::DecoratorRoute
+            | Self::ReceiverType => 1,
             Self::InlineLiteral | Self::Model => 0,
             // Never arbitrated here: a declared operation (carrick#831) is
             // not a statement about a call SITE, so it never competes for one.
