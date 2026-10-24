@@ -5628,6 +5628,24 @@ struct TracedWrite {
     added: std::ops::Range<usize>,
 }
 
+/// A graph row's `file_location` as the file it names, that file relative
+/// to `repo_root` (a [`normalize_protocol_file`] path), and its line.
+fn row_place(location: &str, repo_root: &Path) -> Option<(String, String, u32)> {
+    let (file, line) = location.rsplit_once(':')?;
+    let line = line.parse().ok()?;
+    let normal = normalize_protocol_file(Path::new(file));
+    let relative = normal
+        .strip_prefix(repo_root)
+        .map(Path::to_path_buf)
+        .unwrap_or(normal);
+    let relative = relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Some((file.to_string(), relative, line))
+}
+
 /// The rows a scope or a host decides, at every traced route's site: the
 /// writer [`apply_traced_routes`] (one service, before the payload is built)
 /// and [`crate::route_boundaries`] (across services, at the join point)
@@ -5647,21 +5665,7 @@ fn write_traced_routes(
     }
     let applied = &mut write.applied;
     let repo_root = normalize_protocol_file(Path::new(repo_path));
-    let place = |location: &str| -> Option<(String, String, u32)> {
-        let (file, line) = location.rsplit_once(':')?;
-        let line = line.parse().ok()?;
-        let normal = normalize_protocol_file(Path::new(file));
-        let relative = normal
-            .strip_prefix(&repo_root)
-            .map(Path::to_path_buf)
-            .unwrap_or(normal);
-        let relative = relative
-            .components()
-            .map(|part| part.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        Some((file.to_string(), relative, line))
-    };
+    let place = |location: &str| row_place(location, &repo_root);
     // The graph names its files as the walk did (repo-relative, or under
     // the repo path): a written row names its file the same way.
     let prefix = mount_graph
