@@ -21,7 +21,8 @@ export type InferKind =
   | 'request_body'      // Find request body (req.body/ctx.request.body or call payloads)
   | 'signature_return'  // Function return for the signature hint — NO Promise/wrapper unwrapping
   | 'function_param'    // Type of a single named parameter (explicit or contextually inferred)
-  | 'receiver_type';    // Type of the RECEIVER of a member call (carrick#695)
+  | 'receiver_type'     // Type of the RECEIVER of a member call (carrick#695)
+  | 'request_config';   // A request call's options literal: does it write the `member` that carries the body? (carrick#2674)
 
 // ============================================================================
 // Extraction Config Types (Agent-Informed Payload Unwrapping)
@@ -808,6 +809,8 @@ export interface InferRequestItem {
   alias?: string;
   /** Target parameter name for `function_param` inference. */
   param_name?: string;
+  /** The member of a request options literal that carries the body (`request_config`). */
+  member?: string;
 }
 
 // ============================================================================

@@ -26,6 +26,7 @@ export const InferKindSchema = z.enum([
   'signature_return',
   'function_param',
   'receiver_type',
+  'request_config',
 ]);
 
 // ============================================================================
@@ -113,6 +114,8 @@ export const InferRequestItemSchema = z.object({
   infer_kind: InferKindSchema,
   alias: z.string().optional(),
   param_name: z.string().optional(),
+  // The body-carrying member a `request_config` item asks about.
+  member: z.string().optional(),
 });
 
 /**

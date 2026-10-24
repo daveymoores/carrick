@@ -1254,6 +1254,8 @@ export class TypeInferrer {
         return this.inferFunctionParam(sourceFile, request);
       case 'receiver_type':
         return this.inferReceiverType(sourceFile, request);
+      case 'request_config':
+        return this.inferRequestConfig(sourceFile, request);
       default:
         this.logError(`Unknown infer kind: ${request.infer_kind}`);
         return null;
@@ -6628,6 +6630,55 @@ export class TypeInferrer {
     return this.inferredFromRecoveredPayload(request, recovered);
   }
 
+  /**
+   * carrick#2674: the locator names a request call's options object literal
+   * and the member that carries the call's body. The call sends no request
+   * body when the literal can write no such member: no spread, no computed
+   * key, and no member of that name in any form (assignment, shorthand,
+   * method, accessor, quoted key). Anything else is not decided here, so the
+   * answer is null. `configArgumentBody` stays the reader of the member
+   * itself; the checks above it are this kind's own.
+   */
+  private inferRequestConfig(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): InferredType | null {
+    const member = request.member;
+    if (!member) return null;
+    const located = this.resolveTargetNode(sourceFile, request);
+    if (!located) return null;
+    const literal = this.unwrapExpressionNode(located);
+    if (!Node.isObjectLiteralExpression(literal)) return null;
+    for (const property of literal.getProperties()) {
+      // A spread has no name node, so it falls out here with anything else
+      // unnamed: the literal may write the member through it.
+      const nameNode = Node.isShorthandPropertyAssignment(property)
+        ? property.getNameNode()
+        : (property as { getNameNode?: () => Node }).getNameNode?.();
+      if (!nameNode) return null;
+      if (Node.isComputedPropertyName(nameNode)) return null;
+      const name =
+        Node.isStringLiteral(nameNode) || Node.isNoSubstitutionTemplateLiteral(nameNode)
+          ? nameNode.getLiteralText()
+          : nameNode.getText();
+      if (name === member) return null;
+    }
+    const read = this.configArgumentBody(literal, member, "the call's request config");
+    if (read.kind !== 'no_body') return null;
+    this.log(
+      `Request config at ${request.file_path}:${request.line_number} writes no '${member}' member; ` +
+        'the call sends no request body'
+    );
+    return this.decidedAbstain(request, this.getNodeLocation(literal), {
+      path: '',
+      kind: 'unknown',
+      reason: 'no_request_body',
+      detail:
+        `the call's request config sets no '${read.member}' member, which is where the call ` +
+        'takes its body, so the call sends no request body',
+    });
+  }
+
   /** An `unknown` answer the inferrer decided, carrying its reason at the root. */
   private decidedAbstain(
     request: InferRequestItem,
@@ -11261,6 +11312,8 @@ export class TypeInferrer {
         return 'SigReturn';
       case 'function_param':
         return 'Param';
+      case 'request_config':
+        return 'RequestConfig';
       default:
         return 'Type';
     }
