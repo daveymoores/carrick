@@ -885,6 +885,20 @@ pub struct CloudRepoData {
     /// before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_through: Option<crate::call_through::StoredCallThrough>,
+    /// Where this service's route chains leave it (carrick#2474 R5c): the
+    /// route segments that end at a parameter nothing in the service calls
+    /// or at a callback option, the calls it hands to another service's
+    /// functions, and the callbacks its functions call. Written for an
+    /// analysed service and read back when `--changed-only` carries it, so
+    /// the routes of the services analysed beside it resolve across services
+    /// as a full scan resolves them.
+    ///
+    /// Scanner-only: the cloud stores it and hands it back unread, as it
+    /// does `call_through`. Absent on a service with none, with the receiver
+    /// trace off, and on blobs written before the field existed, which read
+    /// as a service with none: what a carried service recorded before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_boundaries: Option<crate::request_summary::decided_sites::RouteBoundaries>,
 }
 
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
@@ -1081,6 +1095,7 @@ impl CloudRepoData {
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         }
     }
 }
@@ -2664,6 +2679,7 @@ mod tests {
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         }
     }
 

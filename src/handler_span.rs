@@ -268,6 +268,7 @@ mod tests {
             possible_calls: None,
             possible_calls_omitted: None,
             call_through: None,
+            route_boundaries: None,
         };
         for (i, d) in defs.into_iter().enumerate() {
             data.function_definitions

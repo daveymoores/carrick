@@ -43,11 +43,7 @@ pub(super) struct ServiceRoutes<'a> {
     pub(super) boundaries: &'a RouteBoundaries,
     /// Analysed in this run, and so written. A held-back service is read for
     /// its boundaries and never changed. A carried one is never changed and
-    /// has no boundaries until carrick#2474 R5c: on `--changed-only`, a
-    /// route whose boundary only a carried service fills counts
-    /// `routes_across_untraced_unmatched_boundary` (or, where its site also
-    /// serves it in its own service, keeps that path and counts the
-    /// boundary as an unread host).
+    /// brings the boundaries its stored blob holds (carrick#2474 R5c).
     pub(super) writable: bool,
 }
 
