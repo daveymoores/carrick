@@ -1267,31 +1267,7 @@ pub fn mount_graph_to_api_details(
     let endpoints: Vec<ApiEndpointDetails> = mount_graph
         .get_resolved_endpoints()
         .iter()
-        .map(|endpoint| ApiEndpointDetails {
-            owner: Some(OwnerType::App(endpoint.owner.clone())),
-            key: OperationKey::http(&endpoint.method, endpoint.full_path.clone()),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: endpoint.handler.clone(),
-            request_type: None,
-            response_type: None,
-            file_path: PathBuf::from(&endpoint.file_location),
-            repo_name: None,
-            service_name: None,
-            provenance: endpoint.provenance,
-            resolution_source: endpoint.resolution_source,
-            view_module: endpoint.view_module,
-            // The case this operation answers (carrick#831). Part of the
-            // operation's identity, so it travels onto the index row: without
-            // it, nine operations behind one route are one row on the wire.
-            dispatch: endpoint.dispatch.clone(),
-            schema_binding: None,
-            handler_span: endpoint.handler_span,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
-        })
+        .map(endpoint_details)
         .collect();
 
     let calls: Vec<ApiEndpointDetails> = mount_graph
@@ -1301,6 +1277,36 @@ pub fn mount_graph_to_api_details(
         .collect();
 
     (endpoints, calls)
+}
+
+/// One endpoint of a `MountGraph` as the cloud index keys it: on its
+/// `full_path`, the same string its producer manifest entries carry.
+pub fn endpoint_details(endpoint: &crate::mount_graph::ResolvedEndpoint) -> ApiEndpointDetails {
+    ApiEndpointDetails {
+        owner: Some(OwnerType::App(endpoint.owner.clone())),
+        key: OperationKey::http(&endpoint.method, endpoint.full_path.clone()),
+        params: vec![],
+        request_body: None,
+        response_body: None,
+        handler_name: endpoint.handler.clone(),
+        request_type: None,
+        response_type: None,
+        file_path: PathBuf::from(&endpoint.file_location),
+        repo_name: None,
+        service_name: None,
+        provenance: endpoint.provenance,
+        resolution_source: endpoint.resolution_source,
+        view_module: endpoint.view_module,
+        // The case this operation answers (carrick#831). Part of the
+        // operation's identity, so it travels onto the index row: without
+        // it, nine operations behind one route are one row on the wire.
+        dispatch: endpoint.dispatch.clone(),
+        schema_binding: None,
+        handler_span: endpoint.handler_span,
+        name_scope: None,
+        library_semantics: Vec::new(),
+        inference: None,
+    }
 }
 
 /// One consumer call of a `MountGraph` as the cloud index keys it: on its

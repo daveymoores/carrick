@@ -1461,6 +1461,16 @@ fn template_pattern_matches(quasis: &[String], topic: &str) -> bool {
     remaining.ends_with(last.as_str())
 }
 
+/// What the documentation fold does to a graph, by row
+/// ([`FileOrchestrator::documented_folds`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DocumentedFolds {
+    /// Rows that take the documentation's `descriptor_route` label.
+    pub(crate) folded_into: Vec<bool>,
+    /// Documentation rows that go.
+    pub(crate) drop: Vec<bool>,
+}
+
 /// A mount-site binding, resolved back to the file that defines it.
 ///
 /// `child_node` is the name the MOUNTING file registered (`sessionsRoutes`);
@@ -12088,6 +12098,26 @@ impl FileOrchestrator {
     /// operation. With several, every row stays: which one the documentation
     /// describes is not something the paths can say.
     pub(crate) fn fold_documented_operations(graph: &mut MountGraph) -> usize {
+        let folds = Self::documented_folds(graph);
+        Self::apply_documented_folds(graph, &folds)
+    }
+
+    /// What [`Self::fold_documented_operations`] does to `graph`, by row,
+    /// before it does it: which rows take the documentation's label, and
+    /// which documentation rows go. A caller that keeps a projection of the
+    /// graph (carrick#2474 R5b) follows the same marks.
+    pub(crate) fn documented_folds(graph: &MountGraph) -> DocumentedFolds {
+        Self::documented_folds_onto(graph, |_| true)
+    }
+
+    /// [`Self::documented_folds`], where a documentation row whose partners
+    /// include one `may_take` refuses (by index) stays: a row written with
+    /// no types (carrick#2474 R5b) does not take the documentation's place,
+    /// so the documentation's types are not lost.
+    pub(crate) fn documented_folds_onto(
+        graph: &MountGraph,
+        may_take: impl Fn(usize) -> bool,
+    ) -> DocumentedFolds {
         let documentation = |endpoint: &ResolvedEndpoint| {
             endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute)
                 && endpoint.handler.as_deref() == Some(ROUTE_DESCRIPTOR_OWNER)
@@ -12114,6 +12144,9 @@ impl FileOrchestrator {
                 })
                 .map(|(other, _)| other)
                 .collect();
+            if !partners.iter().all(|partner| may_take(*partner)) {
+                continue;
+            }
             match partners.as_slice() {
                 [] => {}
                 [partner] if !folded_into[*partner] => {
@@ -12130,16 +12163,22 @@ impl FileOrchestrator {
                 ),
             }
         }
-        for (endpoint, folded) in graph.endpoints.iter_mut().zip(&folded_into) {
+        DocumentedFolds { folded_into, drop }
+    }
+
+    /// Apply `folds`, read from `graph` by [`Self::documented_folds`]: how
+    /// many documentation rows went.
+    pub(crate) fn apply_documented_folds(graph: &mut MountGraph, folds: &DocumentedFolds) -> usize {
+        for (endpoint, folded) in graph.endpoints.iter_mut().zip(&folds.folded_into) {
             if *folded {
                 endpoint.resolution_source = Some(ResolutionSource::DescriptorRoute);
             }
         }
-        let folded = drop.iter().filter(|dropped| **dropped).count();
+        let folded = folds.drop.iter().filter(|dropped| **dropped).count();
         if folded > 0 {
             debug!("Documented operations folded into the handler row serving them: {folded}");
         }
-        let mut keep = drop.iter().map(|dropped| !dropped);
+        let mut keep = folds.drop.iter().map(|dropped| !dropped);
         graph.endpoints.retain(|_| keep.next().unwrap_or(true));
         folded
     }

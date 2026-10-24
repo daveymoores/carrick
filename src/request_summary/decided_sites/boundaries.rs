@@ -112,8 +112,7 @@ pub struct RouteSegment {
     pub method: String,
     /// The path the route's own call writes.
     pub path: String,
-    /// The handler's name where the call hands one by name. Not read on
-    /// this branch: carrick#2474 R3 S1 names it on `HandlerAt`.
+    /// The handler's name where the call hands one by name.
     pub handler: Option<String>,
     /// The symbol the receiver is read through.
     pub owner: Option<String>,
@@ -294,7 +293,10 @@ impl<'c, 'a> Collect<'c, 'a> {
                     line: site.line,
                     method: method.to_uppercase(),
                     path: path.clone(),
-                    handler: None,
+                    handler: site
+                        .handler
+                        .as_ref()
+                        .and_then(|handler| handler.name.clone()),
                     owner: site
                         .receiver
                         .as_ref()
@@ -471,7 +473,7 @@ pub enum FanOut {
     StatedHosts,
 }
 
-/// carrick#2474 Q5, until David rules: (ii).
+/// carrick#2474 Q5, ruled (ii) by David on 2026-10-23.
 pub const FAN_OUT: FanOut = FanOut::StatedHosts;
 
 /// How one route segment resolves across services.
@@ -482,6 +484,15 @@ pub struct Resolved {
     pub file: String,
     pub line: u32,
     pub method: String,
+    /// The path the route's own call writes.
+    #[serde(skip)]
+    pub path: String,
+    /// The handler's name where the call hands one by name.
+    #[serde(skip)]
+    pub handler: Option<String>,
+    /// The symbol the receiver is read through.
+    #[serde(skip)]
+    pub owner: Option<String>,
     /// Every full path, sorted; empty where the segment does not resolve.
     pub paths: Vec<String>,
     /// Hosts whose path is not read, written around under (ii).
@@ -500,13 +511,64 @@ const MAX_RESOLVED: usize = super::composed::MAX_COMPOSED;
 /// down, or why a way does not resolve.
 type Ways = Vec<Result<Vec<Part>, String>>;
 
-/// Every service's facts, read across services.
+/// The ways `ways` gives, at most [`MAX_RESOLVED`]: past that, the one
+/// way left says `trimmed`.
+fn capped(ways: impl IntoIterator<Item = Result<Vec<Part>, String>>) -> Ways {
+    let mut out = Ways::new();
+    for way in ways {
+        if out.len() == MAX_RESOLVED {
+            return vec![Err("trimmed".to_string())];
+        }
+        out.push(way);
+    }
+    out
+}
+
+/// Every service's facts, read across services, by the function and
+/// parameter each fills or reads.
 struct Across<'b> {
-    call_ins: Vec<&'b CallIn>,
-    hand_outs: Vec<&'b HandOut>,
+    call_ins: BTreeMap<&'b FnAt, BTreeMap<u32, Vec<&'b CallIn>>>,
+    hand_outs: BTreeMap<&'b FnAt, BTreeMap<u32, Vec<&'b HandOut>>>,
 }
 
 impl<'b> Across<'b> {
+    fn of(services: &[(&str, &'b RouteBoundaries)]) -> Self {
+        let mut across = Across {
+            call_ins: BTreeMap::new(),
+            hand_outs: BTreeMap::new(),
+        };
+        for (_, facts) in services {
+            for call_in in &facts.call_ins {
+                across
+                    .call_ins
+                    .entry(&call_in.function)
+                    .or_default()
+                    .entry(call_in.param)
+                    .or_default()
+                    .push(call_in);
+            }
+            for hand_out in &facts.hand_outs {
+                across
+                    .hand_outs
+                    .entry(&hand_out.function)
+                    .or_default()
+                    .entry(hand_out.param)
+                    .or_default()
+                    .push(hand_out);
+            }
+        }
+        across
+    }
+
+    /// The call-ins that fill parameter `param` of `function`.
+    fn call_ins_of(&self, function: &FnAt, param: u32) -> &[&'b CallIn] {
+        self.call_ins
+            .get(function)
+            .and_then(|by_param| by_param.get(&param))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
     /// The ways the boundary `at` resolves, each its parts from the top
     /// down to the boundary. `only_at` narrows an entry parameter's call-ins
     /// to the call at that `file:line` (a callback option belongs to its
@@ -519,22 +581,23 @@ impl<'b> Across<'b> {
         seen.push(at.clone());
         let ways = match at {
             Boundary::EntryParam { function, param } => {
-                let call_ins: Vec<&&CallIn> = self
-                    .call_ins
+                let call_ins: Vec<&CallIn> = self
+                    .call_ins_of(function, *param)
                     .iter()
-                    .filter(|call_in| {
-                        call_in.function == *function
-                            && call_in.param == *param
-                            && only_at.is_none_or(|only| call_in.at == only)
-                    })
+                    .copied()
+                    .filter(|call_in| only_at.is_none_or(|only| call_in.at == only))
                     .collect();
                 if call_ins.is_empty() {
                     vec![Err("unmatched_boundary".to_string())]
                 } else {
-                    call_ins
-                        .into_iter()
-                        .flat_map(|call_in| self.call_in(call_in, seen))
-                        .collect()
+                    let mut ways = Ways::new();
+                    for call_in in call_ins {
+                        ways.extend(self.call_in(call_in, seen));
+                        if ways.len() > MAX_RESOLVED {
+                            break;
+                        }
+                    }
+                    capped(ways)
                 }
             }
             Boundary::CallbackOption {
@@ -568,8 +631,11 @@ impl<'b> Across<'b> {
                     parts
                 }));
             }
+            if out.len() > MAX_RESOLVED {
+                break;
+            }
         }
-        out
+        capped(out)
     }
 
     /// The ways one chain resolves, its own parts below whatever is above
@@ -609,24 +675,27 @@ impl<'b> Across<'b> {
         // runs it, the arguments after the function's are its parameters
         // after the one the member yields (`register(plugin, options)`
         // runs `plugin(instance, options)`).
-        let q: Vec<u32> = match runs_arg {
+        let mut q: Vec<u32> = match runs_arg {
             None => vec![arg],
             Some(runs_arg) => self
                 .call_ins
-                .iter()
-                .filter(|call_in| call_in.function == *runs && call_in.at == host_at)
+                .get(runs)
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .flatten()
+                .filter(|call_in| call_in.at == host_at)
                 .filter_map(|call_in| (arg + call_in.param).checked_sub(runs_arg))
                 .collect(),
         };
-        let hand_outs: Vec<&&HandOut> = self
-            .hand_outs
+        q.sort_unstable();
+        q.dedup();
+        let by_param = self.hand_outs.get(runs);
+        let hand_outs: Vec<&HandOut> = q
             .iter()
-            .filter(|hand_out| {
-                hand_out.function == *runs
-                    && q.contains(&hand_out.param)
-                    && hand_out.key == key
-                    && hand_out.arg == param
-            })
+            .filter_map(|q| by_param.and_then(|by_param| by_param.get(q)))
+            .flatten()
+            .copied()
+            .filter(|hand_out| hand_out.key == key && hand_out.arg == param)
             .collect();
         if hand_outs.is_empty() {
             return vec![Err("unmatched_boundary".to_string())];
@@ -635,9 +704,12 @@ impl<'b> Across<'b> {
         for hand_out in hand_outs {
             for above in &hand_out.instance {
                 out.extend(self.above(above, Some(host_at), seen));
+                if out.len() > MAX_RESOLVED {
+                    return capped(out);
+                }
             }
         }
-        out
+        capped(out)
     }
 }
 
@@ -691,16 +763,7 @@ fn full_paths(parts: &[Part], path: &str) -> Result<Vec<String>, String> {
 /// is not read leaves the whole route unresolved, under
 /// [`FanOut::StatedHosts`] the other hosts' paths stand and it is counted.
 pub fn resolve(services: &[(&str, &RouteBoundaries)], fan_out: FanOut) -> Vec<Resolved> {
-    let across = Across {
-        call_ins: services
-            .iter()
-            .flat_map(|(_, facts)| &facts.call_ins)
-            .collect(),
-        hand_outs: services
-            .iter()
-            .flat_map(|(_, facts)| &facts.hand_outs)
-            .collect(),
-    };
+    let across = Across::of(services);
     let mut out = Vec::new();
     for (service, facts) in services {
         for segment in &facts.routes {
@@ -720,9 +783,8 @@ fn resolve_segment(
     let hosts: Vec<Ways> = match &segment.at {
         Boundary::EntryParam { function, param } => {
             let mut hosts: Vec<Ways> = across
-                .call_ins
+                .call_ins_of(function, *param)
                 .iter()
-                .filter(|call_in| call_in.function == *function && call_in.param == *param)
                 .map(|call_in| {
                     let mut seen = vec![segment.at.clone()];
                     across.call_in(call_in, &mut seen)
@@ -780,6 +842,9 @@ fn resolve_segment(
         file: segment.file.clone(),
         line: segment.line,
         method: segment.method.clone(),
+        path: segment.path.clone(),
+        handler: segment.handler.clone(),
+        owner: segment.owner.clone(),
         paths,
         unread_hosts,
         untraced,
@@ -969,6 +1034,59 @@ mod tests {
         };
         let resolved = resolve(&[("r", &r), ("s", &s)], FanOut::StatedHosts);
         assert_eq!(resolved[0].untraced.as_deref(), Some("cycle"));
+    }
+
+    /// carrick#2474 R5b: the ways one host resolves are capped at
+    /// [`MAX_RESOLVED`]: a host reached through more ways than that is
+    /// counted `trimmed`, even where every way would give the same path.
+    #[test]
+    fn a_host_reached_through_too_many_ways_is_trimmed() {
+        let f = at("packages/r/src/f.ts", 1);
+        let g = at("packages/s/src/g.ts", 1);
+        let r = RouteBoundaries {
+            routes: vec![segment(entry(&f), Vec::new())],
+            ..RouteBoundaries::default()
+        };
+        // `g` calls `f` with its own parameter; `g` is called from as many
+        // places as the cap allows, then one more, each under `/a`.
+        let mut call_ins = vec![call_in(
+            &f,
+            "packages/s/src/g.ts:3",
+            None,
+            Above {
+                parts: Vec::new(),
+                end: End::Boundary {
+                    boundary: entry(&g),
+                },
+            },
+        )];
+        let callers = |count: usize| -> Vec<CallIn> {
+            (0..count)
+                .map(|index| {
+                    call_in(
+                        &g,
+                        &format!("packages/t/src/main.ts:{index}"),
+                        None,
+                        top(vec![stated("/a")]),
+                    )
+                })
+                .collect()
+        };
+        call_ins.extend(callers(MAX_RESOLVED));
+        let s = RouteBoundaries {
+            call_ins: call_ins.clone(),
+            ..RouteBoundaries::default()
+        };
+        let resolved = resolve(&[("r", &r), ("s", &s)], FanOut::StatedHosts);
+        assert_eq!(resolved[0].paths, vec!["/a/x".to_string()]);
+        call_ins.extend(callers(MAX_RESOLVED + 1).into_iter().skip(MAX_RESOLVED));
+        let s = RouteBoundaries {
+            call_ins,
+            ..RouteBoundaries::default()
+        };
+        let resolved = resolve(&[("r", &r), ("s", &s)], FanOut::StatedHosts);
+        assert_eq!(resolved[0].paths, Vec::<String>::new());
+        assert_eq!(resolved[0].untraced.as_deref(), Some("trimmed"));
     }
 
     /// carrick#2474 Q5: two hosts that agree give one path; a third whose

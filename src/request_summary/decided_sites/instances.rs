@@ -725,8 +725,14 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 .calls
                 .at_span(placed.file, written.site.span_start, written.site.span_end)
                 .map(|host| host.call);
+            // A key a later spread or computed key may set again is not
+            // read as the function written there (carrick#2474 R5b).
+            let key_stands = |host: &CallIr, key: &str| match host.args.get(written.arg) {
+                Some(Value::Obj(object)) => !matches!(object.key(key), KeyState::Unread),
+                _ => true,
+            };
             let boundary = match (pieces, written.path.as_slice(), host) {
-                ([Piece::Param(param, _)], [key], Some(host)) => self
+                ([Piece::Param(param, _)], [key], Some(host)) if key_stands(host, key) => self
                     .runs_of(placed.file, host)
                     .map(|(runs, runs_arg)| Boundary::CallbackOption {
                         host_at: self.at_call(placed.file, host),

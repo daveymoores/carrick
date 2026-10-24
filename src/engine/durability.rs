@@ -176,6 +176,12 @@ pub struct ServiceAnalysis {
     /// the service's files are in hand and settled once every service is
     /// (carrick#1146). Never serialised.
     pub call_through: crate::call_through::CallThroughSites,
+    /// Where its route chains leave it, settled across services once every
+    /// service is read (carrick#2474 R5b). Never serialised.
+    pub route_boundaries: crate::request_summary::decided_sites::RouteBoundaries,
+    /// Its fallbacks, stated once the routes across services are written:
+    /// `None` where they were stated already.
+    pub fallbacks: Option<crate::fallback_tally::Pending>,
 }
 
 /// The model work one service still owes once its analysis has run.
