@@ -697,7 +697,7 @@ A specifier that lists nothing carries the verifier's module `reason` (`module_u
 
 Each item locates one expression. The fields are `file_path`, `line_number` and `infer_kind`; a locator is completed by a span (`span_start` + `span_end`), by `expression_text` (+ optional `expression_line`), or by the line alone for the kinds that anchor on a function (`function_return`, `signature_return`, `function_param`, `response_body`, `request_body`). Anything else is rejected per item, and that item alone pads to `unknown` — a bad item never sinks the batch.
 
-`infer_kind` is one of `function_return`, `expression`, `call_result`, `variable`, `response_body`, `request_body`, `signature_return`, `function_param`, `receiver_type`.
+`infer_kind` is one of `function_return`, `expression`, `call_result`, `variable`, `response_body`, `request_body`, `signature_return`, `function_param`, `receiver_type`, `request_config`. A `request_config` item locates a request call's options object literal and carries `member`, the key that holds the call's body; it answers the decided `no_request_body` abstain when the literal can write no such member, and nothing otherwise.
 
 `extraction_config` carries the caller's unwrap rules (wrapper symbols, origin module globs, payload paths). **Live behaviour depends on it**: without it the inferrer cannot unwrap a framework envelope, so a probe written without one does not reproduce what a real scan sees.
 
