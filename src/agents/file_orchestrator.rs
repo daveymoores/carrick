@@ -643,7 +643,7 @@ pub struct ProcessingStats {
     /// candidate there (carrick#2613, `CARRICK_FACT_FILES=1`).
     pub fact_layer_files: usize,
     /// Register-signal candidates kept for the reader at a call discovery
-    /// could not follow, by signal (`C1`-`C4`): the old path's selection
+    /// could not follow, by signal (`C1`-`C3`): the old path's selection
     /// fallback, stated on the scan's fallbacks line (carrick#2613, D4).
     pub fallback_selection: BTreeMap<&'static str, usize>,
     pub total_mounts: usize,
@@ -2550,7 +2550,7 @@ impl FileOrchestrator {
             when_empty: WhenEmpty,
             /// How many candidates of an unrouted protocol it raised.
             unrouted: usize,
-            /// The candidates only register signals raised (C1-C4), by span,
+            /// The candidates only register signals raised (C1-C3), by span,
             /// with those signals. Filled only when the fact layer chooses
             /// the reader's files (carrick#2613, D4).
             held: BTreeMap<(u32, u32), BTreeSet<crate::swc_scanner::RegisterSignal>>,
@@ -2969,7 +2969,6 @@ impl FileOrchestrator {
             let mut scan_result = self.swc_scanner.scan_content(
                 file_path,
                 &content,
-                &framework_detection.data_fetchers,
                 &framework_detection.messaging_clients,
             );
 
@@ -13227,7 +13226,7 @@ export * from "./aFetch.js";"#,
             nc.publish(SUBJECT, JSON.stringify({ id: 1 }));
             nc.subscribe(SUBJECT);
         "#;
-        let nats_scan = scanner.scan_content(&PathBuf::from("orders_pub.ts"), nats_src, &[], &[]);
+        let nats_scan = scanner.scan_content(&PathBuf::from("orders_pub.ts"), nats_src, &[]);
         // Precondition for the whole fix: this file has NO HTTP/data candidates,
         // so it would hit the zero-candidate skip without Part B.
         assert!(
@@ -13265,7 +13264,6 @@ export * from "./aFetch.js";"#,
         let lodash_scan = scanner.scan_content(
             &PathBuf::from("util.ts"),
             "import _ from 'lodash';\n",
-            &[],
             &["nats".to_string()],
         );
         assert!(
@@ -19423,12 +19421,8 @@ export { routes };
     #[test]
     fn an_unanswered_site_of_a_request_helper_is_counted() {
         let content = include_str!("../../tests/fixtures/unawaited-request-helper/client.ts");
-        let scanned = SwcScanner::new().scan_content(
-            std::path::Path::new("src/client.ts"),
-            content,
-            &[],
-            &[],
-        );
+        let scanned =
+            SwcScanner::new().scan_content(std::path::Path::new("src/client.ts"), content, &[]);
         let candidates: HashMap<String, CandidateTarget> = scanned
             .candidates
             .into_iter()
@@ -23982,7 +23976,7 @@ export async function POST(request: Request): Promise<Response> {
             source,
             &[RoutingConvention::nextjs_app()],
         );
-        let scan = scanner.scan_content(rel, source, &[], &[]);
+        let scan = scanner.scan_content(rel, source, &[]);
         let candidates = scan
             .candidates
             .into_iter()
@@ -24588,7 +24582,7 @@ export async function POST(request: Request): Promise<Response> {
     /// derived for it: the module sits outside every routing convention.
     fn unstated_route_candidates(source: &str) -> HashMap<String, CandidateTarget> {
         SwcScanner::new()
-            .scan_content(Path::new("src/handlers/things.ts"), source, &[], &[])
+            .scan_content(Path::new("src/handlers/things.ts"), source, &[])
             .candidates
             .into_iter()
             .filter(|candidate| candidate.protocol == Protocol::Http)
