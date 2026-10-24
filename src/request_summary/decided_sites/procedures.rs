@@ -285,10 +285,15 @@ impl Pass<'_, '_> {
             let Some(parsed) = self.parsed(&mut modules, &file) else {
                 continue;
             };
-            let Some(call) = call_at(&parsed.module, end.span_start, end.span_end) else {
+            let mut at = super::CallAt {
+                target: (end.span_start, end.span_end),
+                args: None,
+            };
+            parsed.module.visit_with(&mut at);
+            let Some(args) = at.args else {
                 continue;
             };
-            let Some(collection) = slot_expr(&call.args, &adapter.runs) else {
+            let Some(collection) = slot_expr(&args, &adapter.runs) else {
                 continue;
             };
             let mut reached: Reached = Vec::new();
@@ -707,29 +712,6 @@ fn slot_expr(args: &[ExprOrSpread], slot: &(usize, Option<String>)) -> Option<Ex
         }
     }
     found
-}
-
-/// The call at `lo..hi` of `module`.
-fn call_at(module: &Module, lo: u32, hi: u32) -> Option<CallExpr> {
-    struct Find {
-        target: (u32, u32),
-        found: Option<CallExpr>,
-    }
-    impl Visit for Find {
-        fn visit_call_expr(&mut self, call: &CallExpr) {
-            if (call.span.lo.0, call.span.hi.0) == self.target {
-                self.found = Some(call.clone());
-                return;
-            }
-            call.visit_children_with(self);
-        }
-    }
-    let mut find = Find {
-        target: (lo, hi),
-        found: None,
-    };
-    module.visit_with(&mut find);
-    find.found
 }
 
 /// The call of `module` handed the expression at `lo..hi` as one of its
