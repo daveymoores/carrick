@@ -152,6 +152,7 @@ interface InferShape {
     alias: string;
     type_string: string;
     is_explicit: boolean;
+    primary_type_symbol?: string;
     stated_body?: {
       root?: string;
       root_source?: string;
@@ -266,11 +267,15 @@ describe('carrick#1749: the body a caller reads, stated by the source', () => {
       assert.strictEqual(inferred.stated_body?.array_depth, 1);
     });
 
-    it('does not report a statement that leaves a position open', async () => {
-      // \`unknown\` at the read is a placeholder the source narrows later; a
-      // model symbol taken from the later cast must not lose to it.
+    it('reports the later statement, never a placeholder that leaves a position open', async () => {
+      // \`unknown\` at the read is a placeholder the source narrows later:
+      // the later cast is the statement reported, never the placeholder
+      // (carrick#2714), so a model symbol taken from it agrees with it.
       const open = await infer('MembersOpen_Response', 'fetchReply("/v1/members-open")');
-      assert.strictEqual(open.stated_body, undefined);
+      assert.deepStrictEqual(
+        { root: open.stated_body?.root, depth: open.stated_body?.array_depth, symbol: open.primary_type_symbol },
+        { root: 'Member', depth: 1, symbol: 'Member' }
+      );
       const loose = await infer('MembersLoose_Response', 'fetchReply("/v1/members-loose")');
       assert.strictEqual(loose.stated_body, undefined);
     });

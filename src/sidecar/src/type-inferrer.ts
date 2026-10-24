@@ -37,6 +37,7 @@ import {
   type PropertyAssignment,
   type StringLiteral,
   type Type,
+  type TypeReferenceNode,
   type VariableDeclaration,
   type Symbol as TsSymbol,
   ts,
@@ -457,6 +458,8 @@ interface StatedInFunction extends DeclaredContract {
   at: Node;
   /** Which statement it is, for the log. */
   how: string;
+  /** The type node the source wrote, where the statement is one (carrick#2714). */
+  typeNode?: Node;
 }
 
 /**
@@ -2622,6 +2625,16 @@ export class TypeInferrer {
       typeString = explicitType;
       isExplicit = true;
     }
+    // carrick#2714: the body read is cast to a placeholder
+    // (`(await res.json()) as { data: Item[] } | { error: unknown }`) and the
+    // source narrows the value later (`return json as { data: Item[] }`).
+    // The narrowed statement is the body, and it is reported as stated, so a
+    // model symbol naming an element inside it is not kept as the body.
+    const narrowed = func ? this.narrowedBodyStatement(terminalNode, func) : undefined;
+    if (narrowed) {
+      typeString = narrowed.text;
+      isExplicit = true;
+    }
 
     // carrick#1843: a rule can now match a thenable or a carrier by its alias,
     // so on a result that is a carrier (`Task<Outcome<Reply<T>, E>>`) the
@@ -2635,6 +2648,18 @@ export class TypeInferrer {
     const resultIsCarrier =
       !explicitType &&
       this.resultCarrierArguments(returnType, terminalNode, callArgs) !== undefined;
+
+    // carrick#2714, carrick#1841: the call returns a request library's
+    // response object, the body in a member around a status, headers and the
+    // request's config. The body is what the source reads that member as, and
+    // never the object: judged against a producer's body, every transport
+    // member reads as one the producer does not send.
+    if (!explicitType && !resultIsCarrier && func) {
+      const transport = this.transportRuleOfCall(callExpr, extractionConfig);
+      if (transport && !this.callStatesTypedPayload(callExpr, extractionConfig)) {
+        return this.transportCallBody(request, callExpr, func, transport.rule, where);
+      }
+    }
 
     // carrick#1877: the terminal holds a thenable the names do not peel, a
     // subclass of `Promise` or a class with a `then` of its own. What a
@@ -2873,7 +2898,9 @@ export class TypeInferrer {
       (callUnwrap.wasUnwrapped || readByProtocol) &&
       !!callAfterRules &&
       this.resultCarrierArguments(callAfterRules, callExpr, callArgs) !== undefined;
-    const anchorSource = carrierPayload ?? (leftCarrier ? undefined : callAfterRules);
+    const anchorSource = narrowed?.typeNode
+      ? narrowed.typeNode.getType()
+      : carrierPayload ?? (leftCarrier ? undefined : callAfterRules);
     let anchor = anchorSource
       ? this.unwrapArrayLevels(this.unwrapPromiseType(anchorSource))
       : undefined;
@@ -2939,7 +2966,11 @@ export class TypeInferrer {
     // carrick#1749: say when the text is the source's own statement of the
     // body, and what that statement is rooted at, so the scanner can tell a
     // model symbol that names the body from one that names a part of it.
-    const statedBody = explicitType ? this.statedBodyAtRead(terminalNode) : undefined;
+    const statedBody = narrowed?.typeNode
+      ? this.statedRoot(narrowed.typeNode)
+      : explicitType
+        ? this.statedBodyAtRead(terminalNode)
+        : undefined;
     if (statedBody) {
       inferred.stated_body = statedBody;
     }
@@ -4482,6 +4513,295 @@ export class TypeInferrer {
       if (same) common.add(name);
     }
     return common;
+  }
+
+  /**
+   * What the source narrows a call's value to, where the type stated at the
+   * walk's terminal is a placeholder that leaves a position open
+   * (carrick#2714, `as { data: Item[] } | { error: unknown }`): the one type
+   * stated for the value later in the function, on its success path
+   * (`return json as { data: Item[] }`). A closed statement at the terminal
+   * keeps the answer it had.
+   */
+  private narrowedBodyStatement(terminal: Node, func: FunctionLike): StatedInFunction | undefined {
+    const placeholder = this.explicitTypeNodeFromAncestor(terminal);
+    if (!placeholder || !this.leavesAPositionOpen(placeholder)) return undefined;
+    const stated = this.statedInFunction(terminal, func, {
+      returned: true,
+      parameters: false,
+      skipFailurePaths: true,
+    });
+    return stated?.typeNode ? stated : undefined;
+  }
+
+  /**
+   * The rule that verifies a call's result as a request library's response
+   * object, or undefined (carrick#2714). The result is that object when its
+   * awaited type is one a rule recognises. It is that object too when the
+   * call states no type arguments and its declared result, with its free
+   * type parameters at their defaults (`freeResultAtDefaults`), is a type a
+   * rule recognises (`get<T, R = Response<T>>(): Promise<R>`).
+   * The compiler then takes the parameter from where the value goes
+   * (`return client.post(…)` in a function declared `Promise<void>` types the
+   * call `Promise<void>`), and that is the caller's claim about the object,
+   * not what the call returns.
+   */
+  private transportRuleOfCall(
+    callExpr: CallExpression,
+    extractionConfig?: ExtractionConfig
+  ): { rule: ExtractionRule } | undefined {
+    if (!extractionConfig || extractionConfig.rules.length === 0) return undefined;
+    const awaited = this.unwrapPromiseType(callExpr.getType());
+    const direct = this.ruleRecognising(awaited, callExpr, extractionConfig);
+    if (direct) return { rule: direct };
+    if (callExpr.getTypeArguments().length > 0) return undefined;
+    const declared = this.freeResultAtDefaults(callExpr);
+    const rule = declared ? this.ruleRecognising(declared, callExpr, extractionConfig) : undefined;
+    return rule ? { rule } : undefined;
+  }
+
+  /**
+   * The first rule that matches `type` as a wrapper whose body is a member
+   * (`payloadPropertyPath`) the type has, whether or not it reads a payload
+   * out of it. A
+   * wrapper with no such member (the platform's `Response`) is read by its
+   * body reads (`res.json()`), which the def-use walk follows.
+   */
+  private ruleRecognising(
+    type: Type,
+    node: Node,
+    config: ExtractionConfig
+  ): ExtractionRule | undefined {
+    return config.rules.find(
+      (rule) =>
+        !!rule.payloadPropertyPath?.length &&
+        !!type.getProperty(rule.payloadPropertyPath[0]) &&
+        this.tryUnwrapWithRule(type, node, rule, config, 0).kind !== 'no-match'
+    );
+  }
+
+  /**
+   * What a call's declared result is when its free type parameters take
+   * their defaults, or undefined. A parameter is free when the declaration's
+   * result mentions it and none of its parameters do, so only a type
+   * argument, the default or the call's return position can fix it. The
+   * result is read through `Promise`, a free parameter (its default), and a
+   * conditional alias whose check type is a free parameter tested against
+   * exactly that parameter's default (`R extends Default ? Response<T> : R`:
+   * the true branch). Anything else is the type as written.
+   */
+  private freeResultAtDefaults(callExpr: CallExpression): Type | undefined {
+    const declaration = this.project
+      .getTypeChecker()
+      .getResolvedSignature(callExpr)
+      ?.getDeclaration();
+    if (
+      !declaration ||
+      !(
+        Node.isMethodSignature(declaration) ||
+        Node.isMethodDeclaration(declaration) ||
+        Node.isFunctionDeclaration(declaration) ||
+        Node.isCallSignatureDeclaration(declaration)
+      )
+    ) {
+      return undefined;
+    }
+    const returnNode = declaration.getReturnTypeNode();
+    if (!returnNode) return undefined;
+    const referenced = (node: Node | undefined): Set<string> =>
+      new Set(
+        (node ? [node, ...node.getDescendants()] : [])
+          .filter((n) => Node.isTypeReference(n))
+          .map((n) => (n as TypeReferenceNode).getTypeName().getText())
+      );
+    const inResult = referenced(returnNode);
+    const inParameters = new Set(
+      declaration.getParameters().flatMap((parameter) => [...referenced(parameter.getTypeNode())])
+    );
+    const free = new Map<string, Node | undefined>();
+    for (const parameter of declaration.getTypeParameters()) {
+      const name = parameter.getName();
+      if (inResult.has(name) && !inParameters.has(name)) free.set(name, parameter.getDefault());
+    }
+    if (free.size === 0) return undefined;
+
+    const atDefaults = (node: Node | undefined, depth: number): Type | undefined => {
+      if (!node || depth > 4) return undefined;
+      if (!Node.isTypeReference(node)) return node.getType();
+      const name = node.getTypeName().getText();
+      if (free.has(name)) return atDefaults(free.get(name), depth + 1);
+      const args = node.getTypeArguments();
+      if ((name === 'Promise' || name === 'PromiseLike') && args.length === 1) {
+        return atDefaults(args[0], depth + 1);
+      }
+      const alias = node
+        .getTypeName()
+        .getSymbol()
+        ?.getDeclarations()
+        .find((d) => Node.isTypeAliasDeclaration(d));
+      const conditional = alias && Node.isTypeAliasDeclaration(alias) ? alias.getTypeNode() : undefined;
+      if (alias && Node.isTypeAliasDeclaration(alias) && conditional && Node.isConditionalTypeNode(conditional)) {
+        const index = alias
+          .getTypeParameters()
+          .findIndex((parameter) => parameter.getName() === conditional.getCheckType().getText());
+        const argument = index >= 0 ? args[index] : undefined;
+        const tested = argument && Node.isTypeReference(argument) ? argument.getTypeName().getText() : undefined;
+        const defaulted = tested !== undefined ? free.get(tested) : undefined;
+        if (defaulted && conditional.getExtendsType().getText() === defaulted.getText()) {
+          return atDefaults(conditional.getTrueType(), depth + 1);
+        }
+      }
+      return node.getType();
+    };
+    return atDefaults(returnNode, 0);
+  }
+
+  /**
+   * The call states the body itself: the rules read a payload out of its
+   * result (`client.get<Widget>(url)`). An untyped payload is no payload to
+   * the rules (they verify the object and read nothing), and a result its
+   * return position chose is no response object to them.
+   */
+  private callStatesTypedPayload(
+    callExpr: CallExpression,
+    extractionConfig?: ExtractionConfig
+  ): boolean {
+    const unwrap = this.unwrapTypeWithConfig(
+      this.unwrapPromiseType(callExpr.getType()),
+      callExpr,
+      extractionConfig
+    );
+    return unwrap.wasUnwrapped && !unwrap.verifiedMachinery && !!unwrap.payloadType;
+  }
+
+  /**
+   * The body of a call that returns a response object (carrick#2714): the
+   * one type the source states, in the function the call is made in, for the
+   * reads of the object's payload member (`res.data as Widget`, `const w:
+   * Widget = res.data`, `return res.data` from a function that declares its
+   * return type), through a binding or in place. Where no read states one,
+   * or two state different types, or the object is handed on whole, the
+   * site states no response contract, and the abstain is decided so the
+   * capture does not re-read the call and publish the object.
+   */
+  private transportCallBody(
+    request: InferRequestItem,
+    callExpr: CallExpression,
+    func: FunctionLike,
+    rule: ExtractionRule,
+    where: string
+  ): InferredType {
+    const reads = this.payloadMemberReads(callExpr, func, rule.payloadPropertyPath ?? []);
+    const statements = reads
+      .map((read) =>
+        this.statedInFunction(read, func, { returned: true, parameters: true, skipFailurePaths: true })
+      )
+      .filter((stated): stated is StatedInFunction => stated !== null);
+    const texts = new Set(statements.map((stated) => stated.text));
+    if (texts.size !== 1) {
+      this.log(
+        `Call result at ${where} is a response object around the body, and the source states ` +
+          `${texts.size === 0 ? 'no type' : `${texts.size} different types`} for the body it reads; ` +
+          'this site states no response contract'
+      );
+      return this.transportAbstain(
+        request,
+        callExpr,
+        "this call returns the client's response object around the body, and the source " +
+          'states no single type for the body it reads from it, so this site states no ' +
+          'response contract'
+      );
+    }
+    const [stated] = statements;
+    this.log(`Call result at ${where} is a response object; the source states its body (${stated.how})`);
+    const anchor = stated.typeNode
+      ? this.unwrapArrayLevels(this.unwrapPromiseType(stated.typeNode.getType()))
+      : undefined;
+    const inferred = this.createInferredType(
+      request,
+      stated.text,
+      true,
+      this.getNodeLocation(stated.at),
+      undefined,
+      anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
+      anchor?.depth,
+      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined
+    );
+    if (stated.typeNode) {
+      inferred.stated_body = this.statedRoot(stated.typeNode);
+    }
+    return inferred;
+  }
+
+  /**
+   * The reads of a response object's payload member (`path`, e.g. `data`)
+   * that take it off the call's value: in place (`(await call).data`),
+   * through the name the value is bound to (`res.data`), or as a name
+   * destructured out of it (`const { data } = await call`).
+   */
+  private payloadMemberReads(callExpr: CallExpression, func: FunctionLike, path: string[]): Node[] {
+    if (path.length === 0) return [];
+    const follow = (start: Node): Node | undefined => {
+      let node: Node = start;
+      for (const segment of path) {
+        const parent = node.getParent();
+        if (
+          !parent ||
+          !Node.isPropertyAccessExpression(parent) ||
+          parent.getExpression() !== node ||
+          parent.getName() !== segment
+        ) {
+          return undefined;
+        }
+        node = parent;
+      }
+      return node;
+    };
+
+    let value: Node = callExpr;
+    for (;;) {
+      const parent = value.getParent();
+      if (
+        parent &&
+        (Node.isParenthesizedExpression(parent) ||
+          Node.isAwaitExpression(parent) ||
+          Node.isNonNullExpression(parent)) &&
+        parent.getExpression() === value
+      ) {
+        value = parent;
+        continue;
+      }
+      break;
+    }
+
+    const inPlace = follow(value);
+    if (inPlace) return [inPlace];
+
+    const declaration = value.getParent();
+    if (!declaration || !Node.isVariableDeclaration(declaration) || declaration.getInitializer() !== value) {
+      return [];
+    }
+    const name = declaration.getNameNode();
+    if (Node.isObjectBindingPattern(name)) {
+      if (path.length !== 1) return [];
+      return name
+        .getElements()
+        .filter(
+          (element) =>
+            !element.getDotDotDotToken() &&
+            (element.getPropertyNameNode()?.getText() ?? element.getName()) === path[0] &&
+            Node.isIdentifier(element.getNameNode())
+        )
+        .map((element) => element.getNameNode());
+    }
+    if (!Node.isIdentifier(name)) return [];
+    const symbol = name.getSymbol()?.compilerSymbol;
+    if (!symbol) return [];
+    return func
+      .getDescendantsOfKind(SyntaxKind.Identifier)
+      .filter((id) => id !== name && id.getSymbol()?.compilerSymbol === symbol)
+      .map(follow)
+      .filter((read): read is Node => read !== undefined);
   }
 
   /**
@@ -9430,11 +9750,18 @@ export class TypeInferrer {
     };
     hold(value);
 
-    const found: Array<{ rank: number; text: string; provenance?: TypeProvenance[]; at: Node; how: string }> = [];
+    const found: Array<{
+      rank: number;
+      text: string;
+      provenance?: TypeProvenance[];
+      at: Node;
+      how: string;
+      typeNode?: Node;
+    }> = [];
     const stateNode = (rank: number, typeNode: Node | undefined, at: Node, how: string): void => {
       if (!typeNode || this.leavesAPositionOpen(typeNode)) return;
       const text = this.structuralTextFromTypeNode(typeNode);
-      if (text) found.push({ rank, text, at, how });
+      if (text) found.push({ rank, text, at, how, typeNode });
     };
 
     for (let i = 0; i < positions.length; i++) {
@@ -9541,7 +9868,7 @@ export class TypeInferrer {
       return null;
     }
     const [first] = decided;
-    return { text: first.text, provenance: first.provenance, at: first.at, how: first.how };
+    return { text: first.text, provenance: first.provenance, at: first.at, how: first.how, typeNode: first.typeNode };
   }
 
   /**
