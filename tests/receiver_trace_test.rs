@@ -108,24 +108,60 @@ fn scan_runs_reading(
     run_git(&repo, &["init", "-q"]);
     run_git(&repo, &["add", "-A"]);
     run_git(&repo, &["commit", "-q", "-m", "init"]);
-    let cassettes = tmp.path().join("cassettes");
+    let storage = tmp.path().join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let home = tmp.path().join("home");
+    let mut cmd = scan_cmd(name, tmp.path(), &repo, &storage, &home, fact_layer, trace);
+    cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1");
+    if reading {
+        cmd.env("CARRICK_PROGRESS", "1");
+    } else {
+        cmd.env_remove("CARRICK_PROGRESS");
+    }
+    let mut scans = vec![run_scan(&mut cmd, &storage)];
+    // A later scan reads the store back, so it finds the first scan's blob.
+    cmd.env_remove("CARRICK_LOCAL_STORAGE_ISOLATE");
+    scans.extend((1..runs).map(|_| run_scan(&mut cmd, &storage)));
+    // Each later scan took the incremental path: its run log says so.
+    let incremental = std::fs::read_dir(home.join(".carrick/logs/runs"))
+        .map(|logs| {
+            logs.filter(|log| {
+                std::fs::read_to_string(log.as_ref().unwrap().path())
+                    .unwrap_or_default()
+                    .contains("Incremental analysis complete")
+            })
+            .count()
+        })
+        .unwrap_or_default();
+    assert_eq!(incremental, runs - 1, "a re-scan took the cold path");
+    scans
+}
+
+/// The scanner on `.` in `repo`, offline, with the fixture `name`'s store
+/// answer replayed, a store at `storage`, and a home and cache under `tmp`.
+fn scan_cmd(
+    name: &str,
+    tmp: &Path,
+    repo: &Path,
+    storage: &Path,
+    home: &Path,
+    fact_layer: bool,
+    trace: Option<&str>,
+) -> Command {
+    let cassettes = tmp.join("cassettes");
     std::fs::create_dir_all(cassettes.join("library-claims")).unwrap();
     std::fs::copy(
         fixture_dir(name).join("library-claims.json"),
         cassettes.join("library-claims/default.json"),
     )
     .unwrap();
-    let storage = tmp.path().join("storage");
-    std::fs::create_dir_all(&storage).unwrap();
-    let home = tmp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(home).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
     cmd.arg(".")
-        .current_dir(&repo)
-        .env("CARRICK_LOCAL_STORAGE_DIR", &storage)
-        .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
-        .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
-        .env("HOME", &home)
+        .current_dir(repo)
+        .env("CARRICK_LOCAL_STORAGE_DIR", storage)
+        .env("CARRICK_CACHE_DIR", tmp.join("cache"))
+        .env("HOME", home)
         .env("CARRICK_MOCK_ALL", "1")
         .env(
             "CARRICK_MOCK_FIXTURE_DIR",
@@ -158,33 +194,18 @@ fn scan_runs_reading(
     if let Some(trace) = trace {
         cmd.env("CARRICK_RECEIVER_TRACE", trace);
     }
-    if reading {
-        cmd.env("CARRICK_PROGRESS", "1");
-    } else {
-        cmd.env_remove("CARRICK_PROGRESS");
-    }
-    let mut scans = vec![run_scan(&mut cmd, &storage)];
-    // A later scan reads the store back, so it finds the first scan's blob.
-    cmd.env_remove("CARRICK_LOCAL_STORAGE_ISOLATE");
-    scans.extend((1..runs).map(|_| run_scan(&mut cmd, &storage)));
-    // Each later scan took the incremental path: its run log says so.
-    let incremental = std::fs::read_dir(home.join(".carrick/logs/runs"))
-        .map(|logs| {
-            logs.filter(|log| {
-                std::fs::read_to_string(log.as_ref().unwrap().path())
-                    .unwrap_or_default()
-                    .contains("Incremental analysis complete")
-            })
-            .count()
-        })
-        .unwrap_or_default();
-    assert_eq!(incremental, runs - 1, "a re-scan took the cold path");
-    scans
+    cmd
 }
 
 /// One scan by `cmd`, the blobs it left in `storage`, and the fallbacks
 /// lines it stated.
 fn run_scan(cmd: &mut Command, storage: &Path) -> (Blobs, Fallbacks) {
+    let (blobs, fallbacks, _) = run_scan_printing(cmd, storage);
+    (blobs, fallbacks)
+}
+
+/// [`run_scan`], and what the scan printed.
+fn run_scan_printing(cmd: &mut Command, storage: &Path) -> (Blobs, Fallbacks, String) {
     let output = cmd.output().expect("spawn carrick");
     assert!(
         output.status.success(),
@@ -225,7 +246,12 @@ fn run_scan(cmd: &mut Command, storage: &Path) -> (Blobs, Fallbacks) {
             .unwrap_or_else(|| "(root)".to_string());
         fallbacks.insert(service, line);
     }
-    (blobs, fallbacks)
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (blobs, fallbacks, printed)
 }
 
 /// Every possible call the blobs hold, as `file:line member`.
@@ -782,4 +808,185 @@ fn routes_across_services_take_the_receiving_scope() {
         scan_fixture("receiver-scopes-across", false, Some("1")),
         scan_fixture("receiver-scopes-across", false, None)
     );
+}
+
+/// A scan flag set for the changed-only tests: the repository's name, and
+/// the unprepared tree allowed.
+fn named(cmd: &mut Command) -> &mut Command {
+    cmd.args(["--repo", "fixture/across"])
+        .env("CARRICK_ALLOW_UNPREPARED", "1")
+}
+
+/// `receiver-scopes-across` scanned in full at commit A into
+/// `<tmp>/storage`, then commit B, which edits only `server`: no other
+/// service reads it, so `--changed-only` analyses `server` and carries the
+/// rest. The repository and the store.
+fn scanned_then_server_edited(tmp: &Path) -> (PathBuf, PathBuf, Blobs) {
+    let name = "receiver-scopes-across";
+    let repo = tmp.join("workspace");
+    copy_dir(&fixture_dir(name).join("repo"), &repo);
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "-A"]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+    let storage = tmp.join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let mut first = scan_cmd(
+        name,
+        tmp,
+        &repo,
+        &storage,
+        &tmp.join("home-a"),
+        true,
+        Some("1"),
+    );
+    named(&mut first).env("CARRICK_LOCAL_STORAGE_ISOLATE", "1");
+    let (stored, _) = run_scan(&mut first, &storage);
+    let audit = repo.join("packages/server/src/audit.ts");
+    let mut source = std::fs::read_to_string(&audit).unwrap();
+    source.push_str("\n// A comment: the service changes, its routes do not.\n");
+    std::fs::write(&audit, source).unwrap();
+    run_git(&repo, &["commit", "-qam", "B: edit server"]);
+    (repo, storage, stored)
+}
+
+/// A `--changed-only` scan of `repo` into `storage`: the blobs, the
+/// fallbacks lines, and the services it printed as carried.
+fn scan_changed_only(tmp: &Path, repo: &Path, storage: &Path) -> (Blobs, Fallbacks, Vec<String>) {
+    let mut scoped = scan_cmd(
+        "receiver-scopes-across",
+        tmp,
+        repo,
+        storage,
+        &tmp.join("home-b"),
+        true,
+        Some("1"),
+    );
+    named(&mut scoped)
+        .arg("--changed-only")
+        .env("CARRICK_PROGRESS", "1");
+    let (blobs, fallbacks, printed) = run_scan_printing(&mut scoped, storage);
+    let mut carried: Vec<String> = printed
+        .lines()
+        .filter_map(|line| {
+            let rest = line.split("scope: ").nth(1)?;
+            let (service, verdict) = rest.split_once(' ')?;
+            verdict.starts_with("carried").then(|| service.to_string())
+        })
+        .collect();
+    carried.sort();
+    (blobs, fallbacks, carried)
+}
+
+/// One service's stored blob, by name.
+fn blob_of(blobs: &Blobs, service: &str) -> serde_json::Value {
+    blobs
+        .values()
+        .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap())
+        .find(|blob| blob["service_name"] == service)
+        .unwrap_or_else(|| panic!("no blob for {service}"))
+}
+
+const AUDIT_ROWS: [&str; 2] = [
+    "packages/server/src/audit.ts:6 GET /api/v1/audit/events library_claim app",
+    "packages/server/src/audit.ts:7 GET /api/v1/audit/events/:id library_claim app",
+];
+
+/// carrick#2474 R5c: a service `--changed-only` carries brings the
+/// boundaries its stored blob holds, so the service analysed beside it
+/// resolves its routes across services as a full scan does. In
+/// `receiver-scopes-across` the audit routes (`server`) are served under the
+/// scope the routes package's plugin opens and hands to `opts.extra`: the
+/// hand-out is recorded in `routes`. A scan that edits only `server` carries
+/// `routes`, `app` and `demo`, and must still write `/api/v1/audit/...`,
+/// with every row and manifest entry what a full scan of the same commit
+/// writes.
+#[test]
+fn a_changed_only_scan_resolves_routes_across_a_carried_service() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (repo, storage, stored) = scanned_then_server_edited(tmp.path());
+    // The routes package stores the callback it hands out.
+    let routes_field = blob_of(&stored, "routes")["route_boundaries"].clone();
+    assert!(
+        routes_field["hand_outs"]
+            .as_array()
+            .is_some_and(|list| !list.is_empty()),
+        "{routes_field:#}"
+    );
+    let full_storage = tmp.path().join("full-storage");
+    copy_dir(&storage, &full_storage);
+
+    let (scoped_blobs, scoped_fallbacks, carried) = scan_changed_only(tmp.path(), &repo, &storage);
+    // Only `server` was analysed: a carried service states no fallbacks.
+    assert_eq!(carried, ["app", "demo", "routes"]);
+    assert_eq!(
+        scoped_fallbacks.keys().cloned().collect::<Vec<_>>(),
+        ["server"]
+    );
+    let mut full = scan_cmd(
+        "receiver-scopes-across",
+        tmp.path(),
+        &repo,
+        &full_storage,
+        &tmp.path().join("home-c"),
+        true,
+        Some("1"),
+    );
+    named(&mut full).env_remove("CARRICK_PROGRESS");
+    let (full_blobs, _) = run_scan(&mut full, &full_storage);
+
+    let (graph, flat) = endpoint_rows(&scoped_blobs);
+    for row in AUDIT_ROWS {
+        assert!(graph.iter().any(|have| have == row), "{row}: {graph:#?}");
+    }
+    assert_eq!((graph, flat), endpoint_rows(&full_blobs));
+    assert_eq!(
+        producer_manifest(&scoped_blobs),
+        producer_manifest(&full_blobs)
+    );
+    // The carried blob is handed back as it was stored.
+    assert_eq!(
+        blob_of(&scoped_blobs, "routes")["route_boundaries"],
+        routes_field
+    );
+}
+
+/// A stored blob written before the field existed reads as a service with
+/// none, as every carried service was read before: the scan completes, the
+/// audit rows keep the path the model stated, and the carried blob is not
+/// given a field it was not stored with.
+#[test]
+fn a_carried_blob_without_boundaries_reads_as_one_with_none() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (repo, storage, _) = scanned_then_server_edited(tmp.path());
+    let path = std::fs::read_dir(&storage)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("routes")
+        })
+        .expect("the routes blob");
+    let mut routes: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        routes
+            .as_object_mut()
+            .unwrap()
+            .remove("route_boundaries")
+            .is_some()
+    );
+    std::fs::write(&path, serde_json::to_string(&routes).unwrap()).unwrap();
+
+    let (blobs, _, carried) = scan_changed_only(tmp.path(), &repo, &storage);
+    assert_eq!(carried, ["app", "demo", "routes"]);
+    let (graph, _) = endpoint_rows(&blobs);
+    assert!(
+        graph
+            .iter()
+            .any(|row| row == "packages/server/src/audit.ts:6 GET /audit/events model app"),
+        "{graph:#?}"
+    );
+    assert!(blob_of(&blobs, "routes").get("route_boundaries").is_none());
 }
