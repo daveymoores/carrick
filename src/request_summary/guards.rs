@@ -3132,7 +3132,9 @@ pub(super) fn key_steps(path: &[String]) -> Vec<Step> {
 /// The function's own guards count, and those of every function written
 /// inside it, where the subject is the parameter as that depth reads it (a
 /// function with a request parameter of its own compares another request).
-/// Callers and callees are not followed. A constant imported from another
+/// Callers and callees are not followed. An export under a wrapper that only
+/// states a type (`(async ({ request }) => ...) satisfies ActionFunction`)
+/// is its function, as a bare arrow is. A constant imported from another
 /// module reads nothing, and neither does a function built by a call
 /// (`withAuth(async ({ request }) => ...)`) or a method read through
 /// `String(request.method)`: the caller keeps the convention's default verb.
@@ -4446,6 +4448,86 @@ export class Feed {
             return other;
         }"#;
         assert_eq!(compared(src, "action"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn compared_methods_ignores_a_closure_over_an_inner_functions_own_request() {
+        // The closure two levels down reads `request` one level out: the inner
+        // function's own request, not the handler's (the `*d == depth` rule).
+        let src = r#"export async function action({ request }) {
+            const other = ({ request }) => {
+                const check = () => request.method === "PUT";
+                return check;
+            };
+            return other;
+        }"#;
+        assert_eq!(compared(src, "action"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn compared_methods_reads_a_closure_two_levels_down_over_the_outer_request() {
+        let src = r#"export async function action({ request }) {
+            const outer = () => {
+                const check = () => request.method === "PUT";
+                return check;
+            };
+            return outer;
+        }"#;
+        assert_eq!(compared(src, "action"), verbs(&["PUT"]));
+    }
+
+    /// An export whose arrow sits inside a wrapper that only states a type
+    /// binds the arrow itself.
+    fn compared_through(wrapped: &str) -> Vec<String> {
+        let src = format!(
+            "export const action = {wrapped};",
+            wrapped = wrapped.replace(
+                "ARROW",
+                r#"async ({ request }) => {
+                    if (request.method !== "PUT") throw new Error("no");
+                }"#,
+            ),
+        );
+        compared(&src, "action")
+    }
+
+    #[test]
+    fn compared_methods_reads_an_arrow_export_under_satisfies() {
+        assert_eq!(
+            compared_through("(ARROW) satisfies ActionFunction"),
+            verbs(&["PUT"])
+        );
+    }
+
+    #[test]
+    fn compared_methods_reads_an_arrow_export_under_as() {
+        assert_eq!(
+            compared_through("(ARROW) as ActionFunction"),
+            verbs(&["PUT"])
+        );
+    }
+
+    #[test]
+    fn compared_methods_reads_a_parenthesised_arrow_export() {
+        assert_eq!(compared_through("(ARROW)"), verbs(&["PUT"]));
+    }
+
+    #[test]
+    fn compared_methods_reads_an_arrow_export_under_a_non_null_assertion() {
+        assert_eq!(compared_through("(ARROW)!"), verbs(&["PUT"]));
+    }
+
+    #[test]
+    fn compared_methods_reads_an_arrow_export_under_a_type_assertion() {
+        assert_eq!(compared_through("<ActionFunction>(ARROW)"), verbs(&["PUT"]));
+    }
+
+    #[test]
+    fn compared_methods_reads_a_function_expression_export_under_satisfies() {
+        let src = r#"export const action = (async function ({ request }) {
+            if (request.method !== "PUT") throw new Error("no");
+        }) satisfies ActionFunction;"#;
+        assert_eq!(compared(src, "action"), verbs(&["PUT"]));
     }
 
     #[test]

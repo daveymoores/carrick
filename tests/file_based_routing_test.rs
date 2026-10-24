@@ -490,6 +490,9 @@ fn a_compared_request_method_narrows_a_role_named_export() {
         // A declaration exported by an export list under a role name.
         "DELETE /api/v1/items/:itemId/links",
         "PATCH /api/v1/items/:itemId/links",
+        // An arrow export under `satisfies`: the wrapper states a type, so the
+        // narrowing still reads and the write default (POST) is not a row.
+        "PUT /api/v1/items/:itemId/flags",
     ]
     .iter()
     .map(|s| s.to_string())
