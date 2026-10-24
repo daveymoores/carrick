@@ -1157,12 +1157,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             .declared_at
             .get(symbol)
             .filter(|(starts, _)| *starts == line)
-            .and_then(|(_, name)| {
-                declared
-                    .module_clients
-                    .get(name)
-                    .or_else(|| declared.shadowed_clients.get(name))
-            })
+            .and_then(|(_, name)| declared.module_instance(name))
             .cloned();
         match client {
             Some(client) => self.client(&client, &declaring, at),
