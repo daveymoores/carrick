@@ -9278,6 +9278,13 @@ export class TypeInferrer {
     if (Node.isObjectLiteralExpression(unwrapped)) {
       const value = this.objectLiteralMemberValue(unwrapped, member);
       if (value) return { kind: 'body', node: value, from };
+      if (
+        unwrapped
+          .getProperties()
+          .some((p) => Node.isSpreadAssignment(p) || this.isComputedMember(p))
+      ) {
+        return this.spreadLiteralBody(unwrapped, member);
+      }
       return { kind: 'no_body', member };
     }
     const property = unwrapped.getType().getProperty(member);
@@ -9292,6 +9299,45 @@ export class TypeInferrer {
     return {
       kind: 'abstain',
       why: `the located request config's type does not resolve its '${member}' member`,
+    };
+  }
+
+  /** A property whose name is computed, so the literal's written keys do not name it. */
+  private isComputedMember(property: Node): boolean {
+    return (
+      (Node.isPropertyAssignment(property) ||
+        Node.isShorthandPropertyAssignment(property) ||
+        Node.isMethodDeclaration(property)) &&
+      Node.isComputedPropertyName(property.getNameNode())
+    );
+  }
+
+  /**
+   * A config literal that spreads another object, or writes a computed key,
+   * names no `body` itself, so the literal's own type is read: the call sends
+   * no body only when that type declares no `body` member, or one typed
+   * `undefined` or `never`. Any other type, and a literal whose type is not
+   * known (a spread of an untyped object), abstains.
+   */
+  private spreadLiteralBody(
+    literal: ObjectLiteralExpression,
+    member: string
+  ): { kind: 'abstain'; why: string } | { kind: 'no_body'; member: string } {
+    const literalType = literal.getType();
+    if (literalType.isAny() || literalType.isUnknown() || literalType.isTypeParameter()) {
+      return {
+        kind: 'abstain',
+        why: `the request config spreads an object whose type is not known, so its '${member}' member is unread`,
+      };
+    }
+    const property = literalType.getProperty(member);
+    if (!property) return { kind: 'no_body', member };
+    const type = property.getTypeAtLocation(literal);
+    const bare = type.isAny() || type.isUnknown() ? type : type.getNonNullableType();
+    if (bare.isNever() || bare.isUndefined() || bare.isVoid()) return { kind: 'no_body', member };
+    return {
+      kind: 'abstain',
+      why: `the request config spreads an object whose '${member}' member may carry a body`,
     };
   }
 
