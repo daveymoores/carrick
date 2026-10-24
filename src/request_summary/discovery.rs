@@ -969,6 +969,79 @@ impl<'a> Outcome<'a> {
     }
 }
 
+/// The inputs that hold `file`: `inputs`, else the first of `siblings` that
+/// does (carrick#2618).
+pub(super) fn inputs_holding<'a>(
+    inputs: &'a RequestSummaryInputs,
+    siblings: &[&'a RequestSummaryInputs],
+    file: &Path,
+) -> &'a RequestSummaryInputs {
+    if inputs.files.contains_key(file) {
+        return inputs;
+    }
+    siblings
+        .iter()
+        .copied()
+        .find(|sibling| sibling.files.contains_key(file))
+        .unwrap_or(inputs)
+}
+
+/// What the call `call` in `file` reaches, [`RequestSummaryInputs::reach`] of
+/// the service that holds `file`. A function of another service of the run
+/// is read in that service's files, from the declaration the call's row names
+/// (or, when the rows say nothing, the key the call graph names); with no
+/// such service the call stays outside the run. The one resolver the
+/// discovery walk and the decided-sites pass share (carrick#2618).
+pub(super) fn reach_across(
+    inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
+    file: &Path,
+    call: &CallIr,
+) -> Reach {
+    let holder = inputs_holding(inputs, siblings, file);
+    let reach = holder.reach(file, call.site.lo, call.site.hi);
+    let Reach::OutsideService(declaring, name) = &reach else {
+        return reach;
+    };
+    let owner = inputs_holding(inputs, siblings, declaring);
+    if !owner.files.contains_key(declaring.as_path()) {
+        return reach;
+    }
+    let named = row_at(holder, file, call).and_then(|row| {
+        let positions = holder.positions.as_ref()?;
+        (positions.path_of(row.decl_file()?) == *declaring && row.symbol() == Some(name.as_str()))
+            .then(|| owner.definition_at(declaring, row.decl_line(), name))
+    });
+    match named {
+        Some(Reach::NoFunction) | None => {
+            let keyed = owner.files[declaring.as_path()]
+                .functions
+                .contains_key(name);
+            if keyed {
+                Reach::Function(declaring.clone(), name.clone())
+            } else {
+                Reach::NoFunction
+            }
+        }
+        Some(read) => read,
+    }
+}
+
+/// The compiler's `call` row for `call` in `file`, from `inputs` (which
+/// holds `file`).
+fn row_at<'a>(inputs: &'a RequestSummaryInputs, file: &Path, call: &CallIr) -> Option<&'a Row> {
+    let positions = inputs.positions.as_ref()?;
+    let ir = inputs.files.get(file)?;
+    positions
+        .lookup(
+            file,
+            ir.swc_start(call.site.lo),
+            ir.swc_start(call.site.hi),
+            Kind::Call,
+        )
+        .ok()
+}
+
 struct Walker<'a> {
     inputs: &'a RequestSummaryInputs,
     /// The run's other services, in declared order (carrick#2618): the walk
@@ -1007,51 +1080,12 @@ impl<'a> Walker<'a> {
     /// that does. Every read keyed by a file goes through this, so a body the
     /// walk enters in a sibling is read with the sibling's own IR and rows.
     fn inputs_for(&self, file: &Path) -> &'a RequestSummaryInputs {
-        if self.inputs.files.contains_key(file) {
-            return self.inputs;
-        }
-        self.siblings
-            .iter()
-            .copied()
-            .find(|sibling| sibling.files.contains_key(file))
-            .unwrap_or(self.inputs)
+        inputs_holding(self.inputs, self.siblings, file)
     }
 
-    /// What the call `call` in `file` reaches, [`RequestSummaryInputs::reach`]
-    /// of the service that holds `file`. A function of another service of
-    /// the run is read in that service's files, from the declaration the
-    /// call's row names (or, when the rows say nothing, the key the call
-    /// graph names); with no such service the call stays outside the run.
+    /// What the call `call` in `file` reaches ([`reach_across`]).
     fn reach(&self, file: &Path, call: &CallIr) -> Reach {
-        let reach = self
-            .inputs_for(file)
-            .reach(file, call.site.lo, call.site.hi);
-        let Reach::OutsideService(declaring, name) = &reach else {
-            return reach;
-        };
-        let owner = self.inputs_for(declaring);
-        if !owner.files.contains_key(declaring.as_path()) {
-            return reach;
-        }
-        let named = self.row(file, call).and_then(|row| {
-            let positions = self.inputs_for(file).positions.as_ref()?;
-            (positions.path_of(row.decl_file()?) == *declaring
-                && row.symbol() == Some(name.as_str()))
-            .then(|| owner.definition_at(declaring, row.decl_line(), name))
-        });
-        match named {
-            Some(Reach::NoFunction) | None => {
-                let keyed = owner.files[declaring.as_path()]
-                    .functions
-                    .contains_key(name);
-                if keyed {
-                    Reach::Function(declaring.clone(), name.clone())
-                } else {
-                    Reach::NoFunction
-                }
-            }
-            Some(read) => read,
-        }
+        reach_across(self.inputs, self.siblings, file, call)
     }
 
     fn rel(&self, file: &Path) -> String {
@@ -1121,17 +1155,7 @@ impl<'a> Walker<'a> {
 
     /// The call row at `call`, when there are rows to read.
     fn row(&self, file: &Path, call: &CallIr) -> Option<&Row> {
-        let inputs = self.inputs_for(file);
-        let positions = inputs.positions.as_ref()?;
-        let ir = inputs.files.get(file)?;
-        positions
-            .lookup(
-                file,
-                ir.swc_start(call.site.lo),
-                ir.swc_start(call.site.hi),
-                Kind::Call,
-            )
-            .ok()
+        row_at(self.inputs_for(file), file, call)
     }
 
     /// The binding `call` is made on (carrick#2474 R1): the row at the
@@ -1511,6 +1535,15 @@ impl<'a> Walker<'a> {
                         self.bind(inner, invoke, callee).under(hop.clone())
                     }
                 };
+                // A sibling's code is read without the instances its makers
+                // build (carrick#2618): a walk into it that finds no site
+                // has not read everything the call runs, as one that passed
+                // a call it could not follow has not. The fact layer keeps
+                // the candidate there, as it did when the call was outside
+                // the service.
+                if !self.inputs.files.contains_key(&id.0) {
+                    out.missed = true;
+                }
                 // A function written at the call that the callee runs.
                 let runs = callee
                     .map(|(_, callee)| callee.invoked_params.clone())
@@ -1710,7 +1743,22 @@ impl<'a> Walker<'a> {
                 discovery.sites.push(record(None, chain, Some(stop)));
                 continue;
             }
+            let mut sibling_routes = 0;
             for found in outcome.ends {
+                // A route registered in a sibling's code (a plugin another
+                // service declares, registered here) is served by this
+                // process, and the receiver trace writes it at the join point
+                // (carrick#2474 R5b): a walk into a sibling states requests,
+                // not routes. The call keeps its candidate as an unread one.
+                if found.end.role == LibraryRole::ServerFramework
+                    && !self
+                        .inputs
+                        .files
+                        .contains_key(&self.root.join(&found.end.file))
+                {
+                    sibling_routes += 1;
+                    continue;
+                }
                 // One of the labelled exports a callee's disagreeing values
                 // reach: the end is kept, with why it is no site.
                 let stop = found.several.then(|| SEVERAL_VALUES.to_string());
@@ -1724,6 +1772,18 @@ impl<'a> Walker<'a> {
                     reached: found.reached,
                     ..record(Some(found.end), found.chain, stop)
                 });
+            }
+            if sibling_routes > 0 {
+                *discovery
+                    .counts
+                    .entry("sibling_routes".to_string())
+                    .or_default() += sibling_routes;
+                let at = (self.rel(file), call.site.span_start, call.site.span_end);
+                if !discovery.sites.iter().any(|site| {
+                    site.file == at.0 && site.span_start == at.1 && site.span_end == at.2
+                }) {
+                    discovery.missed_inside.push(at);
+                }
             }
         }
         for inner in body.nested.iter().chain(&body.detached) {
@@ -2950,6 +3010,19 @@ mod tests {
             with.sites.iter().all(|site| site.line != 18),
             "format() reaches no labelled call"
         );
+        // A walk into a sibling that finds no site is not followed to the
+        // end (its instances are not read): `format(n)` is missed inside, not
+        // finished, so the fact layer keeps a candidate there. Without the
+        // sibling it was unfollowed, which keeps the candidate too.
+        let text = std::fs::read_to_string(on.repo.join(file)).unwrap();
+        let at = |needle: &str| {
+            // SWC numbers a file's bytes from 1.
+            let lo = text.find(needle).unwrap() as u32 + 1;
+            (file.to_string(), lo, lo + needle.len() as u32)
+        };
+        assert_eq!(with.missed_inside, vec![at("format(n)")]);
+        // The construction reads a class with no constructor: nothing to miss.
+        assert_eq!(with.finished, vec![at("new ItemsClient()")]);
         let unfollowed: Vec<(u32, Option<&str>)> = with
             .unfollowed
             .iter()
@@ -2976,6 +3049,55 @@ mod tests {
             "{:?}",
             records_in(&own, http)
         );
+    }
+
+    /// carrick#2618: a labelled call a walk reaches in a sibling's code is a
+    /// site only when it sends. The same fixture with the store labelling
+    /// the export a server framework (a route the sibling registers, which
+    /// the receiver trace writes at the join point) leaves no site: the
+    /// calls into the sibling stay unread (`missed_inside`), so the fact
+    /// layer keeps their candidates.
+    #[test]
+    fn a_route_registered_in_a_sibling_is_no_site() {
+        let Some(on) = super::super::fixture_walk::walked_services(
+            "discovery-siblings",
+            &[("services/app", "app"), ("packages/client", "client")],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/discovery-siblings/library-claims.json"),
+        )
+        .unwrap()
+        .replace("\"http_client\"", "\"server_framework\"");
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0);
+        let labels = Labels::of_answer(&answer);
+        let [app, client] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let with = discover_with(app, &[client], &labels, &on.repo);
+        assert!(with.sites.is_empty(), "{:?}", with.sites);
+        assert_eq!(with.counts.get("sibling_routes"), Some(&3));
+        let file = "services/app/src/main.ts";
+        let source = std::fs::read_to_string(on.repo.join(file)).unwrap();
+        let at = |needle: &str| {
+            let lo = source.find(needle).unwrap() as u32 + 1;
+            (file.to_string(), lo, lo + needle.len() as u32)
+        };
+        for needle in [
+            "getItem(id)",
+            "postTo(\"/api/events\", { at: 1 })",
+            "items.remove(id)",
+        ] {
+            assert!(
+                with.missed_inside.contains(&at(needle)),
+                "{needle}: {:?}",
+                with.missed_inside
+            );
+        }
     }
 
     /// Without rows there is nothing to walk: no site.
