@@ -5465,6 +5465,9 @@ struct TracedApplied {
     refused: usize,
     /// Documentation rows folded onto a written row.
     folded: usize,
+    /// Traced routes with a path no row at the line held and none was
+    /// written for: the registration's binding has no symbol to own a row.
+    owner_unknown: usize,
 }
 
 impl TracedApplied {
@@ -5475,6 +5478,10 @@ impl TracedApplied {
             .iter()
             .map(|(reason, count)| (format!("routes_untraced_{reason}"), *count))
             .chain([
+                (
+                    "routes_untraced_owner_unknown".to_string(),
+                    self.owner_unknown,
+                ),
                 ("routes_trace_disagrees".to_string(), self.disagrees),
                 (
                     "routes_documented_conflict".to_string(),
@@ -5492,12 +5499,14 @@ impl TracedApplied {
 /// The rows at a traced route's file and line are its rows. Where every one
 /// states the route's method and one of its full paths (placeholder names
 /// aside), each takes `library_claim`, except a row the documentation fold
-/// labelled `descriptor_route`, which keeps it, and each traced path no row
-/// holds is written as a copy of a row there. Where any row states another
-/// method or path, the site is counted and nothing is written: the reader
-/// and the trace disagree, and a compare replay decides (orchestrator's
-/// ruling, 2026-10-23). Where no row stands, one row is written per path,
-/// owned by the binding the route is registered on. Then documentation
+/// labelled `descriptor_route` or a `carrick.json` declaration labelled
+/// `declared_operation`, which keeps it, and each traced path no row holds
+/// is written as a copy of an undeclared row there of the route's method.
+/// Where any row states another method or path, the site is counted and
+/// nothing is written: the reader and the trace disagree, and a compare
+/// replay decides (orchestrator's ruling, 2026-10-23). Where no row to copy
+/// stands, one row is written per path, owned by the binding the route is
+/// registered on, and none where that binding has no symbol. Then documentation
 /// rows fold onto the rows written ([`FileOrchestrator::fold_documented_operations`]).
 ///
 /// `repo_path` places the graph's files as the withdraw does.
@@ -5601,14 +5610,34 @@ fn apply_traced_routes(
             );
             continue;
         }
+        // A row the documentation fold or a `carrick.json` declaration
+        // stated keeps its label: a re-scan declares operations before this
+        // pass, a full scan after it.
+        let declared = |row: &crate::mount_graph::ResolvedEndpoint| {
+            matches!(
+                row.resolution_source,
+                Some(ResolutionSource::DescriptorRoute | ResolutionSource::DeclaredOperation)
+            )
+        };
         for &index in &here {
             let row = &mut mount_graph.endpoints[index];
-            if row.resolution_source != Some(ResolutionSource::DescriptorRoute) {
+            if !declared(row) {
                 row.resolution_source = Some(ResolutionSource::LibraryClaim);
                 applied.relabelled += 1;
             }
         }
         for route in &routes {
+            // A copy takes a row of the route's own method: another
+            // method's row is another route's handler, and a declared row
+            // carries one dispatch case.
+            let template = here
+                .iter()
+                .map(|&index| &mount_graph.endpoints[index])
+                .find(|row| {
+                    row.method.eq_ignore_ascii_case(&route.method)
+                        && row.resolution_source != Some(ResolutionSource::DeclaredOperation)
+                });
+            let mut unowned = false;
             for full_path in &route.full_paths {
                 let held = here.iter().any(|&index| {
                     let row = &mount_graph.endpoints[index];
@@ -5626,13 +5655,8 @@ fn apply_traced_routes(
                     applied.refused += 1;
                     continue;
                 }
-                let template = here
-                    .iter()
-                    .map(|&index| &mount_graph.endpoints[index])
-                    .find(|row| row.method.eq_ignore_ascii_case(&route.method))
-                    .or_else(|| here.first().map(|&index| &mount_graph.endpoints[index]));
-                let row = match template {
-                    Some(template) => crate::mount_graph::ResolvedEndpoint {
+                let row = match (template, &route.owner) {
+                    (Some(template), _) => crate::mount_graph::ResolvedEndpoint {
                         method: route.method.clone(),
                         path: route.path.clone(),
                         full_path: full_path.clone(),
@@ -5640,7 +5664,13 @@ fn apply_traced_routes(
                         handler_span: None,
                         ..template.clone()
                     },
-                    None => crate::mount_graph::ResolvedEndpoint {
+                    // With no binding symbol there is no owner to write: the
+                    // reader keeps the site.
+                    (None, None) => {
+                        unowned = true;
+                        continue;
+                    }
+                    (None, Some(owner)) => crate::mount_graph::ResolvedEndpoint {
                         method: route.method.clone(),
                         path: route.path.clone(),
                         full_path: full_path.clone(),
@@ -5650,7 +5680,7 @@ fn apply_traced_routes(
                                 .clone()
                                 .unwrap_or_else(|| "anonymous".to_string()),
                         ),
-                        owner: route.owner.clone().unwrap_or_default(),
+                        owner: owner.clone(),
                         file_location: format!("{prefix}{file}:{line}"),
                         middleware_chain: Vec::new(),
                         repo_name: None,
@@ -5668,6 +5698,7 @@ fn apply_traced_routes(
                 };
                 written.push(row);
             }
+            applied.owner_unknown += usize::from(unowned);
         }
     }
     applied.added = written.len();
@@ -5682,6 +5713,7 @@ fn apply_traced_routes(
         documented_conflict = applied.documented_conflict,
         refused = applied.refused,
         folded = applied.folded,
+        owner_unknown = applied.owner_unknown,
         "receiver trace: routes written into the mount graph"
     );
     applied
@@ -24177,6 +24209,130 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 ("routes_trace_disagrees".to_string(), 3),
                 ("routes_documented_conflict".to_string(), 1),
             ]
+        );
+    }
+
+    /// PR #2687 review: on a re-scan the `carrick.json` declarations are
+    /// applied before the trace, so declared rows stand at the line. They
+    /// keep `declared_operation`, and a traced path they do not hold is
+    /// written afresh, not as a copy carrying one dispatch case.
+    #[test]
+    fn declared_rows_keep_their_label_and_are_never_copied() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let declared = |value: &str| crate::mount_graph::ResolvedEndpoint {
+            handler: Some("rpc".to_string()),
+            dispatch: Some(crate::dispatch::Dispatch {
+                location: crate::dispatch::DispatchLocation::Body,
+                field: "op".to_string(),
+                value: value.to_string(),
+            }),
+            ..traced_row(
+                "src/shared.ts:8",
+                "GET",
+                "/a/ping",
+                "/a/ping",
+                ResolutionSource::DeclaredOperation,
+            )
+        };
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![declared("first"), declared("second")];
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[traced_route(
+                "src/shared.ts",
+                8,
+                "GET",
+                "/ping",
+                &["/a/ping", "/b/ping"],
+            )],
+            ".",
+        );
+        assert_eq!(
+            applied,
+            TracedApplied {
+                added: 1,
+                ..TracedApplied::default()
+            }
+        );
+        assert_eq!(
+            traced_rows(&graph),
+            vec![
+                "src/shared.ts:8 GET /a/ping declared_operation",
+                "src/shared.ts:8 GET /a/ping declared_operation",
+                "src/shared.ts:8 GET /b/ping library_claim",
+            ]
+        );
+        let written = &graph.endpoints[2];
+        assert!(written.dispatch.is_none());
+        assert_eq!(written.owner, "users");
+        assert_eq!(written.handler.as_deref(), Some("list"));
+    }
+
+    /// PR #2687 review: a traced route whose method no row at the line
+    /// states is written from the trace, not as a copy of another method's
+    /// row (its handler and owner are another route's).
+    #[test]
+    fn a_traced_route_is_never_copied_from_another_methods_row() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![traced_row(
+            "src/items.ts:5",
+            "GET",
+            "/items",
+            "/api/items",
+            ResolutionSource::Model,
+        )];
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[
+                traced_route("src/items.ts", 5, "GET", "/items", &["/api/items"]),
+                crate::site_rows::TracedRoute {
+                    handler: Some("create".to_string()),
+                    owner: Some("items".to_string()),
+                    ..traced_route("src/items.ts", 5, "POST", "/items", &["/api/items"])
+                },
+            ],
+            ".",
+        );
+        assert_eq!(
+            applied,
+            TracedApplied {
+                relabelled: 1,
+                added: 1,
+                ..TracedApplied::default()
+            }
+        );
+        let post = &graph.endpoints[1];
+        assert_eq!(post.method, "POST");
+        assert_eq!(post.full_path, "/api/items");
+        assert_eq!(post.handler.as_deref(), Some("create"));
+        assert_eq!(post.owner, "items");
+    }
+
+    /// PR #2687 review: a traced route with no row to copy and no binding
+    /// symbol is not written with an empty owner; it is counted.
+    #[test]
+    fn a_traced_route_with_no_owner_is_counted_not_written() {
+        let mut graph = crate::mount_graph::MountGraph::new();
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[crate::site_rows::TracedRoute {
+                owner: None,
+                ..traced_route("src/users.ts", 8, "GET", "/", &["/v1/users"])
+            }],
+            ".",
+        );
+        assert!(graph.endpoints.is_empty());
+        assert_eq!(
+            applied,
+            TracedApplied {
+                owner_unknown: 1,
+                ..TracedApplied::default()
+            }
+        );
+        assert_eq!(
+            applied.tally(&std::collections::BTreeMap::new()),
+            vec![("routes_untraced_owner_unknown".to_string(), 1)]
         );
     }
 

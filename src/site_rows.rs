@@ -207,7 +207,7 @@ pub struct TracedRoute {
 pub struct TracedRoutes {
     pub routes: Vec<TracedRoute>,
     /// Route sites the trace does not serve at a full path, by reason:
-    /// `method_unstated`, `trimmed`, `no_instance`, `mount_unverified`,
+    /// `method_unstated`, `table_key`, `trimmed`, `no_instance`, `mount_unverified`,
     /// `hole_<end>` (an instance end that is not the top), `unread_prefix`.
     pub untraced: std::collections::BTreeMap<String, usize>,
 }
@@ -245,6 +245,12 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<TracedRoute, 
     else {
         return Err("method_unstated".to_string());
     };
+    // A table's keys are registered by one call in a loop, so they share
+    // its span and [`site_of`] hands every key's record the first key's
+    // site: the site cannot say which key a record is (PR #2687 review).
+    if site.key.is_some() {
+        return Err("table_key".to_string());
+    }
     if site.composed_trimmed {
         return Err("trimmed".to_string());
     }
