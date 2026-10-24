@@ -1,0 +1,9 @@
+{
+  "name": "traced-request-helper",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/request": "^1.0.0",
+    "@fixture/trace": "^1.0.0"
+  }
+}
