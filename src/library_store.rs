@@ -276,6 +276,24 @@ impl Asked {
         }
         claims
     }
+
+    /// The packages of `answer` the store answered for this service: those
+    /// answered at the version it asked about, as [`Self::claims`] keeps
+    /// their exports. A package answered for nothing this service asked is
+    /// no package it can tell answered (carrick#2725): with its exports
+    /// dropped, a call into it would read as answered with nothing to label.
+    fn answered(&self, answer: &LibraryAnswer) -> BTreeSet<String> {
+        self.request
+            .packages
+            .iter()
+            .filter(|package| {
+                answer
+                    .answered_versions
+                    .contains(&(package.package.clone(), package.version.clone()))
+            })
+            .map(|package| package.package.clone())
+            .collect()
+    }
 }
 
 /// What a service asks the store, given every specifier it makes a library
@@ -905,6 +923,8 @@ pub struct LibraryAnswer {
     pub exports: Vec<ExportClaims>,
     /// Every package the store answered, with or without an export.
     pub answered_packages: BTreeSet<String>,
+    /// Every package the store answered, with the version it answered.
+    pub answered_versions: BTreeSet<(String, String)>,
     /// The packages the store has not finished (`pending`).
     pub pending: BTreeSet<String>,
     /// The part of `pending` a wait can end ([`WAITED_REASONS`]).
@@ -975,6 +995,9 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
             answer.dropped += 1;
             continue;
         };
+        answer
+            .answered_versions
+            .insert((package.to_string(), version.to_string()));
         // Label v2 (carrick#2434): the package's type-only packages. A name
         // that is not a string says nothing and is skipped.
         let type_packages: Vec<String> = entry
@@ -1176,8 +1199,8 @@ pub struct FirstAnswer {
     /// reason, answered `skipped` with `build_failed`, and every package
     /// asked when the ask itself failed.
     pub unanswered: BTreeSet<String>,
-    /// Every package the answer holds as answered, with or without an export
-    /// ([`LibraryAnswer::answered_packages`]).
+    /// Every package the answer holds as answered for this service, with or
+    /// without an export ([`Asked::answered`]).
     pub answered: BTreeSet<String>,
     /// The ask itself got no answer (a refusal, an error, a timeout).
     pub ask_failed: bool,
@@ -1231,7 +1254,7 @@ where
         let _ = early.send(FirstAnswer {
             exports: asked.claims(first.exports.clone()),
             unanswered: first.pending.union(&first.build_failed).cloned().collect(),
-            answered: first.answered_packages.clone(),
+            answered: asked.answered(&first),
             ask_failed: false,
         });
     }
@@ -2783,6 +2806,40 @@ mod tests {
         assert!(answer.ask_failed);
         assert!(answer.exports.is_empty());
         assert_eq!(answer.unanswered, specifiers(&["lib", "other"]));
+    }
+
+    /// carrick#2725: the first answer names as answered only the packages
+    /// this service asked about, at the version it asked, as its exports
+    /// are kept. A package the answer holds for anything else (another
+    /// service's ask, another version) is not answered here: its exports
+    /// are dropped, so a call into it would read as answered with nothing
+    /// to label, and the fact layer would call that walk finished.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_answer_names_answered_only_what_this_service_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let asked = asked_lib_and_other(dir.path());
+        let body = r#"{"library_claims":[
+            {"package":"lib","version":"1.0.0","status":"answered","exports":[]},
+            {"package":"other","version":"2.0.0","status":"answered","exports":[]},
+            {"package":"framework","version":"1.0.0","status":"answered","exports":[
+                {"specifier":"framework","export":"default","role":"server_framework",
+                 "side":null,"makes":[],"scopes":[],"ops":[],"reserved":[],"calls":[],"patterns":[]}]}]}"#;
+        let store = FakeStore::new(vec![body.to_string()]);
+        let (early, mut first) = tokio::sync::oneshot::channel();
+        let sent = store.clone();
+        ask_until_settled(
+            &asked,
+            |_| async {},
+            move |request| {
+                let store = sent.clone();
+                async move { store.send(request).await }
+            },
+            Some(early),
+        )
+        .await;
+        let answer = first.try_recv().expect("the first answer is sent");
+        assert!(answer.exports.is_empty(), "no export of an unasked package");
+        assert_eq!(answer.answered, specifiers(&["lib"]));
     }
 
     #[test]

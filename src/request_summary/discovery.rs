@@ -4303,6 +4303,8 @@ mod tests {
             }
             let mut sites: Vec<DiscoverySite> = Vec::new();
             let mut unfollowed: Vec<DiscoverySite> = Vec::new();
+            let mut finished: Vec<(String, u32, u32)> = Vec::new();
+            let mut missed_inside: Vec<(String, u32, u32)> = Vec::new();
             let mut counts: BTreeMap<String, usize> = BTreeMap::new();
             // Every service's inputs are kept: each walk reads the others'
             // files with their own IR and rows (carrick#2618).
@@ -4357,6 +4359,8 @@ mod tests {
                 }
                 sites.extend(discovery.sites);
                 unfollowed.extend(discovery.unfollowed);
+                finished.extend(discovery.finished);
+                missed_inside.extend(discovery.missed_inside);
             }
             crate::outln!("== {label}: {} record(s)", sites.len());
             for (key, count) in &counts {
@@ -4364,7 +4368,13 @@ mod tests {
             }
             all.insert(
                 label.to_string(),
-                serde_json::json!({ "counts": counts, "sites": sites, "unfollowed": unfollowed }),
+                serde_json::json!({
+                    "counts": counts,
+                    "sites": sites,
+                    "unfollowed": unfollowed,
+                    "finished": finished,
+                    "missed_inside": missed_inside,
+                }),
             );
         }
         if let Ok(out) = std::env::var("CARRICK_DISCOVERY_CENSUS_OUT") {
