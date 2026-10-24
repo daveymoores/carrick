@@ -1197,7 +1197,8 @@ fn named_functions<'e>(
 }
 
 /// The names a function writes a member of, anywhere in it: `x.a = …`,
-/// `x[k] = …`, `x.a.b += …`, `x.a++`, `delete x.a`.
+/// `x[k] = …`, `x.a.b += …`, `x.a++`, `delete x.a`, and the target of the
+/// language's `Object.assign(x, …)` (carrick#2674).
 #[derive(Default)]
 pub(super) struct WrittenThrough {
     names: HashSet<String>,
@@ -1243,6 +1244,28 @@ impl Visit for WrittenThrough {
             self.write(member);
         }
         unary.visit_children_with(self);
+    }
+
+    /// `Object.assign(x, …)` writes the keys of every later argument onto
+    /// `x` (its first argument only; the others are read).
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Callee::Expr(callee) = &call.callee
+            && let Expr::Member(member) = unwrap_expression(callee)
+            && let Expr::Ident(object) = unwrap_expression(&member.obj)
+            && object.sym == *"Object"
+            && matches!(&member.prop, MemberProp::Ident(prop) if prop.sym == *"assign")
+            && let Some(target) = call.args.first()
+            && target.spread.is_none()
+        {
+            let mut root = &*target.expr;
+            while let Expr::Member(inner) = unwrap_expression(root) {
+                root = &inner.obj;
+            }
+            if let Expr::Ident(ident) = unwrap_expression(root) {
+                self.names.insert(ident.sym.to_string());
+            }
+        }
+        call.visit_children_with(self);
     }
 }
 

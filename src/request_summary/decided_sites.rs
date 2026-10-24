@@ -3678,6 +3678,86 @@ pub(crate) mod tests {
         }
     }
 
+    /// carrick#2674 P3-1a review: a wrapper that writes a key onto the
+    /// options it hands on (assigning a member, `Object.assign` onto it, or
+    /// spreading it into a new object beside the key) does not hold what the
+    /// caller wrote: neither the payload slot's key nor the method is read
+    /// at the caller, so neither reads as unwritten there. Object.assign onto
+    /// a new object only reads the rest, which still carries.
+    #[test]
+    fn a_key_written_onto_the_carried_options_ends_the_carry() {
+        const WRITTEN: &str = "src/slots/written.ts";
+        let calls = [
+            "fetch(`${process.env.API}${path}/mut`, { ...mutRest, credentials: \"include\" })",
+            "fetch(`${process.env.API}${path}/assign`, { ...assignRest, credentials: \"include\" })",
+            "fetch(`${process.env.API}${path}/closure`, { ...closureRest, credentials: \"include\" })",
+            "fetch(`${process.env.API}${path}/pm`, { method: \"POST\", ...init })",
+            "fetch(`${process.env.API}${path}/pa`, { method: \"POST\", ...assignInit })",
+            "fetch(`${process.env.API}${path}/inner`, { ...innerRest, credentials: \"include\" })",
+            "fetch(`${process.env.API}${path}/mm`, { ...methodRest, credentials: \"include\" })",
+            "fetch(`${process.env.API}${path}/ma`, { credentials: \"include\", ...methodInit })",
+            "fetch(`${process.env.API}${path}/copy`, { ...copyRest, credentials: \"include\" })",
+        ];
+        let (decided, text, _) = decided_at(WRITTEN, &calls, &payloads_label());
+        let sites_at = |needle: &str| {
+            let line = line_of(&text, needle);
+            let here: Vec<_> = decided
+                .sites
+                .iter()
+                .filter(|site| site.line == line)
+                .collect();
+            assert!(!here.is_empty(), "no site at {needle}");
+            here
+        };
+        for needle in [
+            "sendMut({ path",
+            "sendAssign({ path",
+            "sendClosure({ path",
+            "postMut(\"/pm\"",
+            "postAssign(\"/pa\"",
+        ] {
+            for site in sites_at(needle) {
+                assert_eq!(site.payload_slot, None, "{needle}");
+            }
+        }
+        for needle in ["sendMethodMut({ path", "sendMethodAssign(\"/ma\""] {
+            for site in sites_at(needle) {
+                assert_eq!(
+                    site.method,
+                    Some(MethodValue::Pieces(vec![Piece::Unknown])),
+                    "{needle}"
+                );
+            }
+        }
+        // A hop that spreads the rest beside a body decides the site: the
+        // body is written there, and its caller is no site.
+        assert!(
+            !decided
+                .sites
+                .iter()
+                .any(|site| site.line == line_of(&text, "sendOuter({ path"))
+        );
+        let hop = sites_at("sendInner({ ...outerRest");
+        assert_eq!(hop.len(), 1);
+        assert_eq!(
+            hop[0].payload_slot,
+            Some(SlotBinding::Written {
+                arg: 0,
+                key: "body".into(),
+            })
+        );
+        // Control: the rest is only read by Object.assign.
+        let copy = sites_at("sendCopy({ path");
+        assert_eq!(copy.len(), 1);
+        assert_eq!(
+            copy[0].payload_slot,
+            Some(SlotBinding::Unwritten {
+                arg: 0,
+                key: "body".into(),
+            })
+        );
+    }
+
     // -----------------------------------------------------------------------
     // carrick#2524: a site row writes no source text, yields to the
     // summaries' placement, and carries its instance's base.
