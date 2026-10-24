@@ -24436,7 +24436,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 "POST",
                 "/:userId",
                 "/v1/users/:userId",
-                ResolutionSource::DescriptorRoute,
+                ResolutionSource::InlineLiteral,
             ),
             traced_row(
                 "src/users.ts:9",
