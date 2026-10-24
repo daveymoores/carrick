@@ -267,7 +267,7 @@ describe('carrick#1749: the body a caller reads, stated by the source', () => {
       assert.strictEqual(inferred.stated_body?.array_depth, 1);
     });
 
-    it('does not report a statement that leaves a position open', async () => {
+    it('reports the later statement, never a placeholder that leaves a position open', async () => {
       // \`unknown\` at the read is a placeholder the source narrows later:
       // the later cast is the statement reported, never the placeholder
       // (carrick#2714), so a model symbol taken from it agrees with it.
