@@ -194,8 +194,16 @@ fn with_the_switch_at_anything_but_one_the_blob_is_unchanged() {
 /// at the body's value. Switch off, neither is read.
 #[test]
 fn a_caller_that_writes_no_body_through_a_wrapper_is_decided_no_body() {
-    let off = scan(&fixture_dir(), &[]);
-    let on = scan(&fixture_dir(), &[("CARRICK_SITE_PAYLOADS", "1")]);
+    // The global `fetch` is a decided site only with the site questions on,
+    // as the Action runs them.
+    let off = scan(&fixture_dir(), &[("CARRICK_SITE_QUESTIONS", "1")]);
+    let on = scan(
+        &fixture_dir(),
+        &[
+            ("CARRICK_SITE_QUESTIONS", "1"),
+            ("CARRICK_SITE_PAYLOADS", "1"),
+        ],
+    );
     let (note, ping) = (14_u64, 18_u64);
 
     let ping_entry = entry_at(&on, "request", "src/notes.ts", ping);
