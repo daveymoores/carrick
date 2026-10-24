@@ -1543,6 +1543,17 @@ fn match_score(producer_path: &str, consumer_path: &str) -> u8 {
     }
 }
 
+/// A verdict the pair is given before any probe runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreVerdict {
+    /// Nothing was compared, and `reason` says why: stored unverifiable.
+    NotCompared { reason: String },
+    /// An HTTP request pair whose two sides both carry the decided root reason
+    /// `no_request_body`: the call writes no body and the route's handler
+    /// reads none. Compatible and resolved, with a note.
+    NoBodyEitherSide,
+}
+
 /// One built pair: the check spec plus everything the verdict join and the
 /// findings projection need, so no information has to be re-parsed out of
 /// labels after the verdict returns.
@@ -1564,7 +1575,7 @@ pub(crate) struct BuiltPair {
     /// v2 capture surface at all (older scan or degraded capture). The stale
     /// manifest `type_state` is NOT a pre-verdict trigger — check_v2 reads the
     /// real surface and judges resolved-ness itself.
-    pub pre_verdict: Option<(VerdictBucket, String)>,
+    pub pre_verdict: Option<PreVerdict>,
     /// Which side has no surface, when `pre_verdict` is set.
     pub pre_verdict_side: Option<VerdictSide>,
     /// The producer's response type, fully inlined, as the index publishes it
@@ -1943,8 +1954,9 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
                 fields.sort_unstable();
                 fields.dedup();
                 if let Some(mut pair) = build_pair(case_unknown[0], consumer) {
-                    pair.pre_verdict =
-                        Some((VerdictBucket::Unverifiable, case_unknown_reason(&fields)));
+                    pair.pre_verdict = Some(PreVerdict::NotCompared {
+                        reason: case_unknown_reason(&fields),
+                    });
                     pair.pre_verdict_side = None;
                     pairs.push(pair);
                 }
@@ -2007,23 +2019,21 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         None
     };
     let pre_verdict = if !producer.has_surface {
-        Some((
-            VerdictBucket::Unverifiable,
-            format!(
+        Some(PreVerdict::NotCompared {
+            reason: format!(
                 "producer service '{}' has no v2 type surface (older scan or capture degraded) — re-scan it",
                 producer.service_id
             ),
-        ))
+        })
     } else if !consumer.has_surface {
-        Some((
-            VerdictBucket::Unverifiable,
-            format!(
+        Some(PreVerdict::NotCompared {
+            reason: format!(
                 "consumer service '{}' has no v2 type surface (older scan or capture degraded) — re-scan it",
                 consumer.service_id
             ),
-        ))
+        })
     } else {
-        None
+        no_request_body_pre_verdict(protocol, producer, consumer)
     };
 
     // carrick#2054: a response the handler chooses by a field of the
@@ -2092,6 +2102,47 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         unstated_mode,
         unwidened_out_of_budget,
     })
+}
+
+/// The note a pair both of whose sides are decided to carry no request body
+/// is stored with. It is read through the MCP tools, and says why no probe ran.
+pub(crate) const NO_BODY_EITHER_SIDE_NOTE: &str =
+    "the call writes no body key, and the route's handler reads no body";
+
+/// Whether a pair is decided over a request body that is not there.
+///
+/// Both sides publish the literal `unknown` whether the inferrer decided there
+/// is no body or could not read one, so the probe cannot tell them apart. The
+/// decision lives in the manifest entry's root `any_provenance`: the reason
+/// `no_request_body`, on a type that is absent or a bare top type
+/// (carrick#2674). A root reason beside a printed shape is not a decision.
+fn decided_no_request_body(entry: &TypeManifestEntry) -> bool {
+    entry
+        .expanded_definition
+        .as_deref()
+        .is_none_or(text_is_bare_top_type)
+        && entry
+            .any_provenance
+            .iter()
+            .any(|p| p.path.is_empty() && p.reason == "no_request_body")
+}
+
+/// The pre-verdict of an HTTP request pair over a body that is not there
+/// (carrick#2674): both sides decided "no body" is compatible. Every other
+/// mix is probed as before. A call decided "no body" against a route whose
+/// request type requires one is not judged here: the index does not record
+/// whether that type was read from a declared contract or misread, so an
+/// incompatible verdict would rest on a guess.
+fn no_request_body_pre_verdict(
+    protocol: ProbeProtocol,
+    producer: &ServiceEntry,
+    consumer: &ServiceEntry,
+) -> Option<PreVerdict> {
+    (protocol == ProbeProtocol::Http
+        && producer.entry.type_kind == ManifestTypeKind::Request
+        && decided_no_request_body(consumer.entry)
+        && decided_no_request_body(producer.entry))
+    .then_some(PreVerdict::NoBodyEitherSide)
 }
 
 /// Materialize every artifact-carrying service's stub into `dest_root` and
@@ -2167,18 +2218,8 @@ pub(crate) fn run_check(
         if pair.pre_verdict_side == Some(VerdictSide::Consumer) {
             consumer_blamed.insert(pair.spec.pair_key.clone());
         }
-        if let Some((bucket, reason)) = &pair.pre_verdict {
-            // A pre-verdicted pair never reached a probe, so nothing about it
-            // was compared: not a fact, and the pre-verdict reason is why.
-            outcomes.push(outcome_for(
-                pair,
-                *bucket,
-                None,
-                Some(reason.clone()),
-                false,
-                Some(reason.clone()),
-                Vec::new(),
-            ));
+        if let Some(pre_verdict) = &pair.pre_verdict {
+            outcomes.push(pre_verdict_outcome(pair, pre_verdict));
         } else {
             probing.push(pair);
         }
@@ -3136,6 +3177,33 @@ fn unresolved_pair_line(outcome: &PairCheckOutcome) -> Option<String> {
     ))
 }
 
+/// The outcome a pre-verdicted pair is stored with. The first kind compared
+/// nothing, so it is unresolved and the reason is why. The two request-body
+/// kinds are decisions over known sides (the call's "no body" is the
+/// inferrer's reading of the source), so they are `resolved`.
+fn pre_verdict_outcome(pair: &BuiltPair, pre_verdict: &PreVerdict) -> PairCheckOutcome {
+    match pre_verdict {
+        PreVerdict::NotCompared { reason } => outcome_for(
+            pair,
+            VerdictBucket::Unverifiable,
+            None,
+            Some(reason.clone()),
+            false,
+            Some(reason.clone()),
+            Vec::new(),
+        ),
+        PreVerdict::NoBodyEitherSide => outcome_for(
+            pair,
+            VerdictBucket::Compatible,
+            None,
+            None,
+            true,
+            None,
+            vec![NO_BODY_EITHER_SIDE_NOTE.to_string()],
+        ),
+    }
+}
+
 fn outcome_for(
     pair: &BuiltPair,
     bucket: VerdictBucket,
@@ -3144,10 +3212,12 @@ fn outcome_for(
     resolved: bool,
     unresolved_reason: Option<String>,
     // `notes`: observations the check made beside the verdict (carrick#1341).
-    // Empty for every outcome this module SYNTHESISES — a pre-verdicted pair,
-    // a pair the check returned nothing for, a run that did not happen —
-    // since none of those compared anything to observe. Only a real
-    // `CheckVerdict.notes` is ever non-empty here.
+    // Empty for every outcome this module SYNTHESISES — an unresolved
+    // pre-verdicted pair, a pair the check returned nothing for, a run that
+    // did not happen — since none of those compared anything to observe. The
+    // one exception is the pair both sides of which are decided to carry no
+    // request body (`PreVerdict::NoBodyEitherSide`), whose note says why no
+    // probe ran. Otherwise only a real `CheckVerdict.notes` is non-empty here.
     notes: Vec<String>,
 ) -> PairCheckOutcome {
     PairCheckOutcome {
@@ -3424,8 +3494,12 @@ mod tests {
 
         let pairs = build_check_pairs(&[producer, consumer]);
         assert_eq!(pairs.len(), 1);
-        let (bucket, reason) = pairs[0].pre_verdict.as_ref().expect("pre-verdict");
-        assert_eq!(*bucket, VerdictBucket::Unverifiable);
+        let Some(PreVerdict::NotCompared { reason }) = pairs[0].pre_verdict.as_ref() else {
+            panic!(
+                "expected a not-compared pre-verdict: {:?}",
+                pairs[0].pre_verdict
+            );
+        };
         assert!(reason.contains("no v2 type surface"), "{reason}");
     }
 
@@ -7455,12 +7529,12 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         assert_eq!(unknown.len(), 1, "one half for the route, not one per case");
         assert_eq!(
             unknown[0].pre_verdict,
-            Some((
-                VerdictBucket::Unverifiable,
-                "Not compared: this route returns a different response depending on `op` in \
+            Some(PreVerdict::NotCompared {
+                reason:
+                    "Not compared: this route returns a different response depending on `op` in \
                  the request, and Carrick cannot tell which one this call receives."
-                    .to_string()
-            ))
+                        .to_string()
+            })
         );
         assert_eq!(unknown[0].pre_verdict_side, None);
     }
@@ -7601,8 +7675,12 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         );
         let pairs = build_check_pairs(&[no_surface_producer, consumer_ok.clone()]);
         assert_eq!(pairs.len(), 1);
-        let (bucket, reason) = pairs[0].pre_verdict.as_ref().expect("pre-verdict");
-        assert_eq!(*bucket, VerdictBucket::Unverifiable);
+        let Some(PreVerdict::NotCompared { reason }) = pairs[0].pre_verdict.as_ref() else {
+            panic!(
+                "expected a not-compared pre-verdict: {:?}",
+                pairs[0].pre_verdict
+            );
+        };
         assert!(reason.contains("no v2 type surface"), "{reason}");
 
         // Unknown type_state on a side WITH a surface: NO pre-verdict. The
@@ -7629,6 +7707,244 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             "an Unknown-state side WITH a surface must probe, not pre-verdict: {:?}",
             pairs[0].pre_verdict
         );
+    }
+
+    // ---- the request-body pre-verdicts (carrick#2674) ----------------------
+
+    /// One side of a `POST /notes` pair as a manifest entry: its published
+    /// text, and the root reasons the inferrer recorded for it.
+    fn body_entry(
+        role: ManifestRole,
+        kind: ManifestTypeKind,
+        text: Option<&str>,
+        reason: Option<&str>,
+    ) -> TypeManifestEntry {
+        let (alias, file, line) = match role {
+            ManifestRole::Producer => ("P", "src/routes.ts", 3),
+            ManifestRole::Consumer => ("C", "src/client.ts", 8),
+        };
+        let mut e = entry(
+            OperationKey::http("POST", "/notes"),
+            role,
+            kind,
+            alias,
+            file,
+            line,
+            ManifestTypeState::Implicit,
+        );
+        e.expanded_definition = text.map(str::to_string);
+        if let Some(reason) = reason {
+            e.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+                path: String::new(),
+                kind: "unknown".to_string(),
+                reason: reason.to_string(),
+                detail: Some("decided".to_string()),
+            }];
+        }
+        e
+    }
+
+    /// The pairs for one `POST /notes` call against its route. `producer` and
+    /// `consumer` are `(published text, root reason)`; `source` is the
+    /// producer row's resolution source.
+    fn body_pairs(
+        kind: ManifestTypeKind,
+        producer: (Option<&str>, Option<&str>),
+        consumer: (Option<&str>, Option<&str>),
+        source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
+    ) -> Vec<BuiltPair> {
+        let mut api = repo(
+            "api",
+            None,
+            vec![body_entry(
+                ManifestRole::Producer,
+                kind,
+                producer.0,
+                producer.1,
+            )],
+            Some(fake_artifact()),
+        );
+        let mut row = dispatch_row("POST", "/notes", "src/routes.ts:3", None);
+        row.resolution_source = source;
+        api.endpoints = vec![row];
+        let web = repo(
+            "web",
+            None,
+            vec![body_entry(
+                ManifestRole::Consumer,
+                kind,
+                consumer.0,
+                consumer.1,
+            )],
+            Some(fake_artifact()),
+        );
+        build_check_pairs(&[api, web])
+    }
+
+    const DECIDED: Option<&str> = Some("no_request_body");
+
+    /// A route row a deterministic pass found (not the model's reading).
+    fn deterministic_route() -> Option<crate::agents::file_analyzer_agent::ResolutionSource> {
+        Some(crate::agents::file_analyzer_agent::ResolutionSource::DescriptorRoute)
+    }
+
+    fn pre_verdict_of(pairs: &[BuiltPair]) -> Option<PreVerdict> {
+        assert_eq!(pairs.len(), 1, "one pair");
+        pairs[0].pre_verdict.clone()
+    }
+
+    #[test]
+    fn a_pair_decided_to_carry_no_body_on_both_sides_is_compatible_and_resolved() {
+        let pairs = body_pairs(
+            ManifestTypeKind::Request,
+            (Some("unknown"), DECIDED),
+            (None, DECIDED),
+            None,
+        );
+        assert_eq!(pre_verdict_of(&pairs), Some(PreVerdict::NoBodyEitherSide));
+        // The pair is never probed, and its outcome reads as a comparison.
+        let outcome = pre_verdict_outcome(&pairs[0], pairs[0].pre_verdict.as_ref().unwrap());
+        assert_eq!(outcome.bucket, VerdictBucket::Compatible);
+        assert!(outcome.resolved);
+        assert_eq!(outcome.unresolved_reason, None);
+        assert_eq!(outcome.diagnostic, None);
+        assert_eq!(outcome.notes, vec![NO_BODY_EITHER_SIDE_NOTE.to_string()]);
+        assert_eq!(pairs[0].pre_verdict_side, None);
+    }
+
+    #[test]
+    fn one_side_decided_against_a_typed_or_bare_side_gets_no_both_sides_verdict() {
+        let typed = Some("{ name: string; }");
+        // Consumer decided: the producer is typed or a bare top type.
+        for producer in [typed, Some("unknown"), None] {
+            let pairs = body_pairs(
+                ManifestTypeKind::Request,
+                (producer, None),
+                (Some("unknown"), DECIDED),
+                None,
+            );
+            assert_eq!(pre_verdict_of(&pairs), None, "producer {producer:?}");
+        }
+        // Producer decided: the consumer is typed or bare.
+        for consumer in [typed, Some("unknown"), None] {
+            let pairs = body_pairs(
+                ManifestTypeKind::Request,
+                (Some("unknown"), DECIDED),
+                (consumer, None),
+                deterministic_route(),
+            );
+            assert_eq!(pre_verdict_of(&pairs), None, "consumer {consumer:?}");
+        }
+    }
+
+    #[test]
+    fn a_root_reason_beside_a_printed_shape_is_not_a_decision() {
+        let shaped = Some("{ name: string; }");
+        for (producer, consumer) in [
+            ((shaped, DECIDED), (Some("unknown"), DECIDED)),
+            ((Some("unknown"), DECIDED), (shaped, DECIDED)),
+        ] {
+            let pairs = body_pairs(ManifestTypeKind::Request, producer, consumer, None);
+            assert_eq!(pre_verdict_of(&pairs), None);
+        }
+    }
+
+    #[test]
+    fn another_decided_reason_on_both_sides_is_not_a_no_body_decision() {
+        let pairs = body_pairs(
+            ManifestTypeKind::Request,
+            (Some("unknown"), Some("body_built_by_callee")),
+            (Some("unknown"), Some("body_built_by_callee")),
+            deterministic_route(),
+        );
+        assert_eq!(pre_verdict_of(&pairs), None);
+    }
+
+    #[test]
+    fn a_response_pair_never_takes_a_request_body_verdict() {
+        let pairs = body_pairs(
+            ManifestTypeKind::Response,
+            (Some("unknown"), Some("no_success_payload")),
+            (Some("unknown"), Some("no_success_payload")),
+            deterministic_route(),
+        );
+        assert_eq!(pre_verdict_of(&pairs), None);
+        // Nor does a response pair carrying the request reason.
+        let pairs = body_pairs(
+            ManifestTypeKind::Response,
+            (Some("unknown"), DECIDED),
+            (Some("unknown"), DECIDED),
+            deterministic_route(),
+        );
+        assert_eq!(pre_verdict_of(&pairs), None);
+        let pairs = body_pairs(
+            ManifestTypeKind::Response,
+            (Some("{ name: string; }"), None),
+            (Some("unknown"), DECIDED),
+            deterministic_route(),
+        );
+        assert_eq!(pre_verdict_of(&pairs), None);
+    }
+
+    #[test]
+    fn a_side_with_no_surface_keeps_its_not_compared_verdict() {
+        let mut api = repo(
+            "api",
+            None,
+            vec![body_entry(
+                ManifestRole::Producer,
+                ManifestTypeKind::Request,
+                Some("unknown"),
+                DECIDED,
+            )],
+            None,
+        );
+        api.endpoints = vec![dispatch_row("POST", "/notes", "src/routes.ts:3", None)];
+        let web = repo(
+            "web",
+            None,
+            vec![body_entry(
+                ManifestRole::Consumer,
+                ManifestTypeKind::Request,
+                Some("unknown"),
+                DECIDED,
+            )],
+            Some(fake_artifact()),
+        );
+        let pairs = build_check_pairs(&[api, web]);
+        assert!(matches!(
+            pre_verdict_of(&pairs),
+            Some(PreVerdict::NotCompared { .. })
+        ));
+    }
+
+    /// A route found by a deterministic pass can still carry a misread body
+    /// type: the route's source says how the route was found, not how its
+    /// body was read. Against a call decided "no body" it gets no
+    /// pre-verdict, so no incompatible is synthesised; the probe's top-type
+    /// gate stores it unverifiable as before.
+    #[test]
+    fn a_misread_body_on_a_deterministically_found_route_is_not_incompatible() {
+        for text in ["string", "{ name: string; }", "{ id: number; }[]"] {
+            let pairs = body_pairs(
+                ManifestTypeKind::Request,
+                (Some(text), None),
+                (Some("unknown"), DECIDED),
+                deterministic_route(),
+            );
+            assert_eq!(pre_verdict_of(&pairs), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_typed_call_body_against_a_required_body_is_probed() {
+        let pairs = body_pairs(
+            ManifestTypeKind::Request,
+            (Some("{ name: string; }"), None),
+            (Some("{ name: string; }"), None),
+            deterministic_route(),
+        );
+        assert_eq!(pre_verdict_of(&pairs), None);
     }
 
     // ---- end-to-end: capture_v2 -> check_v2 -> pair outcomes -> edge join --
