@@ -1552,10 +1552,6 @@ pub(crate) enum PreVerdict {
     /// `no_request_body`: the call writes no body and the route's handler
     /// reads none. Compatible and resolved, with a note.
     NoBodyEitherSide,
-    /// An HTTP request pair whose call is decided to send no body, against a
-    /// route whose request type, read from code, requires one. Incompatible,
-    /// with `reason` naming both sides.
-    NoBodyAgainstRequiredBody { reason: String },
 }
 
 /// One built pair: the check spec plus everything the verdict join and the
@@ -1692,10 +1688,6 @@ struct ServiceEntry<'a> {
     service_id: &'a str,
     has_surface: bool,
     entry: &'a TypeManifestEntry,
-    /// On a producer: every endpoint row at this entry's site states its
-    /// source outright (it is not the model's own reading, and it records a
-    /// source). Unrecorded is not stated.
-    stated_by_source: bool,
     /// The dispatch case of every row this entry stands for (carrick#831):
     /// on a producer, each case the route answers at this site (several cases
     /// with no site of their own share the route's, and so its alias); on a
@@ -1724,38 +1716,6 @@ fn case_unknown_reason(fields: &[&str]) -> String {
 /// [`build_type_manifest_entries`](crate::engine) builds the entry from.
 type CasesBySite<'a> =
     HashMap<(String, u32, String, String), Vec<Option<&'a crate::dispatch::Dispatch>>>;
-
-/// Whether every HTTP row at a site is one the scan states outright, by the
-/// same `(file, line, method, path)` join as [`cases_by_site`]. A row that
-/// records no source, or whose source is the model's reading
-/// ([`ResolutionSource::is_candidate`]), makes the site not stated.
-///
-/// [`ResolutionSource::is_candidate`]: crate::agents::file_analyzer_agent::ResolutionSource::is_candidate
-fn stated_by_site(
-    rows: &[crate::analyzer::ApiEndpointDetails],
-) -> HashMap<(String, u32, String, String), bool> {
-    let mut by_site: HashMap<(String, u32, String, String), bool> = HashMap::new();
-    for row in rows {
-        let Some((method, path)) = row.key.as_http() else {
-            continue;
-        };
-        let (file, line) =
-            crate::type_manifest::parse_file_location(&row.file_path.to_string_lossy());
-        let stated = row
-            .resolution_source
-            .is_some_and(|source| !source.is_candidate());
-        let slot = by_site
-            .entry((
-                file,
-                line,
-                crate::type_manifest::normalize_manifest_method(method),
-                path.to_string(),
-            ))
-            .or_insert(true);
-        *slot &= stated;
-    }
-    by_site
-}
 
 fn cases_by_site(rows: &[crate::analyzer::ApiEndpointDetails]) -> CasesBySite<'_> {
     let mut by_site: CasesBySite = HashMap::new();
@@ -1855,7 +1815,6 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
         };
         let endpoint_cases = cases_by_site(&repo.endpoints);
         let call_cases = cases_by_site(&repo.calls);
-        let endpoint_sources = stated_by_site(&repo.endpoints);
         for entry in entries {
             let (target, rows) = match entry.role {
                 ManifestRole::Producer => (&mut producers, &endpoint_cases),
@@ -1874,23 +1833,10 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
                 })
                 .cloned()
                 .unwrap_or_else(|| vec![None]);
-            let stated_by_source = entry.role == ManifestRole::Producer
-                && entry.key.as_http().is_some_and(|(method, path)| {
-                    endpoint_sources
-                        .get(&(
-                            entry.file_path.clone(),
-                            entry.line_number,
-                            method.to_string(),
-                            path.to_string(),
-                        ))
-                        .copied()
-                        .unwrap_or(false)
-                });
             target.push(ServiceEntry {
                 service_id,
                 has_surface,
                 entry,
-                stated_by_source,
                 cases,
             });
         }
@@ -2181,203 +2127,22 @@ fn decided_no_request_body(entry: &TypeManifestEntry) -> bool {
             .any(|p| p.path.is_empty() && p.reason == "no_request_body")
 }
 
-/// The longest producer type text a mismatch reason quotes.
-const REQUIRED_BODY_QUOTE_LIMIT: usize = 200;
-
 /// The pre-verdict of an HTTP request pair over a body that is not there
-/// (carrick#2674, ruled 2026-10-24):
-///
-///  - both sides decided "no body": compatible;
-///  - the call decided "no body" and the route, read from code, requires a
-///    body: incompatible;
-///  - every other mix is probed as before.
-///
-/// "Read from code" is the producer row's resolution source: stated outright
-/// by the scan, never the model's own reading and never unrecorded. "Requires
-/// a body" is the printed request type: see [`request_body_is_required`].
+/// (carrick#2674): both sides decided "no body" is compatible. Every other
+/// mix is probed as before. A call decided "no body" against a route whose
+/// request type requires one is not judged here: the index does not record
+/// whether that type was read from a declared contract or misread, so an
+/// incompatible verdict would rest on a guess.
 fn no_request_body_pre_verdict(
     protocol: ProbeProtocol,
     producer: &ServiceEntry,
     consumer: &ServiceEntry,
 ) -> Option<PreVerdict> {
-    if protocol != ProbeProtocol::Http
-        || producer.entry.type_kind != ManifestTypeKind::Request
-        || !decided_no_request_body(consumer.entry)
-    {
-        return None;
-    }
-    if decided_no_request_body(producer.entry) {
-        return Some(PreVerdict::NoBodyEitherSide);
-    }
-    let text = producer.entry.expanded_definition.as_deref()?.trim();
-    if !producer.stated_by_source
-        || contains_disqualifying_top_type(text)
-        || !request_body_is_required(text)
-    {
-        return None;
-    }
-    let quoted: String = if text.chars().count() > REQUIRED_BODY_QUOTE_LIMIT {
-        let head: String = text.chars().take(REQUIRED_BODY_QUOTE_LIMIT).collect();
-        format!("{head}...")
-    } else {
-        text.to_string()
-    };
-    Some(PreVerdict::NoBodyAgainstRequiredBody {
-        reason: format!(
-            "the call sends no request body, but the route's handler requires one: {quoted}"
-        ),
-    })
-}
-
-/// Splits `text` at `separators` that sit outside any bracket, string or
-/// template. `None` when the brackets do not balance, so a text this cannot
-/// read is never decided.
-fn split_top_level(text: &str, separators: &[char]) -> Option<Vec<String>> {
-    let mut parts: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut depth: i32 = 0;
-    let mut quote: Option<char> = None;
-    let mut previous = '\0';
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if let Some(open) = quote {
-            current.push(c);
-            if c == '\\' {
-                if let Some(escaped) = chars.next() {
-                    current.push(escaped);
-                }
-            } else if c == open {
-                quote = None;
-            }
-            previous = c;
-            continue;
-        }
-        match c {
-            '"' | '\'' | '`' => quote = Some(c),
-            '(' | '[' | '{' | '<' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            // The `>` of an arrow type closes nothing.
-            '>' if previous != '=' => depth -= 1,
-            _ => {}
-        }
-        if depth < 0 {
-            return None;
-        }
-        if depth == 0 && separators.contains(&c) {
-            parts.push(std::mem::take(&mut current));
-        } else {
-            current.push(c);
-        }
-        previous = c;
-    }
-    if depth != 0 || quote.is_some() {
-        return None;
-    }
-    parts.push(current);
-    Some(parts)
-}
-
-/// Whether the printed request type needs a body: a call that sends none
-/// cannot satisfy it. Only a shape that says so outright counts, and anything
-/// this cannot read is not required, so the pair is probed as before.
-///
-/// Every member of a union must require one. A member requires one when it is
-/// a primitive, an array, or an object type with at least one required
-/// property and no index signature or method. `undefined`, `void`, `null`,
-/// `{}`, an object whose properties are all optional, a type reference and an
-/// intersection do not.
-pub(crate) fn request_body_is_required(text: &str) -> bool {
-    let text = text.trim().trim_end_matches(';').trim();
-    let Some(members) = split_top_level(text, &['|']) else {
-        return false;
-    };
-    let members: Vec<&str> = members
-        .iter()
-        .map(|m| m.trim())
-        .filter(|m| !m.is_empty())
-        .collect();
-    !members.is_empty() && members.into_iter().all(union_member_requires_a_body)
-}
-
-fn union_member_requires_a_body(member: &str) -> bool {
-    if matches!(member, "string" | "number" | "boolean" | "bigint") {
-        return true;
-    }
-    if let Some(inner) = member.strip_suffix("[]") {
-        return !inner.trim().is_empty();
-    }
-    if let Some(inner) = member
-        .strip_prefix("Array<")
-        .and_then(|rest| rest.strip_suffix('>'))
-    {
-        return !inner.trim().is_empty();
-    }
-    let Some(inner) = member
-        .strip_prefix('{')
-        .and_then(|rest| rest.strip_suffix('}'))
-    else {
-        return false;
-    };
-    // `{ a: string }[]` and `{ a: string } & B` start with `{` and end
-    // elsewhere; a `}` that is not the member's own close is caught by the
-    // balance check: the first `{` must close at the last character.
-    if !braces_close_at_the_end(member) {
-        return false;
-    }
-    let Some(properties) = split_top_level(inner, &[';', ',', '\n']) else {
-        return false;
-    };
-    let mut required = false;
-    for property in properties
-        .iter()
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-    {
-        let Some(name) = split_top_level(property, &[':'])
-            .and_then(|parts| parts.into_iter().next())
-            .filter(|_| property.contains(':'))
-        else {
-            // A bare member (a method, a spread of a type) is not read.
-            return false;
-        };
-        let name = name.trim();
-        if name.starts_with('[') || name.contains('(') || name.contains('<') {
-            return false;
-        }
-        if !name.ends_with('?') {
-            required = true;
-        }
-    }
-    required
-}
-
-/// Whether the `{` that opens `text` closes at its last character.
-fn braces_close_at_the_end(text: &str) -> bool {
-    let mut depth = 0;
-    let mut quote: Option<char> = None;
-    let mut chars = text.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        if let Some(open) = quote {
-            if c == '\\' {
-                chars.next();
-            } else if c == open {
-                quote = None;
-            }
-            continue;
-        }
-        match c {
-            '"' | '\'' | '`' => quote = Some(c),
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return i + c.len_utf8() == text.len();
-                }
-            }
-            _ => {}
-        }
-    }
-    false
+    (protocol == ProbeProtocol::Http
+        && producer.entry.type_kind == ManifestTypeKind::Request
+        && decided_no_request_body(consumer.entry)
+        && decided_no_request_body(producer.entry))
+    .then_some(PreVerdict::NoBodyEitherSide)
 }
 
 /// Materialize every artifact-carrying service's stub into `dest_root` and
@@ -3435,15 +3200,6 @@ fn pre_verdict_outcome(pair: &BuiltPair, pre_verdict: &PreVerdict) -> PairCheckO
             true,
             None,
             vec![NO_BODY_EITHER_SIDE_NOTE.to_string()],
-        ),
-        PreVerdict::NoBodyAgainstRequiredBody { reason } => outcome_for(
-            pair,
-            VerdictBucket::Incompatible,
-            None,
-            Some(reason.clone()),
-            true,
-            None,
-            Vec::new(),
         ),
     }
 }
@@ -8027,7 +7783,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
 
     const DECIDED: Option<&str> = Some("no_request_body");
 
-    fn from_code() -> Option<crate::agents::file_analyzer_agent::ResolutionSource> {
+    /// A route row a deterministic pass found (not the model's reading).
+    fn deterministic_route() -> Option<crate::agents::file_analyzer_agent::ResolutionSource> {
         Some(crate::agents::file_analyzer_agent::ResolutionSource::DescriptorRoute)
     }
 
@@ -8058,8 +7815,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
     #[test]
     fn one_side_decided_against_a_typed_or_bare_side_gets_no_both_sides_verdict() {
         let typed = Some("{ name: string; }");
-        // Consumer decided: the producer is typed (no code-read source, so no
-        // mismatch verdict either) or a bare top type.
+        // Consumer decided: the producer is typed or a bare top type.
         for producer in [typed, Some("unknown"), None] {
             let pairs = body_pairs(
                 ManifestTypeKind::Request,
@@ -8075,7 +7831,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 ManifestTypeKind::Request,
                 (Some("unknown"), DECIDED),
                 (consumer, None),
-                from_code(),
+                deterministic_route(),
             );
             assert_eq!(pre_verdict_of(&pairs), None, "consumer {consumer:?}");
         }
@@ -8099,7 +7855,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             ManifestTypeKind::Request,
             (Some("unknown"), Some("body_built_by_callee")),
             (Some("unknown"), Some("body_built_by_callee")),
-            from_code(),
+            deterministic_route(),
         );
         assert_eq!(pre_verdict_of(&pairs), None);
     }
@@ -8110,7 +7866,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             ManifestTypeKind::Response,
             (Some("unknown"), Some("no_success_payload")),
             (Some("unknown"), Some("no_success_payload")),
-            from_code(),
+            deterministic_route(),
         );
         assert_eq!(pre_verdict_of(&pairs), None);
         // Nor does a response pair carrying the request reason.
@@ -8118,14 +7874,14 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             ManifestTypeKind::Response,
             (Some("unknown"), DECIDED),
             (Some("unknown"), DECIDED),
-            from_code(),
+            deterministic_route(),
         );
         assert_eq!(pre_verdict_of(&pairs), None);
         let pairs = body_pairs(
             ManifestTypeKind::Response,
             (Some("{ name: string; }"), None),
             (Some("unknown"), DECIDED),
-            from_code(),
+            deterministic_route(),
         );
         assert_eq!(pre_verdict_of(&pairs), None);
     }
@@ -8162,121 +7918,22 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         ));
     }
 
-    /// The caller decided "no body"; the route requires one, read from code.
+    /// A route found by a deterministic pass can still carry a misread body
+    /// type: the route's source says how the route was found, not how its
+    /// body was read. Against a call decided "no body" it gets no
+    /// pre-verdict, so no incompatible is synthesised; the probe's top-type
+    /// gate stores it unverifiable as before.
     #[test]
-    fn a_call_with_no_body_against_a_required_body_read_from_code_is_incompatible() {
-        for text in [
-            "{ name: string; }",
-            "{ name: string; tags?: string[]; }",
-            "{ id: number; } | { name: string; }",
-            "string",
-            "{ id: number; }[]",
-        ] {
+    fn a_misread_body_on_a_deterministically_found_route_is_not_incompatible() {
+        for text in ["string", "{ name: string; }", "{ id: number; }[]"] {
             let pairs = body_pairs(
                 ManifestTypeKind::Request,
                 (Some(text), None),
                 (Some("unknown"), DECIDED),
-                from_code(),
-            );
-            let Some(PreVerdict::NoBodyAgainstRequiredBody { reason }) = pre_verdict_of(&pairs)
-            else {
-                panic!("{text}: expected a mismatch pre-verdict");
-            };
-            assert!(reason.contains("sends no request body"), "{reason}");
-            assert!(reason.contains("requires one"), "{reason}");
-            assert!(reason.contains(text), "{reason}");
-            let outcome = pre_verdict_outcome(&pairs[0], pairs[0].pre_verdict.as_ref().unwrap());
-            assert_eq!(outcome.bucket, VerdictBucket::Incompatible);
-            assert!(outcome.resolved);
-            assert_eq!(outcome.diagnostic.as_deref(), Some(reason.as_str()));
-            assert_eq!(outcome.unresolved_reason, None);
-            assert!(outcome.notes.is_empty());
-        }
-    }
-
-    #[test]
-    fn an_optional_or_unreadable_producer_body_is_not_a_mismatch() {
-        for text in [
-            "{ body?: { name: string; }; }",
-            "{ name?: string; tags?: string[]; }",
-            "{ name: string; } | undefined",
-            "{ name: string; } | null",
-            "void",
-            "{}",
-            "{ [key: string]: string; }",
-            "Record<string, string>",
-            "{ name: any; }",
-            "{ name: unknown; }",
-            "unknown",
-            "any",
-        ] {
-            let pairs = body_pairs(
-                ManifestTypeKind::Request,
-                (Some(text), None),
-                (Some("unknown"), DECIDED),
-                from_code(),
+                deterministic_route(),
             );
             assert_eq!(pre_verdict_of(&pairs), None, "{text}");
         }
-        // No published text at all.
-        let pairs = body_pairs(
-            ManifestTypeKind::Request,
-            (None, None),
-            (Some("unknown"), DECIDED),
-            from_code(),
-        );
-        assert_eq!(pre_verdict_of(&pairs), None);
-    }
-
-    #[test]
-    fn a_producer_the_model_stated_is_not_a_mismatch() {
-        use crate::agents::file_analyzer_agent::ResolutionSource;
-        for source in [
-            None,
-            Some(ResolutionSource::Model),
-            Some(ResolutionSource::InlineLiteral),
-        ] {
-            let pairs = body_pairs(
-                ManifestTypeKind::Request,
-                (Some("{ name: string; }"), None),
-                (Some("unknown"), DECIDED),
-                source,
-            );
-            assert_eq!(pre_verdict_of(&pairs), None, "{source:?}");
-        }
-    }
-
-    #[test]
-    fn one_model_row_at_the_producers_site_makes_it_not_stated() {
-        let mut api = repo(
-            "api",
-            None,
-            vec![body_entry(
-                ManifestRole::Producer,
-                ManifestTypeKind::Request,
-                Some("{ name: string; }"),
-                None,
-            )],
-            Some(fake_artifact()),
-        );
-        let mut stated = dispatch_row("POST", "/notes", "src/routes.ts:3", None);
-        stated.resolution_source = from_code();
-        let mut modelled = dispatch_row("POST", "/notes", "src/routes.ts:3", None);
-        modelled.resolution_source =
-            Some(crate::agents::file_analyzer_agent::ResolutionSource::Model);
-        api.endpoints = vec![stated, modelled];
-        let web = repo(
-            "web",
-            None,
-            vec![body_entry(
-                ManifestRole::Consumer,
-                ManifestTypeKind::Request,
-                Some("unknown"),
-                DECIDED,
-            )],
-            Some(fake_artifact()),
-        );
-        assert_eq!(pre_verdict_of(&build_check_pairs(&[api, web])), None);
     }
 
     #[test]
@@ -8285,42 +7942,9 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             ManifestTypeKind::Request,
             (Some("{ name: string; }"), None),
             (Some("{ name: string; }"), None),
-            from_code(),
+            deterministic_route(),
         );
         assert_eq!(pre_verdict_of(&pairs), None);
-    }
-
-    #[test]
-    fn a_required_request_body_is_read_from_the_printed_type() {
-        for (text, required) in [
-            ("{ name: string; }", true),
-            ("{ name?: string; id: number; }", true),
-            ("{ a: { b?: string; }; }", true),
-            ("{ readonly name: string; }", true),
-            ("{ a: string, b: number }", true),
-            ("string", true),
-            ("number", true),
-            ("string[]", true),
-            ("Array<{ a: string; }>", true),
-            ("{ a: string; }[] | { b: number; }", true),
-            ("{ name?: string; }", false),
-            ("{ a: { b: string; }; c?: number; }", true),
-            ("{ a?: { b: string; }; }", false),
-            ("{ a: string; } | undefined", false),
-            ("undefined | { a: string; }", false),
-            ("void", false),
-            ("null", false),
-            ("{}", false),
-            ("{ [key: string]: string; }", false),
-            ("{ a: string; [key: string]: string; }", false),
-            ("Foo", false),
-            ("A & B", false),
-            ("", false),
-            ("{ a: string", false),
-            ("{ run(): void; }", false),
-        ] {
-            assert_eq!(request_body_is_required(text), required, "{text:?}");
-        }
     }
 
     // ---- end-to-end: capture_v2 -> check_v2 -> pair outcomes -> edge join --
