@@ -52,7 +52,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use super::RequestSummaryInputs;
 use super::decided_sites::{
-    Decided, DecidedSite, HandlerAt, MethodValue, PayloadBinding, SiteLabel,
+    Decided, DecidedSite, HandlerAt, MethodValue, PayloadBinding, SiteLabel, SlotBinding,
 };
 use crate::position_rows::{Kind, PositionIndex};
 use crate::site_questions::{
@@ -273,12 +273,20 @@ pub enum PayloadAt {
     /// What a handler is run with: its parameter, as the source writes it,
     /// in the function at `at`.
     Param { at: AnchorAt, name: String },
+    /// A call's options literal, which states `key` absent (carrick#2674
+    /// P3-1a): the call sends no body. Read at the literal as the sidecar's
+    /// `request_config` question, which confirms there is no spread, computed
+    /// key or method in it; its null answer never anchors a body.
+    Unwritten { at: AnchorAt, key: String },
 }
 
 impl PayloadAt {
     pub fn at(&self) -> &AnchorAt {
         match self {
-            PayloadAt::Value(at) | PayloadAt::Result(at) | PayloadAt::Param { at, .. } => at,
+            PayloadAt::Value(at)
+            | PayloadAt::Result(at)
+            | PayloadAt::Param { at, .. }
+            | PayloadAt::Unwritten { at, .. } => at,
         }
     }
 }
@@ -289,6 +297,7 @@ impl PayloadAt {
 fn payload_slots(
     call: &AnchorAt,
     payload_at: Option<&AnchorAt>,
+    carried: Option<PayloadAt>,
     handler: Option<&HandlerAnchor>,
 ) -> PayloadSlots {
     match handler {
@@ -302,7 +311,10 @@ fn payload_slots(
             response: None,
         },
         None => PayloadSlots {
-            request: payload_at.cloned().map(PayloadAt::Value),
+            // The carried binding (the option key read through a spread or a
+            // rest) takes over from the locator where it names a place; the
+            // locator's slot stands wherever it filled one.
+            request: carried.or_else(|| payload_at.cloned().map(PayloadAt::Value)),
             response: Some(PayloadAt::Result(call.clone())),
         },
     }
@@ -1708,6 +1720,31 @@ fn record(
             }),
         _ => None,
     };
+    let carried = site.payload_slot.as_ref().and_then(|binding| {
+        let (arg, key) = match binding {
+            SlotBinding::Written { arg, key } | SlotBinding::Unwritten { arg, key } => (*arg, key),
+        };
+        let expr = parts.arg_exprs.get(arg)?;
+        let parsed = sources.get(file)?;
+        let at = |span: Span| AnchorAt {
+            file: file.to_string(),
+            line: parsed.line(span.lo.0),
+            span_start: span.lo.0,
+            span_end: span.hi.0,
+        };
+        match binding {
+            SlotBinding::Written { .. } => {
+                payload_expr(expr, Some(key)).map(|span| PayloadAt::Value(at(span)))
+            }
+            SlotBinding::Unwritten { .. } => match expr {
+                Expr::Object(_) => Some(PayloadAt::Unwritten {
+                    at: at(expr.span()),
+                    key: key.clone(),
+                }),
+                _ => None,
+            },
+        }
+    });
     let handler = site.handler.clone().map(
         |HandlerAt {
              file,
@@ -1747,6 +1784,7 @@ fn record(
     let payloads = payload_slots(
         &anchors.call,
         anchors.payload_at.as_ref(),
+        carried,
         anchors.handler.as_ref(),
     );
     Some(SiteRecord {
@@ -2354,7 +2392,8 @@ mod tests {
     // `decided-sites/src/slots/rooms.ts`, each call its own discovery site.
 
     use super::super::decided_sites::tests::{
-        ROOMS, bottom, decided_fixture, end_for, fetch_label, line_of, rooms_sites, span_of,
+        PAYLOAD_CALLS, PAYLOADS, ROOMS, bottom, decided_fixture, end_for, fetch_label, line_of,
+        payloads_label, rooms_sites, span_of,
     };
 
     const ENV: &str = "src/slots/env.ts";
@@ -2428,6 +2467,95 @@ mod tests {
             .iter()
             .find(|record| record.state.point.at == at)
             .unwrap_or_else(|| panic!("{at}"))
+    }
+
+    /// The records of `payloads.ts`: each fetch its own discovery site, the
+    /// label's payload slot the request's `body` key.
+    fn payloads_records() -> (Vec<SiteRecord>, String) {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let text = std::fs::read_to_string(root.join(PAYLOADS)).unwrap();
+        let label = payloads_label();
+        let sites: Vec<_> = PAYLOAD_CALLS
+            .iter()
+            .map(|call| bottom(&end_for(&label, PAYLOADS, &text, call), "fetch"))
+            .collect();
+        let labels = vec![label];
+        let decided = decided_sites(&inputs, &root, &sites, &labels);
+        (site_records(&inputs, &root, &decided, &labels), text)
+    }
+
+    /// carrick#2674 P3-1a: a request's slot is the value its body key holds
+    /// at the deciding call, or the options literal that states the key
+    /// absent, wherever a wrapper hands the caller's options on. A control
+    /// that is not read leaves the slot empty. The anchors and the forced
+    /// payload argument stay as they were: the bound payload is still the one
+    /// built inside the wrapper, and the slot is off the wire.
+    #[test]
+    fn a_request_slot_is_the_carried_body_or_the_literal_that_writes_none() {
+        let (records, text) = payloads_records();
+        let record = |needle: &str| {
+            let at = format!("{PAYLOADS}:{}", line_of(&text, needle));
+            records
+                .iter()
+                .find(|record| record.state.point.at == at)
+                .unwrap_or_else(|| panic!("{at}"))
+        };
+        let anchor = |needle: &str| {
+            let (span_start, span_end) = span_of(&text, needle);
+            AnchorAt {
+                file: PAYLOADS.to_string(),
+                line: line_of(&text, needle),
+                span_start,
+                span_end,
+            }
+        };
+        let note = record("send({ path: \"/notes\"");
+        assert_eq!(
+            note.payloads.request,
+            Some(PayloadAt::Value(anchor("JSON.stringify(note)")))
+        );
+        let ping = record("send({ path: \"/ping\"");
+        assert_eq!(
+            ping.payloads.request,
+            Some(PayloadAt::Unwritten {
+                at: anchor("{ path: \"/ping\", method: \"POST\" }"),
+                key: "body".to_string(),
+            })
+        );
+        let logout = record("post(\"/logout\", {})");
+        let call = anchor("post(\"/logout\", {})");
+        let literal = call.span_start + "post(\"/logout\", ".len() as u32;
+        assert_eq!(
+            logout.payloads.request,
+            Some(PayloadAt::Unwritten {
+                at: AnchorAt {
+                    span_start: literal,
+                    span_end: literal + 2,
+                    ..call
+                },
+                key: "body".to_string(),
+            })
+        );
+        // A direct call states its own body: the locator's slot, unchanged.
+        let direct = record("direct/body`");
+        assert_eq!(
+            direct.payloads.request,
+            direct.anchors.payload_at.clone().map(PayloadAt::Value)
+        );
+        assert!(direct.payloads.request.is_some());
+        for needle in ["call(\"/x\"", "wrapped(\"/wrapped\"", "direct/spread`"] {
+            assert_eq!(record(needle).payloads.request, None, "{needle}");
+        }
+        // Nothing else moves.
+        assert_eq!(ping.anchors.payload_at, None);
+        assert!(matches!(
+            ping.anchors.payload,
+            Some(PayloadBinding::BuiltInside { .. })
+        ));
+        assert!(!ping.state.forced.contains_key(&Slot::PayloadArgument));
+        let whole = serde_json::to_value(ping).unwrap();
+        assert!(!whole.to_string().contains("Unwritten"), "{whole}");
     }
 
     /// The records of `env.ts`: each call its own discovery site.

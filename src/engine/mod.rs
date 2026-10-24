@@ -7520,6 +7520,7 @@ fn site_infer_requests(
             None => span.saturating_sub(crate::swc_scanner::SWC_SPAN_BASE),
         };
         InferRequestItem {
+            member: None,
             file_path: path.to_string_lossy().into_owned(),
             line_number: anchor.line,
             span_start: Some(position(anchor.span_start)),
@@ -25113,6 +25114,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             .expect("the stand-in answers init");
         let items: Vec<InferRequestItem> = (1..=ITEMS as u32)
             .map(|line| InferRequestItem {
+                member: None,
                 file_path: "src/a.ts".to_string(),
                 line_number: line,
                 span_start: None,

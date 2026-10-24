@@ -255,6 +255,7 @@ fn a_handlers_payload_is_its_parameter_and_an_empty_slot_asks_nothing() {
 
 fn item(alias: &str, line: u32) -> InferRequestItem {
     InferRequestItem {
+        member: None,
         file_path: FILE.to_string(),
         line_number: line,
         span_start: None,
@@ -319,6 +320,7 @@ fn every_kind_sent_is_one_the_sidecar_declares() {
         InferKind::Expression,
         InferKind::CallResult,
         InferKind::FunctionParam,
+        InferKind::RequestConfig,
     ] {
         let spelled = serde_json::to_value(kind).unwrap();
         let spelled = spelled.as_str().unwrap();
@@ -327,4 +329,61 @@ fn every_kind_sent_is_one_the_sidecar_declares() {
             "{spelled} is not in the sidecar's InferKind"
         );
     }
+}
+
+/// carrick#2674 P3-1a: an options literal that states the body key absent
+/// asks the sidecar the `request_config` question at the literal, with the
+/// key as `member`. Every other request carries no member, so it serialises
+/// as it did.
+#[test]
+fn an_unwritten_slot_asks_the_request_config_question_with_its_key() {
+    let dir = repo();
+    let root = dir.path().to_string_lossy().into_owned();
+    let literal = PayloadSlots {
+        request: Some(PayloadAt::Unwritten {
+            at: at("\"/orders\""),
+            key: "body".to_string(),
+        }),
+        response: None,
+    };
+    let requests = SitePayloads::of(&[record("http_client", false, literal)])
+        .requests(&[entry(http(), "consumer", "request", "Req", 2)], &root);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].infer_kind, InferKind::RequestConfig);
+    assert_eq!(requests[0].member.as_deref(), Some("body"));
+    assert_eq!(requests[0].alias.as_deref(), Some("Req"));
+    let wire = serde_json::to_value(&requests[0]).unwrap();
+    assert_eq!(wire["infer_kind"], "request_config");
+    assert_eq!(wire["member"], "body");
+
+    let value = SitePayloads::of(&[record("http_client", false, call_slots())])
+        .requests(&[entry(http(), "consumer", "request", "Req", 2)], &root);
+    assert_eq!(value[0].infer_kind, InferKind::RequestBody);
+    assert_eq!(value[0].member, None);
+    assert!(
+        serde_json::to_value(&value[0])
+            .unwrap()
+            .get("member")
+            .is_none()
+    );
+}
+
+/// An unwritten slot is an HTTP options question: on any other protocol the
+/// reader's request stands, and nothing is asked.
+#[test]
+fn an_unwritten_slot_is_not_asked_of_another_protocol() {
+    let dir = repo();
+    let root = dir.path().to_string_lossy().into_owned();
+    let literal = PayloadSlots {
+        request: Some(PayloadAt::Unwritten {
+            at: at("\"/orders\""),
+            key: "body".to_string(),
+        }),
+        response: None,
+    };
+    let socket =
+        json!({ "protocol": "socket", "event": "orders", "direction": "client_to_server" });
+    let requests = SitePayloads::of(&[record("socket", false, literal)])
+        .requests(&[entry(socket, "producer", "response", "Sub", 2)], &root);
+    assert!(requests.is_empty(), "{requests:?}");
 }

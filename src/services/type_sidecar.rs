@@ -69,6 +69,12 @@ pub enum InferKind {
     /// is at an `x.verb("/lit", arg)` site, so the site's ROLE can be read off
     /// the compiler rather than guessed from the call's shape.
     ReceiverType,
+    /// Whether a call's options literal writes the key `member` names
+    /// (carrick#2674 P3-1a). The sidecar answers the decided abstain
+    /// `no_request_body` when the literal has no spread, computed key or
+    /// method and no such property, and null otherwise. A null answer never
+    /// anchors a body: it is not a request body inference.
+    RequestConfig,
 }
 
 /// A rule for unwrapping machinery/wrapper types to extract payload types.
@@ -183,6 +189,10 @@ pub struct InferRequestItem {
     /// Target parameter name for `FunctionParam` inference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub param_name: Option<String>,
+    /// The option key `RequestConfig` asks about. Absent from every other
+    /// request, so those serialise as they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
 }
 
 // ============================================================================
@@ -4857,6 +4867,7 @@ mod tests {
     #[test]
     fn test_infer_request_serialization() {
         let request = InferRequestItem {
+            member: None,
             file_path: "src/routes.ts".to_string(),
             line_number: 42,
             span_start: Some(128),
@@ -5012,6 +5023,7 @@ mod tests {
             InferKind::SignatureReturn,
             InferKind::FunctionParam,
             InferKind::ReceiverType,
+            InferKind::RequestConfig,
         ];
         for kind in &infer_kinds {
             match kind {
@@ -5023,7 +5035,8 @@ mod tests {
                 | InferKind::RequestBody
                 | InferKind::SignatureReturn
                 | InferKind::FunctionParam
-                | InferKind::ReceiverType => {}
+                | InferKind::ReceiverType
+                | InferKind::RequestConfig => {}
             }
         }
         let slot = || ClaimSlot {
@@ -5087,6 +5100,7 @@ mod tests {
                 requests: infer_kinds
                     .into_iter()
                     .map(|infer_kind| InferRequestItem {
+                        member: None,
                         file_path: "/repo/src/orders.ts".into(),
                         line_number: 4,
                         span_start: Some(10),
@@ -5485,6 +5499,7 @@ mod tests {
             type_packages: BTreeMap::new(),
         };
         let item = |infer_kind| InferRequestItem {
+            member: None,
             file_path: "src/app.ts".into(),
             line_number: 1,
             span_start: None,
@@ -7223,6 +7238,7 @@ mod tests {
     #[test]
     fn model_symbols_are_sent_for_producer_response_reads_only() {
         let item = |alias: &str, infer_kind: InferKind| InferRequestItem {
+            member: None,
             file_path: "src/routes.ts".into(),
             line_number: 4,
             span_start: None,
@@ -7448,6 +7464,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             .expect("the stand-in answers init");
         let items: Vec<InferRequestItem> = (0..ITEMS as u32)
             .map(|line| InferRequestItem {
+                member: None,
                 file_path: "src/a.ts".to_string(),
                 line_number: line + 1,
                 span_start: None,

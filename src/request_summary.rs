@@ -450,8 +450,9 @@ pub struct ObjValue {
     /// holds: the parameter's position and the keys the destructuring takes
     /// out, with how many functions out the parameter is (0: this one's;
     /// a closure reads its enclosing function's, carrick#1949). Only a
-    /// decided site's option key (its method) reads this; the body a request
-    /// sends does not, so no body row moves.
+    /// decided site's option keys (its method, and its payload slot's key,
+    /// carrick#2674) read this; the body a request sends does not, so no body
+    /// row moves.
     pub under_rest: Option<(u8, usize, BTreeSet<String>)>,
     /// The keys whose value depends on which spread branch runs (carrick#2474
     /// R5e): `open` is also set, for the readers that only ask whether
@@ -476,8 +477,9 @@ pub enum KeyState<'a> {
 }
 
 impl ObjValue {
-    /// What this object states about `key`. Only a prefix slot reads this
-    /// (carrick#2474 R5e); body and name readers keep `open`.
+    /// What this object states about `key`. Only a prefix slot and a payload
+    /// slot's key read this (carrick#2474 R5e, carrick#2674); body and name
+    /// readers keep `open`.
     pub fn key(&self, key: &str) -> KeyState<'_> {
         match self.fields.get(key) {
             Some(value) => KeyState::Known(value),

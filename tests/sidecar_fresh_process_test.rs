@@ -151,6 +151,7 @@ fn infer(
     let (sidecar, result, _) = off_thread(sidecar, move |sidecar| {
         sidecar.infer_types(
             &[InferRequestItem {
+                member: None,
                 file_path: "src/a.ts".to_string(),
                 line_number: 1,
                 span_start: None,

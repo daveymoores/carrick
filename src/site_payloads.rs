@@ -141,6 +141,11 @@ impl SitePayloads {
             let Some(slot) = slot else {
                 continue;
             };
+            // The question is about a request's options: no other protocol's
+            // payload is asked it, so the reader's request stands there.
+            if matches!(slot, PayloadAt::Unwritten { .. }) && !http {
+                continue;
+            }
             if !seen.insert(entry.type_alias.clone()) {
                 continue;
             }
@@ -151,11 +156,18 @@ impl SitePayloads {
             let Some(source) = source.as_deref() else {
                 continue;
             };
-            let (infer_kind, param_name) = match slot {
-                PayloadAt::Value(_) if http => (InferKind::RequestBody, None),
-                PayloadAt::Value(_) => (InferKind::Expression, None),
-                PayloadAt::Result(_) => (InferKind::CallResult, None),
-                PayloadAt::Param { name, .. } => (InferKind::FunctionParam, Some(name.clone())),
+            let (infer_kind, param_name, member) = match slot {
+                PayloadAt::Value(_) if http => (InferKind::RequestBody, None, None),
+                PayloadAt::Value(_) => (InferKind::Expression, None, None),
+                PayloadAt::Result(_) => (InferKind::CallResult, None, None),
+                PayloadAt::Param { name, .. } => {
+                    (InferKind::FunctionParam, Some(name.clone()), None)
+                }
+                // The options literal states the key absent: ask the
+                // sidecar to confirm it (carrick#2674 P3-1a).
+                PayloadAt::Unwritten { key, .. } => {
+                    (InferKind::RequestConfig, None, Some(key.clone()))
+                }
             };
             requests.push(InferRequestItem {
                 file_path: root.join(&at.file).to_string_lossy().into_owned(),
@@ -167,6 +179,7 @@ impl SitePayloads {
                 infer_kind,
                 alias: Some(entry.type_alias.clone()),
                 param_name,
+                member,
             });
         }
         requests

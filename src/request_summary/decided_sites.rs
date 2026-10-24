@@ -56,7 +56,7 @@ use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
 use super::row_calls::Reach;
-use super::{CallIr, FnIr, Piece, RequestSummaryInputs, Value, concat, render_target};
+use super::{CallIr, FnIr, KeyState, Piece, RequestSummaryInputs, Value, concat, render_target};
 
 pub mod boundaries;
 mod composed;
@@ -482,6 +482,20 @@ pub enum PayloadBinding {
     },
 }
 
+/// Where the value a deciding call's own option key holds is read, or that
+/// nothing is written there (carrick#2674 P3-1a). Scanner-side only: it is
+/// read by the payload slots alone, so it is never part of a site's state, its
+/// sha or a cache key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotBinding {
+    /// The deciding call's argument `arg` writes `key` as a plain property.
+    Written { arg: usize, key: String },
+    /// The deciding call's argument `arg` is an object literal that states
+    /// `key` absent (no spread, no computed key, no method): the call sends
+    /// nothing there.
+    Unwritten { arg: usize, key: String },
+}
+
 /// The function that handles a receive site or one key of a handler table:
 /// its repo-relative file, line and span.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,6 +542,12 @@ pub struct DecidedSite {
     /// receive at its handler slot (the payload arrives in the handler's
     /// first parameter).
     pub payload: Option<PayloadBinding>,
+    /// Where the payload's option key is read at the deciding call, carried
+    /// up through a spread or a destructured rest of the caller's options
+    /// (carrick#2674 P3-1a). `payload` stays as it is: it feeds the forced
+    /// `payload_argument` slot and `anchors.payload_at`, which are on the
+    /// wire. Read only by the payload slots.
+    pub payload_slot: Option<SlotBinding>,
     /// The function that handles a receive site, or a handler table's key.
     pub handler: Option<HandlerAt>,
     /// What the label's method slot holds here, when it names one.
@@ -1063,6 +1083,45 @@ fn payload_binding(root: &Path, down: &[Placed<'_>], slot: &ArgSlot) -> Option<P
 /// is written, as [`payload_binding`] reads it: the index in `down` of the
 /// call that writes it, and that call's argument and option key.
 fn bound_at(down: &[Placed<'_>], slot: &ArgSlot) -> Option<(usize, usize, Option<String>)> {
+    walk_bound(down, slot, false)
+}
+
+/// The option key `slot` names, read at the deciding call (`down[0]`) by
+/// carrying it up through every call that hands the caller's options on
+/// (carrick#2674 P3-1a): a hop whose object does not write the key and holds
+/// the caller's options under a spread of its own parameter or the rest of a
+/// destructured one, as the method slot reads them ([`written_at`]). The
+/// carry that stops below the deciding call gives nothing: a call below
+/// builds the value.
+fn payload_slot(down: &[Placed<'_>], slot: &ArgSlot) -> Option<SlotBinding> {
+    let key = slot.key.as_ref()?;
+    let (0, arg, Some(carried)) = walk_bound(down, slot, true)? else {
+        return None;
+    };
+    let Value::Obj(object) = argument(down.first()?.call, arg)? else {
+        return None;
+    };
+    match object.key(&carried) {
+        KeyState::Known(_) => Some(SlotBinding::Written {
+            arg,
+            key: key.clone(),
+        }),
+        KeyState::Absent => Some(SlotBinding::Unwritten {
+            arg,
+            key: key.clone(),
+        }),
+        KeyState::Unread => None,
+    }
+}
+
+/// The walk behind [`bound_at`]. With `options` it also carries an option
+/// key through a hop's spread or rest ([`payload_slot`]), and returns `None`
+/// where it would stop below the deciding call.
+fn walk_bound(
+    down: &[Placed<'_>],
+    slot: &ArgSlot,
+    options: bool,
+) -> Option<(usize, usize, Option<String>)> {
     let whole_param = |value: &Value| match value {
         Value::Str(pieces) => match pieces.as_slice() {
             [Piece::Param(index, _)] => Some(*index),
@@ -1093,9 +1152,30 @@ fn bound_at(down: &[Placed<'_>], slot: &ArgSlot) -> Option<(usize, usize, Option
             Some((index, field)) => {
                 arg = index;
                 key = field;
+                continue;
             }
-            None => return Some((k, arg, key)),
+            None if !options => return Some((k, arg, key)),
+            None => {}
         }
+        // The caller's options under a spread or a rest, with the key not
+        // written beside it (the method slot's two arms).
+        let (Some(field), Some(Value::Obj(object))) = (&key, argument(placed.call, arg)) else {
+            return None;
+        };
+        if object.fields.contains_key(field) {
+            return None;
+        }
+        arg = match (&object.under_param, &object.under_rest) {
+            (Some((index, before)), _) if placed.depth == 0 && !before.contains_key(field) => {
+                *index
+            }
+            (None, Some((depth, index, taken)))
+                if *depth == placed.depth && !taken.contains(field) =>
+            {
+                *index
+            }
+            _ => return None,
+        };
     }
     let first = down.first()?;
     if first.call.site_args.is_some() && first.call.args.get(arg).is_none() {
@@ -1347,6 +1427,9 @@ impl<'a> Walk<'a, '_> {
             Some(slot) => payload_binding(self.root, down, slot),
             None => handler_slot.and_then(|slot| payload_binding(self.root, down, slot)),
         };
+        let payload_slot = label
+            .and_then(|label| label.payload.as_ref())
+            .and_then(|slot| payload_slot(down, slot));
         let handler = handler_slot
             .and_then(|slot| bound_at(down, slot))
             .and_then(|(at, arg, _)| handler_at(self.root, &down[at], arg));
@@ -1366,6 +1449,7 @@ impl<'a> Walk<'a, '_> {
             name_args,
             via,
             payload,
+            payload_slot,
             handler,
             method,
             receiver: self.receiver.clone(),
@@ -1541,6 +1625,7 @@ impl<'a> Walk<'a, '_> {
                 name_args: BTreeSet::new(),
                 via: Vec::new(),
                 payload: None,
+                payload_slot: None,
                 handler: Some(entry.handler),
                 method: None,
                 receiver: self.receiver.clone(),
@@ -3497,6 +3582,99 @@ pub(crate) mod tests {
             .collect();
         for call in ["sendNote({", "closeWith(`/notes/"] {
             assert!(!lines.contains(&line_of(&text, call)), "{call}: {lines:?}");
+        }
+    }
+
+    pub(crate) const PAYLOADS: &str = "src/slots/payloads.ts";
+
+    /// The fetches of `slots/payloads.ts`.
+    pub(crate) const PAYLOAD_CALLS: [&str; 9] = [
+        "fetch(`${process.env.API}${path}`, { ...rest, credentials: \"include\" })",
+        "fetch(`${process.env.API}${path}`, { ...tracedRest, credentials: \"include\" })",
+        "fetch(`${process.env.API}${path}`, { ...requestInit, credentials: \"include\" })",
+        "fetch(`${process.env.API}${path}`, { method: \"POST\", ...init })",
+        "fetch(`${process.env.API}/direct/ping`, { method: \"POST\" })",
+        "fetch(`${process.env.API}/direct/body`, { method: \"POST\", body })",
+        "fetch(`${process.env.API}${path}`, { ...bodiless, credentials: \"include\" })",
+        "fetch(`${process.env.API}${path}`, withDefaults(init))",
+        "fetch(`${process.env.API}/direct/spread`, { ...getDefaults(), method: \"POST\" })",
+    ];
+
+    /// `fetch`, with the request's `body` key as its payload slot.
+    pub(crate) fn payloads_label() -> SiteLabel {
+        let mut label = fetch_label();
+        label.payload = Some(ArgSlot {
+            arg: 1,
+            key: Some("body".into()),
+        });
+        label
+    }
+
+    fn payloads_decided() -> (Decided, String) {
+        let (decided, text, _) = decided_at(PAYLOADS, &PAYLOAD_CALLS, &payloads_label());
+        (decided, text)
+    }
+
+    /// carrick#2674 P3-1a: the option key a payload slot names is carried up
+    /// through a wrapper's spread of its own parameter and the rest of a
+    /// destructured one, at any closure depth for the rest, and read at the
+    /// deciding call: written there, or stated absent by a literal that holds
+    /// no spread. A wrapper that takes the key out, hands the options through
+    /// a call, or a literal that spreads another object, is not read. The
+    /// payload binding itself stays as it was.
+    #[test]
+    fn a_payload_key_is_carried_through_a_spread_and_a_rest_to_the_deciding_call() {
+        let (decided, text) = payloads_decided();
+        let slot_at = |needle: &str| {
+            let line = line_of(&text, needle);
+            let mut here = decided.sites.iter().filter(|site| site.line == line);
+            let site = here.next().unwrap_or_else(|| panic!("no site at {needle}"));
+            assert!(here.next().is_none(), "{needle}");
+            site.payload_slot.clone()
+        };
+        let written = |arg| {
+            Some(SlotBinding::Written {
+                arg,
+                key: "body".into(),
+            })
+        };
+        let unwritten = |arg| {
+            Some(SlotBinding::Unwritten {
+                arg,
+                key: "body".into(),
+            })
+        };
+        // The rest of a destructured parameter.
+        assert_eq!(slot_at("send({ path: \"/notes\""), written(0));
+        assert_eq!(slot_at("send({ path: \"/ping\""), unwritten(0));
+        // The same rest, in a closure.
+        assert_eq!(slot_at("sendTraced({ path: \"/traced\""), written(0));
+        assert_eq!(slot_at("sendTraced({ path: \"/traced/ping\""), unwritten(0));
+        assert_eq!(
+            slot_at("call(`/notes/${id}`, { method: \"DELETE\""),
+            unwritten(1)
+        );
+        assert_eq!(slot_at("call(`/notes/${id}/title`"), written(1));
+        // A spread of the function's own parameter.
+        assert_eq!(slot_at("post(\"/logout\", {})"), unwritten(1));
+        assert_eq!(slot_at("post(\"/tags\""), written(1));
+        // A direct call that writes a closed literal.
+        assert_eq!(slot_at("direct/ping`"), unwritten(1));
+        assert_eq!(slot_at("direct/body`"), written(1));
+        // Controls: nothing is read.
+        assert_eq!(slot_at("call(\"/x\""), None);
+        assert_eq!(slot_at("sendStripped({ path"), None);
+        assert_eq!(slot_at("wrapped(\"/wrapped\""), None);
+        assert_eq!(slot_at("direct/spread`"), None);
+        // The payload binding is what it was: built inside the wrapper.
+        for needle in ["send({ path: \"/ping\"", "post(\"/logout\", {})"] {
+            let line = line_of(&text, needle);
+            let site = decided.sites.iter().find(|site| site.line == line).unwrap();
+            assert!(
+                matches!(site.payload, Some(PayloadBinding::BuiltInside { .. })),
+                "{needle}: {:?}",
+                site.payload
+            );
         }
     }
 
