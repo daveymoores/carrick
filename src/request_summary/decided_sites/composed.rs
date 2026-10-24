@@ -66,6 +66,11 @@ pub(super) struct Mounts {
     /// names, or an argument the label does not name. Such an instance is
     /// served somewhere the trace cannot say, so it is not "the top".
     unverified: Vec<(String, u32)>,
+    /// The mount calls (`file:line`) the trace ignores because a file only
+    /// tests import makes them (carrick#2775): a helper that builds its own
+    /// app for the suite serves nothing in production. Each would have been
+    /// a verified edge or an unverified root; neither is recorded.
+    pub(super) test_only: Vec<String>,
 }
 
 /// The service's mounts: the verified edges, and the instances handed to a
@@ -78,9 +83,25 @@ pub(super) fn mount_edges<'a>(
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
 ) -> Mounts {
-    let edges = verified_edges(calls, inputs, root, makers, scopes, index);
-    let unverified = unverified_roots(calls, inputs, root, makers, scopes, index, &edges);
-    Mounts { edges, unverified }
+    let mut test_only = Vec::new();
+    let edges = verified_edges(calls, inputs, root, makers, scopes, index, &mut test_only);
+    let unverified = unverified_roots(
+        calls,
+        inputs,
+        root,
+        makers,
+        scopes,
+        index,
+        &edges,
+        &mut test_only,
+    );
+    test_only.sort();
+    test_only.dedup();
+    Mounts {
+        edges,
+        unverified,
+        test_only,
+    }
 }
 
 /// Every instance handed, at any argument, to a library call made on an
@@ -94,6 +115,7 @@ fn unverified_roots<'a>(
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
     edges: &[MountEdge],
+    test_only: &mut Vec<String>,
 ) -> Vec<(String, u32)> {
     let mut placed: Vec<Placed<'a>> = calls
         .by_span
@@ -141,7 +163,12 @@ fn unverified_roots<'a>(
                 };
                 let here = (file.clone(), *line);
                 let read = edges.iter().any(|edge| edge.child == here && edge.at == at);
-                if packages.contains(&package.as_str()) && !read && !out.contains(&here) {
+                if !packages.contains(&package.as_str()) || read {
+                    continue;
+                }
+                if inputs.test_only.contains(placed.file) {
+                    test_only.push(at.clone());
+                } else if !out.contains(&here) {
                     out.push(here);
                 }
             }
@@ -160,6 +187,7 @@ fn verified_edges<'a>(
     makers: &[MakerLabel],
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
+    test_only: &mut Vec<String>,
 ) -> Vec<MountEdge> {
     let mounts: Vec<&ScopeLabel> = scopes
         .iter()
@@ -211,9 +239,14 @@ fn verified_edges<'a>(
                 let InstanceAt::Root { file, line, .. } = &child.end else {
                     continue;
                 };
+                let at = format!("{}:{}", relative(root, placed.file), placed.call.site.line);
+                if inputs.test_only.contains(placed.file) {
+                    test_only.push(at);
+                    continue;
+                }
                 edges.push(MountEdge {
                     child: (file.clone(), *line),
-                    at: format!("{}:{}", relative(root, placed.file), placed.call.site.line),
+                    at,
                     member: label.member.clone(),
                     prefix: walk().prefix_of(&placed, &label.name, None),
                     parents: parents.clone(),
