@@ -9120,12 +9120,19 @@ fn discover_with_positions(
     // The files only tests import: the receiver trace ignores the router
     // mounts made in them (carrick#2775). Read for the trace alone.
     let test_only = if receiver_trace {
-        crate::test_only_files::of(
+        let started = Instant::now();
+        let test_only = crate::test_only_files::of(
             repo_root,
             &files,
             &workspace,
             &service_ignore_patterns(service),
-        )
+        );
+        debug!(
+            test_only = test_only.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "receiver trace: files only tests import"
+        );
+        test_only
     } else {
         HashSet::new()
     };
