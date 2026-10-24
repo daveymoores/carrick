@@ -3731,7 +3731,7 @@ mod tests {
             .map(|path| path.strip_prefix(&on.repo).unwrap().display().to_string())
             .collect();
         only.sort();
-        assert_eq!(only, vec!["src/harness.ts"]);
+        assert_eq!(only, vec!["src/edge.ts", "src/harness.ts", "src/worker.ts"]);
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
             &declarations.verified_scopes,
@@ -3742,6 +3742,7 @@ mod tests {
             texts(&[
                 "src/api.ts:8 <- /v1/items",
                 "src/api.ts:9 <- /v1/items",
+                "src/edge.ts:8 <- /v2/ping",
                 "src/jobs.ts:8 <- /jobs (mount_unverified)",
             ])
         );

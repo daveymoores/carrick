@@ -53,6 +53,9 @@ pub(super) struct MountEdge {
     prefix: Prefix,
     /// The ends of the mount call's own receiver the label applies to.
     parents: Vec<InstanceEnd>,
+    /// Made in a file only tests import (carrick#2775); kept only while no
+    /// mount made elsewhere hands the same instance.
+    in_test_only: bool,
 }
 
 /// What a service's instances are mounted under (carrick#2474 R3 S0).
@@ -125,6 +128,7 @@ fn unverified_roots<'a>(
     let walk = || InstanceWalk::new(calls, inputs, root, makers, scopes, index);
     let mut out: Vec<(String, u32)> = Vec::new();
     let mut test_only: Vec<String> = Vec::new();
+    let mut held: Vec<(String, (String, u32))> = Vec::new();
     for placed in placed {
         if !walk().library_call(placed.file, placed.call) {
             continue;
@@ -160,11 +164,25 @@ fn unverified_roots<'a>(
                     continue;
                 }
                 if inputs.test_only.contains(placed.file) {
-                    test_only.push(at.clone());
+                    held.push((at.clone(), here));
                 } else if !out.contains(&here) {
                     out.push(here);
                 }
             }
+        }
+    }
+    // A test-only file's mount is ignored only when the same instance is
+    // also handed from a file that is not test-only; otherwise (an entry only
+    // a test imports) it is the instance's only mount and stays.
+    for (at, here) in held {
+        let elsewhere = out.contains(&here)
+            || edges
+                .iter()
+                .any(|edge| edge.child == here && !edge.in_test_only);
+        if elsewhere {
+            test_only.push(at);
+        } else if !out.contains(&here) {
+            out.push(here);
         }
     }
     (out, test_only)
@@ -208,7 +226,6 @@ fn verified_edges<'a>(
     });
     let walk = || InstanceWalk::new(calls, inputs, root, makers, scopes, index);
     let mut edges = Vec::new();
-    let mut test_only: Vec<String> = Vec::new();
     for placed in placed {
         if !walk().library_call(placed.file, placed.call) {
             continue;
@@ -234,20 +251,33 @@ fn verified_edges<'a>(
                     continue;
                 };
                 let at = format!("{}:{}", relative(root, placed.file), placed.call.site.line);
-                if inputs.test_only.contains(placed.file) {
-                    test_only.push(at);
-                    continue;
-                }
                 edges.push(MountEdge {
                     child: (file.clone(), *line),
                     at,
                     member: label.member.clone(),
                     prefix: walk().prefix_of(&placed, &label.name, None),
                     parents: parents.clone(),
+                    in_test_only: inputs.test_only.contains(placed.file),
                 });
             }
         }
     }
+    // A mount a test-only file makes is dropped when a file that is not
+    // test-only also hands the same instance; an entry only a test imports
+    // is its instance's only mount and stays.
+    let served: Vec<(String, u32)> = edges
+        .iter()
+        .filter(|edge| !edge.in_test_only)
+        .map(|edge| edge.child.clone())
+        .collect();
+    let mut test_only: Vec<String> = Vec::new();
+    edges.retain(|edge| {
+        let drop = edge.in_test_only && served.contains(&edge.child);
+        if drop {
+            test_only.push(edge.at.clone());
+        }
+        !drop
+    });
     (edges, test_only)
 }
 
