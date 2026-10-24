@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.3.130](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.129...carrick-v0.3.130) (2026-10-24)
+
+
+### Features
+
+* **check:** a request pair decided over no body is judged without a probe ([#2674](https://github.com/carrick-tools/carrick/issues/2674) piece 1) ([#2767](https://github.com/carrick-tools/carrick/issues/2767)) ([802c4cf](https://github.com/carrick-tools/carrick/commit/802c4cf721e0e83e253aa6051bde7a36468dcbae))
+* **routes:** a file route's compared methods come from the guard IR ([#2740](https://github.com/carrick-tools/carrick/issues/2740)) ([#2758](https://github.com/carrick-tools/carrick/issues/2758)) ([f381d31](https://github.com/carrick-tools/carrick/commit/f381d31f1cb7b8a31392e84795f98849496b3ae1))
+* **scanner:** the receiver trace ignores router mounts made in files only tests import ([#2775](https://github.com/carrick-tools/carrick/issues/2775) slice A) ([#2781](https://github.com/carrick-tools/carrick/issues/2781)) ([ffce80f](https://github.com/carrick-tools/carrick/commit/ffce80fec1c9548fd40eb406a2a54adea5050b65))
+* **sidecar:** request_config infer kind ([#2674](https://github.com/carrick-tools/carrick/issues/2674) P3-1a sidecar case) ([#2765](https://github.com/carrick-tools/carrick/issues/2765)) ([2eeec71](https://github.com/carrick-tools/carrick/commit/2eeec71e86824839fe628e73b688ab02c4f8b73b))
+* **site-payloads:** carry request options through spread/rest and decide no body ([#2674](https://github.com/carrick-tools/carrick/issues/2674) P3-1a) ([#2766](https://github.com/carrick-tools/carrick/issues/2766)) ([10b07e7](https://github.com/carrick-tools/carrick/commit/10b07e7d9d467b87d057f601fbcd271020277322))
+* **trace:** procedure routes take their key paths ([#2474](https://github.com/carrick-tools/carrick/issues/2474) R6c) ([#2760](https://github.com/carrick-tools/carrick/issues/2760)) ([8fa330d](https://github.com/carrick-tools/carrick/commit/8fa330d48a9ec4ffe761fa96f8413109e3ef4daa))
+
+
+### Bug Fixes
+
+* **call_through:** list call flows in source order so side_calls are stable ([#2759](https://github.com/carrick-tools/carrick/issues/2759)) ([#2770](https://github.com/carrick-tools/carrick/issues/2770)) ([cee9155](https://github.com/carrick-tools/carrick/commit/cee91559e290392bf1e048df8c1a43507d249aa1))
+* **dispatch:** count below-band dispatch rows apart from model rows ([#2693](https://github.com/carrick-tools/carrick/issues/2693)) ([#2771](https://github.com/carrick-tools/carrick/issues/2771)) ([4cb9cf9](https://github.com/carrick-tools/carrick/commit/4cb9cf9c756dc9bb73293c769956e44d9e56af75))
+* **scan:** a request inside a handed callback reads keyed slots through the enclosing helper's parameter ([#2783](https://github.com/carrick-tools/carrick/issues/2783)) ([efac225](https://github.com/carrick-tools/carrick/commit/efac225730e4cc057f953639f6b2bf3d0b8c4864))
+* **sidecar:** a body read in a catch clause is not the call's response type ([#2756](https://github.com/carrick-tools/carrick/issues/2756)) ([#2764](https://github.com/carrick-tools/carrick/issues/2764)) ([3aae639](https://github.com/carrick-tools/carrick/commit/3aae639f47716592cb357b768bdbb87410517109))
+* **sidecar:** read a config spread before deciding no body ([#2762](https://github.com/carrick-tools/carrick/issues/2762)) ([#2769](https://github.com/carrick-tools/carrick/issues/2769)) ([db565e4](https://github.com/carrick-tools/carrick/commit/db565e49bba29f2bd4bf65c94b961fa91db299ad))
+
+
+### Refactoring
+
+* **join:** delete the route-literal witness ([#2474](https://github.com/carrick-tools/carrick/issues/2474) R7 D2) ([#2717](https://github.com/carrick-tools/carrick/issues/2717)) ([6d2f8c9](https://github.com/carrick-tools/carrick/commit/6d2f8c91d557cbf27c3599080790efa9e223c32a))
+* **routes:** delete the request-method guard collector ([#2474](https://github.com/carrick-tools/carrick/issues/2474) R7 D3) ([#2718](https://github.com/carrick-tools/carrick/issues/2718)) ([3a86063](https://github.com/carrick-tools/carrick/commit/3a860631dd56b29f5207269ef9d9a05ce959119d))
+* **scanner:** delete Signal 4b (C1), the request-helper register signal ([#2440](https://github.com/carrick-tools/carrick/issues/2440)) ([#2678](https://github.com/carrick-tools/carrick/issues/2678)) ([fa7036c](https://github.com/carrick-tools/carrick/commit/fa7036c7d5f5bda6fec87d9988aa2beab225c807))
+* **scanner:** delete the typed-receiver route arm ([#2441](https://github.com/carrick-tools/carrick/issues/2441) D1) ([#2768](https://github.com/carrick-tools/carrick/issues/2768)) ([bab8fdf](https://github.com/carrick-tools/carrick/commit/bab8fdf227e3d4afabf2426cce6adbcd4edd9e3f))
+
 ## [0.3.129](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.128...carrick-v0.3.129) (2026-10-24)
 
 
