@@ -83,18 +83,10 @@ pub(super) fn mount_edges<'a>(
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
 ) -> Mounts {
-    let mut test_only = Vec::new();
-    let edges = verified_edges(calls, inputs, root, makers, scopes, index, &mut test_only);
-    let unverified = unverified_roots(
-        calls,
-        inputs,
-        root,
-        makers,
-        scopes,
-        index,
-        &edges,
-        &mut test_only,
-    );
+    let (edges, mut test_only) = verified_edges(calls, inputs, root, makers, scopes, index);
+    let (unverified, ignored) =
+        unverified_roots(calls, inputs, root, makers, scopes, index, &edges);
+    test_only.extend(ignored);
     test_only.sort();
     test_only.dedup();
     Mounts {
@@ -106,7 +98,8 @@ pub(super) fn mount_edges<'a>(
 
 /// Every instance handed, at any argument, to a library call made on an
 /// instance of the same package, that no verified edge in `edges` reads
-/// (that call and that instance).
+/// (that call and that instance), and the mount calls (`file:line`) a test-only
+/// file makes, which are neither (carrick#2775).
 fn unverified_roots<'a>(
     calls: &Calls<'a>,
     inputs: &RequestSummaryInputs,
@@ -115,8 +108,7 @@ fn unverified_roots<'a>(
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
     edges: &[MountEdge],
-    test_only: &mut Vec<String>,
-) -> Vec<(String, u32)> {
+) -> (Vec<(String, u32)>, Vec<String>) {
     let mut placed: Vec<Placed<'a>> = calls
         .by_span
         .values()
@@ -132,6 +124,7 @@ fn unverified_roots<'a>(
     });
     let walk = || InstanceWalk::new(calls, inputs, root, makers, scopes, index);
     let mut out: Vec<(String, u32)> = Vec::new();
+    let mut test_only: Vec<String> = Vec::new();
     for placed in placed {
         if !walk().library_call(placed.file, placed.call) {
             continue;
@@ -174,12 +167,13 @@ fn unverified_roots<'a>(
             }
         }
     }
-    out
+    (out, test_only)
 }
 
 /// Every verified mount edge of the service: each call of a member a
 /// `mounts` label names, made on an instance the label applies to, with
-/// each maker's result it is handed.
+/// each maker's result it is handed; and the mount calls (`file:line`) made in
+/// a test-only file, which are not edges (carrick#2775).
 fn verified_edges<'a>(
     calls: &Calls<'a>,
     inputs: &RequestSummaryInputs,
@@ -187,14 +181,13 @@ fn verified_edges<'a>(
     makers: &[MakerLabel],
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
-    test_only: &mut Vec<String>,
-) -> Vec<MountEdge> {
+) -> (Vec<MountEdge>, Vec<String>) {
     let mounts: Vec<&ScopeLabel> = scopes
         .iter()
         .filter(|label| matches!(label.binds, ScopeBinds::Mounts { .. }))
         .collect();
     if mounts.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut placed: Vec<Placed<'a>> = calls
         .by_span
@@ -215,6 +208,7 @@ fn verified_edges<'a>(
     });
     let walk = || InstanceWalk::new(calls, inputs, root, makers, scopes, index);
     let mut edges = Vec::new();
+    let mut test_only: Vec<String> = Vec::new();
     for placed in placed {
         if !walk().library_call(placed.file, placed.call) {
             continue;
@@ -254,7 +248,7 @@ fn verified_edges<'a>(
             }
         }
     }
-    edges
+    (edges, test_only)
 }
 
 /// One walk from an instance end up to the top: the prefixes and edges
