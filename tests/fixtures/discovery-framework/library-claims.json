@@ -1,0 +1,23 @@
+{
+  "library_claims": [
+    {
+      "package": "fixture-server",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-server",
+          "export": "default",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "call", "key_labels": {}, "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

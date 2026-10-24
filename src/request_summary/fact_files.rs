@@ -299,6 +299,76 @@ mod tests {
         assert!(facts.listed_in("e.ts").is_empty());
     }
 
+    /// carrick#2725: a route registered on a framework instance handed in as
+    /// a parameter, in a module that imports the framework as a type only,
+    /// is no finished walk: the service asked the store nothing about the
+    /// framework, so its first answer holds no export of it and does not
+    /// name it answered, and the call is `unanswered_package`, which D4
+    /// keeps. Counting it answered while its exports are dropped (what the
+    /// first answer did with a store answer that holds more than was asked)
+    /// made both walks finished. The fixture's README says more.
+    #[test]
+    fn a_route_on_a_framework_parameter_is_no_finished_walk() {
+        use super::super::discovery::{Labels, discover};
+        let Some(on) = super::super::fixture_walk::walked(
+            "discovery-framework",
+            "services/api",
+            "api",
+            &[],
+            true,
+        ) else {
+            return;
+        };
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-framework");
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        );
+        assert_eq!(answer.exports.len(), 1, "the store labels the framework");
+        let source =
+            std::fs::read_to_string(fixture.join("repo/services/api/src/routes.ts")).unwrap();
+        // Each registration's SWC span: byte offset + 1, the call without its `;`.
+        let spans: Vec<(u32, u32)> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("app.get(") || line.starts_with("app.post("))
+            .map(|line| {
+                let call = line.trim_end_matches(';');
+                let start = source.find(call).unwrap() as u32 + 1;
+                (start, start + call.len() as u32)
+            })
+            .collect();
+        assert_eq!(spans.len(), 2);
+        let read = |first: &FirstAnswer| {
+            let labels = Labels::of_answered(&first.exports, &first.answered);
+            let discovery = discover(&on.inputs, &labels, &on.repo);
+            FactFiles::of(&discovery, &Decided::default(), None, first, &on.repo)
+        };
+        // The first answer this service gets: nothing asked, nothing answered.
+        let first = FirstAnswer::default();
+        let facts = read(&first);
+        for span in &spans {
+            assert_eq!(
+                facts.followed("services/api/src/routes.ts", *span),
+                Some(&Followed::Unfollowed("unanswered_package".to_string())),
+                "{span:?}"
+            );
+        }
+        // The framework named answered with its exports dropped: finished.
+        let leaked = FirstAnswer {
+            answered: answer.answered_packages.clone(),
+            ..FirstAnswer::default()
+        };
+        let facts = read(&leaked);
+        for span in &spans {
+            assert_eq!(
+                facts.followed("services/api/src/routes.ts", *span),
+                Some(&Followed::Finished),
+                "{span:?}"
+            );
+        }
+    }
+
     /// An unfollowed call and a finished walk are recorded and select no
     /// file; a finished walk never hides what another record says.
     #[test]
