@@ -1,0 +1,45 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "/v1/workspaces/${id}",
+      "method": "GET",
+      "pattern_matched": "restRequest<Workspace>(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "target": "/v1/workspaces/${id}",
+      "method": "POST",
+      "pattern_matched": "restRequest<Workspace>(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:15",
+      "line_number": 15,
+      "target": "/v1/workspaces/${id}",
+      "method": "POST",
+      "pattern_matched": "sendConfig<void>(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

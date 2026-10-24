@@ -1,0 +1,85 @@
+{
+  "library_claims": [
+    {
+      "package": "lib:lib.dom.d.ts",
+      "version": "6.0.2",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "lib:lib.dom.d.ts",
+          "export": "fetch",
+          "role": "http_client",
+          "side": "client",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": null,
+              "on": "export",
+              "name": { "arg": 0 },
+              "method_key": { "arg": 1, "key": "method" },
+              "method_default": "GET",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@fixture/request",
+      "version": "1.0.0",
+      "status": "answered",
+      "surface_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "exports": [
+        {
+          "specifier": "@fixture/request",
+          "export": "Request",
+          "role": "http_client",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": "make",
+              "on": "export",
+              "name": { "arg": 0, "key": "url" },
+              "method_key": { "arg": 0, "key": "method" },
+              "payload": { "arg": 0, "key": "body" },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@fixture/trace",
+      "version": "1.0.0",
+      "status": "answered",
+      "surface_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "exports": [
+        {
+          "specifier": "@fixture/trace",
+          "export": "span",
+          "role": "none",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

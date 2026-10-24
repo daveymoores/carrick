@@ -984,6 +984,20 @@ fn filled(pieces: &[Piece], call: &CallIr) -> Vec<Piece> {
     }))
 }
 
+/// One key of a value that is a whole parameter: of the function the call
+/// is written in, or of one around it when the call sits in a function
+/// written inside that one (`span(() => fetch(url, init))` reads `init`'s
+/// `method` as a key of the enclosing function's parameter). `None` when
+/// the value is anything else.
+fn keyed(pieces: &[Piece], key: &str) -> Option<Piece> {
+    match pieces {
+        [Piece::Param(index, name)] => Some(Piece::ParamKey(*index, key.to_string(), name.clone())),
+        [Piece::Outer(depth, inner)] => keyed(std::slice::from_ref(&**inner), key)
+            .map(|piece| Piece::Outer(*depth, Box::new(piece))),
+        _ => None,
+    }
+}
+
 /// The argument positions `pieces` reads, as the callee's own parameters.
 fn parameter_positions(pieces: &[Piece]) -> BTreeSet<usize> {
     pieces
@@ -1007,12 +1021,9 @@ fn slot_value(call: &CallIr, slot: &ArgSlot) -> Vec<Piece> {
             .fields
             .get(key)
             .map_or(vec![Piece::Unknown], Value::pieces),
-        (Some(key), Value::Str(pieces)) => match pieces.as_slice() {
-            [Piece::Param(index, name)] => {
-                vec![Piece::ParamKey(*index, key.clone(), name.clone())]
-            }
-            _ => vec![Piece::Unknown],
-        },
+        (Some(key), Value::Str(pieces)) => {
+            keyed(pieces, key).map_or(vec![Piece::Unknown], |piece| vec![piece])
+        }
         _ => vec![Piece::Unknown],
     }
 }
@@ -1129,12 +1140,9 @@ fn written_at(call: &CallIr, arg: usize, key: Option<&str>) -> MethodValue {
             },
             (None, _) => MethodValue::Pieces(vec![Piece::Unknown]),
         },
-        (Some(key), Value::Str(pieces)) => match pieces.as_slice() {
-            [Piece::Param(index, name)] => {
-                MethodValue::Pieces(vec![Piece::ParamKey(*index, key.to_string(), name.clone())])
-            }
-            _ => MethodValue::Pieces(vec![Piece::Unknown]),
-        },
+        (Some(key), Value::Str(pieces)) => {
+            MethodValue::Pieces(vec![keyed(pieces, key).unwrap_or(Piece::Unknown)])
+        }
         _ => MethodValue::Pieces(vec![Piece::Unknown]),
     }
 }
