@@ -279,19 +279,16 @@ pub enum RegisterSignal {
     C2,
     /// Signal 5: the method-name and object-name lists.
     C3,
-    /// Signal 2: a call rooted at an import from a detected package.
-    C4,
 }
 
 impl RegisterSignal {
-    pub const ALL: [Self; 4] = [Self::C1, Self::C2, Self::C3, Self::C4];
+    pub const ALL: [Self; 3] = [Self::C1, Self::C2, Self::C3];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::C1 => "C1",
             Self::C2 => "C2",
             Self::C3 => "C3",
-            Self::C4 => "C4",
         }
     }
 }
@@ -553,12 +550,7 @@ impl SwcScanner {
     /// Returns a ScanResult with candidates and whether the file should be analyzed.
     /// If no candidates are found, the file can be skipped.
     #[allow(dead_code)]
-    pub fn scan_file(
-        &self,
-        file_path: &Path,
-        data_fetchers: &[String],
-        messaging_clients: &[String],
-    ) -> ScanResult {
+    pub fn scan_file(&self, file_path: &Path, messaging_clients: &[String]) -> ScanResult {
         let handler = Handler::with_tty_emitter(
             ColorConfig::Never,
             true,
@@ -597,7 +589,6 @@ impl SwcScanner {
         let new_url_paths = collect_new_url_paths(&module, &self.source_map);
         let mut visitor = CandidateVisitor::new(
             self.source_map.clone(),
-            package_import_locals(&module, data_fetchers),
             imports_messaging_client,
             const_string_values,
             new_url_paths,
@@ -628,10 +619,9 @@ impl SwcScanner {
         &self,
         file_path: &Path,
         content: &str,
-        data_fetchers: &[String],
         messaging_clients: &[String],
     ) -> ScanResult {
-        self.scan_content_with(file_path, content, data_fetchers, messaging_clients, None)
+        self.scan_content_with(file_path, content, messaging_clients, None)
     }
 
     /// The HTTP candidates at the calls the fact layer found in a file
@@ -646,7 +636,7 @@ impl SwcScanner {
         content: &str,
         spans: &BTreeSet<(u32, u32)>,
     ) -> ScanResult {
-        let mut result = self.scan_content_with(file_path, content, &[], &[], Some(spans.clone()));
+        let mut result = self.scan_content_with(file_path, content, &[], Some(spans.clone()));
         result
             .candidates
             .retain(|candidate| spans.contains(&(candidate.span_start, candidate.span_end)));
@@ -660,7 +650,6 @@ impl SwcScanner {
         &self,
         file_path: &Path,
         content: &str,
-        data_fetchers: &[String],
         messaging_clients: &[String],
         wanted: Option<BTreeSet<(u32, u32)>>,
     ) -> ScanResult {
@@ -728,7 +717,6 @@ impl SwcScanner {
         let new_url_paths = collect_new_url_paths(&module, &file_source_map);
         let mut visitor = CandidateVisitor::new(
             file_source_map,
-            package_import_locals(&module, data_fetchers),
             imports_messaging_client,
             const_string_values,
             new_url_paths,
@@ -2278,11 +2266,6 @@ struct CandidateVisitor {
     candidates: Vec<CandidateTarget>,
     source_map: Lrc<SourceMap>,
     function_stack: Vec<String>,
-    /// Local binding names imported from a known network/data-fetching package
-    /// (e.g. `axios` from `import axios from 'axios'`). Calls rooted at one of
-    /// these are emitted as candidates regardless of method name, so bespoke
-    /// client wrappers (`client.users.list()`) are not missed.
-    network_import_locals: HashSet<String>,
     /// Span ranges already emitted, so the broadened signals below don't push
     /// the same call site twice (candidate ids are span-based).
     seen_spans: HashSet<(u32, u32)>,
@@ -2362,7 +2345,6 @@ impl CandidateVisitor {
     #[allow(clippy::too_many_arguments)]
     fn new(
         source_map: Lrc<SourceMap>,
-        network_import_locals: HashSet<String>,
         file_imports_messaging_client: bool,
         const_string_values: HashMap<String, String>,
         new_url_paths: NewUrlPathMap,
@@ -2375,7 +2357,6 @@ impl CandidateVisitor {
             candidates: Vec::new(),
             source_map,
             function_stack: Vec::new(),
-            network_import_locals,
             seen_spans: HashSet::new(),
             await_depth: 0,
             file_imports_messaging_client,
@@ -2521,20 +2502,6 @@ impl CandidateVisitor {
         };
         prop.sym.as_ref() == "sendBeacon"
             && matches!(&*member.obj, Expr::Ident(obj) if obj.sym.as_ref() == "navigator")
-    }
-
-    /// Root identifier of a callee expression, e.g. `client` in
-    /// `client.users.list()` or `client(...)`.
-    fn callee_root_ident(expr: &Expr) -> Option<String> {
-        match expr {
-            Expr::Ident(ident) => Some(ident.sym.to_string()),
-            Expr::Member(member) => Self::callee_root_ident(&member.obj),
-            Expr::Call(call) => match &call.callee {
-                Callee::Expr(e) => Self::callee_root_ident(e),
-                _ => None,
-            },
-            _ => None,
-        }
     }
 
     /// Does the first argument look like a URL (has a network scheme)? This is a
@@ -3236,11 +3203,7 @@ impl CandidateVisitor {
     /// "post", `w['post'](...)` -> "post"). `None` for non-member callees and
     /// non-literal computed properties. Used by the structural signals (URL
     /// scheme, awaited stringish call) so the candidate hint carries the full
-    /// `object.property` callee even when the package is absent from the
-    /// LLM-detected `data_fetchers` list — without this, the same call site's
-    /// hint flips between `axios.post` and bare `axios` depending on a per-run
-    /// LLM detection output, which is exactly the kind of prompt variance the
-    /// candidate layer exists to prevent.
+    /// `object.property` callee.
     fn callee_member_prop(expr: &Expr) -> Option<String> {
         let Expr::Member(member) = expr else {
             return None;
@@ -3593,30 +3556,6 @@ impl Visit for CandidateVisitor {
                 Some("sendBeacon".to_string()),
             );
         }
-
-        self.register_signal = Some(RegisterSignal::C4);
-        // FROZEN (old path, 2026-10-21): Signal 2's detection-list gate, this
-        // block and the `network_import_locals` field (`package_import_locals`
-        // stays: the messaging gate reads it). Deletions and safety fixes
-        // only. Fixes for wrong or missing rows go in discovery (a call that
-        // reaches a labelled library export). Delete when discovery is on by
-        // default and the four-repo replay shows no site only this signal
-        // raised (carrick#2440, target 4).
-        // Signal 2: call rooted at an identifier imported from a known
-        // network/data-fetching package (covers wrappers regardless of method
-        // name), or direct invocation of such an import (`client(url)`).
-        if let Callee::Expr(callee_expr) = &call.callee
-            && let Some(root) = Self::callee_root_ident(callee_expr)
-            && self.network_import_locals.contains(&root)
-        {
-            // Same member-property extraction as Signals 3/4 (incl. computed
-            // string properties like `client["post"](url)`), so every signal
-            // that can emit this span first labels it identically.
-            let property = Self::callee_member_prop(callee_expr);
-            self.push_candidate(call, root, property);
-        }
-
-        self.register_signal = None;
 
         // Signal 2b: the call declares its method and URL as data on a single
         // object-literal argument (`client({ method: "post", url: "/x" })`).
@@ -4045,8 +3984,7 @@ pub(crate) fn collect_const_string_values(module: &Module) -> HashMap<String, St
 /// The package list comes from framework detection — the LLM decides which of
 /// the repo's dependencies are data-fetching libraries / messaging clients —
 /// so the scanner carries no hardcoded package list. Called with
-/// `data_fetchers` for the network-call Signal 2 and with `messaging_clients`
-/// for the NewExpr subscriber gate (carrick#402). This is a recall booster for
+/// `messaging_clients` for the NewExpr subscriber gate (carrick#402). This is a recall booster for
 /// the gatekeeper, not an authoritative classification: the LLM still decides
 /// what each call is. Matching is the same exact-or-`"<pkg>/"`-prefix
 /// convention as `file_imports_messaging_client`.
@@ -4087,7 +4025,9 @@ mod tests {
     use std::path::PathBuf;
 
     fn scan_test_content(content: &str) -> ScanResult {
-        scan_test_content_with_fetchers(content, &[])
+        let scanner = SwcScanner::new();
+        let path = PathBuf::from("test.ts");
+        scanner.scan_content(&path, content, &[])
     }
 
     /// [`SWC_SPAN_BASE`] is a claim about SWC's numbering that every span sent
@@ -4106,12 +4046,6 @@ mod tests {
         let call = content.find("fetch").expect("the call is in the source") as u32;
         assert_eq!(candidate.span_start, call + SWC_SPAN_BASE);
         assert_eq!(candidate.span_end, content.len() as u32 - 1 + SWC_SPAN_BASE);
-    }
-
-    fn scan_test_content_with_fetchers(content: &str, data_fetchers: &[String]) -> ScanResult {
-        let scanner = SwcScanner::new();
-        let path = PathBuf::from("test.ts");
-        scanner.scan_content(&path, content, data_fetchers, &[])
     }
 
     fn handler_names(content: &str) -> Vec<String> {
@@ -4135,7 +4069,7 @@ mod tests {
                       \x20 await axios.get(\"/orders\");\n\
                       \x20 fetch(\"/health\");\n\
                       }\n";
-        let result = scan_test_content_with_fetchers(source, &["axios".to_string()]);
+        let result = scan_test_content(source);
         let span_of = |needle: &str| {
             let call = result
                 .candidates
@@ -4155,8 +4089,8 @@ mod tests {
             .expect("the register signals raised the axios call");
         assert_eq!(
             axios.iter().copied().collect::<Vec<_>>(),
-            vec![RegisterSignal::C2, RegisterSignal::C3, RegisterSignal::C4],
-            "the await gate, the name lists and the detected import all raised it"
+            vec![RegisterSignal::C2, RegisterSignal::C3],
+            "the await gate and the name lists both raised it"
         );
         assert!(
             !result.register_signals.contains_key(&span_of("fetch(")),
@@ -4207,65 +4141,6 @@ mod tests {
         let healthy = scan_test_content("const x = 1;");
         assert!(!healthy.parse_failed);
         assert!(healthy.candidates.is_empty());
-    }
-
-    #[test]
-    fn candidate_hint_is_stable_across_data_fetcher_detection() {
-        // carrick#359: the candidate for a member call must carry the same
-        // `object.property` callee whether or not the package appears in the
-        // LLM-detected data_fetchers list. Before this guard, `axios.post`
-        // (Signal 2, import-gated) degraded to bare `axios` with a null
-        // property (Signal 4, awaited-stringish) whenever a scan's detect
-        // output omitted axios — a per-run LLM output mutating the candidate
-        // hint the file-analyzer prompt presents.
-        let content = r#"
-import axios from "axios";
-export async function record(event: unknown): Promise<void> {
-  await axios.post(`${process.env.HOOK_URL ?? "http://localhost:3099"}/audit/events`, event);
-}
-"#;
-
-        let with_fetcher = scan_test_content_with_fetchers(content, &["axios".to_string()]);
-        let without_fetcher = scan_test_content(content);
-
-        let pick = |r: &ScanResult| {
-            let c = r
-                .candidates
-                .iter()
-                .find(|c| c.callee_object == "axios")
-                .expect("axios candidate must be emitted")
-                .clone();
-            (
-                c.candidate_id.clone(),
-                c.callee_object.clone(),
-                c.callee_property.clone(),
-                c.path_snippet.clone(),
-            )
-        };
-        let a = pick(&with_fetcher);
-        let b = pick(&without_fetcher);
-        assert_eq!(a, b, "candidate must not depend on data_fetchers");
-        assert_eq!(a.2.as_deref(), Some("post"));
-    }
-
-    #[test]
-    fn imported_fetcher_computed_property_call_carries_property() {
-        // Signal 2 (import-gated) must extract computed string properties the
-        // same way Signals 3/4 do, so whichever signal emits a span first
-        // labels it identically.
-        let content = r#"
-import client from "client-lib";
-export async function load() {
-  await client["post"]("/things", {});
-}
-"#;
-        let result = scan_test_content_with_fetchers(content, &["client-lib".to_string()]);
-        let c = result
-            .candidates
-            .iter()
-            .find(|c| c.callee_object == "client")
-            .expect("imported-fetcher candidate must be emitted");
-        assert_eq!(c.callee_property.as_deref(), Some("post"));
     }
 
     #[test]
@@ -4668,26 +4543,6 @@ export default function handler() {}
     fn exported_handlers_empty_when_no_exports() {
         let content = "const x = 1; function f() {}";
         assert!(handler_names(content).is_empty());
-    }
-
-    #[test]
-    fn detects_imported_client_wrapper_calls() {
-        // `sdk`/`doThing` match none of the name heuristics; only the
-        // import-based signal catches this, and only because detection flagged
-        // `got` as a data fetcher (no hardcoded package list in the scanner).
-        let content = r#"
-import sdk from 'got';
-async function run() { return sdk.doThing(); }
-"#;
-        let fetchers = vec!["got".to_string()];
-        assert!(
-            !scan_test_content_with_fetchers(content, &fetchers)
-                .candidates
-                .is_empty()
-        );
-        // Without detection flagging the package, the wrapper call is invisible
-        // to the import signal (the other signals don't apply here either).
-        assert!(scan_test_content(content).candidates.is_empty());
     }
 
     #[test]
@@ -5900,8 +5755,8 @@ createRouter()
         let file_a_content = "fetch('/api/a');";
         let file_b_content = "fetch('/api/b');";
 
-        let result_a = scanner.scan_content(&PathBuf::from("a.ts"), file_a_content, &[], &[]);
-        let result_b = scanner.scan_content(&PathBuf::from("b.ts"), file_b_content, &[], &[]);
+        let result_a = scanner.scan_content(&PathBuf::from("a.ts"), file_a_content, &[]);
+        let result_b = scanner.scan_content(&PathBuf::from("b.ts"), file_b_content, &[]);
 
         assert!(
             !result_a.candidates.is_empty(),
@@ -6396,12 +6251,8 @@ apiHandler.route('/data', handleData);
 
         // Gated in (messaging_clients=["nats"]): the publish call is surfaced,
         // proving const-string topic resolution works (`SUBJECT` -> literal).
-        let gated_in = publisher_scanner.scan_content(
-            &publisher_path,
-            &publisher_src,
-            &[],
-            &["nats".to_string()],
-        );
+        let gated_in =
+            publisher_scanner.scan_content(&publisher_path, &publisher_src, &["nats".to_string()]);
         assert!(
             gated_in
                 .candidates
@@ -6412,7 +6263,7 @@ apiHandler.route('/data', handleData);
         );
 
         // Gated out (messaging_clients=[]): the file is inert — zero candidates.
-        let gated_out = publisher_scanner.scan_content(&publisher_path, &publisher_src, &[], &[]);
+        let gated_out = publisher_scanner.scan_content(&publisher_path, &publisher_src, &[]);
         assert!(
             gated_out.candidates.is_empty(),
             "gated out (messaging_clients=[]): publisher file must surface 0 candidates, got {:?}",
@@ -6430,7 +6281,6 @@ apiHandler.route('/data', handleData);
         let sub_gated_in = subscriber_scanner.scan_content(
             &subscriber_path,
             &subscriber_src,
-            &[],
             &["nats".to_string()],
         );
         assert!(
@@ -6442,8 +6292,7 @@ apiHandler.route('/data', handleData);
             sub_gated_in.candidates
         );
 
-        let sub_gated_out =
-            subscriber_scanner.scan_content(&subscriber_path, &subscriber_src, &[], &[]);
+        let sub_gated_out = subscriber_scanner.scan_content(&subscriber_path, &subscriber_src, &[]);
         assert!(
             sub_gated_out.candidates.is_empty(),
             "gated out: subscriber file must surface 0 candidates, got {:?}",
@@ -6465,7 +6314,7 @@ io.on('connection', (socket) => {
         let socket_path = PathBuf::from("realtime.ts");
         let socket_scanner = SwcScanner::new();
         let socket_scan =
-            socket_scanner.scan_content(&socket_path, socket_src, &[], &["nats".to_string()]);
+            socket_scanner.scan_content(&socket_path, socket_src, &["nats".to_string()]);
         assert!(
             !socket_scan
                 .candidates
@@ -6513,7 +6362,6 @@ export class NetworkMonitor {
         let result = scanner.scan_content(
             &PathBuf::from("network-monitor.ts"),
             src,
-            &[],
             &["@metamask/messenger".to_string()],
         );
         let props: Vec<&str> = result
@@ -6535,7 +6383,7 @@ export class NetworkMonitor {
         );
 
         // Empty messaging_clients: both tiers off, file fully inert.
-        let inert = scanner.scan_content(&PathBuf::from("network-monitor.ts"), src, &[], &[]);
+        let inert = scanner.scan_content(&PathBuf::from("network-monitor.ts"), src, &[]);
         assert!(
             inert.candidates.is_empty(),
             "with no detected messaging clients the file must surface 0 candidates, got {:?}",
@@ -6568,12 +6416,7 @@ export class PollController {
 }
 "#;
         let scanner = SwcScanner::new();
-        let result = scanner.scan_content(
-            &PathBuf::from("poll.ts"),
-            src,
-            &[],
-            &["fakebus".to_string()],
-        );
+        let result = scanner.scan_content(&PathBuf::from("poll.ts"), src, &["fakebus".to_string()]);
         let ops = &result.pubsub_anchor_ops;
         assert_eq!(ops.len(), 3, "expected 3 anchor ops, got {ops:?}");
         assert!(
@@ -6619,12 +6462,7 @@ export async function start() {
 }
 "#;
         let scanner = SwcScanner::new();
-        let result = scanner.scan_content(
-            &PathBuf::from("feed.ts"),
-            src,
-            &[],
-            &["fakebus".to_string()],
-        );
+        let result = scanner.scan_content(&PathBuf::from("feed.ts"), src, &["fakebus".to_string()]);
         let mut ops: Vec<(String, PubsubRole, usize)> = result
             .pubsub_anchor_ops
             .iter()
@@ -6661,12 +6499,8 @@ export function run(payload: object, dynamic: string) {
 }
 "#;
         let scanner = SwcScanner::new();
-        let gated_in = scanner.scan_content(
-            &PathBuf::from("guarded.ts"),
-            src,
-            &[],
-            &["fakebus".to_string()],
-        );
+        let gated_in =
+            scanner.scan_content(&PathBuf::from("guarded.ts"), src, &["fakebus".to_string()]);
         assert!(
             gated_in.pubsub_anchor_ops.is_empty(),
             "payload-carrying / unresolvable / nested / non-vocab calls must not anchor, got {:?}",
@@ -6678,8 +6512,7 @@ export function run(payload: object, dynamic: string) {
 import { bus } from 'fakebus';
 bus.publish('plain.topic');
 "#;
-        let gated_out =
-            scanner.scan_content(&PathBuf::from("guarded.ts"), no_payload_src, &[], &[]);
+        let gated_out = scanner.scan_content(&PathBuf::from("guarded.ts"), no_payload_src, &[]);
         assert!(
             gated_out.pubsub_anchor_ops.is_empty(),
             "empty messaging_clients must keep the anchor path inert, got {:?}",
@@ -6704,7 +6537,7 @@ bus.publish('plain.topic');
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
         let scanner = SwcScanner::new();
 
-        let gated_in = scanner.scan_content(&path, &src, &[], &["kafkajs".to_string()]);
+        let gated_in = scanner.scan_content(&path, &src, &["kafkajs".to_string()]);
         assert!(
             gated_in
                 .candidates
@@ -6728,7 +6561,7 @@ bus.publish('plain.topic');
             "options-object subscribe registers its handler elsewhere; the anchor must be payload-less"
         );
 
-        let gated_out = scanner.scan_content(&path, &src, &[], &[]);
+        let gated_out = scanner.scan_content(&path, &src, &[]);
         assert!(
             gated_out.pubsub_anchor_ops.is_empty(),
             "empty messaging_clients must keep the kafkajs file anchor-inert, got {:?}",
@@ -6762,7 +6595,6 @@ export async function start(): Promise<void> {
         let result = scanner.scan_content(
             &PathBuf::from("consumer.ts"),
             src,
-            &[],
             &["fakekafka".to_string()],
         );
         let ops = &result.pubsub_anchor_ops;
@@ -6804,7 +6636,7 @@ export async function start(): Promise<void> {
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
         let scanner = SwcScanner::new();
 
-        let gated_in = scanner.scan_content(&path, &src, &[], &["bullmq".to_string()]);
+        let gated_in = scanner.scan_content(&path, &src, &["bullmq".to_string()]);
         assert!(
             gated_in
                 .candidates
@@ -6824,7 +6656,7 @@ export async function start(): Promise<void> {
             gated_in.pubsub_anchor_ops
         );
 
-        let gated_out = scanner.scan_content(&path, &src, &[], &[]);
+        let gated_out = scanner.scan_content(&path, &src, &[]);
         assert!(
             gated_out.pubsub_anchor_ops.is_empty(),
             "empty messaging_clients must keep the worker file anchor-inert, got {:?}",
@@ -6847,12 +6679,8 @@ export const job = new CronJob('0 * * * *', () => {});
 export const unused = Worker;
 "#;
         let scanner = SwcScanner::new();
-        let result = scanner.scan_content(
-            &PathBuf::from("scheduler.ts"),
-            src,
-            &[],
-            &["bullmq".to_string()],
-        );
+        let result =
+            scanner.scan_content(&PathBuf::from("scheduler.ts"), src, &["bullmq".to_string()]);
         assert!(
             result.pubsub_anchor_ops.is_empty(),
             "new CronJob('lit', fn) must NOT anchor: cron is not a detected \
@@ -6890,7 +6718,6 @@ bus.subscribe('user.deleted', handlerRef);
         let result = scanner.scan_content(
             &PathBuf::from("subscriber.ts"),
             src,
-            &[],
             &["fakebus".to_string()],
         );
         let ops = &result.pubsub_anchor_ops;

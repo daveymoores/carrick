@@ -445,7 +445,7 @@ fn files_only_the_fact_layer_finds_are_logged_as_fact_only() {
             .any(|line| line.contains("packages unanswered at dispatch 1")),
         "{lines:#?}"
     );
-    for signal in ["C1", "C2", "C3", "C4"] {
+    for signal in ["C1", "C2", "C3"] {
         assert!(
             lines
                 .iter()
