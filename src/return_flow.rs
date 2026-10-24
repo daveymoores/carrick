@@ -45,11 +45,14 @@ pub enum Flow {
 
 /// Every call written in `module`, by its span, with how its value reaches
 /// the return of the innermost function it is written in. A call at module
-/// level is in no function and is not listed.
-pub fn call_flows(module: &swc_ecma_ast::Module) -> HashMap<Span, Flow> {
+/// level is in no function and is not listed. In source order, so a reader
+/// that keys two calls to one entry keeps the same one every run (carrick#2759).
+pub fn call_flows(module: &swc_ecma_ast::Module) -> Vec<(Span, Flow)> {
     let mut reader = Reader::default();
     module.visit_with(&mut reader);
-    reader.flows
+    let mut flows: Vec<(Span, Flow)> = reader.flows.into_iter().collect();
+    flows.sort_by_key(|(span, _)| (span.lo, span.hi));
+    flows
 }
 
 #[derive(Default)]
@@ -347,6 +350,33 @@ mod tests {
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    #[test]
+    fn calls_are_listed_in_source_order() {
+        let source = "function f(a) { one(a); one(a); two(a); one(a); three(one(a)); return 1; }\n";
+        for _ in 0..20 {
+            let cm: Lrc<SourceMap> = Default::default();
+            let file = cm.new_source_file(
+                Lrc::new(FileName::Custom("t.ts".into())),
+                source.to_string(),
+            );
+            let module = parse_file_as_module(
+                &file,
+                Syntax::Typescript(TsSyntax::default()),
+                Default::default(),
+                None,
+                &mut Vec::new(),
+            )
+            .expect("parses");
+            let starts: Vec<_> = call_flows(&module)
+                .into_iter()
+                .map(|(span, _)| span.lo)
+                .collect();
+            let mut sorted = starts.clone();
+            sorted.sort();
+            assert_eq!(starts, sorted);
+        }
     }
 
     fn flow_of<'a>(flows: &'a [(String, Flow)], text: &str) -> &'a Flow {
