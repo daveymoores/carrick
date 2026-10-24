@@ -1528,8 +1528,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // service hands it (carrick#2474 R5b): each service recorded its side
     // during its own analysis, and here, with every service in hand, the
     // records are matched and the routes they resolve are written. A
-    // carried or held-back service is read and never written. Each service
-    // states its fallbacks once its counts are in.
+    // held-back service's records are read and it is never written. A
+    // carried service is never written and records nothing until R5c (its
+    // boundaries are empty), so on `--changed-only` a route whose boundary
+    // only a carried service fills counts `unmatched_boundary`. Each
+    // service states its fallbacks once its counts are in.
     {
         let mut services: Vec<route_boundaries::ServiceRoutes<'_>> = runs
             .iter_mut()
@@ -5517,6 +5520,10 @@ struct TracedApplied {
     /// Traced routes with a path no row at the line held and none was
     /// written for: the registration's binding has no symbol to own a row.
     owner_unknown: usize,
+    /// Reader rows at a route's own path left as read: every traced full
+    /// path is held by another row at the line, so correcting it would make
+    /// a twin of that row.
+    twin: usize,
 }
 
 impl TracedApplied {
@@ -5536,6 +5543,7 @@ impl TracedApplied {
                     "routes_documented_conflict".to_string(),
                     self.documented_conflict,
                 ),
+                ("routes_trace_twin".to_string(), self.twin),
             ])
             .filter(|(_, count)| *count > 0)
             .collect()
@@ -5581,6 +5589,7 @@ fn apply_traced_routes(
         refused = write.applied.refused,
         folded = write.applied.folded,
         owner_unknown = write.applied.owner_unknown,
+        twin = write.applied.twin,
         "receiver trace: routes written into the mount graph"
     );
     write.applied
@@ -5682,7 +5691,8 @@ fn write_traced_routes(
             .collect();
         // Row 4: a reader row at the route's own path with no prefix read
         // the call and not its scopes. It takes a traced full path no row
-        // here holds yet, keeping its owner and handler.
+        // here holds yet, keeping its owner and handler; where every one is
+        // held, it is left as read and counted (a twin).
         let own_path = |index: usize| {
             let row = &mount_graph.endpoints[index];
             !matches!(
@@ -5693,6 +5703,7 @@ fn write_traced_routes(
                     && MountGraph::paths_equal_modulo_param_names(&route.path, &row.full_path)
             })
         };
+        let mut twins: Vec<usize> = Vec::new();
         let disagreeing = if !disagreeing.is_empty()
             && disagreeing.iter().all(|&index| own_path(index))
         {
@@ -5716,9 +5727,10 @@ fn write_traced_routes(
                     .full_paths
                     .iter()
                     .find(|full_path| !held(full_path))
-                    .or_else(|| route.full_paths.first())
                     .cloned()
                 else {
+                    applied.twin += 1;
+                    twins.push(index);
                     continue;
                 };
                 let row = &mut mount_graph.endpoints[index];
@@ -5768,10 +5780,13 @@ fn write_traced_routes(
             )
         };
         for &index in &here {
-            if write
-                .corrected
-                .iter()
-                .any(|(corrected, _)| *corrected == index)
+            // A corrected row took its label already; a twin left as read
+            // states a path the trace does not, and keeps its own.
+            if twins.contains(&index)
+                || write
+                    .corrected
+                    .iter()
+                    .any(|(corrected, _)| *corrected == index)
             {
                 continue;
             }
@@ -24491,6 +24506,62 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(
             applied.tally(&std::collections::BTreeMap::new()),
             vec![("routes_untraced_owner_unknown".to_string(), 1)]
+        );
+    }
+
+    /// PR #2734 review: two reader rows at a route's own path and one
+    /// traced full path. The first takes it (row 4); the second is left as
+    /// read, with its own label, and counted: moving it too would make a
+    /// twin of the first under one key.
+    #[test]
+    fn a_second_own_path_row_with_no_free_full_path_is_left_and_counted() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![
+            traced_row(
+                "src/orders.ts:4",
+                "GET",
+                "/orders",
+                "/orders",
+                ResolutionSource::Model,
+            ),
+            traced_row(
+                "src/orders.ts:4",
+                "GET",
+                "/orders",
+                "/orders",
+                ResolutionSource::Model,
+            ),
+        ];
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[traced_route(
+                "src/orders.ts",
+                4,
+                "GET",
+                "/orders",
+                &["/api/v1/orders"],
+            )],
+            ".",
+        );
+        assert_eq!(
+            applied,
+            TracedApplied {
+                corrected: 1,
+                twin: 1,
+                ..TracedApplied::default()
+            }
+        );
+        assert_eq!(
+            traced_rows(&graph),
+            vec![
+                "src/orders.ts:4 GET /api/v1/orders library_claim",
+                "src/orders.ts:4 GET /orders model",
+            ]
+        );
+        assert_eq!(
+            applied.tally(&std::collections::BTreeMap::new()),
+            vec![("routes_trace_twin".to_string(), 1)]
         );
     }
 

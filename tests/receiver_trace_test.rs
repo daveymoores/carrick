@@ -629,15 +629,17 @@ fn producer_manifest(blobs: &Blobs) -> Vec<String> {
 /// the plugin) and hands it to `opts.extra`; the main host writes `extra` as
 /// a callback that registers the package's admin helper and its own audit
 /// routes; two more hosts register the plugin, one with a closed literal and
-/// one with a spread no reader states. The mock answer states each route at
-/// its literal path.
+/// one with a spread no reader states. The routes package also registers its
+/// order routes on an app of its own (`standalone.ts`), at the root. The
+/// mock answer states each route at its literal path.
 ///
 /// With the trace on, at the join point: the audit rows (in the host's
 /// service) and the admin rows (in the routes package) take the scope's
 /// prefix, corrected in place (row 4). The orders route is served by three
 /// hosts, one of which states no prefix that can be read: under Q5 (ii)
 /// (David, 2026-10-23) it takes the path the other two state, and the unread
-/// host is counted. No host's `basePrefix` value is ever read (2026-10-14
+/// host is counted; the package's own app serves it at `/orders` as well.
+/// No host's `basePrefix` value is ever read (2026-10-14
 /// ruling 1). Each corrected row's producer manifest entries take its new
 /// key and keep their alias. The routes package's documentation rows then
 /// fold onto the rows written in its own service; the two documenting the
@@ -679,6 +681,10 @@ fn routes_across_services_take_the_receiving_scope() {
             "packages/routes/src/docs.ts:4 GET /api/v1/orders descriptor_route __route_descriptor__",
             // Q5 (ii): the path two hosts state; the third is counted.
             "packages/routes/src/orders.ts:4 GET /api/v1/orders library_claim app",
+            // The package's own app serves the same routes at its root
+            // (PR #2734 review): that chain stays in the service, and its
+            // path stands beside the hosts'.
+            "packages/routes/src/orders.ts:4 GET /orders library_claim app",
             "packages/server/src/audit.ts:6 GET /api/v1/audit/events library_claim app",
             "packages/server/src/audit.ts:7 GET /api/v1/audit/events/:id library_claim app",
         ]
@@ -748,7 +754,7 @@ fn routes_across_services_take_the_receiving_scope() {
     assert_eq!(
         counts("routes"),
         vec![
-            "routes_across_added_untyped=2",
+            "routes_across_added_untyped=3",
             "routes_across_corrected=1",
             "routes_across_unread_host=1",
             // The package's own sites end at the plugin's parameter: the

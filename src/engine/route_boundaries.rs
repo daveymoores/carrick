@@ -41,8 +41,13 @@ pub(super) struct ServiceRoutes<'a> {
     pub(super) data: &'a mut CloudRepoData,
     /// Where its route chains leave it.
     pub(super) boundaries: &'a RouteBoundaries,
-    /// Analysed in this run, and so written. A carried or held-back service
-    /// is read for its boundaries and never changed.
+    /// Analysed in this run, and so written. A held-back service is read for
+    /// its boundaries and never changed. A carried one is never changed and
+    /// has no boundaries until carrick#2474 R5c: on `--changed-only`, a
+    /// route whose boundary only a carried service fills counts
+    /// `routes_across_untraced_unmatched_boundary` (or, where its site also
+    /// serves it in its own service, keeps that path and counts the
+    /// boundary as an unread host).
     pub(super) writable: bool,
 }
 
@@ -108,6 +113,7 @@ pub(super) fn settle(
             ("routes_across_owner_unknown", applied.owner_unknown),
             ("routes_trace_disagrees", applied.disagrees),
             ("routes_documented_conflict", applied.documented_conflict),
+            ("routes_across_twin", applied.twin),
         ] {
             if value > 0 {
                 *count.entry(key.to_string()).or_default() += value;
@@ -146,6 +152,12 @@ fn flat_row<'d>(
             && endpoint.dispatch == row.dispatch
             && endpoint.file_path == Path::new(&row.file_location)
     })
+}
+
+/// Whether an endpoint row written at `file:line` holds the possible call
+/// `call`: a call at that line whose role is not `consumer`.
+fn held_by_endpoint(call: &crate::possible_calls::PossibleCall, file: &str, line: u32) -> bool {
+    call.file_path == file && call.line_number == line && call.role.as_deref() != Some("consumer")
 }
 
 /// Whether `entry` is a producer manifest entry of `row` while it stated
@@ -202,7 +214,9 @@ fn write(
             flat.resolution_source = row.resolution_source;
         }
         // The key changes and the alias stays, as the call-through re-key
-        // does: the alias names the site the types were read at.
+        // does: the alias names the site the types were read at. Entries
+        // name a row only by file, line and key, so a twin the writer left
+        // at the old path (`routes_across_twin`) gives its entries up too.
         let key = OperationKey::http(
             &normalize_manifest_method(&row.method),
             row.full_path.clone(),
@@ -218,11 +232,13 @@ fn write(
     for index in write.added.clone() {
         let row = &graph.endpoints[index];
         endpoints.push(crate::cloud_storage::endpoint_details(row));
-        // A possible call at the line now has a row.
+        // A possible call at the line now has a row, unless it is a
+        // consumer's: an endpoint row is no call row (the in-service rule,
+        // `site_rows::fold_rows`).
         if let (Some(calls), Some((file, line))) =
             (possible_calls.as_mut(), file_and_line(&row.file_location))
         {
-            calls.retain(|call| !(call.file_path == file && call.line_number == line));
+            calls.retain(|call| !held_by_endpoint(call, file, line));
         }
     }
     if write.applied.added > 0 || write.applied.corrected > 0 {
@@ -252,4 +268,38 @@ fn write(
         write.applied.folded = FileOrchestrator::apply_documented_folds(graph, &folds);
     }
     write.applied
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::possible_calls::{PossibleCall, Unread, UnreadReason};
+
+    fn call(line: u32, role: Option<&str>) -> PossibleCall {
+        PossibleCall {
+            file_path: "src/a.ts".to_string(),
+            line_number: line,
+            span_start: 0,
+            span_end: 1,
+            kind: Some("http".to_string()),
+            role: role.map(str::to_string),
+            labelled_end: None,
+            unread: Unread {
+                slot: "path".to_string(),
+                reason: UnreadReason::NameNeverBound,
+            },
+            trace_depth: 0,
+        }
+    }
+
+    /// PR #2734 review: a row added at a line holds the possible calls of
+    /// a producer, or of no role, there; a consumer's call at that line is
+    /// no endpoint's and stays, as in one service (`site_rows::fold_rows`).
+    #[test]
+    fn an_added_row_keeps_a_consumers_possible_call_at_its_line() {
+        assert!(held_by_endpoint(&call(4, Some("producer")), "src/a.ts", 4));
+        assert!(held_by_endpoint(&call(4, None), "src/a.ts", 4));
+        assert!(!held_by_endpoint(&call(4, Some("consumer")), "src/a.ts", 4));
+        assert!(!held_by_endpoint(&call(5, Some("producer")), "src/a.ts", 4));
+    }
 }
