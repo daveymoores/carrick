@@ -4509,10 +4509,9 @@ export class TypeInferrer {
    * The rule that verifies a call's result as a request library's response
    * object, or undefined (carrick#2714). The result is that object when its
    * awaited type is one a rule recognises. It is that object too when the
-   * call states no type arguments, its declared signature has a type
-   * parameter that only its result mentions, and the result as declared
-   * (with that parameter's default, through the aliases it is written with)
-   * names a type a rule recognises (`get<T, R = Response<T>>(): Promise<R>`).
+   * call states no type arguments and its declared result, with its free
+   * type parameters at their defaults (`freeResultAtDefaults`), is a type a
+   * rule recognises (`get<T, R = Response<T>>(): Promise<R>`).
    * The compiler then takes the parameter from where the value goes
    * (`return client.post(…)` in a function declared `Promise<void>` types the
    * call `Promise<void>`), and that is the caller's claim about the object,
@@ -4527,32 +4526,40 @@ export class TypeInferrer {
     const direct = this.ruleRecognising(awaited, callExpr, extractionConfig);
     if (direct) return { rule: direct, contextual: false };
     if (callExpr.getTypeArguments().length > 0) return undefined;
-    for (const named of this.typesNamedByFreeResult(callExpr)) {
-      const rule = this.ruleRecognising(named, callExpr, extractionConfig);
-      if (rule) return { rule, contextual: true };
-    }
-    return undefined;
+    const declared = this.freeResultAtDefaults(callExpr);
+    const rule = declared ? this.ruleRecognising(declared, callExpr, extractionConfig) : undefined;
+    return rule ? { rule, contextual: true } : undefined;
   }
 
-  /** The first rule that matches `type` as a wrapper, whether or not it reads a payload. */
+  /**
+   * The first rule that matches `type` as a wrapper whose body is a member
+   * (`payloadPropertyPath`), whether or not it reads a payload out of it. A
+   * wrapper with no such member (the platform's `Response`) is read by its
+   * body reads (`res.json()`), which the def-use walk follows.
+   */
   private ruleRecognising(
     type: Type,
     node: Node,
     config: ExtractionConfig
   ): ExtractionRule | undefined {
     return config.rules.find(
-      (rule) => this.tryUnwrapWithRule(type, node, rule, config, 0).kind !== 'no-match'
+      (rule) =>
+        (rule.payloadPropertyPath?.length ?? 0) > 0 &&
+        this.tryUnwrapWithRule(type, node, rule, config, 0).kind !== 'no-match'
     );
   }
 
   /**
-   * The types a call's declared result names, where a type parameter of the
-   * declaration appears in its result and in none of its parameters, so only
-   * a type argument, the default or the call's return position can fix it.
-   * Read off the declared return type, the defaults of those parameters, and
-   * the type aliases they are written with (a bounded walk); empty otherwise.
+   * What a call's declared result is when its free type parameters take
+   * their defaults, or undefined. A parameter is free when the declaration's
+   * result mentions it and none of its parameters do, so only a type
+   * argument, the default or the call's return position can fix it. The
+   * result is read through `Promise`, a free parameter (its default), and a
+   * conditional alias whose check type is a free parameter tested against
+   * exactly that parameter's default (`R extends Default ? Response<T> : R`:
+   * the true branch). Anything else is the type as written.
    */
-  private typesNamedByFreeResult(callExpr: CallExpression): Type[] {
+  private freeResultAtDefaults(callExpr: CallExpression): Type | undefined {
     const declaration = this.project
       .getTypeChecker()
       .getResolvedSignature(callExpr)
@@ -4566,10 +4573,10 @@ export class TypeInferrer {
         Node.isCallSignatureDeclaration(declaration)
       )
     ) {
-      return [];
+      return undefined;
     }
     const returnNode = declaration.getReturnTypeNode();
-    if (!returnNode) return [];
+    if (!returnNode) return undefined;
     const referenced = (node: Node | undefined): Set<string> =>
       new Set(
         (node ? [node, ...node.getDescendants()] : [])
@@ -4580,29 +4587,42 @@ export class TypeInferrer {
     const inParameters = new Set(
       declaration.getParameters().flatMap((parameter) => [...referenced(parameter.getTypeNode())])
     );
-    const free = declaration
-      .getTypeParameters()
-      .filter((parameter) => inResult.has(parameter.getName()) && !inParameters.has(parameter.getName()));
-    if (free.length === 0) return [];
+    const free = new Map<string, Node | undefined>();
+    for (const parameter of declaration.getTypeParameters()) {
+      const name = parameter.getName();
+      if (inResult.has(name) && !inParameters.has(name)) free.set(name, parameter.getDefault());
+    }
+    if (free.size === 0) return undefined;
 
-    const named: Type[] = [];
-    const seen = new Set<Node>();
-    const walk = (node: Node | undefined, depth: number): void => {
-      if (!node || depth > 3 || seen.has(node)) return;
-      seen.add(node);
-      for (const reference of [node, ...node.getDescendants()].filter((n) => Node.isTypeReference(n))) {
-        named.push(reference.getType());
-        const alias = (reference as TypeReferenceNode)
-          .getTypeName()
-          .getSymbol()
-          ?.getDeclarations()
-          .find((d) => Node.isTypeAliasDeclaration(d));
-        if (alias && Node.isTypeAliasDeclaration(alias)) walk(alias.getTypeNode(), depth + 1);
+    const atDefaults = (node: Node | undefined, depth: number): Type | undefined => {
+      if (!node || depth > 4) return undefined;
+      if (!Node.isTypeReference(node)) return node.getType();
+      const name = node.getTypeName().getText();
+      if (free.has(name)) return atDefaults(free.get(name), depth + 1);
+      const args = node.getTypeArguments();
+      if ((name === 'Promise' || name === 'PromiseLike') && args.length === 1) {
+        return atDefaults(args[0], depth + 1);
       }
+      const alias = node
+        .getTypeName()
+        .getSymbol()
+        ?.getDeclarations()
+        .find((d) => Node.isTypeAliasDeclaration(d));
+      const conditional = alias && Node.isTypeAliasDeclaration(alias) ? alias.getTypeNode() : undefined;
+      if (alias && Node.isTypeAliasDeclaration(alias) && conditional && Node.isConditionalTypeNode(conditional)) {
+        const index = alias
+          .getTypeParameters()
+          .findIndex((parameter) => parameter.getName() === conditional.getCheckType().getText());
+        const argument = index >= 0 ? args[index] : undefined;
+        const tested = argument && Node.isTypeReference(argument) ? argument.getTypeName().getText() : undefined;
+        const defaulted = tested !== undefined ? free.get(tested) : undefined;
+        if (defaulted && conditional.getExtendsType().getText() === defaulted.getText()) {
+          return atDefaults(conditional.getTrueType(), depth + 1);
+        }
+      }
+      return node.getType();
     };
-    walk(returnNode, 0);
-    for (const parameter of free) walk(parameter.getDefault(), 0);
-    return named;
+    return atDefaults(returnNode, 0);
   }
 
   /**

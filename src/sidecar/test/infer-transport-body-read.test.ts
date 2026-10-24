@@ -58,9 +58,24 @@ export interface ResultClient {
   post<T = any, R = ResponseDefault, D = any>(url: string, body?: D): Promise<ResponseResult<T, R, D>>;
 }
 export declare const results: ResultClient;
+
+type ResponseMap = { raw: HttpResponse<unknown> };
+type MappedResult<R, J> = R extends keyof ResponseMap ? ResponseMap[R] : J;
+export interface BodyClient {
+  fetch<T = any, R extends string = "json">(url: string): Promise<MappedResult<R, T>>;
+}
+export declare const bodies: BodyClient;
+
+export interface WireResponse {
+  ok: boolean;
+  status: number;
+  headers: Record<string, string>;
+  json(): Promise<unknown>;
+}
+export declare function send(url: string): Promise<WireResponse>;
 `;
 
-const SERVICE_TS = `import { http, results, type HttpResponse } from "tiny-http";
+const SERVICE_TS = `import { http, results, bodies, send, type HttpResponse } from "tiny-http";
 
 export interface Widget {
   id: string;
@@ -113,6 +128,15 @@ export async function returnedAsVoidThroughResultAlias(): Promise<void> {
   return results.post("/v1/widgets/result-ping", {});
 }
 
+export async function bodyReturned(): Promise<Widget> {
+  return bodies.fetch("/v1/widgets/body");
+}
+
+export async function sentAndRead() {
+  const res = await send("/v1/widgets/sent");
+  return (await res.json()) as Widget;
+}
+
 declare function apiFetch(url: string): Promise<{ ok: boolean; json(): Promise<unknown> }>;
 
 export async function narrowedEnvelope(): Promise<{ data: Widget[] }> {
@@ -136,6 +160,12 @@ const EXTRACTION_CONFIG = {
       payloadPropertyPath: ['data'],
       unwrapRecursively: true,
       maxDepth: 4,
+    },
+    {
+      wrapperSymbols: ['WireResponse'],
+      machineryIndicators: ['headers', 'status', 'ok'],
+      originModuleGlobs: [HTTP_PACKAGE, `${HTTP_PACKAGE}/*`],
+      unwrapRecursively: false,
     },
   ],
 };
@@ -264,6 +294,18 @@ describe('carrick#2714: a consumer reads the body, never the transport response 
 
   it('a result written through a conditional alias, returned where the function declares Promise<void>, is a decided abstain', async () => {
     assertDecidedTransport(await infer('ResultVoid', 'results.post("/v1/widgets/result-ping", {})'));
+  });
+
+  it('a client that returns the body by default is not read as the response object another branch names', async () => {
+    const inferred = await infer('BodyClient', 'bodies.fetch("/v1/widgets/body")');
+    assert.strictEqual(inferred.type_string, 'Widget', JSON.stringify(inferred));
+    assert.deepStrictEqual((inferred.any_provenance ?? []).filter((p) => p.path === ''), []);
+  });
+
+  it('a response whose rule names no payload member is read by its body read, as before', async () => {
+    const inferred = await infer('Sent', 'send("/v1/widgets/sent")');
+    assert.strictEqual(collapse(inferred.type_string), WIDGET, JSON.stringify(inferred));
+    assert.strictEqual(inferred.is_explicit, true);
   });
 
   it('a call that states its payload type keeps that payload', async () => {
