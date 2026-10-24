@@ -3564,6 +3564,10 @@ mod tests {
         let got = composed_lines(&decided, false);
         let want = texts(&[
             "src/admin.ts:8 <- /admin/stats",
+            // A router exported under another name than its local, mounted
+            // in another module: composed through that mount, not served at
+            // the top (carrick#2474 R3).
+            "src/aliased.ts:8 <- /api/v1/w",
             "src/extra.ts:9 <- /a/pong",
             "src/extra.ts:9 <- /b/pong",
             "src/index.ts:14 <- /bare",
@@ -3607,6 +3611,7 @@ mod tests {
         let bare = composed_lines(&unverified, false);
         for kept in [
             "src/users.ts:8 <- / (mount_unverified)",
+            "src/aliased.ts:8 <- /w (mount_unverified)",
             "src/index.ts:46 <- /s (mount_unverified)",
             "src/index.ts:19 <- /health",
             "src/index.ts:14 <- /bare (runs_by_library)",
@@ -3656,6 +3661,7 @@ mod tests {
             served,
             texts(&[
                 "src/admin.ts:8 GET /stats <- /admin/stats",
+                "src/aliased.ts:8 GET /w <- /api/v1/w",
                 "src/extra.ts:9 POST /pong <- /a/pong /b/pong",
                 "src/index.ts:14 GET /bare <- /bare",
                 "src/index.ts:19 GET /health <- /health",

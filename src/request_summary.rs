@@ -1364,6 +1364,11 @@ pub struct FileIr {
     /// only by the receiver trace, through the declaration the compiler
     /// names at a use, which tells the two bindings apart.
     shadowed_clients: HashMap<String, ClientRef>,
+    /// Each module-scope `const` whose initialiser is only a name
+    /// (`export const alias = web`), by binding, with that name: read only
+    /// by the receiver trace, which follows an import of `alias` to the
+    /// instance `web` holds ([`Self::module_instance`], carrick#2474 R3).
+    module_aliases: HashMap<String, String>,
     /// Every import binding the file uses, with how it uses it. What a module
     /// that declares one of them holds is changed by these uses too.
     imported: HashMap<String, BindingUse>,
@@ -1516,6 +1521,28 @@ struct OwnGetter {
 }
 
 impl FileIr {
+    /// The instance the module-scope binding `name` holds, through each
+    /// `const` that only names another binding ([`Self::module_aliases`]):
+    /// `export const alias = web` holds what `web` holds (carrick#2474 R3).
+    fn module_instance(&self, name: &str) -> Option<&ClientRef> {
+        let mut name = name;
+        let mut seen: Vec<&str> = Vec::new();
+        loop {
+            if let Some(client) = self
+                .module_clients
+                .get(name)
+                .or_else(|| self.shadowed_clients.get(name))
+            {
+                return Some(client);
+            }
+            if seen.contains(&name) {
+                return None;
+            }
+            seen.push(name);
+            name = self.module_aliases.get(name)?;
+        }
+    }
+
     /// A span start this file's [`BindingUse`]s record (discovery
     /// numbering) in SWC numbering, as [`Site::span_start`] is.
     pub(crate) fn swc_start(&self, lo: u32) -> u32 {
@@ -1774,6 +1801,13 @@ pub fn extract_file_ir(
                         && let Some(HeldInstance::Returned(lo, hi)) = returned_call(init)
                     {
                         module_scope.returned_consts.insert(name.clone(), (lo, hi));
+                    }
+                    if client.is_none()
+                        && let Expr::Ident(target) =
+                            crate::graphql_document_sites::unwrap_expression(init)
+                    {
+                        file.module_aliases
+                            .insert(name.clone(), target.sym.to_string());
                     }
                     if let Some(client) = client {
                         let client = module_scope.with_uses(client, &name);

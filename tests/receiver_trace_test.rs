@@ -307,6 +307,7 @@ fn traced_routes_take_their_composed_paths() {
         possible_calls(&off),
         vec![
             "src/admin.ts:8 get",
+            "src/aliased.ts:8 get",
             "src/extra.ts:9 post",
             "src/index.ts:46 get",
             "src/reports.ts:9 get",
@@ -322,6 +323,9 @@ fn traced_routes_take_their_composed_paths() {
         graph,
         vec![
             "src/admin.ts:8 GET /admin/stats library_claim admin",
+            // Built as `web`, exported as `aliased`, mounted at `/api/v1`: the
+            // instance is read through the export and both ends are verified.
+            "src/aliased.ts:8 GET /api/v1/w library_claim web",
             "src/extra.ts:9 POST /a/pong library_claim shared",
             "src/extra.ts:9 POST /b/pong library_claim shared",
             "src/index.ts:14 GET /bare library_claim app",

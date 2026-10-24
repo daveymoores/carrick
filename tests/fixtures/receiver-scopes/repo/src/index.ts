@@ -45,3 +45,7 @@ withOptions(app);
 const sub = router();
 sub.get("/s", ok);
 app.attach(sub);
+// A router exported under another name than its local, mounted under a
+// prefix here (imported last so the lines above keep their numbers).
+import { aliased } from "./aliased";
+app.route("/api/v1", aliased);
