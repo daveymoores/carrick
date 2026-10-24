@@ -1062,7 +1062,8 @@ export interface ListedSurface {
  * array of `[package, exports]` for every surface that listed at least one
  * export, sorted by `package` (code unit order). A specifier that lists
  * nothing (unresolved, local, no value exports) is left out, so asking for a
- * subpath a version does not have changes nothing. Type text already names
+ * subpath a version does not have changes nothing. Handler members are not
+ * hashed. Type text already names
  * the request's directory as `<root>`.
  */
 export function fullSurfaceSha256(surfaces: readonly LibrarySurface[]): string {
@@ -1070,7 +1071,10 @@ export function fullSurfaceSha256(surfaces: readonly LibrarySurface[]): string {
     .filter(surface => surface.reason === undefined && surface.exports.length > 0)
     .map(surface => [surface.package, surface.exports] as const)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  return crypto.createHash('sha256').update(JSON.stringify(listed)).digest('hex');
+  // A member's `handlers` (carrick#2674) is out of the hash at every depth, so
+  // a package's key does not change when the lister learns to list them.
+  const text = JSON.stringify(listed, (key, value) => (key === 'handlers' ? undefined : value));
+  return crypto.createHash('sha256').update(text).digest('hex');
 }
 
 function exportKey(check: { package: string; export: string }): string {

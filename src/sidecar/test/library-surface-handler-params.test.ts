@@ -12,7 +12,10 @@ import * as assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 import { SidecarClient } from './helpers.js';
+import { fullSurfaceSha256 } from '../src/library-claims.js';
+import type { LibrarySurface } from '../src/types.js';
 
 const TSCONFIG = JSON.stringify({
   compilerOptions: {
@@ -63,6 +66,18 @@ ${VERBS.map(verb => `  ${verb}(path: string, handler: Handle): this;`).join('\n'
 }
 export declare function big(): Big;
 `;
+
+// A package with no function-taking member: it lists no handlers, so its
+// hash is the one the lister gave before handlers were listed (taken from the
+// lister of the commit before carrick#2674 S3).
+const PLAIN = `export interface Store {
+  get(key: string): string | undefined;
+  set(key: string, value: string): this;
+  size: number;
+}
+export declare function store(): Store;
+`;
+const PLAIN_SHA256 = 'fdcafa087f195f0aa200868c56992380a4439b554da8eb586881a3fa542b5497';
 
 interface HandlerMember {
   path: string[];
@@ -116,7 +131,7 @@ describe('list_library_surface: handler parameter members (carrick#2674 S3)', ()
       'package.json': JSON.stringify({ name: 'svc' }),
       'src/index.ts': 'export const service = 1;\n',
     };
-    for (const [name, text] of [['fixture-routes', ROUTES], ['fixture-big', BIG]]) {
+    for (const [name, text] of [['fixture-routes', ROUTES], ['fixture-big', BIG], ['fixture-plain', PLAIN]]) {
       files[`node_modules/${name}/package.json`] = JSON.stringify({ name, version: '1.0.0', types: 'index.d.ts' });
       files[`node_modules/${name}/index.d.ts`] = text;
     }
@@ -203,5 +218,47 @@ describe('list_library_surface: handler parameter members (carrick#2674 S3)', ()
       0
     );
     assert.strictEqual(shortEntries, handlerEntries - 1);
+  });
+
+  it('keeps handlers out of the full-surface hash, at every depth', async () => {
+    const response = await client.send<{ status: string; surfaces: Surface[]; surface_sha256: string }>(
+      { request_id: `s-${requestId++}`, action: 'list_library_surface', from_dir: root, packages: ['fixture-routes'] },
+      60_000
+    );
+    const [routes] = response.surfaces;
+    assert.ok(membersOf(routes).some(m => m.handlers !== undefined), 'the fixture lists no handlers');
+    const stripped = JSON.parse(JSON.stringify(routes, (key, value) => (key === 'handlers' ? undefined : value))) as Surface;
+    const expected = crypto
+      .createHash('sha256')
+      .update(JSON.stringify([[routes.package, stripped.exports]]))
+      .digest('hex');
+    assert.strictEqual(response.surface_sha256, expected);
+    const withHandlers = crypto
+      .createHash('sha256')
+      .update(JSON.stringify([[routes.package, routes.exports]]))
+      .digest('hex');
+    assert.notStrictEqual(response.surface_sha256, withHandlers);
+  });
+
+  it('hashes a package with no handlers as the lister did before it listed them', async () => {
+    const response = await client.send<{ status: string; surfaces: Surface[]; surface_sha256: string }>(
+      { request_id: `s-${requestId++}`, action: 'list_library_surface', from_dir: root, packages: ['fixture-plain'] },
+      60_000
+    );
+    assert.ok(membersOf(response.surfaces[0]).every(m => m.handlers === undefined));
+    assert.strictEqual(response.surface_sha256, PLAIN_SHA256);
+  });
+
+  it('hashes a surface the same with and without handlers', () => {
+    const member = (handlers?: unknown) => ({ name: 'get', own: true, ...(handlers ? { handlers } : {}), signatures: [] });
+    const surface = (members: unknown[]): LibrarySurface =>
+      ({ package: 'p', exports: [{ export: 'x', receivers: [{ receiver: 'r', members }] }] }) as unknown as LibrarySurface;
+    const handlers = [{ arg: 1, params: [{ param: 0, name: 'request', type: 'R', members: [] }] }];
+    assert.strictEqual(fullSurfaceSha256([surface([member(handlers)])]), fullSurfaceSha256([surface([member()])]));
+    // Another field of the member still moves the hash.
+    assert.notStrictEqual(
+      fullSurfaceSha256([surface([{ ...member(), own: false }])]),
+      fullSurfaceSha256([surface([member()])])
+    );
   });
 });
