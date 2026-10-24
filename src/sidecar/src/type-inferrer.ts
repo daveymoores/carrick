@@ -3855,7 +3855,12 @@ export class TypeInferrer {
       // `response.json()` is one in place.
       const callValueIsTransport = this.typeIsOrContainsResponseMachinery(callValue);
       const startPos = callExpr.getStart();
-      const candidates = this.collectDefUseNodes(func);
+      const candidates = this.catchReadsDeferred(
+        this.collectDefUseNodes(func),
+        func,
+        startPos,
+        currentNames
+      );
 
       for (const expr of candidates) {
         if (expr.getStart() <= startPos) continue;
@@ -3980,6 +3985,39 @@ export class TypeInferrer {
     }
 
     return { terminal: callExpr, projectionOnly: false, projections: [] };
+  }
+
+  /**
+   * carrick#2756: what a `catch` clause does with the response describes a
+   * body that failed to read (`catch (e) { log(await res.text()); throw e }`),
+   * not the payload, yet it comes after the success read and would win as the
+   * last whole read. Where the source uses the tracked value anywhere outside
+   * a `catch` clause that does not hold the call, the clause's uses are left
+   * out of the walk. Where every use is in such a clause the walk is as it was.
+   */
+  private catchReadsDeferred(
+    candidates: Node[],
+    func: Node,
+    startPos: number,
+    names: string[]
+  ): Node[] {
+    const inLaterCatch = (node: Node): boolean =>
+      node
+        .getAncestors()
+        .some(
+          (a) =>
+            Node.isCatchClause(a) &&
+            a.getStart() > startPos &&
+            a.getAncestors().includes(func)
+        );
+    const usesOutside = candidates.some(
+      (c) =>
+        c.getStart() > startPos &&
+        Node.isIdentifier(c) &&
+        this.isIdentifierUsage(c, names) &&
+        !inLaterCatch(c)
+    );
+    return usesOutside ? candidates.filter((c) => !inLaterCatch(c)) : candidates;
   }
 
   /**
