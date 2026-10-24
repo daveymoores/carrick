@@ -82,6 +82,13 @@ pub struct FactFiles {
     pub listed: BTreeMap<String, BTreeSet<(u32, u32)>>,
     /// What discovery recorded at each call, by file and SWC span.
     pub calls: BTreeMap<(String, u32, u32), Followed>,
+    /// The lines of the calls made through an export the store labels a
+    /// server framework, or through an instance one built, by file
+    /// (carrick#2745). A route registration (`app.get("/x", handler)`) has a
+    /// request's shape; the role the store gives the export is what tells
+    /// them apart. The orchestrator keeps these calls out of the request
+    /// members it joins to callers.
+    pub server_framework_calls: BTreeMap<String, BTreeSet<u32>>,
     /// Packages the first answer left without exports.
     pub unanswered_packages: usize,
     /// The ask got no answer at all.
@@ -158,11 +165,22 @@ impl FactFiles {
         }
         if let Some(library) = library {
             for site in &library.sites {
+                let relative = site.file.strip_prefix(root).unwrap_or(&site.file);
+                let file = relative.to_string_lossy().replace('\\', "/");
+                if first.exports.iter().any(|claim| {
+                    claim.role == LibraryRole::ServerFramework
+                        && claim.specifier == site.specifier
+                        && claim.export == site.export
+                }) {
+                    facts
+                        .server_framework_calls
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(site.line);
+                }
                 if !first.unanswered.contains(site.package()) {
                     continue;
                 }
-                let relative = site.file.strip_prefix(root).unwrap_or(&site.file);
-                let file = relative.to_string_lossy().replace('\\', "/");
                 facts.select(&file, (site.span_start, site.span_end), true);
                 facts.files.entry(file).or_default().unanswered_package = true;
             }
@@ -202,6 +220,16 @@ impl FactFiles {
             count(|why| why.lead),
             count(|why| why.unanswered_package),
         )
+    }
+
+    /// Whether the call on `line` of `module` is made through a server
+    /// framework export or an instance one built (carrick#2745). `module` is
+    /// compared component-wise by its tail, so a canonical path still matches
+    /// the repo-relative key.
+    pub fn server_framework_call(&self, module: &Path, line: u32) -> bool {
+        self.server_framework_calls
+            .iter()
+            .any(|(file, lines)| module.ends_with(Path::new(file)) && lines.contains(&line))
     }
 
     /// What discovery recorded at the call at `span` in `file`, or `None`
@@ -393,5 +421,68 @@ mod tests {
         assert_eq!(facts.followed("g.ts", (2, 6)), Some(&Followed::Finished));
         assert!(facts.followed("f.ts", (1, 4)).unwrap().short());
         assert!(!Followed::Finished.short());
+    }
+
+    /// carrick#2745: a route registration and a client call have the same
+    /// shape; the store's role for the export is what separates them.
+    #[test]
+    fn a_call_through_a_server_framework_export_is_recorded_by_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        std::fs::write(
+            root.join("package.json"),
+            "{ \"name\": \"service\", \"dependencies\": { \"@fixture/server\": \"^1.0.0\", \"@fixture/http\": \"^1.0.0\" } }\n",
+        )
+        .expect("write manifest");
+        let files = [
+            (
+                "src/app.ts",
+                "import server from \"@fixture/server\";\n\nexport function create() {\n  const srv = server();\n  srv.get(\"/health\", () => \"ok\");\n  return srv;\n}\n",
+            ),
+            (
+                "src/status.ts",
+                "import http from \"@fixture/http\";\n\nexport function read() {\n  return http.get(\"/api/v1/status\");\n}\n",
+            ),
+        ];
+        for (name, source) in files {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(&path, source).expect("write source");
+        }
+        let sites = super::super::library_sites::library_sites(
+            &crate::engine::discover_request_inputs(&root),
+        );
+        let claim = |package: &str, role: &str| {
+            serde_json::json!({
+                "package": package, "version": "1.0.0", "status": "answered",
+                "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "exports": [{
+                    "specifier": package, "export": "default", "role": role,
+                    "side": null, "classifier": "fixture-classifier", "makes": [],
+                    "scopes": [], "ops": [], "reserved": [], "calls": [], "patterns": []
+                }]
+            })
+        };
+        let text = serde_json::json!({
+            "library_claims": [
+                claim("@fixture/server", "server_framework"),
+                claim("@fixture/http", "http_client"),
+            ]
+        })
+        .to_string();
+        let first = FirstAnswer {
+            exports: crate::library_store::parse_answer(&text).exports,
+            ..FirstAnswer::default()
+        };
+        let facts = FactFiles::of(
+            &Discovery::default(),
+            &Decided::default(),
+            Some(&sites),
+            &first,
+            &root,
+        );
+        assert!(facts.server_framework_call(&root.join("src/app.ts"), 5));
+        assert!(!facts.server_framework_call(&root.join("src/status.ts"), 4));
+        assert!(!facts.server_framework_call(&root.join("src/other/app.ts"), 5));
     }
 }
