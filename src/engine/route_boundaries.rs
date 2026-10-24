@@ -231,10 +231,10 @@ fn write(
         let added = write.added.clone();
         let folds = FileOrchestrator::documented_folds_onto(graph, |index| !added.contains(&index));
         for (index, row) in graph.endpoints.iter().enumerate() {
-            if folds.folded_into[index] {
-                if let Some(flat) = flat_row(endpoints, row, &row.full_path) {
-                    flat.resolution_source = Some(ResolutionSource::DescriptorRoute);
-                }
+            if folds.folded_into[index]
+                && let Some(flat) = flat_row(endpoints, row, &row.full_path)
+            {
+                flat.resolution_source = Some(ResolutionSource::DescriptorRoute);
             }
             if folds.drop[index] {
                 let key = OperationKey::http(&row.method, row.full_path.clone());
