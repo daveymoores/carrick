@@ -8644,8 +8644,9 @@ impl FileOrchestrator {
     /// request into a name.
     ///
     /// A model row with no span (its id joined no candidate) is placed by its
-    /// line (carrick#2281): at the one outermost call that opens there, when
-    /// the row's own text writes that call ([`crate::call_through::FileCalls`]).
+    /// line and text (carrick#2281, carrick#2726): at the call covering its
+    /// line that the row's own text opens with
+    /// ([`crate::call_through::FileCalls::written_at`]).
     /// `content` is the file the candidates' spans were read from; it is
     /// parsed only when such a row is in the file.
     pub(crate) fn withdraw_silent_sites(

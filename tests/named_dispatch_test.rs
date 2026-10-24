@@ -141,10 +141,13 @@ fn as_stated(target: &str) -> Vec<(String, String, String)> {
 /// A call of a function that only stores a handler under a name in a
 /// `new Map()` the module builds and never replaces sends nothing, at module
 /// level, whichever order it takes the handler and the name in, and on the
-/// opening line of a call written over three lines.
+/// opening line or an inner line of a call written over three lines whose
+/// text the row writes (carrick#2726). A row whose text opens with an
+/// argument's call that sends nothing (`withAudit` hands back its argument)
+/// is placed there and goes too.
 #[test]
 fn a_registration_into_a_language_collection_states_no_row() {
-    for line in [16, 17, 18] {
+    for line in [16, 17, 18, 20, 22] {
         assert_eq!(rows_at(HANDLERS, line), vec![], "{HANDLERS}:{line}");
     }
 }
@@ -165,13 +168,10 @@ fn a_span_carrying_row_at_a_registration_goes_too() {
     assert_eq!(rows_at(USE, 8), vec![]);
 }
 
-/// What the placement cannot vouch for keeps the model's row: a row on an
-/// inner line of a multi-line call, one whose text writes an argument's call,
-/// one at a chain whose outermost call is not the registration.
+/// What the placement cannot vouch for keeps the model's row: one at a chain
+/// whose outermost call is not the registration.
 #[test]
 fn a_row_the_placement_cannot_vouch_for_stays() {
-    assert_eq!(rows_at(HANDLERS, 20), as_stated("/orders.save.inner"));
-    assert_eq!(rows_at(HANDLERS, 22), as_stated("/orders.audit"));
     assert_eq!(rows_at(HANDLERS, 23), as_stated("/orders.later"));
 }
 

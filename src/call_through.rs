@@ -782,18 +782,36 @@ impl FileCalls {
         })
     }
 
-    /// The span start of the call a model row with no span was recorded at
-    /// ([`place`]), when the row's own call text writes that call: it holds
-    /// the call's callee followed by `(`, whitespace aside. A row with no
-    /// text, one whose text writes another call (an argument of the call,
-    /// say), or one at a chain of calls, names none.
+    /// The span start of the call a model row with no span was recorded at:
+    /// the call its own text opens with (carrick#2726), the one the span join
+    /// would reach. Among the calls whose extent covers the row's line, those
+    /// whose callee followed by `(` begins the row's text, whitespace aside;
+    /// the outermost of them when there is one. A row with no text, one whose
+    /// text opens with no call covering its line, or one at a chain of calls,
+    /// names none.
     pub(crate) fn written_at(&self, row: &DataCallResult) -> Option<u32> {
         if row.call_expression_span_start.is_some() {
             return None;
         }
-        let call = place(&self.calls, row)?;
-        let callee = self.callees.get(&call.span())?;
+        let line = u32::try_from(row.line_number).ok()?;
         let text = squeeze(row.call_expression_text.as_deref()?);
+        let opening: Vec<&CallExtent> = self
+            .calls
+            .iter()
+            .filter(|call| call.line <= line && line <= call.last_line)
+            .filter(|call| {
+                self.callees
+                    .get(&call.span())
+                    .is_some_and(|callee| text.starts_with(&format!("{callee}(")))
+            })
+            .collect();
+        let mut outermost = opening
+            .iter()
+            .filter(|call| !opening.iter().any(|other| other.contains(call)));
+        let call = outermost.next()?;
+        if outermost.next().is_some() {
+            return None;
+        }
         // A chain (`register(…).then(…)`) opens where its first call does, and
         // a silent site is known by its start alone: the outer call would read
         // as the inner one.
@@ -801,7 +819,7 @@ impl FileCalls {
             .calls
             .iter()
             .any(|other| other.lo == call.lo && other.span() != call.span());
-        (!chained && text.contains(&format!("{callee}("))).then_some(call.lo)
+        (!chained).then_some(call.lo)
     }
 }
 

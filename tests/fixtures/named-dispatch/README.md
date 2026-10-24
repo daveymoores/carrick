@@ -24,12 +24,14 @@ under test raises no candidate unless stated, so its row keeps the `@line:N`
 id it was written with, joins nothing, and has no span: it is placed by its
 line.
 
-Withdrawn: `handlers.ts` lines 16, 17 and 18 (the opening line of a call over
-three lines), `bound.ts` line 7, and `use.ts` line 8 (an awaited call with a
-string first argument raises a candidate, so that row has a span).
+Withdrawn: `handlers.ts` lines 16, 17, 18 and 20 (the opening line and an
+inner line of a call over three lines, whose text the row writes: a row is
+placed at the call its text opens with, carrick#2726), 22 (the row's text
+opens with the argument's call, `withAudit`, which sends nothing),
+`bound.ts` line 7, and `use.ts` line 8 (an awaited call with a string first
+argument raises a candidate, so that row has a span).
 
-Kept as stated: `handlers.ts` line 20 (an inner line of the three-line call),
-22 (the row's text writes the argument's call), 23 (a chain), 24 to 27 (maps
+Kept as stated: `handlers.ts` line 23 (a chain), 24 to 27 (maps
 the module cannot vouch for, and a call nothing resolves); `bound.ts` lines 8
 (a route written into a callable that may send) and 9 (a factory that sends);
 `use.ts` lines 12 (the dispatcher calls the handler) and 16 (a route written

@@ -16407,12 +16407,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     }
 
     /// carrick#2281: a model row whose id joined no candidate has no span. It
-    /// is placed by its line, at the one outermost call opening there, and
-    /// withdrawn when that call is silent and the row's text writes it. The
-    /// silent set and the placement count in the same units, so a row at a
-    /// silent call goes. A row on an inner line of a multi-line call, at a
-    /// chain whose outermost call is not silent, with text naming an
-    /// argument's call, or with no text, stays.
+    /// is placed at the call covering its line that its text opens with
+    /// (carrick#2726), and withdrawn when that call is silent. The silent set
+    /// and the placement count in the same units, so a row at a silent call
+    /// goes: on the call's first line or an inner one, and at an argument's
+    /// call (`withAudit` sends nothing) when the text opens with it. A row at
+    /// a chain whose outermost call is not silent, or with no text, stays.
     #[test]
     fn a_model_row_with_no_span_is_withdrawn_at_the_silent_call_its_line_opens() {
         use crate::agents::file_analyzer_agent::{
@@ -16493,17 +16493,82 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             .iter()
             .map(|call| (call.line_number, call.call_expression_text.as_deref()))
             .collect();
-        assert_eq!(withdrawn, 3, "kept: {kept:?}");
+        assert_eq!(withdrawn, 5, "kept: {kept:?}");
         assert_eq!(
             kept,
             vec![
-                (10, Some(multi_line)),
-                (12, Some("withAudit(listOrders)")),
                 (13, Some("register(listOrders, \"orders.then\")")),
                 (13, Some(chain)),
                 (7, None),
             ]
         );
+    }
+
+    /// carrick#2726: a model row with no span is placed at the call its own
+    /// text opens with, among the calls whose extent covers its line: the
+    /// call the span join reaches. A row on the line of an injected inner
+    /// call whose text writes the whole silent outer call goes; a row whose
+    /// text is the inner call alone stays.
+    #[test]
+    fn a_model_row_with_no_span_is_placed_at_the_call_its_text_opens_with() {
+        use crate::agents::file_analyzer_agent::{
+            DataCallResult, FileAnalysisResult, ResolutionSource,
+        };
+        let use_source = "function check(value: unknown, label: string) {\n  return label.length > 0 ? value : undefined;\n}\n\nexport async function remove(deps: { del: (id: string) => Promise<unknown> }, id: string) {\n  check(\n    await deps.del(id),\n    \"label\",\n  );\n}\n";
+        let (dir, discovery) = discover_sources(&[("src/use.ts", use_source)]);
+        let path = dir.path().join("src/use.ts");
+        let silent = summaries_of(&discovery)
+            .silent(&path)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            silent.contains(&site_start(use_source, "check(\n    await")),
+            "the local `check` sends nothing: {silent:?}"
+        );
+        let row = |text: &str| DataCallResult {
+            candidate_id: "@line:7".to_string(),
+            line_number: 7,
+            target: "/stated/:id".to_string(),
+            method: Some("DELETE".to_string()),
+            call_kind: None,
+            pattern_matched: String::new(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: Some(text.to_string()),
+            call_expression_line: Some(7),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            dispatch: None,
+            resolution_source: Some(ResolutionSource::Model),
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+        };
+        let whole = "check(\n    await deps.del(id),\n    \"label\",\n  )";
+        let mut result = FileAnalysisResult {
+            data_calls: vec![row(whole), row("deps.del(id)")],
+            ..Default::default()
+        };
+        let withdrawn = crate::agents::file_orchestrator::FileOrchestrator::withdraw_silent_sites(
+            &mut result,
+            &silent,
+            &path,
+            use_source,
+        );
+        let kept: Vec<Option<&str>> = result
+            .data_calls
+            .iter()
+            .map(|call| call.call_expression_text.as_deref())
+            .collect();
+        assert_eq!(withdrawn, 1, "kept: {kept:?}");
+        assert_eq!(kept, vec![Some("deps.del(id)")]);
     }
 
     /// The (line, method, target) of every summary row `file` states.
