@@ -254,17 +254,19 @@ pub(super) struct Pass<'w, 'a> {
     pub(super) site_labels: &'w [SiteLabel],
 }
 
+/// A procedure site the walk reached (by its labelled call's file and
+/// span) with the key path that names it, or why none does (`unread_key`,
+/// `walk_stopped`), and its owner.
+type Leaf = (
+    (String, u32, u32),
+    Result<String, &'static str>,
+    Option<String>,
+);
+
 /// What the walk down one adapter's collection reached.
 #[derive(Default)]
 struct Reached {
-    /// Each procedure site (by its labelled call's file and span) with the
-    /// key path that names it, or why none does (`unread_key`,
-    /// `walk_stopped`), and its owner.
-    leaves: Vec<(
-        (String, u32, u32),
-        Result<String, &'static str>,
-        Option<String>,
-    )>,
+    leaves: Vec<Leaf>,
     /// Each value the walk stopped at with no procedure to count it on: a
     /// name of this service it could not read the binding of, a function
     /// of this service whose returns it could not read, or the depth cap.
