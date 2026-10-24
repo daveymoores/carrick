@@ -106,6 +106,14 @@ const NESTED: &str = "function makeSender(): (path: string) => Promise<void> {\n
 
 const TRACED: &str = "import relay from \"@fixture/relay\";\nimport span from \"@fixture/span\";\n\nasync function traced(url: string): Promise<void> {\n  span(() => relay(url));\n}\n\nexport async function go(): Promise<void> {\n  await traced(\"/traced\");\n}\n";
 
+const REGISTERS: &str = "import server from \"@fixture/server\";\n\nfunction health(): string {\n  return \"ok\";\n}\n\nexport function createServer() {\n  const srv = server();\n  srv.get(\"/health\", () => health());\n  return srv;\n}\n";
+
+const REGISTERS_CALLER: &str = "import { createServer } from \"./registers\";\n\nexport function start() {\n  return createServer();\n}\n";
+
+const STATUS: &str = "import send from \"@fixture/http\";\n\nexport function readStatus(): Promise<unknown> {\n  return send(\"/api/v1/status\", { method: \"GET\" });\n}\n";
+
+const POLL: &str = "import { readStatus } from \"./status\";\n\nexport function poll(): void {\n  void readStatus();\n}\n";
+
 /// An answer the reader gives for one file, keyed by its stem.
 fn canned_answer(repo: &Path, stem: &str, answer: serde_json::Value) {
     let dir = repo.join("__llm__/analyze-file");
@@ -149,6 +157,22 @@ fn repo(tmp: &Path) -> PathBuf {
         "declare function span<T>(work: () => T): T;\nexport default span;\n",
     );
     fs::write(repo.join("src/traced.ts"), TRACED).unwrap();
+    add_package(
+        &repo,
+        "@fixture/server",
+        "1.0.0",
+        "export interface App {\n  get(path: string, handler: () => string): void;\n}\ndeclare function server(): App;\nexport default server;\n",
+    );
+    add_package(
+        &repo,
+        "@fixture/http",
+        "1.0.0",
+        "declare function send(target: string, init?: { method?: string }): Promise<unknown>;\nexport default send;\n",
+    );
+    fs::write(repo.join("src/registers.ts"), REGISTERS).unwrap();
+    fs::write(repo.join("src/registers_caller.ts"), REGISTERS_CALLER).unwrap();
+    fs::write(repo.join("src/status.ts"), STATUS).unwrap();
+    fs::write(repo.join("src/poll.ts"), POLL).unwrap();
     canned_answer(
         &repo,
         "notify",
@@ -209,6 +233,20 @@ fn repo(tmp: &Path) -> PathBuf {
             "ops": [], "reserved": [], "calls": [], "patterns": []
         }]
     }));
+    for (package, role, side) in [
+        ("@fixture/server", "server_framework", Some("server")),
+        ("@fixture/http", "http_client", None),
+    ] {
+        claims.push(serde_json::json!({
+            "package": package, "version": "1.0.0", "status": "answered",
+            "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "exports": [{
+                "specifier": package, "export": "default", "role": role,
+                "side": side, "classifier": "fixture-classifier", "makes": [], "scopes": [],
+                "ops": [], "reserved": [], "calls": [], "patterns": []
+            }]
+        }));
+    }
     claims.push(serde_json::json!({
         "package": "@fixture/slow", "version": "1.0.0", "status": "pending",
         "reason": "lister_unavailable"
@@ -583,4 +621,46 @@ fn a_kept_candidate_reaches_the_imported_member_join() {
         assert_eq!(row["method"], "PUT", "{name}: {row}");
         assert_eq!(row["path"], "/api/v2/items/:item", "{name}: {row}");
     }
+}
+
+/// carrick#2745: a route registration has a request's shape
+/// (`srv.get("/health", handler)`); the store's role for the export tells
+/// them apart. The callee registers a route, so no call row is stated at its
+/// caller; a callee that sends a request keeps its row.
+#[test]
+fn a_callee_that_registers_a_route_states_no_call_at_its_caller() {
+    let on = choosing();
+    let at = |scan: &Scan, file: &str, line: i64| -> Vec<serde_json::Value> {
+        scan.calls
+            .iter()
+            .filter(|call| {
+                call["file"].as_str().is_some_and(|f| f.ends_with(file))
+                    && call["line"].as_i64() == Some(line)
+            })
+            .cloned()
+            .collect()
+    };
+    let registered = at(on, "registers_caller.ts", 4);
+    assert!(
+        registered.is_empty(),
+        "a route registration is not a request: {registered:#?}"
+    );
+    let polled = at(on, "poll.ts", 4);
+    assert_eq!(
+        polled.len(),
+        1,
+        "the control keeps its row: {:#?}",
+        on.calls
+    );
+    assert_eq!(polled[0]["method"], "GET", "{}", polled[0]);
+    assert_eq!(polled[0]["path"], "/api/v1/status", "{}", polled[0]);
+    assert!(
+        on.log_has(&["is a server-framework call", "registers.ts:9"]),
+        "the drop is logged: {}",
+        on.log
+    );
+    assert!(
+        !recording().log_has(&["is a server-framework call"]),
+        "the off arm does not run the filter"
+    );
 }
