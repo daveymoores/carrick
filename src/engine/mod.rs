@@ -5416,6 +5416,7 @@ async fn dispatch_rows_of(
         unanswered_records = made("records_unanswered"),
         rows_fact = made("rows_fact"),
         rows_model = made("rows_model"),
+        rows_below_band = made("rows_below_band"),
         not_a_route = made("not_a_route"),
         leads = rows.leads.len() as u64,
         leads_by_reason = ?leads_by_reason,
