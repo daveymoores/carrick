@@ -104,6 +104,29 @@ export async function removeOrder(): Promise<void> {
   }
 }
 
+export async function catchLogsText(): Promise<Order> {
+  const res = await fetch("/orders/catch-logs-text");
+  try {
+    const j = (await res.json()) as Order;
+    return j;
+  } catch (e) {
+    console.log(await res.text());
+    throw e;
+  }
+}
+
+export async function catchOnlyText(): Promise<void> {
+  const res = await fetch("/orders/catch-only-text");
+  try {
+    await settle();
+  } catch (e) {
+    console.log(await res.text());
+    throw e;
+  }
+}
+
+declare function settle(): Promise<void>;
+
 export async function pingOrders(): Promise<void> {
   const res = await fetch("/orders/ping", { method: "DELETE" });
   if (!res.ok) {
@@ -290,5 +313,18 @@ describe('carrick#1796: a body read on the failure path is not the response type
     );
     assert.ok(inferred, 'the row must be answered');
     assert.match(collapse(inferred.type_string), /^Uint8Array\b/);
+  });
+
+  it('reads the success body, not the text a catch clause logs (carrick#2756)', async () => {
+    const inferred = await infer('Endpoint_CatchLogsText_Response', 'fetch("/orders/catch-logs-text")');
+    assert.ok(inferred, 'the row must be answered');
+    assert.notStrictEqual(collapse(inferred.type_string), 'string');
+    assert.strictEqual(collapse(inferred.type_string), ORDER_TEXT);
+  });
+
+  it('keeps a body read held only in a catch clause as it was (carrick#2756 control)', async () => {
+    const inferred = await infer('Endpoint_CatchOnlyText_Response', 'fetch("/orders/catch-only-text")');
+    assert.ok(inferred, 'the row must be answered');
+    assert.strictEqual(collapse(inferred.type_string), 'string');
   });
 });
