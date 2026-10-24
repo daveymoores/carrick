@@ -600,7 +600,10 @@ fn consumer_identity(location: &str) -> (String, u32) {
 /// reader a comparison happened when none did. `resolved` (carrick#730) is
 /// true only when a deep walk over both sides, run in the assembled workspace
 /// after the pinned externals installed, found no `any`/`unknown` at any
-/// depth — so it is the only field that answers this question.
+/// depth — so it is the only field that answers this question. The one
+/// exception is a request pair whose sides carry the decided root reason
+/// `no_request_body` (carrick#2674): a top type there is a reading, not a gap,
+/// and the pair is stored resolved.
 ///
 /// A verdict that exists but is not resolved is `Unresolved`: it was
 /// attempted and could not be reached. `NotChecked` is for a finding no

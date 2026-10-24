@@ -271,7 +271,11 @@ pub struct DirectionVerdict {
     /// Whether `verdict` is a comparison between two KNOWN types on this
     /// direction, or the absence of one (carrick#730/#734). True only when the
     /// check's deep walk over both sides of THIS direction found no
-    /// `any`/`unknown` at any depth.
+    /// `any`/`unknown` at any depth. One exception: a request direction where
+    /// the inferrer decided the call sends no body (root reason
+    /// `no_request_body`, carrick#2674) is resolved though its type prints
+    /// `unknown`, because the decision is the reading. A bare `unknown` with
+    /// no such reason stays unresolved.
     pub resolved: bool,
     /// Which side, and where in it, left this direction unresolved. Present
     /// only alongside `resolved: false`.
