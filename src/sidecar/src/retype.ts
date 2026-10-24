@@ -35,7 +35,7 @@ import {
   testsOnPath,
   type Statuses,
 } from './failure-path.js';
-import { statesNoBody } from './capture/status-table.js';
+import { statesNoBody } from './capture/index.js';
 import { lineIndex } from './line-index.js';
 import { typeToStringAsDeclared } from './print-type.js';
 import { fileDiagnostics, type FileDiagnostic } from './unwidened.js';
