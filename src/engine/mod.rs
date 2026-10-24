@@ -3948,7 +3948,7 @@ async fn analyze_current_repo_incremental(
                     fact_sender,
                 ),
             );
-            report_fallbacks(fallbacks, analysis.as_ref().ok().map(|done| &done.stats));
+            let fallbacks = analysis_fallbacks(fallbacks, &analysis, |done| &done.stats);
             let analysis = analysis?;
             setup.detection.client_semantics = settled;
             crate::phase_timing::mark(crate::phase_timing::Phase::Model);
@@ -4055,6 +4055,12 @@ async fn analyze_current_repo_incremental(
             if withdrawn > 0 {
                 debug!("Model routes withdrawn at library definitions: {withdrawn}");
             }
+            let traced = apply_traced_routes(
+                &mut mount_graph,
+                &protocol_extractions.site.traced.routes,
+                repo_path,
+            );
+            report_route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
             crate::phase_timing::mark(crate::phase_timing::Phase::Protocols);
 
             // Collect the intents started after discovery (body_source is
@@ -5038,6 +5044,20 @@ async fn site_rows_of(
     rows.rows.retain(|row| {
         !protocol_producer_provenance(&root.join(&row.file), repo_path, service).is_mock()
     });
+    // With the receiver trace on, the routes it serves at a full path
+    // (carrick#2474 R3 S1), written into the mount graph by
+    // [`apply_traced_routes`].
+    if context.declarations.is_some() {
+        rows.traced = crate::site_rows::traced(&decided, &records);
+        rows.traced.routes.retain(|route| {
+            !protocol_producer_provenance(&root.join(&route.file), repo_path, service).is_mock()
+        });
+        debug!(
+            traced = rows.traced.routes.len(),
+            untraced = ?rows.traced.untraced,
+            "receiver trace: routes served at a full path"
+        );
+    }
     key_site_requests_canonically(&mut rows, &UrlNormalizer::new(service));
     let mut leads_by_reason: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
@@ -5426,6 +5446,277 @@ fn withdraw_model_routes_at_definitions(
             ))
     });
     before - mount_graph.endpoints.len()
+}
+
+/// What [`apply_traced_routes`] did to the mount graph.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TracedApplied {
+    /// Rows at a traced route's line that agree with it, now `library_claim`.
+    relabelled: usize,
+    /// Rows written for a traced path no row at its line held.
+    added: usize,
+    /// Route sites where a row at the line states a method or path the trace
+    /// does not: nothing there is written.
+    disagrees: usize,
+    /// Of the rows that disagree, those the documentation fold labelled
+    /// `descriptor_route`.
+    documented_conflict: usize,
+    /// Traced paths no route is served at ([`crate::swc_scanner::is_producer_route_path`]).
+    refused: usize,
+    /// Documentation rows folded onto a written row.
+    folded: usize,
+    /// Traced routes with a path no row at the line held and none was
+    /// written for: the registration's binding has no symbol to own a row.
+    owner_unknown: usize,
+}
+
+impl TracedApplied {
+    /// The fallback tally's keys (carrick#2474 R3 S1): the route sites the
+    /// trace left to the reader, by reason, and where it disagreed with it.
+    fn tally(&self, untraced: &std::collections::BTreeMap<String, usize>) -> Vec<(String, usize)> {
+        untraced
+            .iter()
+            .map(|(reason, count)| (format!("routes_untraced_{reason}"), *count))
+            .chain([
+                (
+                    "routes_untraced_owner_unknown".to_string(),
+                    self.owner_unknown,
+                ),
+                ("routes_trace_disagrees".to_string(), self.disagrees),
+                (
+                    "routes_documented_conflict".to_string(),
+                    self.documented_conflict,
+                ),
+            ])
+            .filter(|(_, count)| *count > 0)
+            .collect()
+    }
+}
+
+/// Write the routes the receiver trace serves at a full path into the mount
+/// graph (carrick#2474 R3 S1), keeping every row the scan already states.
+///
+/// The rows at a traced route's file and line are its rows. Where every one
+/// states the route's method and one of its full paths (placeholder names
+/// aside), each takes `library_claim`, except a row the documentation fold
+/// labelled `descriptor_route` or a `carrick.json` declaration labelled
+/// `declared_operation`, which keeps it, and each traced path no row holds
+/// is written as a copy of an undeclared row there of the route's method.
+/// Where any row states another method or path, the site is counted and
+/// nothing is written: the reader and the trace disagree, and a compare
+/// replay decides (orchestrator's ruling, 2026-10-23). Where no row to copy
+/// stands, one row is written per path, owned by the binding the route is
+/// registered on, and none where that binding has no symbol. Then documentation
+/// rows fold onto the rows written ([`FileOrchestrator::fold_documented_operations`]).
+///
+/// `repo_path` places the graph's files as the withdraw does.
+fn apply_traced_routes(
+    mount_graph: &mut MountGraph,
+    traced: &[crate::site_rows::TracedRoute],
+    repo_path: &str,
+) -> TracedApplied {
+    use crate::agents::file_analyzer_agent::ResolutionSource;
+    let mut applied = TracedApplied::default();
+    if traced.is_empty() {
+        return applied;
+    }
+    let repo_root = normalize_protocol_file(Path::new(repo_path));
+    let place = |location: &str| -> Option<(String, String, u32)> {
+        let (file, line) = location.rsplit_once(':')?;
+        let line = line.parse().ok()?;
+        let normal = normalize_protocol_file(Path::new(file));
+        let relative = normal
+            .strip_prefix(&repo_root)
+            .map(Path::to_path_buf)
+            .unwrap_or(normal);
+        let relative = relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        Some((file.to_string(), relative, line))
+    };
+    // The graph names its files as the walk did (repo-relative, or under
+    // the repo path): a written row names its file the same way.
+    let prefix = mount_graph
+        .endpoints
+        .iter()
+        .find_map(|endpoint| {
+            let (raw, relative, _) = place(&endpoint.file_location)?;
+            raw.strip_suffix(&relative).map(str::to_string)
+        })
+        .unwrap_or_default();
+    let mut sites: std::collections::BTreeMap<(&str, u32), Vec<&crate::site_rows::TracedRoute>> =
+        std::collections::BTreeMap::new();
+    for route in traced {
+        sites
+            .entry((route.file.as_str(), route.line))
+            .or_default()
+            .push(route);
+    }
+    let mut written: Vec<crate::mount_graph::ResolvedEndpoint> = Vec::new();
+    for ((file, line), routes) in sites {
+        let here: Vec<usize> = mount_graph
+            .endpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, endpoint)| {
+                place(&endpoint.file_location)
+                    .is_some_and(|(_, relative, at)| relative == file && at == line)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let states = |method: &str, full_path: &str| {
+            routes.iter().any(|route| {
+                route.method.eq_ignore_ascii_case(method)
+                    && route
+                        .full_paths
+                        .iter()
+                        .any(|traced| MountGraph::paths_equal_modulo_param_names(traced, full_path))
+            })
+        };
+        let disagreeing: Vec<usize> = here
+            .iter()
+            .copied()
+            .filter(|&index| {
+                let row = &mount_graph.endpoints[index];
+                !states(&row.method, &row.full_path)
+            })
+            .collect();
+        if !disagreeing.is_empty() {
+            applied.disagrees += 1;
+            applied.documented_conflict += disagreeing
+                .iter()
+                .filter(|&&index| {
+                    mount_graph.endpoints[index].resolution_source
+                        == Some(ResolutionSource::DescriptorRoute)
+                })
+                .count();
+            debug!(
+                file,
+                line,
+                rows = ?disagreeing
+                    .iter()
+                    .map(|&index| {
+                        let row = &mount_graph.endpoints[index];
+                        format!("{} {}", row.method, row.full_path)
+                    })
+                    .collect::<Vec<_>>(),
+                traced = ?routes
+                    .iter()
+                    .map(|route| format!("{} {}", route.method, route.full_paths.join(" | ")))
+                    .collect::<Vec<_>>(),
+                "receiver trace: a row at a traced route states another method or path; nothing written"
+            );
+            continue;
+        }
+        // A row the documentation fold or a `carrick.json` declaration
+        // stated keeps its label: a re-scan declares operations before this
+        // pass, a full scan after it.
+        let declared = |row: &crate::mount_graph::ResolvedEndpoint| {
+            matches!(
+                row.resolution_source,
+                Some(ResolutionSource::DescriptorRoute | ResolutionSource::DeclaredOperation)
+            )
+        };
+        for &index in &here {
+            let row = &mut mount_graph.endpoints[index];
+            if !declared(row) {
+                row.resolution_source = Some(ResolutionSource::LibraryClaim);
+                applied.relabelled += 1;
+            }
+        }
+        for route in &routes {
+            // A copy takes a row of the route's own method: another
+            // method's row is another route's handler, and a declared row
+            // carries one dispatch case.
+            let template = here
+                .iter()
+                .map(|&index| &mount_graph.endpoints[index])
+                .find(|row| {
+                    row.method.eq_ignore_ascii_case(&route.method)
+                        && row.resolution_source != Some(ResolutionSource::DeclaredOperation)
+                });
+            let mut unowned = false;
+            for full_path in &route.full_paths {
+                let held = here.iter().any(|&index| {
+                    let row = &mount_graph.endpoints[index];
+                    row.method.eq_ignore_ascii_case(&route.method)
+                        && MountGraph::paths_equal_modulo_param_names(&row.full_path, full_path)
+                }) || written.iter().any(|row| {
+                    row.file_location == format!("{prefix}{file}:{line}")
+                        && row.method == route.method
+                        && row.full_path == *full_path
+                });
+                if held {
+                    continue;
+                }
+                if !crate::swc_scanner::is_producer_route_path(full_path) {
+                    applied.refused += 1;
+                    continue;
+                }
+                let row = match (template, &route.owner) {
+                    (Some(template), _) => crate::mount_graph::ResolvedEndpoint {
+                        method: route.method.clone(),
+                        path: route.path.clone(),
+                        full_path: full_path.clone(),
+                        resolution_source: Some(ResolutionSource::LibraryClaim),
+                        handler_span: None,
+                        ..template.clone()
+                    },
+                    // With no binding symbol there is no owner to write: the
+                    // reader keeps the site.
+                    (None, None) => {
+                        unowned = true;
+                        continue;
+                    }
+                    (None, Some(owner)) => crate::mount_graph::ResolvedEndpoint {
+                        method: route.method.clone(),
+                        path: route.path.clone(),
+                        full_path: full_path.clone(),
+                        handler: Some(
+                            route
+                                .handler
+                                .clone()
+                                .unwrap_or_else(|| "anonymous".to_string()),
+                        ),
+                        owner: owner.clone(),
+                        file_location: format!("{prefix}{file}:{line}"),
+                        middleware_chain: Vec::new(),
+                        repo_name: None,
+                        service_name: None,
+                        provenance: crate::file_finder::endpoint_provenance(
+                            &Path::new(repo_path).join(file),
+                            Path::new(repo_path),
+                        ),
+                        evidence: carrick_match::MatchEvidence::RouteDefinition,
+                        resolution_source: Some(ResolutionSource::LibraryClaim),
+                        view_module: false,
+                        dispatch: None,
+                        handler_span: None,
+                    },
+                };
+                written.push(row);
+            }
+            applied.owner_unknown += usize::from(unowned);
+        }
+    }
+    applied.added = written.len();
+    if applied.added > 0 {
+        mount_graph.endpoints.extend(written);
+        applied.folded = FileOrchestrator::fold_documented_operations(mount_graph);
+    }
+    debug!(
+        relabelled = applied.relabelled,
+        added = applied.added,
+        disagrees = applied.disagrees,
+        documented_conflict = applied.documented_conflict,
+        refused = applied.refused,
+        folded = applied.folded,
+        owner_unknown = applied.owner_unknown,
+        "receiver trace: routes written into the mount graph"
+    );
+    applied
 }
 
 /// Attribute a service's GraphQL documents to schema identities, fold the
@@ -8774,22 +9065,39 @@ fn summarize_requests(
     summaries
 }
 
-/// State the service's fallbacks to the old path (`fallback_tally`), once its
+/// The service's fallbacks to the old path (`fallback_tally`) once its
 /// analysis is done: the summaries' own, and, when the fact layer chooses the
 /// reader's files, each register signal's candidates kept where discovery
 /// could not follow the call (`fallback_selection_<signal>`, carrick#2613).
-fn report_fallbacks(
-    mut fallbacks: crate::fallback_tally::ServiceFallbacks,
-    stats: Option<&crate::agents::file_orchestrator::ProcessingStats>,
-) {
-    if let Some(stats) = stats {
-        for (signal, count) in &stats.fallback_selection {
-            fallbacks
-                .counts
+/// They are stated when the value is dropped: at once on a failed analysis,
+/// otherwise once the traced routes are written ([`report_route_fallbacks`])
+/// or the scan stops early.
+fn analysis_fallbacks<T, E>(
+    fallbacks: crate::fallback_tally::ServiceFallbacks,
+    analysis: &Result<T, E>,
+    stats: impl Fn(&T) -> &crate::agents::file_orchestrator::ProcessingStats,
+) -> crate::fallback_tally::Pending {
+    let mut pending = crate::fallback_tally::Pending::new(fallbacks);
+    if let Ok(done) = analysis {
+        for (signal, count) in &stats(done).fallback_selection {
+            pending
+                .counts()
                 .insert(format!("fallback_selection_{signal}"), *count);
         }
     }
-    crate::fallback_tally::report(&fallbacks);
+    pending
+}
+
+/// State the service's fallbacks, with the route sites the receiver trace
+/// left to the reader and where it disagreed with it (carrick#2474 R3 S1).
+fn report_route_fallbacks(
+    mut fallbacks: crate::fallback_tally::Pending,
+    site: &crate::site_rows::SiteRows,
+    applied: &TracedApplied,
+) {
+    fallbacks
+        .counts()
+        .extend(applied.tally(&site.traced.untraced));
 }
 
 /// A service's library semantics while the in-scan schedule settles them
@@ -8959,7 +9267,7 @@ async fn compose_summaries(
     let settled = settling.settled().await;
     let index = summarize_requests(inputs, settled.as_deref(), sidecar, service_root);
     let placements = index.placements();
-    // Stated once the analysis is done ([`report_fallbacks`]), with what the
+    // Stated once the analysis is done ([`analysis_fallbacks`]), with what the
     // reader's file selection fell back on.
     let fallbacks =
         crate::fallback_tally::ServiceFallbacks::of(crate::current_service::name(), inputs, &index);
@@ -10506,10 +10814,7 @@ async fn analyze_current_repo(
             fact_sender,
         ),
     );
-    report_fallbacks(
-        fallbacks,
-        analysis_result.as_ref().ok().map(|done| &done.stats),
-    );
+    let fallbacks = analysis_fallbacks(fallbacks, &analysis_result, |done| &done.stats);
     let analysis_result = analysis_result?;
     setup.detection.client_semantics = settled;
     crate::phase_timing::mark(crate::phase_timing::Phase::Model);
@@ -10600,6 +10905,12 @@ async fn analyze_current_repo(
     if withdrawn > 0 {
         debug!("Model routes withdrawn at library definitions: {withdrawn}");
     }
+    let traced = apply_traced_routes(
+        &mut analysis_result.mount_graph,
+        &protocol_extractions.site.traced.routes,
+        repo_path,
+    );
+    report_route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
     // The repo's own statement of what a body-dispatching handler serves
     // (carrick#831), applied after every pass that reads the source: a
     // declaration replaces what inference produced for the same handler, so
@@ -22304,9 +22615,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 crate::site_rows::RowSide::Call,
                 true,
             )],
-            leads: Vec::new(),
-            routes: Vec::new(),
-            through: Vec::new(),
+            ..crate::site_rows::SiteRows::default()
         };
         assert_eq!(blob(off), before);
         assert_eq!(blob(stray), before);
@@ -23100,9 +23409,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     ),
                     below,
                 ],
-                leads: Vec::new(),
-                routes: Vec::new(),
-                through: Vec::new(),
+                ..crate::site_rows::SiteRows::default()
             },
             ..ProtocolExtractions::default()
         };
@@ -23175,9 +23482,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     true,
                 ),
             ],
-            leads: Vec::new(),
-            routes: Vec::new(),
-            through: Vec::new(),
+            ..crate::site_rows::SiteRows::default()
         };
         key_site_requests_canonically(&mut rows, &UrlNormalizer::new(&config));
         let keys: Vec<String> = rows.rows.iter().map(|row| row.key.canonical()).collect();
@@ -23647,6 +23952,437 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             ),
             1,
             "an absolute repo path withdraws the same route"
+        );
+    }
+
+    /// A row at `file:line` stating `method full_path`, from `source`.
+    fn traced_row(
+        location: &str,
+        method: &str,
+        path: &str,
+        full_path: &str,
+        source: crate::agents::file_analyzer_agent::ResolutionSource,
+    ) -> crate::mount_graph::ResolvedEndpoint {
+        crate::mount_graph::ResolvedEndpoint {
+            view_module: false,
+            method: method.to_string(),
+            path: path.to_string(),
+            full_path: full_path.to_string(),
+            handler: Some("list".to_string()),
+            owner: "router".to_string(),
+            file_location: location.to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: Some(source),
+            dispatch: None,
+            handler_span: None,
+        }
+    }
+
+    /// A route the trace serves at `full_paths`.
+    fn traced_route(
+        file: &str,
+        line: u32,
+        method: &str,
+        path: &str,
+        full_paths: &[&str],
+    ) -> crate::site_rows::TracedRoute {
+        crate::site_rows::TracedRoute {
+            file: file.to_string(),
+            line,
+            method: method.to_string(),
+            path: path.to_string(),
+            full_paths: full_paths.iter().map(|path| path.to_string()).collect(),
+            handler: Some("list".to_string()),
+            owner: Some("users".to_string()),
+        }
+    }
+
+    /// Each endpoint row as `file:line METHOD full_path source`.
+    fn traced_rows(graph: &crate::mount_graph::MountGraph) -> Vec<String> {
+        graph
+            .endpoints
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} {} {} {}",
+                    row.file_location,
+                    row.method,
+                    row.full_path,
+                    row.resolution_source
+                        .as_ref()
+                        .and_then(|source| serde_json::to_value(source).ok())
+                        .and_then(|source| source.as_str().map(str::to_string))
+                        .unwrap_or_default()
+                )
+            })
+            .collect()
+    }
+
+    /// carrick#2474 R3 S1: a traced route with no row at its line is
+    /// written, one row per full path, owned by its binding and handed its
+    /// handler by name; a path no route is served at is not.
+    #[test]
+    fn a_traced_route_with_no_row_at_its_line_is_written() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![traced_row(
+            "src/other.ts:3",
+            "GET",
+            "/health",
+            "/health",
+            ResolutionSource::Model,
+        )];
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[
+                traced_route("src/users.ts", 8, "GET", "/", &["/v1/users"]),
+                // One router mounted twice: two paths at one line.
+                traced_route("src/shared.ts", 8, "GET", "/ping", &["/a/ping", "/b/ping"]),
+                traced_route("src/odd.ts", 4, "GET", "ping", &["ping"]),
+            ],
+            ".",
+        );
+        assert_eq!(applied.added, 3);
+        assert_eq!(applied.refused, 1);
+        assert_eq!(
+            traced_rows(&graph),
+            vec![
+                "src/other.ts:3 GET /health model",
+                "src/shared.ts:8 GET /a/ping library_claim",
+                "src/shared.ts:8 GET /b/ping library_claim",
+                "src/users.ts:8 GET /v1/users library_claim",
+            ]
+        );
+        let users = graph
+            .endpoints
+            .iter()
+            .find(|row| row.full_path == "/v1/users")
+            .unwrap();
+        assert_eq!(users.path, "/");
+        assert_eq!(users.owner, "users");
+        assert_eq!(users.handler.as_deref(), Some("list"));
+        assert_eq!(
+            users.provenance,
+            crate::operation::EndpointProvenance::Route
+        );
+
+        // A graph whose rows name the walked path writes its rows the same way.
+        let mut walked = crate::mount_graph::MountGraph::new();
+        walked.endpoints = vec![traced_row(
+            "./src/other.ts:3",
+            "GET",
+            "/health",
+            "/health",
+            ResolutionSource::Model,
+        )];
+        apply_traced_routes(
+            &mut walked,
+            &[traced_route("src/users.ts", 8, "GET", "/", &["/v1/users"])],
+            ".",
+        );
+        assert_eq!(walked.endpoints[1].file_location, "./src/users.ts:8");
+    }
+
+    /// carrick#2474 R3 S1: rows at a traced route's line that state its
+    /// method and one of its paths keep them and take `library_claim`; a
+    /// traced path none holds is written as a copy of a row there. Two rows
+    /// for one traced path both stay.
+    #[test]
+    fn rows_that_agree_with_a_traced_route_are_kept_and_its_other_paths_added() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![
+            traced_row(
+                "src/shared.ts:8",
+                "GET",
+                "/ping",
+                "/a/ping",
+                ResolutionSource::Model,
+            ),
+            // Placeholder names aside, the same path.
+            traced_row(
+                "src/users.ts:9",
+                "POST",
+                "/:userId",
+                "/v1/users/:userId",
+                ResolutionSource::ReceiverType,
+            ),
+            traced_row(
+                "src/users.ts:9",
+                "POST",
+                "/:userId",
+                "/v1/users/:userId",
+                ResolutionSource::Model,
+            ),
+        ];
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[
+                traced_route("src/shared.ts", 8, "GET", "/ping", &["/a/ping", "/b/ping"]),
+                traced_route("src/users.ts", 9, "POST", "/:id", &["/v1/users/:id"]),
+            ],
+            ".",
+        );
+        assert_eq!(
+            applied,
+            TracedApplied {
+                relabelled: 3,
+                added: 1,
+                ..TracedApplied::default()
+            }
+        );
+        assert_eq!(
+            traced_rows(&graph),
+            vec![
+                "src/shared.ts:8 GET /a/ping library_claim",
+                "src/users.ts:9 POST /v1/users/:userId library_claim",
+                "src/users.ts:9 POST /v1/users/:userId library_claim",
+                "src/shared.ts:8 GET /b/ping library_claim",
+            ]
+        );
+        // The copy keeps the row's owner and handler.
+        assert_eq!(graph.endpoints[3].owner, "router");
+        assert_eq!(graph.endpoints[3].path, "/ping");
+    }
+
+    /// carrick#2474 R3 S1 (orchestrator's ruling, 2026-10-23): where a row
+    /// at a traced route's line states another path or method, the site is
+    /// counted and nothing there is written; a documentation row that
+    /// disagrees is counted apart.
+    #[test]
+    fn a_row_that_disagrees_with_a_traced_route_is_kept_and_nothing_written() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![
+            traced_row(
+                "src/items.ts:8",
+                "GET",
+                "/leaf",
+                "/leaf",
+                ResolutionSource::Model,
+            ),
+            traced_row(
+                "src/items.ts:12",
+                "PUT",
+                "/items",
+                "/api/items",
+                ResolutionSource::Model,
+            ),
+            traced_row(
+                "src/docs.ts:4",
+                "GET",
+                "/old",
+                "/old",
+                ResolutionSource::DescriptorRoute,
+            ),
+        ];
+        let before = traced_rows(&graph);
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[
+                traced_route("src/items.ts", 8, "GET", "/leaf", &["/api/deep/leaf"]),
+                traced_route("src/items.ts", 12, "GET", "/items", &["/api/items"]),
+                traced_route("src/docs.ts", 4, "GET", "/old", &["/v1/old"]),
+            ],
+            ".",
+        );
+        assert_eq!(
+            applied,
+            TracedApplied {
+                disagrees: 3,
+                documented_conflict: 1,
+                ..TracedApplied::default()
+            }
+        );
+        assert_eq!(traced_rows(&graph), before);
+        assert_eq!(
+            applied.tally(&std::collections::BTreeMap::from([(
+                "mount_unverified".to_string(),
+                2
+            )])),
+            vec![
+                ("routes_untraced_mount_unverified".to_string(), 2),
+                ("routes_trace_disagrees".to_string(), 3),
+                ("routes_documented_conflict".to_string(), 1),
+            ]
+        );
+    }
+
+    /// PR #2687 review: on a re-scan the `carrick.json` declarations are
+    /// applied before the trace, so declared rows stand at the line. They
+    /// keep `declared_operation`, and a traced path they do not hold is
+    /// written afresh, not as a copy carrying one dispatch case.
+    #[test]
+    fn declared_rows_keep_their_label_and_are_never_copied() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let declared = |value: &str| crate::mount_graph::ResolvedEndpoint {
+            handler: Some("rpc".to_string()),
+            dispatch: Some(crate::dispatch::Dispatch {
+                location: crate::dispatch::DispatchLocation::Body,
+                field: "op".to_string(),
+                value: value.to_string(),
+            }),
+            ..traced_row(
+                "src/shared.ts:8",
+                "GET",
+                "/a/ping",
+                "/a/ping",
+                ResolutionSource::DeclaredOperation,
+            )
+        };
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![declared("first"), declared("second")];
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[traced_route(
+                "src/shared.ts",
+                8,
+                "GET",
+                "/ping",
+                &["/a/ping", "/b/ping"],
+            )],
+            ".",
+        );
+        assert_eq!(
+            applied,
+            TracedApplied {
+                added: 1,
+                ..TracedApplied::default()
+            }
+        );
+        assert_eq!(
+            traced_rows(&graph),
+            vec![
+                "src/shared.ts:8 GET /a/ping declared_operation",
+                "src/shared.ts:8 GET /a/ping declared_operation",
+                "src/shared.ts:8 GET /b/ping library_claim",
+            ]
+        );
+        let written = &graph.endpoints[2];
+        assert!(written.dispatch.is_none());
+        assert_eq!(written.owner, "users");
+        assert_eq!(written.handler.as_deref(), Some("list"));
+    }
+
+    /// PR #2687 review: a traced route whose method no row at the line
+    /// states is written from the trace, not as a copy of another method's
+    /// row (its handler and owner are another route's).
+    #[test]
+    fn a_traced_route_is_never_copied_from_another_methods_row() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![traced_row(
+            "src/items.ts:5",
+            "GET",
+            "/items",
+            "/api/items",
+            ResolutionSource::Model,
+        )];
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[
+                traced_route("src/items.ts", 5, "GET", "/items", &["/api/items"]),
+                crate::site_rows::TracedRoute {
+                    handler: Some("create".to_string()),
+                    owner: Some("items".to_string()),
+                    ..traced_route("src/items.ts", 5, "POST", "/items", &["/api/items"])
+                },
+            ],
+            ".",
+        );
+        assert_eq!(
+            applied,
+            TracedApplied {
+                relabelled: 1,
+                added: 1,
+                ..TracedApplied::default()
+            }
+        );
+        let post = &graph.endpoints[1];
+        assert_eq!(post.method, "POST");
+        assert_eq!(post.full_path, "/api/items");
+        assert_eq!(post.handler.as_deref(), Some("create"));
+        assert_eq!(post.owner, "items");
+    }
+
+    /// PR #2687 review: a traced route with no row to copy and no binding
+    /// symbol is not written with an empty owner; it is counted.
+    #[test]
+    fn a_traced_route_with_no_owner_is_counted_not_written() {
+        let mut graph = crate::mount_graph::MountGraph::new();
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[crate::site_rows::TracedRoute {
+                owner: None,
+                ..traced_route("src/users.ts", 8, "GET", "/", &["/v1/users"])
+            }],
+            ".",
+        );
+        assert!(graph.endpoints.is_empty());
+        assert_eq!(
+            applied,
+            TracedApplied {
+                owner_unknown: 1,
+                ..TracedApplied::default()
+            }
+        );
+        assert_eq!(
+            applied.tally(&std::collections::BTreeMap::new()),
+            vec![("routes_untraced_owner_unknown".to_string(), 1)]
+        );
+    }
+
+    /// carrick#2474 R3 S1: a documentation row that agrees keeps its label,
+    /// and a bare documentation row folds onto a route the trace wrote.
+    #[test]
+    fn documentation_folds_onto_a_written_route_and_keeps_its_label() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![
+            traced_row(
+                "src/health.ts:5",
+                "GET",
+                "/health",
+                "/health",
+                ResolutionSource::DescriptorRoute,
+            ),
+            crate::mount_graph::ResolvedEndpoint {
+                handler: Some("__route_descriptor__".to_string()),
+                ..traced_row(
+                    "src/openapi.ts:20",
+                    "GET",
+                    "/v1/users",
+                    "/v1/users",
+                    ResolutionSource::DescriptorRoute,
+                )
+            },
+        ];
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[
+                traced_route("src/health.ts", 5, "GET", "/health", &["/health"]),
+                traced_route("src/users.ts", 8, "GET", "/", &["/v1/users"]),
+            ],
+            ".",
+        );
+        assert_eq!(
+            applied,
+            TracedApplied {
+                added: 1,
+                folded: 1,
+                ..TracedApplied::default()
+            }
+        );
+        assert_eq!(
+            traced_rows(&graph),
+            vec![
+                "src/health.ts:5 GET /health descriptor_route",
+                "src/users.ts:8 GET /v1/users descriptor_route",
+            ]
         );
     }
 

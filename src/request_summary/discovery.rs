@@ -3634,6 +3634,51 @@ mod tests {
             )
             .unwrap()
         );
+        // The routes served from the top are the ones R3 writes
+        // (carrick#2474 R3 S1); the rest are counted by their end.
+        let routes = crate::site_rows::traced(&decided, &traced);
+        let mut served: Vec<String> = routes
+            .routes
+            .iter()
+            .map(|route| {
+                format!(
+                    "{}:{} {} {} <- {}",
+                    route.file,
+                    route.line,
+                    route.method,
+                    route.path,
+                    route.full_paths.join(" ")
+                )
+            })
+            .collect();
+        served.sort();
+        assert_eq!(
+            served,
+            texts(&[
+                "src/admin.ts:8 GET /stats <- /admin/stats",
+                "src/extra.ts:9 POST /pong <- /a/pong /b/pong",
+                "src/index.ts:14 GET /bare <- /bare",
+                "src/index.ts:19 GET /health <- /health",
+                "src/index.ts:26 GET /inline <- /in/inline",
+                "src/index.ts:37 GET /x <- /v2/x",
+                "src/index.ts:38 GET /y <- /v3/y",
+                "src/items.ts:12 GET /items <- /api/items",
+                "src/items.ts:8 GET /leaf <- /api/deep/leaf",
+                "src/reports.ts:9 GET /daily <- /r/daily",
+                "src/shared.ts:8 GET /ping <- /a/ping /b/ping",
+                "src/users.ts:8 GET / <- /v1/users",
+                "src/users.ts:9 POST /:id <- /v1/users/:id",
+            ]),
+            "{served:#?}"
+        );
+        assert_eq!(
+            routes.untraced,
+            std::collections::BTreeMap::from([
+                ("hole_callback_option".to_string(), 1),
+                ("hole_entry_point".to_string(), 3),
+                ("mount_unverified".to_string(), 1),
+            ])
+        );
     }
 
     /// The composed paths of the route sites of the fixture `name`, with the

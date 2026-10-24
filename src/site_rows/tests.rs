@@ -74,6 +74,7 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
             line: LINE,
             span_start: 120,
             span_end: 129,
+            name: None,
         }),
         method: None,
         receiver: None,
@@ -537,9 +538,7 @@ fn fold_one(
             .into_iter()
             .filter(|row| row.file == file)
             .collect(),
-        leads: Vec::new(),
-        routes: Vec::new(),
-        through: Vec::new(),
+        ..SiteRows::default()
     };
     fold_rows(calls, endpoints, &one, Path::new("."), make)
 }
@@ -732,8 +731,7 @@ fn a_lead_on_a_line_with_a_row_is_dropped() {
             lead_at("src/b.ts", 5, Some("consumer")),
             lead_at("src/b.ts", 5, Some("producer")),
         ],
-        routes: Vec::new(),
-        through: Vec::new(),
+        ..SiteRows::default()
     };
     let fold = fold_rows(&mut calls, &mut endpoints, &site, Path::new("."), make);
     let kept: Vec<(&str, u32, Option<&str>)> = fold
@@ -1234,4 +1232,109 @@ fn a_reader_row_above_a_decided_site_folds_onto_the_sites_row() {
     };
     fold_rows(&mut after, &mut Vec::new(), &off, Path::new("."), make);
     assert_eq!(after.len(), before.len());
+}
+
+// ---------------------------------------------------------------------------
+// Routes the receiver trace serves at a full path (carrick#2474 R3 S1).
+
+/// A route site in `file` at span `start..start + 30` whose instance ends
+/// `ends`, each with `path` composed, and whose own path is `/items/:id`.
+fn traced_site(file: &str, start: u32, ends: &[(&str, Option<&str>)]) -> DecidedSite {
+    let mut site = route_site(file, "get");
+    site.span_start = start;
+    site.span_end = start + 30;
+    site.name = vec![crate::request_summary::Piece::Lit("/items/:id".to_string())];
+    site.receiver = Some(crate::request_summary::discovery::ReceiverAt {
+        symbol: Some("items".to_string()),
+        decl_file: None,
+        decl_line: None,
+        kind: crate::request_summary::discovery::ReceiverKind::Binding,
+    });
+    site.composed = ends
+        .iter()
+        .map(
+            |(end, path)| crate::request_summary::decided_sites::Composed {
+                path: path.map(str::to_string),
+                edges: Vec::new(),
+                end: end.to_string(),
+            },
+        )
+        .collect();
+    site
+}
+
+/// Each reason a route site is left to the reader, counted once, beside
+/// the one route the trace serves (PR #2687 review). A table's keys share
+/// their loop's call span, so no keyed site is served.
+#[test]
+fn every_route_the_trace_does_not_serve_is_counted_by_why() {
+    let served = traced_site("src/served.ts", 100, &[("top", Some("/v1/items/:id"))]);
+    let unstated = traced_site("src/unstated.ts", 100, &[("top", Some("/v1/items/:id"))]);
+    let keyed = DecidedSite {
+        key: Some("/items/:id".to_string()),
+        ..traced_site("src/table.ts", 100, &[("top", Some("/items/:id"))])
+    };
+    let trimmed = DecidedSite {
+        composed_trimmed: true,
+        ..traced_site("src/trimmed.ts", 100, &[("top", Some("/v1/items/:id"))])
+    };
+    let no_instance = traced_site("src/none.ts", 100, &[]);
+    let unverified = traced_site("src/mounted.ts", 100, &[("mount_unverified", None)]);
+    let hole = traced_site(
+        "src/hole.ts",
+        100,
+        &[("top", Some("/v1/items/:id")), ("entry_point", None)],
+    );
+    let unread = traced_site("src/unread.ts", 100, &[("top", None)]);
+    let unnamed = DecidedSite {
+        name: Vec::new(),
+        ..traced_site("src/unnamed.ts", 100, &[("top", Some("/v1/items/:id"))])
+    };
+    let sites = [
+        &served,
+        &unstated,
+        &keyed,
+        &trimmed,
+        &no_instance,
+        &unverified,
+        &hole,
+        &unread,
+        &unnamed,
+    ];
+    let records: Vec<SiteRecord> = sites
+        .iter()
+        .map(|site| {
+            let method = (site.file != "src/unstated.ts").then_some("get");
+            route_record(site, method)
+        })
+        .collect();
+    let decided = Decided {
+        sites: sites.iter().map(|site| (*site).clone()).collect(),
+        ..Decided::default()
+    };
+    let routes = traced(&decided, &records);
+    assert_eq!(
+        routes.routes,
+        vec![TracedRoute {
+            file: "src/served.ts".to_string(),
+            line: LINE,
+            method: "GET".to_string(),
+            path: "/items/:id".to_string(),
+            full_paths: vec!["/v1/items/:id".to_string()],
+            handler: None,
+            owner: Some("items".to_string()),
+        }]
+    );
+    assert_eq!(
+        routes.untraced,
+        BTreeMap::from([
+            ("hole_entry_point".to_string(), 1),
+            ("method_unstated".to_string(), 1),
+            ("mount_unverified".to_string(), 1),
+            ("no_instance".to_string(), 1),
+            ("table_key".to_string(), 1),
+            ("trimmed".to_string(), 1),
+            ("unread_prefix".to_string(), 2),
+        ])
+    );
 }

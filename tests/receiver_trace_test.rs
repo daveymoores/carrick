@@ -60,9 +60,26 @@ fn scan(fact_layer: bool, trace: Option<&str>) -> Blobs {
 
 /// [`scan`] of the fixture `name`.
 fn scan_fixture(name: &str, fact_layer: bool, trace: Option<&str>) -> Blobs {
+    scan_runs(name, &[], fact_layer, trace, 1).remove(0)
+}
+
+/// `runs` scans of one committed copy of the fixture `name`, with `extra`
+/// files written into it before the commit, sharing one store and cache:
+/// every scan after the first takes the incremental path. The blobs after
+/// each scan.
+fn scan_runs(
+    name: &str,
+    extra: &[(&str, &str)],
+    fact_layer: bool,
+    trace: Option<&str>,
+    runs: usize,
+) -> Vec<Blobs> {
     let tmp = tempfile::tempdir().expect("temp dir");
     let repo = tmp.path().join("workspace");
     copy_dir(&fixture_dir(name).join("repo"), &repo);
+    for (relative, contents) in extra {
+        std::fs::write(repo.join(relative), contents).unwrap();
+    }
     run_git(&repo, &["init", "-q"]);
     run_git(&repo, &["add", "-A"]);
     run_git(&repo, &["commit", "-q", "-m", "init"]);
@@ -116,6 +133,27 @@ fn scan_fixture(name: &str, fact_layer: bool, trace: Option<&str>) -> Blobs {
     if let Some(trace) = trace {
         cmd.env("CARRICK_RECEIVER_TRACE", trace);
     }
+    let mut scans = vec![run_scan(&mut cmd, &storage)];
+    // A later scan reads the store back, so it finds the first scan's blob.
+    cmd.env_remove("CARRICK_LOCAL_STORAGE_ISOLATE");
+    scans.extend((1..runs).map(|_| run_scan(&mut cmd, &storage)));
+    // Each later scan took the incremental path: its run log says so.
+    let incremental = std::fs::read_dir(home.join(".carrick/logs/runs"))
+        .map(|logs| {
+            logs.filter(|log| {
+                std::fs::read_to_string(log.as_ref().unwrap().path())
+                    .unwrap_or_default()
+                    .contains("Incremental analysis complete")
+            })
+            .count()
+        })
+        .unwrap_or_default();
+    assert_eq!(incremental, runs - 1, "a re-scan took the cold path");
+    scans
+}
+
+/// One scan by `cmd`, and the blobs it left in `storage`.
+fn run_scan(cmd: &mut Command, storage: &Path) -> Blobs {
     let output = cmd.output().expect("spawn carrick");
     assert!(
         output.status.success(),
@@ -124,7 +162,7 @@ fn scan_fixture(name: &str, fact_layer: bool, trace: Option<&str>) -> Blobs {
         String::from_utf8_lossy(&output.stderr)
     );
     let mut blobs = Blobs::new();
-    for entry in std::fs::read_dir(&storage).expect("the store reads") {
+    for entry in std::fs::read_dir(storage).expect("the store reads") {
         let path = entry.expect("dir entry").path();
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
@@ -171,7 +209,8 @@ fn possible_calls(blobs: &Blobs) -> Vec<String> {
 
 /// carrick#2474 R1: the routes only the trace finds (a parameter, a
 /// callback's parameter, a field set from a constructor parameter) reach
-/// the blob as route sites with no owner only with the switch set to `1`.
+/// the blob only with the switch set to `1`: as rows where the trace serves
+/// them from the top (R3 S1), otherwise as route sites with no owner.
 /// Unset, the blob holds the route sites found without it. With the fact
 /// layer off the switch changes no byte.
 #[test]
@@ -183,12 +222,12 @@ fn the_receiver_trace_switch_moves_only_what_it_finds() {
         possible_calls(&on),
         vec![
             "src/app.ts:19 post".to_string(),
-            "src/app.ts:25 get".to_string(),
             // The file's other routes have endpoint rows at their lines.
             "src/helpers.ts:47 get".to_string(),
             "src/helpers.ts:61 get".to_string(),
             "src/routes.ts:11 get".to_string(),
-            "src/users.ts:8 get".to_string(),
+            // `src/app.ts:25` and `src/users.ts:8` are served from the top:
+            // the trace writes their rows (carrick#2474 R3 S1).
         ]
     );
     // Only `1` turns it on.
@@ -197,37 +236,137 @@ fn the_receiver_trace_switch_moves_only_what_it_finds() {
     assert_eq!(scan(false, Some("1")), scan(false, None));
 }
 
-/// carrick#2474 R2b: the scope and mount edges and the composed paths are
-/// record-only. On a fixture of mounts and plugin scopes the switch moves
-/// only the route sites R1's declaration arm finds (a plugin's scoped app,
-/// a scope a member returns, an option's callback), and with the fact layer
-/// off it changes no byte.
+/// Every HTTP endpoint row of the blobs' mount graphs, as `file:line METHOD
+/// full_path source owner`, and the same of the payload's flat `endpoints`.
+fn endpoint_rows(blobs: &Blobs) -> (Vec<String>, Vec<String>) {
+    let source = |row: &serde_json::Value| {
+        row["resolution_source"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut graph = Vec::new();
+    let mut flat = Vec::new();
+    for text in blobs.values() {
+        let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+        for row in blob["mount_graph"]["endpoints"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            graph.push(format!(
+                "{} {} {} {} {}",
+                row["file_location"].as_str().unwrap_or_default(),
+                row["method"].as_str().unwrap_or_default(),
+                row["full_path"].as_str().unwrap_or_default(),
+                source(&row),
+                row["owner"].as_str().unwrap_or_default(),
+            ));
+        }
+        for row in blob["endpoints"].as_array().cloned().unwrap_or_default() {
+            if row["key"]["protocol"] != "http" {
+                continue;
+            }
+            flat.push(format!(
+                "{} {} {} {}",
+                row["file_path"].as_str().unwrap_or_default(),
+                row["key"]["method"].as_str().unwrap_or_default(),
+                row["key"]["path"].as_str().unwrap_or_default(),
+                source(&row),
+            ));
+        }
+    }
+    graph.sort();
+    flat.sort();
+    (graph, flat)
+}
+
+/// carrick#2474 R3 S1: with the switch on, every route the trace serves at
+/// a full path from the top (the answer key
+/// `each_route_is_composed_under_its_scopes_and_mounts`) is a mount-graph
+/// row at its line, `library_claim`, and so is the payload's flat row. The
+/// mock answer's rows that agree are kept and relabelled; the two whose
+/// path the trace disagrees with (`items.ts`, read without its plugin
+/// prefixes) are kept as they are and nothing is written there
+/// (orchestrator's ruling, 2026-10-23). No row is removed. A route the
+/// trace cannot place (a callback option, a plugin nothing calls, a mount
+/// it cannot verify) keeps today's reading, a possible call. With the
+/// switch off, or with the fact layer off, nothing moves.
 #[test]
-fn the_scope_trace_writes_nothing_of_its_own() {
+fn traced_routes_take_their_composed_paths() {
     let off = scan_fixture("receiver-scopes", true, None);
-    let mounted = [
-        "src/admin.ts:8 get",
-        "src/extra.ts:9 post",
-        "src/index.ts:46 get",
-        "src/reports.ts:9 get",
-        "src/shared.ts:8 get",
-        "src/users.ts:8 get",
-        "src/users.ts:9 post",
+    let (off_graph, _) = endpoint_rows(&off);
+    let mock = vec![
+        "src/index.ts:14 GET /bare model app",
+        "src/index.ts:19 GET /health model app",
+        "src/items.ts:12 GET /items model app",
+        "src/items.ts:8 GET /leaf model app",
     ];
-    assert_eq!(possible_calls(&off), mounted.to_vec());
+    assert_eq!(off_graph, mock);
+    assert_eq!(
+        possible_calls(&off),
+        vec![
+            "src/admin.ts:8 get",
+            "src/extra.ts:9 post",
+            "src/index.ts:46 get",
+            "src/reports.ts:9 get",
+            "src/shared.ts:8 get",
+            "src/users.ts:8 get",
+            "src/users.ts:9 post",
+        ]
+    );
+
     let on = scan_fixture("receiver-scopes", true, Some("1"));
-    let mut traced: Vec<&str> = mounted.to_vec();
-    traced.extend([
-        "src/index.ts:26 get",
-        "src/index.ts:37 get",
-        "src/index.ts:38 get",
-        "src/options.ts:16 get",
-        "src/versioned.ts:10 get",
-        "src/versioned.ts:22 get",
-        "src/versioned.ts:28 get",
-    ]);
-    traced.sort();
-    assert_eq!(possible_calls(&on), traced);
+    let (graph, flat) = endpoint_rows(&on);
+    assert_eq!(
+        graph,
+        vec![
+            "src/admin.ts:8 GET /admin/stats library_claim admin",
+            "src/extra.ts:9 POST /a/pong library_claim shared",
+            "src/extra.ts:9 POST /b/pong library_claim shared",
+            "src/index.ts:14 GET /bare library_claim app",
+            "src/index.ts:19 GET /health library_claim app",
+            "src/index.ts:26 GET /in/inline library_claim scoped",
+            "src/index.ts:37 GET /v2/x library_claim v2",
+            "src/index.ts:38 GET /v3/y library_claim basePath",
+            // The trace serves these at `/api/items` and `/api/deep/leaf`:
+            // the rows disagree, so they stand and nothing is written.
+            "src/items.ts:12 GET /items model app",
+            "src/items.ts:8 GET /leaf model app",
+            "src/reports.ts:9 GET /r/daily library_claim made",
+            "src/shared.ts:8 GET /a/ping library_claim shared",
+            "src/shared.ts:8 GET /b/ping library_claim shared",
+            "src/users.ts:8 GET /v1/users library_claim users",
+            "src/users.ts:9 POST /v1/users/:id library_claim users",
+        ]
+    );
+    let flat_of_graph: Vec<String> = {
+        let mut rows: Vec<String> = graph
+            .iter()
+            .map(|row| row.rsplit_once(' ').unwrap().0.to_string())
+            .collect();
+        rows.sort();
+        rows
+    };
+    assert_eq!(flat, flat_of_graph);
+    // Every row the switch-off scan states is still there, at its path.
+    for row in &mock {
+        let (site, _) = row.rsplit_once(" model ").unwrap();
+        assert!(
+            graph.iter().any(|kept| kept.starts_with(site)),
+            "{site} was removed: {graph:#?}"
+        );
+    }
+    assert_eq!(
+        possible_calls(&on),
+        vec![
+            "src/index.ts:46 get",
+            "src/options.ts:16 get",
+            "src/versioned.ts:10 get",
+            "src/versioned.ts:22 get",
+            "src/versioned.ts:28 get",
+        ]
+    );
     assert_eq!(
         scan_fixture("receiver-scopes", false, Some("1")),
         scan_fixture("receiver-scopes", false, None)
@@ -269,13 +408,32 @@ fn unread_reasons(blobs: &Blobs) -> BTreeMap<String, String> {
 /// registrations are on a local instance, on a parameter, and on a router
 /// whose members no declaration verifies for, so only the instance the
 /// maker builds names the op. Without the trace they stay no site.
+///
+/// Every spread here is at or after the handler slot, so the path slot is
+/// read, and each instance is served from the top: with the trace on, the
+/// trace writes each one's row at its path (carrick#2474 R3 S1) and no
+/// possible call is left.
 #[test]
 fn a_spread_argument_leaves_the_slots_before_it_read() {
-    let on = unread_reasons(&scan_fixture("receiver-spread", true, Some("1")));
+    let on_blobs = scan_fixture("receiver-spread", true, Some("1"));
+    let on = unread_reasons(&on_blobs);
     let off = unread_reasons(&scan_fixture("receiver-spread", true, None));
+    assert_eq!(on, BTreeMap::new());
+    assert_eq!(
+        endpoint_rows(&on_blobs).0,
+        vec![
+            "src/app.ts:20 GET /plain library_claim app",
+            "src/app.ts:21 GET /spread library_claim app",
+            "src/app.ts:22 POST /const library_claim app",
+            "src/app.ts:29 GET /plain library_claim api",
+            "src/app.ts:30 GET /spread library_claim api",
+            "src/app.ts:31 POST /const library_claim api",
+            "src/spread.ts:15 GET /by-id library_claim app",
+            "src/spread.ts:16 POST /by-name library_claim app",
+        ]
+    );
     // The registrations with no spread, on the instances the maker builds.
     for line in ["src/app.ts:20", "src/app.ts:29"] {
-        assert_eq!(on.get(line).map(String::as_str), Some("owner_unknown"));
         assert_eq!(off.get(line).map(String::as_str), Some("owner_unknown"));
     }
     for line in [
@@ -289,11 +447,6 @@ fn a_spread_argument_leaves_the_slots_before_it_read() {
         "src/spread.ts:15",
         "src/spread.ts:16",
     ] {
-        assert_eq!(
-            on.get(line).map(String::as_str),
-            Some("owner_unknown"),
-            "{line}: the path is read and only the owner is unknown"
-        );
         assert!(!off.contains_key(line), "{line}: no site without the trace");
     }
     // With the fact layer off the switch changes no byte.
@@ -301,4 +454,94 @@ fn a_spread_argument_leaves_the_slots_before_it_read() {
         scan_fixture("receiver-spread", false, Some("1")),
         scan_fixture("receiver-spread", false, None)
     );
+}
+
+/// The `receiver-scopes` service with a `carrick.json` that declares two
+/// operations on `GET /health`, a route the trace serves from the top.
+const DECLARED_HEALTH: &str = r#"{
+  "services": [{ "name": "web", "directory": ".", "tsconfig": "tsconfig.json" }],
+  "operations": [{
+    "service": "web",
+    "route": "GET /health",
+    "dispatch": { "location": "body", "field": "op" },
+    "operations": [{ "value": "status" }, { "value": "ready" }]
+  }]
+}
+"#;
+
+/// PR #2687 review: a re-scan applies `carrick.json`'s declared operations
+/// before the trace writes its routes, a cold scan after. The declared rows
+/// keep `declared_operation` either way, so the re-scan's rows are the cold
+/// scan's.
+#[test]
+fn a_rescan_keeps_the_declared_rows_at_a_traced_route() {
+    let scans = scan_runs(
+        "receiver-scopes",
+        &[("carrick.json", DECLARED_HEALTH)],
+        true,
+        Some("1"),
+        2,
+    );
+    let (cold, _) = endpoint_rows(&scans[0]);
+    let (warm, _) = endpoint_rows(&scans[1]);
+    let health: Vec<&String> = cold
+        .iter()
+        .filter(|row| row.starts_with("src/index.ts:19 "))
+        .collect();
+    assert_eq!(
+        health,
+        vec![
+            "src/index.ts:19 GET /health declared_operation app",
+            "src/index.ts:19 GET /health declared_operation app",
+        ],
+        "{cold:#?}"
+    );
+    assert_eq!(warm, cold);
+}
+
+/// A router whose routes a loop registers from a table: one call, one
+/// span, a key per entry.
+const LOOP_TABLE: &str = r#"import router, { Reply, Request } from "fixture-router";
+
+function list(_request: Request, reply: Reply): void {
+  reply.send("list");
+}
+
+function show(_request: Request, reply: Reply): void {
+  reply.send("show");
+}
+
+const table = {
+  "/t/list": list,
+  "/t/show": show,
+};
+
+const api = router();
+for (const [path, handler] of Object.entries(table)) {
+  api.get(path, handler);
+}
+export default api;
+"#;
+
+/// PR #2687 review: a table's keys share their loop's call, so the trace
+/// cannot say which key a site is; it writes none of them, and no key's
+/// route is written at another key's line.
+#[test]
+fn routes_a_loop_registers_from_a_table_are_not_written() {
+    let table_rows = |trace: Option<&str>| -> Vec<String> {
+        let blobs = scan_runs(
+            "receiver-scopes",
+            &[("src/table.ts", LOOP_TABLE)],
+            true,
+            trace,
+            1,
+        )
+        .remove(0);
+        endpoint_rows(&blobs)
+            .0
+            .into_iter()
+            .filter(|row| row.starts_with("src/table.ts:"))
+            .collect()
+    };
+    assert_eq!(table_rows(Some("1")), table_rows(None));
 }

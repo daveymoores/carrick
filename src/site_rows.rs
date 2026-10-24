@@ -175,6 +175,125 @@ pub struct SiteRows {
     /// Calls above a decided site on its chain (carrick#2614), whose reader
     /// rows fold onto the row the site holds.
     pub through: Vec<Through>,
+    /// With the receiver trace on, the route sites it serves at a full path
+    /// (carrick#2474 R3 S1, [`traced`]): the engine writes them into the
+    /// mount graph.
+    pub traced: TracedRoutes,
+}
+
+/// A route the receiver trace serves at a full path it composed from the
+/// top (carrick#2474 R3 S1): every instance end of its site is `top` and
+/// every prefix is text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TracedRoute {
+    /// Repo-relative, `/`-separated.
+    pub file: String,
+    pub line: u32,
+    /// The method the label forces, upper case.
+    pub method: String,
+    /// The path the route's own call writes.
+    pub path: String,
+    /// Every full path it is served at, sorted, one per stated value.
+    pub full_paths: Vec<String>,
+    /// The handler's name where the call hands it by name.
+    pub handler: Option<String>,
+    /// The symbol of the binding the route is registered on.
+    pub owner: Option<String>,
+}
+
+/// The route sites the receiver trace serves at a full path, and the rest
+/// counted by why not ([`traced`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TracedRoutes {
+    pub routes: Vec<TracedRoute>,
+    /// Route sites the trace does not serve at a full path, by reason:
+    /// `method_unstated`, `table_key`, `trimmed`, `no_instance`, `mount_unverified`,
+    /// `hole_<end>` (an instance end that is not the top), `unread_prefix`.
+    pub untraced: std::collections::BTreeMap<String, usize>,
+}
+
+/// The routes the receiver trace serves at a full path (carrick#2474 R3
+/// S1): each record the label states as a route ([`label_states_a_route`])
+/// whose method the label forces and whose decided site composed a path
+/// for every instance end, each ending at the top. A site with any other
+/// end, a prefix that is not text, or paths left out at the cap keeps the
+/// reader's reading, counted by reason.
+pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
+    let mut out = TracedRoutes::default();
+    for record in records {
+        if record.bucket == Bucket::Lead || !label_states_a_route(record) {
+            continue;
+        }
+        let Some(site) = site_of(decided, &record.anchors) else {
+            continue;
+        };
+        match traced_route(site, record) {
+            Ok(route) => out.routes.push(route),
+            Err(reason) => *out.untraced.entry(reason).or_default() += 1,
+        }
+    }
+    out
+}
+
+/// `site`'s traced route, or why it has none.
+fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<TracedRoute, String> {
+    let Some(method) = record
+        .state
+        .forced
+        .get(&Slot::Method)
+        .filter(|method| crate::type_manifest::is_producer_method(method))
+    else {
+        return Err("method_unstated".to_string());
+    };
+    // A table's keys are registered by one call in a loop, so they share
+    // its span and [`site_of`] hands every key's record the first key's
+    // site: the site cannot say which key a record is (PR #2687 review).
+    if site.key.is_some() {
+        return Err("table_key".to_string());
+    }
+    if site.composed_trimmed {
+        return Err("trimmed".to_string());
+    }
+    if site.composed.is_empty() {
+        return Err("no_instance".to_string());
+    }
+    if let Some(end) = site
+        .composed
+        .iter()
+        .map(|composed| composed.end.as_str())
+        .find(|end| *end != "top")
+    {
+        return Err(match end {
+            "mount_unverified" => end.to_string(),
+            _ => format!("hole_{end}"),
+        });
+    }
+    let (Some(path), Some(mut full_paths)) = (
+        site.name_text(),
+        site.composed
+            .iter()
+            .map(|composed| composed.path.clone())
+            .collect::<Option<Vec<String>>>(),
+    ) else {
+        return Err("unread_prefix".to_string());
+    };
+    full_paths.sort();
+    full_paths.dedup();
+    Ok(TracedRoute {
+        file: site.file.clone(),
+        line: site.line,
+        method: method.to_uppercase(),
+        path,
+        full_paths,
+        handler: site
+            .handler
+            .as_ref()
+            .and_then(|handler| handler.name.clone()),
+        owner: site
+            .receiver
+            .as_ref()
+            .and_then(|receiver| receiver.symbol.clone()),
+    })
 }
 
 /// The id a site is asked under: its file and call span, unique in a run.
@@ -433,6 +552,7 @@ pub fn of(
         leads: crate::possible_calls::from_sites(decided, records),
         routes: Vec::new(),
         through: decided.through.clone(),
+        traced: TracedRoutes::default(),
     };
     for record in records {
         if record.bucket == Bucket::Lead {

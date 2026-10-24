@@ -112,6 +112,28 @@ pub fn report(fallbacks: &ServiceFallbacks) {
     }
 }
 
+/// One service's fallbacks, stated ([`report`]) once, when the service's
+/// scan is done or leaves early: counts added after the analysis, such as
+/// the route sites the receiver trace leaves to the reader (carrick#2474 R3
+/// S1), reach the line without an exit that skips it.
+pub struct Pending(ServiceFallbacks);
+
+impl Pending {
+    pub fn new(fallbacks: ServiceFallbacks) -> Self {
+        Self(fallbacks)
+    }
+
+    pub fn counts(&mut self) -> &mut BTreeMap<String, usize> {
+        &mut self.0.counts
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        report(&self.0);
+    }
+}
+
 /// Read one service's fallbacks out of a line of a scan's stderr.
 pub fn parse(line: &str) -> Option<ServiceFallbacks> {
     let payload = line.trim_start().strip_prefix(MARKER)?;

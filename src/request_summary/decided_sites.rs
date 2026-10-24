@@ -488,6 +488,9 @@ pub struct HandlerAt {
     pub line: u32,
     pub span_start: u32,
     pub span_end: u32,
+    /// The name written at the call when the handler is handed by name
+    /// (`get('/x', list)`); `None` for a function written in place.
+    pub name: Option<String>,
 }
 
 /// One call between a decided site and its labelled call.
@@ -1228,11 +1231,16 @@ fn handler_at(root: &Path, placed: &Placed<'_>, arg: usize) -> Option<HandlerAt>
             .unwrap_or(name.span),
         other => other.span(),
     };
+    let name = match super::unwrap_value(&written.expr) {
+        Expr::Ident(name) => Some(name.sym.to_string()),
+        _ => None,
+    };
     Some(HandlerAt {
         file: relative(root, placed.file),
         line: cm.lookup_char_pos(span.lo).line as u32,
         span_start: span.lo.0,
         span_end: span.hi.0,
+        name,
     })
 }
 
@@ -2086,6 +2094,7 @@ fn loop_table(file: &Path, end: &LabelledEnd, arg: usize) -> Option<Vec<TableKey
         line: line(span),
         span_start: span.lo.0,
         span_end: span.hi.0,
+        name: None,
     };
     let mut keys = Vec::new();
     for prop in &table?.props {
@@ -3202,6 +3211,7 @@ pub(crate) mod tests {
                 line: line_of(&text, inline),
                 span_start: start,
                 span_end: end,
+                name: None,
             })
         );
         assert_eq!(
