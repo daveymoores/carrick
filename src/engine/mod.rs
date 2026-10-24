@@ -3686,6 +3686,7 @@ async fn analyze_current_repo_incremental(
         cm.clone(),
         positions,
         crate::request_summary::ROWS_JOIN_BUDGET,
+        crate::request_summary::discovery::receiver_trace_enabled(),
     )?;
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
@@ -5123,6 +5124,7 @@ async fn site_rows_of(
         debug!(
             traced = rows.traced.routes.len(),
             untraced = ?rows.traced.untraced,
+            test_only_mounts = decided.test_only_mounts.len(),
             "receiver trace: routes served at a full path"
         );
     }
@@ -8884,6 +8886,7 @@ fn discover_files_and_symbols(
         cm,
         None,
         crate::request_summary::ROWS_JOIN_BUDGET,
+        false,
     )
 }
 
@@ -8891,13 +8894,15 @@ fn discover_files_and_symbols(
 /// rows, when the run walked them, to the text discovery parses it from
 /// (carrick#2413): the one read of the file, so the rows' hash is checked
 /// against the bytes every span is counted in. Binding the rows may take
-/// `rows_budget` (carrick#2564).
+/// `rows_budget` (carrick#2564). With `receiver_trace`, it also reads the
+/// files only tests import (carrick#2775).
 fn discover_with_positions(
     repo_path: &str,
     service: &Config,
     cm: Lrc<SourceMap>,
     mut positions: Option<crate::position_rows::PositionIndex>,
     rows_budget: std::time::Duration,
+    receiver_trace: bool,
 ) -> FileDiscoveryResult {
     crate::scan_stage::enter(crate::scan_stage::Stage::Discovery);
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
@@ -9112,6 +9117,25 @@ fn discover_with_positions(
         &bindings_wanted,
     );
     report_unresolved_imports(&resolution.unresolved, &workspace.unfollowed_extends());
+    // The files only tests import: the receiver trace ignores the router
+    // mounts made in them (carrick#2775). Read for the trace alone.
+    let test_only = if receiver_trace {
+        let started = Instant::now();
+        let test_only = crate::test_only_files::of(
+            repo_root,
+            &files,
+            &workspace,
+            &service_ignore_patterns(service),
+        );
+        debug!(
+            test_only = test_only.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "receiver trace: files only tests import"
+        );
+        test_only
+    } else {
+        HashSet::new()
+    };
 
     // Composed later, once the library semantics this service can use are
     // verified: that needs detection and the service's sidecar, and both come
@@ -9126,6 +9150,7 @@ fn discover_with_positions(
         links: None,
         row_calls: None,
         rows_ran_out: false,
+        test_only,
     }
     .linked(
         service.service_name.as_deref().unwrap_or("(root)"),
@@ -9221,6 +9246,7 @@ pub(crate) fn discover_service_inputs_within(
         cm,
         positions,
         budget,
+        true,
     )
     .expect("discovery reads the service")
     .request_inputs

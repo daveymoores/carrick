@@ -53,6 +53,9 @@ pub(super) struct MountEdge {
     prefix: Prefix,
     /// The ends of the mount call's own receiver the label applies to.
     parents: Vec<InstanceEnd>,
+    /// Made in a file only tests import (carrick#2775); kept only while no
+    /// mount made elsewhere hands the same instance.
+    in_test_only: bool,
 }
 
 /// What a service's instances are mounted under (carrick#2474 R3 S0).
@@ -66,6 +69,11 @@ pub(super) struct Mounts {
     /// names, or an argument the label does not name. Such an instance is
     /// served somewhere the trace cannot say, so it is not "the top".
     unverified: Vec<(String, u32)>,
+    /// The mount calls (`file:line`) the trace ignores because a file only
+    /// tests import makes them (carrick#2775): a helper that builds its own
+    /// app for the suite serves nothing in production. Each would have been
+    /// a verified edge or an unverified root; neither is recorded.
+    pub(super) test_only: Vec<String>,
 }
 
 /// The service's mounts: the verified edges, and the instances handed to a
@@ -78,14 +86,23 @@ pub(super) fn mount_edges<'a>(
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
 ) -> Mounts {
-    let edges = verified_edges(calls, inputs, root, makers, scopes, index);
-    let unverified = unverified_roots(calls, inputs, root, makers, scopes, index, &edges);
-    Mounts { edges, unverified }
+    let (edges, mut test_only) = verified_edges(calls, inputs, root, makers, scopes, index);
+    let (unverified, ignored) =
+        unverified_roots(calls, inputs, root, makers, scopes, index, &edges);
+    test_only.extend(ignored);
+    test_only.sort();
+    test_only.dedup();
+    Mounts {
+        edges,
+        unverified,
+        test_only,
+    }
 }
 
 /// Every instance handed, at any argument, to a library call made on an
 /// instance of the same package, that no verified edge in `edges` reads
-/// (that call and that instance).
+/// (that call and that instance), and the mount calls (`file:line`) a test-only
+/// file makes, which are neither (carrick#2775).
 fn unverified_roots<'a>(
     calls: &Calls<'a>,
     inputs: &RequestSummaryInputs,
@@ -94,7 +111,7 @@ fn unverified_roots<'a>(
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
     edges: &[MountEdge],
-) -> Vec<(String, u32)> {
+) -> (Vec<(String, u32)>, Vec<String>) {
     let mut placed: Vec<Placed<'a>> = calls
         .by_span
         .values()
@@ -110,6 +127,8 @@ fn unverified_roots<'a>(
     });
     let walk = || InstanceWalk::new(calls, inputs, root, makers, scopes, index);
     let mut out: Vec<(String, u32)> = Vec::new();
+    let mut test_only: Vec<String> = Vec::new();
+    let mut held: Vec<(String, (String, u32))> = Vec::new();
     for placed in placed {
         if !walk().library_call(placed.file, placed.call) {
             continue;
@@ -141,18 +160,38 @@ fn unverified_roots<'a>(
                 };
                 let here = (file.clone(), *line);
                 let read = edges.iter().any(|edge| edge.child == here && edge.at == at);
-                if packages.contains(&package.as_str()) && !read && !out.contains(&here) {
+                if !packages.contains(&package.as_str()) || read {
+                    continue;
+                }
+                if inputs.test_only.contains(placed.file) {
+                    held.push((at.clone(), here));
+                } else if !out.contains(&here) {
                     out.push(here);
                 }
             }
         }
     }
-    out
+    // A test-only file's mount is ignored only when the same instance is
+    // also handed from a file that is not test-only; otherwise (an entry only
+    // a test imports) it is the instance's only mount and stays.
+    for (at, here) in held {
+        let elsewhere = out.contains(&here)
+            || edges
+                .iter()
+                .any(|edge| edge.child == here && !edge.in_test_only);
+        if elsewhere {
+            test_only.push(at);
+        } else if !out.contains(&here) {
+            out.push(here);
+        }
+    }
+    (out, test_only)
 }
 
 /// Every verified mount edge of the service: each call of a member a
 /// `mounts` label names, made on an instance the label applies to, with
-/// each maker's result it is handed.
+/// each maker's result it is handed; and the mount calls (`file:line`) made in
+/// a test-only file, which are not edges (carrick#2775).
 fn verified_edges<'a>(
     calls: &Calls<'a>,
     inputs: &RequestSummaryInputs,
@@ -160,13 +199,13 @@ fn verified_edges<'a>(
     makers: &[MakerLabel],
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
-) -> Vec<MountEdge> {
+) -> (Vec<MountEdge>, Vec<String>) {
     let mounts: Vec<&ScopeLabel> = scopes
         .iter()
         .filter(|label| matches!(label.binds, ScopeBinds::Mounts { .. }))
         .collect();
     if mounts.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut placed: Vec<Placed<'a>> = calls
         .by_span
@@ -211,17 +250,35 @@ fn verified_edges<'a>(
                 let InstanceAt::Root { file, line, .. } = &child.end else {
                     continue;
                 };
+                let at = format!("{}:{}", relative(root, placed.file), placed.call.site.line);
                 edges.push(MountEdge {
                     child: (file.clone(), *line),
-                    at: format!("{}:{}", relative(root, placed.file), placed.call.site.line),
+                    at,
                     member: label.member.clone(),
                     prefix: walk().prefix_of(&placed, &label.name, None),
                     parents: parents.clone(),
+                    in_test_only: inputs.test_only.contains(placed.file),
                 });
             }
         }
     }
-    edges
+    // A mount a test-only file makes is dropped when a file that is not
+    // test-only also hands the same instance; an entry only a test imports
+    // is its instance's only mount and stays.
+    let served: Vec<(String, u32)> = edges
+        .iter()
+        .filter(|edge| !edge.in_test_only)
+        .map(|edge| edge.child.clone())
+        .collect();
+    let mut test_only: Vec<String> = Vec::new();
+    edges.retain(|edge| {
+        let drop = edge.in_test_only && served.contains(&edge.child);
+        if drop {
+            test_only.push(edge.at.clone());
+        }
+        !drop
+    });
+    (edges, test_only)
 }
 
 /// One walk from an instance end up to the top: the prefixes and edges

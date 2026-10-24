@@ -3711,6 +3711,47 @@ mod tests {
         );
     }
 
+    /// carrick#2775: the mounts made in a file only tests import are not
+    /// read. The helper `harness.ts` (no test name, imported by one test
+    /// file alone) hands the router to a member no label names and mounts it
+    /// under another prefix; the router is served at its production mount
+    /// alone (T1) and the run counts the two mounts it ignored (T4). A
+    /// helper a production file also imports keeps its path-less mount
+    /// unverified (T2). Only `harness.ts` is test-only (T3).
+    #[test]
+    fn a_mount_in_a_file_only_tests_import_is_ignored() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-mount-test-helper")
+        else {
+            return;
+        };
+        let mut only: Vec<String> = on
+            .inputs
+            .test_only
+            .iter()
+            .map(|path| path.strip_prefix(&on.repo).unwrap().display().to_string())
+            .collect();
+        only.sort();
+        assert_eq!(only, vec!["src/edge.ts", "src/harness.ts", "src/worker.ts"]);
+        let scopes = super::super::decided_sites::ScopeLabel::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        assert_eq!(
+            composed_lines(&decided, false),
+            texts(&[
+                "src/api.ts:8 <- /v1/items",
+                "src/api.ts:9 <- /v1/items",
+                "src/edge.ts:8 <- /v2/ping",
+                "src/jobs.ts:8 <- /jobs (mount_unverified)",
+            ])
+        );
+        assert_eq!(
+            decided.test_only_mounts,
+            texts(&["src/harness.ts:7", "src/harness.ts:9"])
+        );
+    }
+
     /// The composed paths of the route sites of the fixture `name`, with the
     /// receiver trace on and the scope claims its own request verified.
     fn composed_fixture(name: &str, dir: &str, service: &str) -> Option<Vec<String>> {

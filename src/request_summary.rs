@@ -7944,6 +7944,10 @@ pub struct RequestSummaryInputs {
     /// [`Self::positions`] `None`. Counted per scan
     /// ([`crate::fallback_tally`]).
     pub(crate) rows_ran_out: bool,
+    /// With the receiver trace on, the service's files only tests import
+    /// ([`crate::test_only_files`], carrick#2775), as walked: the trace
+    /// ignores the router mounts made in them. Empty with it off.
+    pub(crate) test_only: HashSet<PathBuf>,
 }
 
 impl RequestSummaryInputs {

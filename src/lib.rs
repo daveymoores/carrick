@@ -93,6 +93,7 @@ pub mod site_questions;
 pub mod site_rows;
 pub mod socket_io;
 pub mod swc_scanner;
+pub mod test_only_files;
 pub mod time_limits;
 pub mod type_manifest;
 pub mod untrusted_yarn;

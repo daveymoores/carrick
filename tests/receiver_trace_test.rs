@@ -1135,3 +1135,31 @@ fn procedure_routes_take_their_key_paths() {
         scan_fixture("procedure-router", false, None)
     );
 }
+
+/// carrick#2775: with the switch on, a router mounted by a helper only tests
+/// import is served at its production mount alone (`/v1`), not unverified;
+/// a router whose only mount is made in an entry only a test imports keeps
+/// that mount (`/v2`);
+/// a router mounted path-less from a helper a production file also imports
+/// stays a possible call. With the switch unset, nothing is traced.
+#[test]
+fn a_helper_only_tests_import_does_not_unverify_its_router() {
+    let name = "receiver-mount-test-helper";
+    let on = scan_fixture(name, true, Some("1"));
+    let (graph, _) = endpoint_rows(&on);
+    assert_eq!(
+        graph,
+        vec![
+            "src/api.ts:8 GET /v1/items library_claim api",
+            "src/api.ts:9 POST /v1/items library_claim api",
+            "src/edge.ts:8 GET /v2/ping library_claim edge",
+        ]
+    );
+    assert_eq!(possible_calls(&on), vec!["src/jobs.ts:8 get"]);
+    let off = scan_fixture(name, true, None);
+    let (graph, _) = endpoint_rows(&off);
+    assert!(
+        graph.iter().all(|row| !row.contains("library_claim")),
+        "{graph:#?}"
+    );
+}

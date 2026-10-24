@@ -726,6 +726,10 @@ pub struct Decided {
     /// at with no procedure to count it on (carrick#2474 R6c), once per
     /// adapter.
     pub procedure_stops: usize,
+    /// With the receiver trace on, the router mounts it ignored because a
+    /// file only tests import makes them (carrick#2775), by `file:line`.
+    /// Counted in the run log.
+    pub test_only_mounts: Vec<String>,
 }
 
 /// A discovered call whose request is decided lower down its chain
@@ -1843,6 +1847,7 @@ fn decide(
                 site_labels: labels,
             }
             .run(&mut out, discovered);
+            out.test_only_mounts = mounts.test_only.clone();
             mounts
         }
         _ => composed::Mounts::default(),

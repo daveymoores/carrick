@@ -154,6 +154,31 @@ pub fn is_scanned_source(path: &Path, root_dir: &Path) -> bool {
     has_source_extension(path) && !is_test_path(path, root_dir)
 }
 
+/// Whether `path` is a test source below `root_dir` (a source file under a
+/// test directory or with a test suffix): the files [`find_files`] skips.
+pub fn is_test_source(path: &Path, root_dir: &Path) -> bool {
+    has_source_extension(path) && is_test_path(path, root_dir)
+}
+
+/// Every source file below `root`, test sources included, under no folder
+/// named in `ignore_patterns` and through no link out of the checkout. For a
+/// reader of who imports a file, which must see the tests [`find_files`]
+/// leaves unread (carrick#2775).
+pub fn source_files_below(root: &Path, ignore_patterns: &[&str]) -> Vec<PathBuf> {
+    let bound = untrusted_bound(root);
+    source_entries(
+        root,
+        ignore_patterns,
+        &[],
+        &Exclusion::default(),
+        bound.as_deref(),
+        &RefCell::default(),
+    )
+    .filter(|entry| entry.path().is_file() && has_source_extension(entry.path()))
+    .map(|entry| entry.path().to_path_buf())
+    .collect()
+}
+
 /// Whether any path segment BELOW the scan root matches an ignore pattern
 /// exactly. Matching whole segments (not substrings) keeps files like
 /// `src/buildkite.ts` or `lib/distances.ts` in scope, and stripping the root
