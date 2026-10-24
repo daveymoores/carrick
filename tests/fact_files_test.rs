@@ -23,7 +23,10 @@
 //! - `src/nested.ts`, the same signal on a local helper that calls a function
 //!   a factory returned: the walk finds no site, but did not read everything;
 //! - `src/traced.ts`, the same signal on a local helper that hands a
-//!   package's function a callback that calls the labelled relay.
+//!   package's function a callback that calls the labelled relay;
+//! - `src/helper.ts`, an in-module request helper that builds its URL with a
+//!   call and passes it to the labelled relay, called un-awaited from a
+//!   client object of arrow methods, beside a helper that never sends.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -114,6 +117,8 @@ const STATUS: &str = "import send from \"@fixture/http\";\n\nexport function rea
 
 const POLL: &str = "import { readStatus } from \"./status\";\n\nexport function poll(): void {\n  void readStatus();\n}\n";
 
+const HELPER: &str = "import relay from \"@fixture/relay\";\n\nfunction withPath(path: string): string {\n  return `/v2${path}`;\n}\n\nfunction request(path: string): void {\n  relay(withPath(path));\n}\n\nfunction shout(path: string): string {\n  return path.toUpperCase();\n}\n\nexport const items = {\n  list: () => request(\"/items\"),\n  title: () => shout(\"/items\"),\n};\n";
+
 /// An answer the reader gives for one file, keyed by its stem.
 fn canned_answer(repo: &Path, stem: &str, answer: serde_json::Value) {
     let dir = repo.join("__llm__/analyze-file");
@@ -173,6 +178,7 @@ fn repo(tmp: &Path) -> PathBuf {
     fs::write(repo.join("src/registers_caller.ts"), REGISTERS_CALLER).unwrap();
     fs::write(repo.join("src/status.ts"), STATUS).unwrap();
     fs::write(repo.join("src/poll.ts"), POLL).unwrap();
+    fs::write(repo.join("src/helper.ts"), HELPER).unwrap();
     canned_answer(
         &repo,
         "notify",
@@ -445,7 +451,7 @@ fn files_only_the_fact_layer_finds_are_logged_as_fact_only() {
             .any(|line| line.contains("packages unanswered at dispatch 1")),
         "{lines:#?}"
     );
-    for signal in ["C1", "C2", "C3", "C4"] {
+    for signal in ["C2", "C3", "C4"] {
         assert!(
             lines
                 .iter()
@@ -662,5 +668,26 @@ fn a_callee_that_registers_a_route_states_no_call_at_its_caller() {
     assert!(
         !recording().log_has(&["is a server-framework call"]),
         "the off arm does not run the filter"
+    );
+}
+
+/// The fact layer lists a call into an in-module request helper that reaches
+/// a labelled export, awaited or not, and never one into a helper that sends
+/// nothing. With the switch off the file is not read: no signal raises it.
+#[test]
+fn an_unawaited_call_into_a_request_helper_is_a_fact_site() {
+    let on = choosing();
+    assert_eq!(
+        on.listed("src/helper.ts"),
+        vec![
+            span_id(HELPER, "relay(withPath(path))"),
+            span_id(HELPER, "request(\"/items\")")
+        ],
+        "the helper's own send and the call into it, never the call into `shout`: {}",
+        on.log
+    );
+    assert!(
+        recording().prompt("src/helper.ts").is_none(),
+        "without the switch the file is not read"
     );
 }

@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.129](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.128...carrick-v0.3.129) (2026-10-24)
+
+
+### Features
+
+* **trace:** a carried service stores and brings its route boundaries ([#2474](https://github.com/carrick-tools/carrick/issues/2474) R5c) ([#2752](https://github.com/carrick-tools/carrick/issues/2752)) ([0e12915](https://github.com/carrick-tools/carrick/commit/0e12915d5daf1ee726f1d2c3060f50d22e067b64))
+* **trace:** a documentation row folds onto the handler row another service composed ([#2474](https://github.com/carrick-tools/carrick/issues/2474) R5d) ([#2750](https://github.com/carrick-tools/carrick/issues/2750)) ([958356c](https://github.com/carrick-tools/carrick/commit/958356cd8fadef208fdd9a0b060156bd0fbfd571))
+
+
+### Bug Fixes
+
+* **trace:** a function that calls itself with a longer value ends the instance walk ([#2748](https://github.com/carrick-tools/carrick/issues/2748)) ([#2757](https://github.com/carrick-tools/carrick/issues/2757)) ([23639bf](https://github.com/carrick-tools/carrick/commit/23639bfefd666b41abff9d5e8e310c50b1a1dffb))
+
 ## [0.3.128](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.127...carrick-v0.3.128) (2026-10-24)
 
 
