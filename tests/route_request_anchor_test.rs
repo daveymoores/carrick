@@ -342,7 +342,7 @@ fn resolve_request_type(
         .expect("sidecar init");
 
     let result = sidecar
-        .resolve_all_types(&[], &[item], None)
+        .resolve_all_types(&[], &[item], None, None)
         .expect("resolve_all_types");
     let inferred = result
         .inferred_types

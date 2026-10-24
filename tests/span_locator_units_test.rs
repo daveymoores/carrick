@@ -231,7 +231,7 @@ fn inferred_call_type(source: &str) -> Option<String> {
         .wait_ready(Duration::from_secs(60))
         .expect("sidecar init");
     let result = sidecar
-        .resolve_all_types(&[], std::slice::from_ref(&item), None)
+        .resolve_all_types(&[], std::slice::from_ref(&item), None, None)
         .expect("infer request");
 
     Some(

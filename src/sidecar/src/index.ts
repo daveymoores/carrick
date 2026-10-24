@@ -31,7 +31,8 @@ import {
   runCheck,
 } from './capture/index.js';
 import { Retyper, type TopTypeWalk } from './retype.js';
-import { LibraryClaimsVerifier, httpCheck } from './library-claims.js';
+import { LibraryClaimsVerifier, httpCheck, type LabelledMembers } from './library-claims.js';
+import { readServerLabels } from './server-labels.js';
 import { PROGRESS_INTERVAL_MS, atMostEvery } from './progress.js';
 import { mergeInferTimings } from './infer-timing.js';
 import { addProgramFiles, listProgramFiles } from './program-files.js';
@@ -59,6 +60,8 @@ import type {
   PositionRowsResponse,
   ImplementationsResponse,
   ErrorResponse,
+  ServerClaims,
+  InferRequestItem,
 } from './types.js';
 
 // ===========================================================================
@@ -78,6 +81,11 @@ interface ProjectComponents {
   typeInferrer: TypeInferrer;
   retyper: Retyper;
   claimsVerifier: LibraryClaimsVerifier;
+  /**
+   * carrick#2674: the members a set of server claims names for this program,
+   * by the claims' text. Read once: each reading builds a program of its own.
+   */
+  labelledMembers: Map<string, LabelledMembers>;
 }
 
 /**
@@ -160,6 +168,7 @@ function projectComponents(key = ''): ProjectComponents {
         packageDirectoryOf: (file) => loader.packageDirectoryOf(file),
         resolveModule: (name, from, options) => loader.resolveThroughGraph(name, from, options),
       }),
+      labelledMembers: new Map(),
     };
     components.set(key, built);
   }
@@ -418,16 +427,19 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
       writeProgress(request.request_id, 'infer', `${done} of ${request.requests.length}`)
     );
     const results = [...byProject(request.requests, (item) => item.file_path)].map(
-      ([key, items]) =>
-        projectComponents(key).typeInferrer.infer(
+      ([key, items]) => {
+        const built = projectComponents(key);
+        return built.typeInferrer.infer(
           items,
           request.extraction_config,
           () => {
             done += 1;
             report();
           },
-          request.model_symbols
-        )
+          request.model_symbols,
+          labelledMembersFor(built, key, items, request.server_claims)
+        );
+      }
     );
     const result =
       results.length === 1
@@ -461,6 +473,52 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
       errors: [error],
     };
   }
+}
+
+/**
+ * How long reading one program's server-framework labels may take: as
+ * long as a verify_library_claims request, since the reading builds a
+ * program of its own. Labels it does not reach are not read.
+ */
+const SERVER_CLAIMS_BUDGET_MS = 600_000;
+
+/** The infer kinds a route row asks: only these read a handler's parameters (carrick#2674). */
+const ROUTE_ROW_KINDS: ReadonlySet<string> = new Set(['response_body', 'request_body']);
+
+/**
+ * carrick#2674: the members an `infer` request's server-framework claims
+ * name, verified again in a program of their own beside the inferrer's for
+ * `key` (`readServerLabels`). Undefined when the request carries none, or
+ * the group asks no route row, so the inferrer reads nothing new. Read once
+ * per program and claims.
+ */
+function labelledMembersFor(
+  built: ProjectComponents,
+  key: string,
+  items: readonly InferRequestItem[],
+  claims: ServerClaims | undefined
+): LabelledMembers | undefined {
+  if (!claims || claims.checks.length === 0) return undefined;
+  if (!items.some((item) => ROUTE_ROW_KINDS.has(item.infer_kind))) return undefined;
+  const cacheKey = JSON.stringify(claims);
+  let labels = built.labelledMembers.get(cacheKey);
+  if (!labels) {
+    const loader = initializedLoader();
+    labels = readServerLabels(
+      {
+        getRepoRoot: () => loader.getRepoRoot(),
+        scriptProjectFor: (owner) => loader.scriptProjectFor(owner),
+        packageDirectoryOf: (file) => loader.packageDirectoryOf(file),
+        resolveModule: (name, from, options) => loader.resolveThroughGraph(name, from, options),
+      },
+      key,
+      claims,
+      SERVER_CLAIMS_BUDGET_MS,
+      log
+    );
+    built.labelledMembers.set(cacheKey, labels);
+  }
+  return labels;
 }
 
 /**

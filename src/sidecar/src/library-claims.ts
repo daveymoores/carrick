@@ -173,6 +173,11 @@ interface RoleRules {
    * any of them is `claim_invalid`.
    */
   methods?: ReadonlySet<string>;
+  /**
+   * A `send` op needs no name: it answers on the connection the request
+   * came in on (carrick#2674).
+   */
+  namelessSends?: boolean;
 }
 
 const HTTP_RULES: RoleRules = { http: true, message: false, ops: new Set(['request']) };
@@ -193,6 +198,15 @@ const HTTP_V2_RULES: RoleRules = { http: false, message: true, ops: new Set(['re
  * the method from the member's own name (`get` registers GET) or from a slot.
  */
 const SERVER_RULES: RoleRules = { http: false, message: true, ops: new Set(['receive']), methods: ROUTE_METHODS };
+
+/**
+ * A server's rules as `labelledMembers` reads them (carrick#2674): a `send`
+ * op is the reply a handler sends back through its reply parameter, on the
+ * connection the request came in on, so it names nothing on the wire. Only
+ * the stated-parameter reading takes these; `run` keeps `SERVER_RULES`, so
+ * no verdict the scanner reads rows from changes.
+ */
+const SERVER_REPLY_RULES: RoleRules = { ...SERVER_RULES, ops: new Set(['receive', 'send']), namelessSends: true };
 
 /**
  * The role table: the role alone picks the checks. A role this build does
@@ -223,7 +237,18 @@ function hasV2Field(claim: LibraryClaim): boolean {
 
 /** How one check came out, before it is stamped with its claim and receiver. */
 type Outcome =
-  | { verdict: 'verified'; declarations?: DeclaredAt[] }
+  | {
+      verdict: 'verified';
+      declarations?: DeclaredAt[];
+      /**
+       * In-process only, never stamped onto a verdict: the declarations of
+       * the member a verified op calls, and, for a receive op whose
+       * `request` names a `body`, of the member that path ends on
+       * (carrick#2674). Read by `labelledMembers`.
+       */
+      members?: readonly ts.Declaration[];
+      bodyMembers?: readonly ts.Declaration[];
+    }
   | { verdict: 'failed' | 'unchecked'; reason: string };
 
 /** Where a member is declared, spelled as a position row's `decl_file` and `decl_line`. */
@@ -457,7 +482,14 @@ export class LibraryClaimsVerifier {
    * A check on an instance or a scope reads the maker or scope claims of the
    * same request first, whatever their place in it.
    */
-  run(fromDir: string, checks: LibraryCheck[], budgetMs: number, scanRoot?: string): VerifyResult {
+  run(
+    fromDir: string,
+    checks: LibraryCheck[],
+    budgetMs: number,
+    scanRoot?: string,
+    options: RunOptions = {}
+  ): VerifyResult {
+    const { observe, readReplies = false, typePackages = {} } = options;
     const deadline = performance.now() + budgetMs;
     const stamp = (check: LibraryCheck, outcome: Outcome): SemanticsResult =>
       outcome.verdict === 'verified'
@@ -490,7 +522,11 @@ export class LibraryClaimsVerifier {
       if (check.role === 'http_client' && hasV2Field(check.claim)) v2Exports.add(exportKey(check));
     }
     const rulesFor = (check: LibraryCheck): RoleRules | undefined =>
-      check.role === 'http_client' && v2Exports.has(exportKey(check)) ? HTTP_V2_RULES : ROLE_TABLE[check.role];
+      check.role === 'http_client' && v2Exports.has(exportKey(check))
+        ? HTTP_V2_RULES
+        : readReplies && check.role === 'server_framework'
+          ? SERVER_REPLY_RULES
+          : ROLE_TABLE[check.role];
     for (const check of checks) {
       const key = exportKey(check);
       if (!importIndex.has(key)) {
@@ -671,7 +707,10 @@ export class LibraryClaimsVerifier {
           value: types.map(type => ({
             type,
             pkg: check.package,
-            home: reader.homeOf(check.package, [exported.target, ...typeSymbols(type)]),
+            home: withTypePackages(
+              reader.homeOf(check.package, [exported.target, ...typeSymbols(type)]),
+              typePackages[check.package]
+            ),
             makerBindsName,
             scoped: receiverPath.scope !== undefined,
             makerHolding,
@@ -788,13 +827,21 @@ export class LibraryClaimsVerifier {
         const collectionsOf = check.claim.kind === 'make' && check.claim.runs !== undefined ? collections : undefined;
         const holding: ts.Signature[] = [];
         const declarations: DeclaredAt[] = [];
+        const members: ts.Declaration[] = [];
+        const bodyMembers: ts.Declaration[] = [];
         for (const receiver of receivers.value) {
           const result = reader.judgeMessage(receiver, check.claim, rules, builtAtDefaults, collectionsOf);
           if (result.outcome.verdict !== 'verified') return result;
           holding.push(...(result.holding ?? []));
           declarations.push(...(result.outcome.declarations ?? []));
+          members.push(...(result.outcome.members ?? []));
+          bodyMembers.push(...(result.outcome.bodyMembers ?? []));
         }
-        return { outcome: declarations.length > 0 ? { verdict: 'verified', declarations: sortedDeclarations(declarations) } : VERIFIED, holding };
+        const verified: Outcome =
+          declarations.length > 0 ? { verdict: 'verified', declarations: sortedDeclarations(declarations) } : { ...VERIFIED };
+        if (verified.verdict === 'verified' && members.length > 0) verified.members = members;
+        if (verified.verdict === 'verified' && bodyMembers.length > 0) verified.bodyMembers = bodyMembers;
+        return { outcome: verified, holding };
       };
 
       const semantics: SemanticsResult[] = [];
@@ -804,7 +851,9 @@ export class LibraryClaimsVerifier {
           semantics.push(stamp(check, unchecked('budget')));
           continue;
         }
-        semantics.push(stamp(check, judge(index).outcome));
+        const outcome = judge(index).outcome;
+        observe?.(check, outcome);
+        semantics.push(stamp(check, outcome));
       }
 
       return {
@@ -814,6 +863,49 @@ export class LibraryClaimsVerifier {
     } finally {
       this.project.removeSourceFile(probe);
     }
+  }
+
+  /**
+   * The members a service's server-framework labels name, read with the
+   * verifier itself so only a label that verifies in the service's own
+   * program counts (carrick#2674): each verified `send` op that carries a
+   * `payload` slot, and each verified `receive` op whose `request` names a
+   * `body` path. Other checks are not judged.
+   */
+  labelledMembers(
+    fromDir: string,
+    checks: LibraryCheck[],
+    budgetMs: number,
+    scanRoot?: string,
+    typePackages: Readonly<Record<string, readonly string[]>> = {}
+  ): LabelledMembers {
+    const sends = new Map<string, ClaimSlot>();
+    const bodies = new Set<string>();
+    const wanted = checks.filter(
+      check =>
+        check.role === 'server_framework' &&
+        check.claim.kind === 'op' &&
+        ((check.claim.op === 'send' && check.claim.payload !== undefined) ||
+          (check.claim.op === 'receive' && check.claim.request?.body !== undefined))
+    );
+    // A receiver an op is read on can need the maker or scope claims beside it.
+    const context = checks.filter(
+      check => check.role === 'server_framework' && (check.claim.kind === 'make' || check.claim.kind === 'scope')
+    );
+    if (wanted.length === 0) return { sends, bodies };
+    const outcomes: Record<string, number> = {};
+    const observe = (check: LibraryCheck, outcome: Outcome): void => {
+      if (check.claim.kind !== 'op') return;
+      const read = outcome.verdict === 'verified' ? 'verified' : `${outcome.verdict} ${outcome.reason}`;
+      outcomes[read] = (outcomes[read] ?? 0) + 1;
+      if (outcome.verdict !== 'verified') return;
+      if (check.claim.op === 'send' && check.claim.payload !== undefined) {
+        for (const member of outcome.members ?? []) sends.set(declarationKey(member), check.claim.payload);
+      }
+      for (const member of outcome.bodyMembers ?? []) bodies.add(declarationKey(member));
+    };
+    this.run(fromDir, [...context, ...wanted], budgetMs, scanRoot, { observe, readReplies: true, typePackages });
+    return { sends, bodies, outcomes };
   }
 
   /**
@@ -1029,15 +1121,60 @@ function placementInvalid(claim: LibraryClaim): boolean {
 }
 
 /**
- * Where a handler's request holds its path and method (#2474 R0) is read on
- * a receive op with a handler, and names `path` or `url`; every member path
- * it gives is non-empty.
+ * Where a handler's request holds its path, method and body (#2474 R0,
+ * carrick#2674) is read on a receive op with a handler, and names `path`,
+ * `url` or `body`; every member path it gives is non-empty.
  */
 function requestAtValid(claim: OpClaim): boolean {
   const request = claim.request!;
   if (claim.op !== 'receive' || claim.handler === undefined) return false;
-  if (request.path === undefined && request.url === undefined) return false;
-  return [request.path, request.url, request.method].every(members => members === undefined || members.length > 0);
+  if (request.path === undefined && request.url === undefined && request.body === undefined) return false;
+  return [request.path, request.url, request.method, request.body].every(
+    members => members === undefined || members.length > 0
+  );
+}
+
+/** What `run` reads beyond the checks; none of it is part of a verdict. */
+interface RunOptions {
+  /** Called with each check's outcome, in request order. */
+  observe?: (check: LibraryCheck, outcome: Outcome) => void;
+  /** Read server `send` ops as replies (`SERVER_REPLY_RULES`). */
+  readReplies?: boolean;
+  /**
+   * Per package specifier, the type-only packages the store says its surface
+   * re-exports (carrick#2674): a member one of them declares is the
+   * package's own, as the store reads it.
+   */
+  typePackages?: Readonly<Record<string, readonly string[]>>;
+}
+
+/** A receiver's home packages, with the type-only packages the store lists for its package. */
+function withTypePackages(home: ReadonlySet<string>, typePackages: readonly string[] | undefined): ReadonlySet<string> {
+  return typePackages && typePackages.length > 0 ? new Set([...home, ...typePackages]) : home;
+}
+
+/**
+ * A declaration's key within one process: its file as the compiler names it
+ * and its start. Two programs of one project name a declaration alike, so a
+ * label read in the verifier's probe program joins a member read in the
+ * inferrer's (carrick#2674).
+ */
+export function declarationKey(declaration: ts.Node): string {
+  const file = declaration.getSourceFile();
+  return `${file.fileName}:${declaration.getStart(file)}`;
+}
+
+/**
+ * The members a service's verified server-framework labels name, by
+ * {@link declarationKey} (carrick#2674): each `send` op member with the slot
+ * its payload sits in, and each member a receive op's `request.body` path
+ * ends on.
+ */
+export interface LabelledMembers {
+  sends: ReadonlyMap<string, ClaimSlot>;
+  bodies: ReadonlySet<string>;
+  /** How each label read came out (`verified`, or the reason it was not), for the log. */
+  outcomes?: Readonly<Record<string, number>>;
 }
 
 /**
@@ -2187,7 +2324,8 @@ class DeclarationReader {
     // what it runs, and one that hands its handler a receiver (a server's
     // connection event) names nothing on the wire itself, so neither needs a
     // name of its own.
-    const nameless = claim.runs !== undefined || claim.yields !== undefined;
+    const nameless =
+      claim.runs !== undefined || claim.yields !== undefined || (claim.op === 'send' && rules.namelessSends === true);
     if ((name === undefined && !nameless) || (claim.op === 'send' && claim.payload === undefined)) {
       return unchecked('claim_invalid');
     }
@@ -2219,6 +2357,7 @@ class DeclarationReader {
     const labels = claim.key_labels ?? {};
     let best: RankedFailure | undefined;
     let held = false;
+    const bodyMembers: ts.Declaration[] = [];
     for (const signature of callee.signatures) {
       let result = this.messageSignatureOutcome(signature, layout.value, labels);
       if (result.rank === Infinity && claim.yields !== undefined) {
@@ -2226,7 +2365,7 @@ class DeclarationReader {
         if (given) result = { rank: 5, outcome: given };
       }
       if (result.rank === Infinity && claim.request !== undefined) {
-        const read = this.requestOutcome(signature, claim.handler!, claim.request);
+        const read = this.requestOutcome(signature, claim.handler!, claim.request, bodyMembers);
         if (read) result = { rank: 5, outcome: read };
       }
       if (result.rank === Infinity) {
@@ -2238,7 +2377,15 @@ class DeclarationReader {
     if (!held) return best!.outcome;
     if (boundRuns) return this.boundRunsOutcome(receiver.makerHolding!, boundRuns);
     const declarations = this.declarationsOf(callee);
-    return declarations.length > 0 ? { verdict: 'verified', declarations } : VERIFIED;
+    const members = callee.named
+      ? (callee.named.property.declarations ?? [])
+      : callee.signatures.flatMap(signature => signature.getDeclaration() ?? []);
+    return {
+      verdict: 'verified',
+      ...(declarations.length > 0 ? { declarations } : {}),
+      ...(members.length > 0 ? { members } : {}),
+      ...(bodyMembers.length > 0 ? { bodyMembers } : {}),
+    };
   }
 
   /**
@@ -2435,13 +2582,19 @@ class DeclarationReader {
   }
 
   /**
-   * `request: { param, path?, url?, method? }` on a receive op (#2474 R0):
-   * some signature of the handler this overload takes declares a parameter
-   * at `param` on which every member path the claim gives resolves, step by
-   * step, through properties the library declares (`declaredProperty`).
-   * Undefined when it holds.
+   * `request: { param, path?, url?, method?, body? }` on a receive op (#2474
+   * R0, carrick#2674): some signature of the handler this overload takes
+   * declares a parameter at `param` on which every member path the claim
+   * gives resolves, step by step, through properties the library declares
+   * (`declaredProperty`). Undefined when it holds; the declarations of the
+   * member the `body` path ends on are then added to `bodyMembers`.
    */
-  private requestOutcome(signature: ts.Signature, handler: ClaimSlot, request: RequestAt): Outcome | undefined {
+  private requestOutcome(
+    signature: ts.Signature,
+    handler: ClaimSlot,
+    request: RequestAt,
+    bodyMembers: ts.Declaration[]
+  ): Outcome | undefined {
     let declared = this.keyParameterAt(signature, handler.arg);
     if (declared !== undefined && handler.key !== undefined) {
       const property = this.declaredProperty(declared, handler.key);
@@ -2450,22 +2603,32 @@ class DeclarationReader {
     if (declared === undefined) return failed('param_missing');
     const slot = this.throughConditional(this.throughConstraint(declared));
     if (slot === VARIADIC) return unchecked('handler_untyped');
-    const paths = [request.path, request.url, request.method].filter((p): p is string[] => p !== undefined);
+    const paths = [request.path, request.url, request.method, request.body].filter(
+      (p): p is string[] => p !== undefined
+    );
     let best: Outcome = failed('param_missing');
     for (const part of this.parts(slot)) {
       for (const handed of part.getCallSignatures()) {
         const given = this.parameterAt(handed, request.param);
         if (given === undefined || given === VARIADIC) continue;
+        const ends = new Map<string[], ts.Symbol>();
         const resolves = paths.every(members => {
           let at: Slot = given;
+          let last: ts.Symbol | undefined;
           for (const member of members) {
             const property = this.declaredProperty(at, member);
             if (!property) return false;
+            last = property;
             at = this.checker.getTypeOfSymbol(property);
           }
+          if (last) ends.set(members, last);
           return true;
         });
-        if (resolves) return undefined;
+        if (resolves) {
+          const body = request.body ? ends.get(request.body) : undefined;
+          bodyMembers.push(...(body?.declarations ?? []));
+          return undefined;
+        }
         best = failed('request_member_missing');
       }
     }

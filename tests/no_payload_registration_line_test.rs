@@ -271,7 +271,7 @@ fn test_no_payload_registration_line_types_imported_handler_only() {
         .wait_ready(Duration::from_secs(60))
         .expect("sidecar init");
     let result = sidecar
-        .resolve_all_types(&[], &items, None)
+        .resolve_all_types(&[], &items, None, None)
         .expect("resolve_all_types");
     let type_of = |line: i32| {
         let alias = format!("Route_{line}_Response");

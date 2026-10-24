@@ -1119,6 +1119,22 @@ pub enum LibraryClaim {
     },
 }
 
+/// The server-framework claims an `infer` request reads route handlers'
+/// parameters through (carrick#2674): the checks, verified again in the
+/// service's program from `from_dir`, as `verify_library_claims` reads them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServerClaims {
+    pub from_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_root: Option<String>,
+    pub checks: Vec<LibraryCheck>,
+    /// Per package specifier, the type-only packages the store says its
+    /// surface re-exports: a reply member one of them declares is the
+    /// package's own.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub type_packages: BTreeMap<String, Vec<String>>,
+}
+
 /// One claim to check on one receiver: `export`, `instance:<member>`,
 /// `instance:()`, `instance:new` or `instance:new:<member>`, each optionally
 /// followed by `>scope:<path.member>` (what that scope member returns). The
@@ -1239,6 +1255,11 @@ enum SidecarRequest {
         /// item of `requests` reads, joined by alias.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         model_symbols: Vec<ModelSymbol>,
+        /// carrick#2674: the service's settled server-framework claims, which
+        /// the sidecar verifies again and reads route handlers' parameters
+        /// through.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_claims: Option<ServerClaims>,
     },
     #[serde(rename = "capture_v2")]
     CaptureV2 {
@@ -3043,7 +3064,7 @@ impl TypeSidecar {
         requests: &[InferRequestItem],
         extraction_config: Option<&ExtractionConfig>,
     ) -> Result<SidecarResponse, SidecarError> {
-        self.infer_types_beside_model_symbols(requests, extraction_config, &[])
+        self.infer_types_beside_model_symbols(requests, extraction_config, &[], None)
     }
 
     /// `infer_types`, with the model's symbol for each producer response the
@@ -3054,6 +3075,7 @@ impl TypeSidecar {
         requests: &[InferRequestItem],
         extraction_config: Option<&ExtractionConfig>,
         model_symbols: &[ModelSymbol],
+        server_claims: Option<&ServerClaims>,
     ) -> Result<SidecarResponse, SidecarError> {
         self.ensure_ready()?;
 
@@ -3087,6 +3109,12 @@ impl TypeSidecar {
                 .filter(|config| !config.rules.is_empty())
                 .cloned(),
             model_symbols: model_symbols.to_vec(),
+            server_claims: claims_for_route_rows(requests, server_claims).map(|claims| {
+                ServerClaims {
+                    scan_root: claims.scan_root.clone().or_else(|| self.scan_root_arg()),
+                    ..claims.clone()
+                }
+            }),
         };
 
         self.send_request(&request)?;
@@ -3454,6 +3482,8 @@ impl TypeSidecar {
     /// * `explicit` - Symbols for explicit type bundling
     /// * `infer` - Requests for type inference
     /// * `extraction_config` - Optional agent-generated unwrap rules
+    /// * `server_claims` - The service's settled server-framework claims
+    ///   (carrick#2674), or `None`
     ///
     /// # Returns
     /// Combined result with both explicit and inferred types.
@@ -3462,6 +3492,7 @@ impl TypeSidecar {
         explicit: &[SymbolRequest],
         infer: &[InferRequestItem],
         extraction_config: Option<&ExtractionConfig>,
+        server_claims: Option<&ServerClaims>,
     ) -> Result<TypeResolutionResult, SidecarError> {
         self.ensure_ready()?;
 
@@ -3483,6 +3514,7 @@ impl TypeSidecar {
                 infer,
                 extraction_config,
                 &producer_response_model_symbols(explicit, infer),
+                server_claims,
             )?;
             if let Some(inferred) = infer_response.inferred_types {
                 result.inferred_types = inferred;
@@ -4062,6 +4094,26 @@ pub struct AnchorChange {
 pub struct AnchorRoot {
     pub symbol: String,
     pub source_file: String,
+}
+
+/// The server claims an `infer` request carries (carrick#2674): only where
+/// they name a check and some item is a route row (a response or request
+/// body), the only rows that read a handler's parameters through them. The
+/// sidecar reads the labels in a program of its own, so a batch with no route
+/// row would pay for nothing.
+fn claims_for_route_rows<'a>(
+    requests: &[InferRequestItem],
+    server_claims: Option<&'a ServerClaims>,
+) -> Option<&'a ServerClaims> {
+    server_claims.filter(|claims| {
+        !claims.checks.is_empty()
+            && requests.iter().any(|item| {
+                matches!(
+                    item.infer_kind,
+                    InferKind::ResponseBody | InferKind::RequestBody
+                )
+            })
+    })
 }
 
 /// An infer kind that reads what a producer sends (carrick#2111). Not a
@@ -5059,6 +5111,43 @@ mod tests {
                     symbol_name: "Order".into(),
                     source_file: "src/types.ts".into(),
                 }],
+                server_claims: Some(ServerClaims {
+                    from_dir: "/repo".into(),
+                    scan_root: Some("/repo".into()),
+                    checks: vec![LibraryCheck {
+                        claim_id: "c".into(),
+                        package: "@fixture/server".into(),
+                        export: "response".into(),
+                        role: LibraryRole::ServerFramework,
+                        receiver: "export".into(),
+                        claim: LibraryClaim::Op {
+                            op: LibraryOp::Send,
+                            member: Some("json".into()),
+                            path: vec![],
+                            on: Some(ClaimOn::Export),
+                            of: None,
+                            name: None,
+                            payload: Some(ClaimSlot { arg: 0, key: None }),
+                            handler: None,
+                            ack: None,
+                            key_labels: BTreeMap::new(),
+                            name_scope: None,
+                            picker: None,
+                            options: None,
+                            method: None,
+                            method_key: None,
+                            method_default: None,
+                            base: None,
+                            runs: None,
+                            yields: None,
+                            request: None,
+                        },
+                    }],
+                    type_packages: BTreeMap::from([(
+                        "@fixture/server".to_string(),
+                        vec!["@fixture/server-core".to_string()],
+                    )]),
+                }),
             },
             SidecarRequest::CaptureV2 {
                 request_id: id(),
@@ -5374,6 +5463,50 @@ mod tests {
     /// Each request above goes through the built schema and must come back
     /// whole. The sidecar has to be built for that, so one that is not fails
     /// this test rather than skipping it.
+    /// carrick#2674: an `infer` request carries the server claims only with a
+    /// route row; a batch of other rows reads no handler parameter.
+    #[test]
+    fn server_claims_ride_only_with_route_rows() {
+        let claims = ServerClaims {
+            from_dir: "/repo".into(),
+            scan_root: None,
+            checks: vec![
+                serde_json::from_value(serde_json::json!({
+                    "claim_id": "c", "package": "@fixture/server", "export": "default",
+                    "role": "server_framework", "receiver": "export",
+                    "claim": { "kind": "make", "form": "call", "member": null }
+                }))
+                .unwrap(),
+            ],
+            type_packages: BTreeMap::new(),
+        };
+        let item = |infer_kind| InferRequestItem {
+            file_path: "src/app.ts".into(),
+            line_number: 1,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind,
+            alias: None,
+            param_name: None,
+        };
+        let others = [item(InferKind::CallResult), item(InferKind::FunctionReturn)];
+        assert_eq!(claims_for_route_rows(&others, Some(&claims)), None);
+        for kind in [InferKind::ResponseBody, InferKind::RequestBody] {
+            let rows = [item(InferKind::CallResult), item(kind)];
+            assert_eq!(claims_for_route_rows(&rows, Some(&claims)), Some(&claims));
+        }
+        let empty = ServerClaims {
+            checks: vec![],
+            ..claims.clone()
+        };
+        assert_eq!(
+            claims_for_route_rows(&[item(InferKind::ResponseBody)], Some(&empty)),
+            None
+        );
+    }
+
     #[test]
     fn the_sidecar_schema_keeps_every_key_the_client_writes() {
         let validators =

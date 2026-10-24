@@ -4012,6 +4012,7 @@ async fn analyze_current_repo_incremental(
                 &semantics_root,
             );
             protocol_extractions.library = library;
+            let server_claims = server_claims_of(&claims, &semantics_root);
             let declarations = member_declarations(
                 crate::site_questions::enabled()
                     && crate::request_summary::discovery::receiver_trace_enabled(),
@@ -4252,6 +4253,7 @@ async fn analyze_current_repo_incremental(
                 &protocol_requests,
                 &protocol_infer,
                 &payload_infer,
+                server_claims.as_ref(),
                 &mut cloud_data,
             );
             crate::phase_timing::mark(crate::phase_timing::Phase::Types);
@@ -4997,6 +4999,22 @@ fn library_rows(
         read_library_rows(&ask.sites, &settled.exports, sidecar, from_dir),
         settled.exports,
     )
+}
+
+/// The settled server-framework claims a service's `infer` request reads
+/// route handlers' parameters through (carrick#2674), verified again by the
+/// sidecar from `from_dir`; `None` when the service has none.
+fn server_claims_of(
+    claims: &[crate::library_claims::ExportClaims],
+    from_dir: &Path,
+) -> Option<crate::services::type_sidecar::ServerClaims> {
+    let checks = crate::library_claims::server_checks(claims);
+    (!checks.is_empty()).then(|| crate::services::type_sidecar::ServerClaims {
+        from_dir: from_dir.to_string_lossy().into_owned(),
+        scan_root: None,
+        type_packages: crate::library_claims::server_type_packages(claims),
+        checks,
+    })
 }
 
 /// The service's site rows (carrick#2439): every call discovery finds that
@@ -8020,6 +8038,7 @@ fn resolve_types_if_available(
     extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
     payload_infer: &[crate::services::type_sidecar::InferRequestItem],
+    server_claims: Option<&crate::services::type_sidecar::ServerClaims>,
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
     let Some(sidecar) = sidecar else {
@@ -8055,6 +8074,7 @@ fn resolve_types_if_available(
                 extra_explicit,
                 extra_infer,
                 payload_infer,
+                server_claims,
             ) {
                 Ok(type_resolution) => {
                     debug!(
@@ -10862,6 +10882,7 @@ async fn analyze_current_repo(
     let (library, claims) =
         library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root);
     protocol_extractions.library = library;
+    let server_claims = server_claims_of(&claims, &service_root);
     let declarations = member_declarations(
         crate::site_questions::enabled()
             && crate::request_summary::discovery::receiver_trace_enabled(),
@@ -11062,6 +11083,7 @@ async fn analyze_current_repo(
         &protocol_requests,
         &protocol_infer,
         &payload_infer,
+        server_claims.as_ref(),
         &mut cloud_data,
     );
 

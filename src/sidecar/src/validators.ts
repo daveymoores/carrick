@@ -9,6 +9,7 @@ import type {
   InferKind,
   SymbolRequest,
   InferRequestItem,
+  LibraryCheck,
 } from './types.js';
 
 // ============================================================================
@@ -296,6 +297,8 @@ export const InferRequestSchema = BaseRequestSchema.extend({
       })
     )
     .optional(),
+  // Declared below with the library claims; read lazily (carrick#2674).
+  server_claims: z.lazy(() => ServerClaimsSchema).optional(),
 });
 
 export const HealthRequestSchema = BaseRequestSchema.extend({
@@ -458,6 +461,7 @@ const RequestAtSchema = z
     path: z.array(z.string().min(1)).optional(),
     url: z.array(z.string().min(1)).optional(),
     method: z.array(z.string().min(1)).optional(),
+    body: z.array(z.string().min(1)).optional(),
   })
   .strict();
 
@@ -566,6 +570,36 @@ const LibraryCheckSchema = z
     claim: LibraryClaimSchema,
   })
   .strict();
+
+/**
+ * The server-framework claims an `infer` request reads handler parameters
+ * through (carrick#2674). Each check is read on its own by
+ * `settledServerChecks`: a refused one is dropped, never the request.
+ */
+const ServerClaimsSchema = z
+  .object({
+    from_dir: z.string().min(1),
+    scan_root: z.string().min(1).optional(),
+    checks: z.array(z.unknown()),
+    type_packages: z.record(z.string().min(1), z.array(z.string().min(1))).optional(),
+  })
+  .strict();
+
+/**
+ * The checks of an `infer` request's server claims the library-check schema
+ * takes, and how many it refused (carrick#2674). A refused claim reads
+ * nothing; the others still do.
+ */
+export function settledServerChecks(checks: readonly unknown[]): { checks: LibraryCheck[]; refused: number } {
+  const settled: LibraryCheck[] = [];
+  let refused = 0;
+  for (const check of checks) {
+    const parsed = LibraryCheckSchema.safeParse(check);
+    if (parsed.success) settled.push(parsed.data as LibraryCheck);
+    else refused += 1;
+  }
+  return { checks: settled, refused };
+}
 
 export const VerifyLibraryClaimsRequestSchema = BaseRequestSchema.extend({
   action: z.literal('verify_library_claims'),

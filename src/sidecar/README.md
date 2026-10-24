@@ -64,7 +64,7 @@ let sidecar = TypeSidecar::spawn(&sidecar_path)?;
 sidecar.start_init(&absolute_repo_path, None);
 
 // Requests block until the sidecar is ready, then until they answer
-let result = sidecar.resolve_all_types(&explicit_symbols, &infer_requests, None)?;
+let result = sidecar.resolve_all_types(&explicit_symbols, &infer_requests, None, None)?;
 let captured = sidecar.capture_v2(&repo_root, service_name, &anchors, &out_dir, None)?;
 ```
 
@@ -702,6 +702,8 @@ Each item locates one expression. The fields are `file_path`, `line_number` and 
 `extraction_config` carries the caller's unwrap rules (wrapper symbols, origin module globs, payload paths). **Live behaviour depends on it**: without it the inferrer cannot unwrap a framework envelope, so a probe written without one does not reproduce what a real scan sees.
 
 `model_symbols` (optional) carries the type a model named for a producer's response, one entry per alias: `{ "alias", "symbol_name", "source_file" }`. For a `response_body` or `function_return` request with that alias, the answer carries `model_symbol_relation`: how the named type relates to the compiler's type of what the handler sends, by assignability both ways. `relation` is `same`, `list` (the read is a list of the symbol, `depth` levels), `member` (the symbol is one member of the read's union), `nullable` (the read is the symbol or `null`/`undefined`) or `different`. It is absent where nothing could be compared: the symbol does not resolve to a type in the program, or the read holds `any` or `unknown`. The scanner keeps the symbol on `same` and `member`, keeps it at the read's depth on `list`, and drops it otherwise so the inference defines the alias (carrick#2111).
+
+`server_claims` (optional, carrick#2674) carries the service's settled server-framework claims: `{ "from_dir", "scan_root?", "checks": [<verify_library_claims check>...], "type_packages?": { "<specifier>": ["<type-only package>"...] } }`. Each is verified again in the service's program, where a member one of the specifier's `type_packages` (the store's list) declares counts as the package's own; a server `send` op is read as a reply on the request's own connection, so it needs no name here (and only here). Through the members the verified claims name, matched by declaration and never by name, a route handler's own parameters are read. The request: the member a receive op's `request.body` path ends on, read at the handler's parameter, is the body where the source fills it, and decides `no_request_body` where it is `never`, or the unfilled `unknown` while the source writes a type argument for the route, and nothing reads it in the handler or the repo functions the request is handed to, two calls deep. The reply: where today's reading is nothing, `void` or an undecided `unknown`, the payload a labelled `send` member's slot takes, declared through a type parameter of the reply type, cut to the union variants a typed success-status send through the parameter carries. Absent or empty, nothing new is read.
 
 A `response_body` or `function_return` answer can also carry `unwidened_type_string`: the same inference read again with every literal on the handler's path kept at its literal type (`scope: "all" | "specific"` where `type_string` says `scope: string`). It is absent when the two are the same, and when keeping the literals added a diagnostic on the path. The reading of one batch stops after 120 seconds and keeps the answers it has.
 
