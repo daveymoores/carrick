@@ -12,3 +12,7 @@ export const restRequest = <T>(config: RestConfig): Promise<T> => {
     Request.make<T>({ ...rest, url: `${env.API_URL}${path}`, headers: { ...headers } }),
   );
 };
+
+// The caller's whole bag is the request, made inside the span.
+export const sendConfig = <T>(config: RequestConfig): Promise<T> =>
+  span("config request", () => Request.make<T>(config));

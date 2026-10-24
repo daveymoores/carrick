@@ -13,6 +13,9 @@
 //!   writes (`PUT`) or leaves out (`GET`, the label's default). Read inside
 //!   the callback, the parameter is one function out, and its key used to
 //!   be read as unknown, so the method was asked and the site stated no row.
+//! - `src/rest.ts`'s `sendConfig` hands its whole options parameter to a
+//!   labelled call inside the span, whose name and method are keys of it
+//!   (`url`, `method`): both are read through the enclosing parameter.
 //! - `src/plain.ts` is the same helper with no span: its site was already a
 //!   fact, and stays one.
 //! - `src/rest.ts` spreads the rest of a destructured options bag inside the
@@ -154,6 +157,10 @@ fn a_request_inside_a_handed_callback_reads_its_method_from_the_helper_s_caller(
         (
             "the caller writes no method: the label's GET",
             "src/tasks-api.ts:10 GET /v1/tasks/:id request_summary",
+        ),
+        (
+            "the caller's whole bag, its `url` and `method` read inside the span",
+            "src/workspace-api.ts:15 DELETE /v1/workspaces/:id request_summary",
         ),
         (
             "control: no span around the request",

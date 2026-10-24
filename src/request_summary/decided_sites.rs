@@ -971,9 +971,12 @@ fn filled(pieces: &[Piece], call: &CallIr) -> Vec<Piece> {
                     .map_or(vec![Piece::Unknown], Value::pieces),
                 // The caller passes its own parameter on whole: its key waits on
                 // the caller's caller.
-                Some(Value::Str(pieces)) => {
-                    keyed(pieces, key, Some(name)).map_or(vec![Piece::Unknown], |piece| vec![piece])
-                }
+                Some(Value::Str(pieces)) => match pieces.as_slice() {
+                    [Piece::Param(passed, _)] => {
+                        vec![Piece::ParamKey(*passed, key.clone(), name.clone())]
+                    }
+                    _ => vec![Piece::Unknown],
+                },
                 _ => vec![Piece::Unknown],
             },
             other => vec![other.clone()],
@@ -984,17 +987,12 @@ fn filled(pieces: &[Piece], call: &CallIr) -> Vec<Piece> {
 /// One key of a value that is a whole parameter: of the function the call
 /// is written in, or of one around it when the call sits in a function
 /// written inside that one (`span(() => fetch(url, init))` reads `init`'s
-/// `method` as a key of the enclosing function's parameter). `name` is the
-/// text the key is read by, the parameter's own where not given. `None`
-/// when the value is anything else.
-fn keyed(pieces: &[Piece], key: &str, name: Option<&String>) -> Option<Piece> {
+/// `method` as a key of the enclosing function's parameter). `None` when
+/// the value is anything else.
+fn keyed(pieces: &[Piece], key: &str) -> Option<Piece> {
     match pieces {
-        [Piece::Param(index, own)] => Some(Piece::ParamKey(
-            *index,
-            key.to_string(),
-            name.unwrap_or(own).clone(),
-        )),
-        [Piece::Outer(depth, inner)] => keyed(std::slice::from_ref(&**inner), key, name)
+        [Piece::Param(index, name)] => Some(Piece::ParamKey(*index, key.to_string(), name.clone())),
+        [Piece::Outer(depth, inner)] => keyed(std::slice::from_ref(&**inner), key)
             .map(|piece| Piece::Outer(*depth, Box::new(piece))),
         _ => None,
     }
@@ -1024,7 +1022,7 @@ fn slot_value(call: &CallIr, slot: &ArgSlot) -> Vec<Piece> {
             .get(key)
             .map_or(vec![Piece::Unknown], Value::pieces),
         (Some(key), Value::Str(pieces)) => {
-            keyed(pieces, key, None).map_or(vec![Piece::Unknown], |piece| vec![piece])
+            keyed(pieces, key).map_or(vec![Piece::Unknown], |piece| vec![piece])
         }
         _ => vec![Piece::Unknown],
     }
@@ -1143,7 +1141,7 @@ fn written_at(call: &CallIr, arg: usize, key: Option<&str>) -> MethodValue {
             (None, _) => MethodValue::Pieces(vec![Piece::Unknown]),
         },
         (Some(key), Value::Str(pieces)) => {
-            MethodValue::Pieces(vec![keyed(pieces, key, None).unwrap_or(Piece::Unknown)])
+            MethodValue::Pieces(vec![keyed(pieces, key).unwrap_or(Piece::Unknown)])
         }
         _ => MethodValue::Pieces(vec![Piece::Unknown]),
     }
