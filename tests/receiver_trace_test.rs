@@ -904,7 +904,8 @@ const AUDIT_ROWS: [&str; 2] = [
 /// hand-out is recorded in `routes`. A scan that edits only `server` carries
 /// `routes`, `app` and `demo`, and must still write `/api/v1/audit/...`,
 /// with every row and manifest entry what a full scan of the same commit
-/// writes.
+/// writes, but one label: the documentation fold across services stands
+/// only when both services are written (R5d, #2761).
 #[test]
 fn a_changed_only_scan_resolves_routes_across_a_carried_service() {
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -943,7 +944,32 @@ fn a_changed_only_scan_resolves_routes_across_a_carried_service() {
     for row in AUDIT_ROWS {
         assert!(graph.iter().any(|have| have == row), "{row}: {graph:#?}");
     }
-    assert_eq!((graph, flat), endpoint_rows(&full_blobs));
+    // One label differs, and only it (carrick#2474 R5d, #2761): the full
+    // scan folds `routes`' documentation of `audit.ts:6` onto it, a fold
+    // that stands only when both services are written. Carried, `routes`
+    // comes back as stored, without the documentation row, so the
+    // re-derived `audit.ts:6` keeps the label its own analysis gives it.
+    let (mut full_graph, full_flat) = endpoint_rows(&full_blobs);
+    let (scoped_label, full_label) = (
+        "packages/server/src/audit.ts:6 GET /api/v1/audit/events library_claim app",
+        "packages/server/src/audit.ts:6 GET /api/v1/audit/events descriptor_route app",
+    );
+    let folded = full_graph
+        .iter()
+        .position(|row| row == full_label)
+        .unwrap_or_else(|| panic!("{full_label}: {full_graph:#?}"));
+    full_graph[folded] = scoped_label.to_string();
+    let full_flat: Vec<String> = full_flat
+        .into_iter()
+        .map(|row| {
+            if row == "packages/server/src/audit.ts:6 GET /api/v1/audit/events descriptor_route" {
+                "packages/server/src/audit.ts:6 GET /api/v1/audit/events library_claim".to_string()
+            } else {
+                row
+            }
+        })
+        .collect();
+    assert_eq!((graph, flat), (full_graph, full_flat));
     assert_eq!(
         producer_manifest(&scoped_blobs),
         producer_manifest(&full_blobs)
