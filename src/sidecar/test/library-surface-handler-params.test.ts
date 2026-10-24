@@ -1,8 +1,8 @@
 /**
  * carrick#2674 S3: `list_library_surface` lists the members a route handler's
  * own parameters declare, so a picker can name `request.body` on a receive
- * op's `request` field. They count against the per-package cap and are listed
- * before any signature, so a large framework does not lose them.
+ * op's `request` field. They have a cap of their own, so the main listing, its
+ * `truncated` count and the hash are the ones the lister gave without them.
  *
  * Every package below is invented and its declarations are hand-written.
  */
@@ -78,6 +78,8 @@ const PLAIN = `export interface Store {
 export declare function store(): Store;
 `;
 const PLAIN_SHA256 = 'fdcafa087f195f0aa200868c56992380a4439b554da8eb586881a3fa542b5497';
+
+const OVER_CAP_SHA256 = '5a0c16b95fc38a8abb2ad3b6f20a2ebc3dccbbd66d02da6d942590a66c5c9982';
 
 interface HandlerMember {
   path: string[];
@@ -190,34 +192,39 @@ describe('list_library_surface: handler parameter members (carrick#2674 S3)', ()
     assert.strictEqual(byName.get('on')!.handlers, undefined);
   });
 
-  it('counts the members against the cap and lists them before any signature', async () => {
+  it('lists the members under a cap of their own, so a small cap still lists them', async () => {
     const [full] = await surface(['fixture-big']);
     const fullMembers = membersOf(full);
     assert.deepStrictEqual(fullMembers.map(m => m.name), [...VERBS].sort());
     assert.strictEqual(full.truncated, 0);
-    const handlerEntries = fullMembers.reduce(
-      (n, m) => n + m.handlers!.reduce((k, h) => k + h.params.reduce((j, p) => j + 1 + p.members.length, 0), 0),
-      0
-    );
-    // Entries before the signatures: the export, its receivers, each member name, each handler entry.
-    const receivers = full.exports.reduce((n, e) => n + e.receivers.length, 0);
-    const before = full.exports.length + receivers + fullMembers.length + handlerEntries;
-    const [capped] = await surface(['fixture-big'], { max_entries: before });
-    assert.deepStrictEqual(
-      membersOf(capped).map(m => [m.name, m.handlers]),
-      fullMembers.map(m => [m.name, m.handlers])
-    );
-    // The cap cut the signatures, and counted them.
+    const entries = (listed: Surface): number =>
+      membersOf(listed).reduce(
+        (n, m) => n + (m.handlers ?? []).reduce((k, h) => k + h.params.reduce((j, p) => j + 1 + p.members.length, 0), 0),
+        0
+      );
+    const handlerEntries = entries(full);
+    // Under a cap that cuts the signatures, the handler members still take a
+    // cap of their own: all of it, not what the main listing left.
+    const [capped] = await surface(['fixture-big'], { max_entries: 20 });
     assert.ok(capped.truncated > 0, 'nothing was cut');
-    assert.ok(membersOf(capped).every(m => m.signatures.length === 0));
-    // One entry fewer loses the last handler member, not a member name.
-    const [short] = await surface(['fixture-big'], { max_entries: before - 1 });
+    assert.ok(handlerEntries > 20, 'the fixture is too small to reach the cap');
+    assert.strictEqual(entries(capped), 20);
+    // One entry fewer than the cap holds loses the last handler member only.
+    const [short] = await surface(['fixture-big'], { max_entries: handlerEntries - 1 });
     assert.deepStrictEqual(membersOf(short).map(m => m.name), [...VERBS].sort());
-    const shortEntries = membersOf(short).reduce(
-      (n, m) => n + m.handlers!.reduce((k, h) => k + h.params.reduce((j, p) => j + 1 + p.members.length, 0), 0),
-      0
+    assert.strictEqual(entries(short), handlerEntries - 1);
+  });
+
+  it('hashes a package over the cap as the lister did before it listed handlers', async () => {
+    // Taken from the lister of the commit before carrick#2674 S3, at the cap
+    // below: handler members take nothing from the main cap, so the truncated
+    // count and the hash are the ones it gave.
+    const response = await client.send<{ status: string; surfaces: Surface[]; surface_sha256: string }>(
+      { request_id: `s-${requestId++}`, action: 'list_library_surface', from_dir: root, packages: ['fixture-big'], max_entries: 20 },
+      60_000
     );
-    assert.strictEqual(shortEntries, handlerEntries - 1);
+    assert.strictEqual(response.surfaces[0].truncated, 6);
+    assert.strictEqual(response.surface_sha256, OVER_CAP_SHA256);
   });
 
   it('keeps handlers out of the full-surface hash, at every depth', async () => {

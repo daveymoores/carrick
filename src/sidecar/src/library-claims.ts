@@ -3362,6 +3362,15 @@ class DeclarationReader {
       dropped += 1;
       return false;
     };
+    // Handler-parameter members (carrick#2674) have a cap of their own, so they
+    // take nothing from the main one: the listing, `truncated` and the hash are
+    // the ones the lister gave before handlers were listed.
+    let handlerBudget = maxEntries;
+    const takeHandler = (): boolean => {
+      if (handlerBudget <= 0) return false;
+      handlerBudget -= 1;
+      return true;
+    };
     // Four passes: every export and receiver, then every member name, then the
     // members of each handler's parameters (carrick#2674), then signatures.
     const names: Array<() => void> = [];
@@ -3379,7 +3388,7 @@ class DeclarationReader {
       const receiverOf = (receiverName: string, receiverType: ts.Type): void => {
         if (!take()) return;
         const home = this.homeOf(pkg, [target, ...typeSymbols(receiverType)]);
-        entry.receivers.push(this.outlineReceiver(pkg, receiverName, receiverType, home, take, names, handlers, fills));
+        entry.receivers.push(this.outlineReceiver(pkg, receiverName, receiverType, home, take, takeHandler, names, handlers, fills));
       };
       receiverOf('export', type);
       for (const maker of this.makers(pkg, target, type)) {
@@ -3566,6 +3575,7 @@ class DeclarationReader {
     type: ts.Type,
     home: ReadonlySet<string>,
     take: () => boolean,
+    takeHandler: () => boolean,
     names: Array<() => void>,
     handlers: Array<() => void>,
     fills: Array<() => void>
@@ -3594,7 +3604,7 @@ class DeclarationReader {
         const member: SurfaceMember = { name: property.getName(), own, signatures: [] };
         receiver.members.push(member);
         handlers.push(() => {
-          const listed = this.listHandlers(own ? callee.signatures : library, take);
+          const listed = this.listHandlers(own ? callee.signatures : library, takeHandler);
           if (listed.length > 0) member.handlers = listed;
         });
         fills.push(() => (member.signatures = this.listSignatures(own ? callee.signatures : library, holder.type, take)));
