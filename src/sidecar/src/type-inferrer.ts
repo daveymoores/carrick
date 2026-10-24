@@ -2624,7 +2624,7 @@ export class TypeInferrer {
     // member reads as one the producer does not send.
     if (!explicitType && !resultIsCarrier && func) {
       const transport = this.transportRuleOfCall(callExpr, extractionConfig);
-      if (transport && !this.callStatesTypedPayload(callExpr, transport.contextual, extractionConfig)) {
+      if (transport && !this.callStatesTypedPayload(callExpr, extractionConfig)) {
         return this.transportCallBody(request, callExpr, func, transport.rule, where);
       }
     }
@@ -4484,17 +4484,14 @@ export class TypeInferrer {
   }
 
   /**
-   * What the source narrows a body read to, where the read itself is cast to
-   * a placeholder (carrick#2714): `terminal` is a zero-argument `json()` or
-   * `text()` read, the type stated at it leaves a position open, and one type
-   * is stated for the value later in the function, on its success path.
+   * What the source narrows a call's value to, where the type stated at the
+   * walk's terminal is a placeholder that leaves a position open
+   * (carrick#2714, `as { data: Item[] } | { error: unknown }`): the one type
+   * stated for the value later in the function, on its success path
+   * (`return json as { data: Item[] }`). A closed statement at the terminal
+   * keeps the answer it had.
    */
   private narrowedBodyStatement(terminal: Node, func: FunctionLike): StatedInFunction | undefined {
-    if (!Node.isCallExpression(terminal) || terminal.getArguments().length !== 0) return undefined;
-    const reader = terminal.getExpression();
-    if (!Node.isPropertyAccessExpression(reader) || !['json', 'text'].includes(reader.getName())) {
-      return undefined;
-    }
     const placeholder = this.explicitTypeNodeFromAncestor(terminal);
     if (!placeholder || !this.leavesAPositionOpen(placeholder)) return undefined;
     const stated = this.statedInFunction(terminal, func, {
@@ -4515,25 +4512,26 @@ export class TypeInferrer {
    * The compiler then takes the parameter from where the value goes
    * (`return client.post(…)` in a function declared `Promise<void>` types the
    * call `Promise<void>`), and that is the caller's claim about the object,
-   * not what the call returns (`contextual`).
+   * not what the call returns.
    */
   private transportRuleOfCall(
     callExpr: CallExpression,
     extractionConfig?: ExtractionConfig
-  ): { rule: ExtractionRule; contextual: boolean } | undefined {
+  ): { rule: ExtractionRule } | undefined {
     if (!extractionConfig || extractionConfig.rules.length === 0) return undefined;
     const awaited = this.unwrapPromiseType(callExpr.getType());
     const direct = this.ruleRecognising(awaited, callExpr, extractionConfig);
-    if (direct) return { rule: direct, contextual: false };
+    if (direct) return { rule: direct };
     if (callExpr.getTypeArguments().length > 0) return undefined;
     const declared = this.freeResultAtDefaults(callExpr);
     const rule = declared ? this.ruleRecognising(declared, callExpr, extractionConfig) : undefined;
-    return rule ? { rule, contextual: true } : undefined;
+    return rule ? { rule } : undefined;
   }
 
   /**
    * The first rule that matches `type` as a wrapper whose body is a member
-   * (`payloadPropertyPath`), whether or not it reads a payload out of it. A
+   * (`payloadPropertyPath`) the type has, whether or not it reads a payload
+   * out of it. A
    * wrapper with no such member (the platform's `Response`) is read by its
    * body reads (`res.json()`), which the def-use walk follows.
    */
@@ -4544,7 +4542,8 @@ export class TypeInferrer {
   ): ExtractionRule | undefined {
     return config.rules.find(
       (rule) =>
-        (rule.payloadPropertyPath?.length ?? 0) > 0 &&
+        !!rule.payloadPropertyPath?.length &&
+        !!type.getProperty(rule.payloadPropertyPath[0]) &&
         this.tryUnwrapWithRule(type, node, rule, config, 0).kind !== 'no-match'
     );
   }
@@ -4626,24 +4625,21 @@ export class TypeInferrer {
   }
 
   /**
-   * The call states the body itself: its result is the response object (not
-   * a type its return position chose), and the rules read a payload out of it
-   * that is neither `any`, `unknown` nor `void` (`client.get<Widget>(url)`).
+   * The call states the body itself: the rules read a payload out of its
+   * result (`client.get<Widget>(url)`). An untyped payload is no payload to
+   * the rules (they verify the object and read nothing), and a result its
+   * return position chose is no response object to them.
    */
   private callStatesTypedPayload(
     callExpr: CallExpression,
-    contextual: boolean,
     extractionConfig?: ExtractionConfig
   ): boolean {
-    if (contextual) return false;
     const unwrap = this.unwrapTypeWithConfig(
       this.unwrapPromiseType(callExpr.getType()),
       callExpr,
       extractionConfig
     );
-    if (!unwrap.wasUnwrapped || unwrap.verifiedMachinery || !unwrap.payloadType) return false;
-    const payload = unwrap.payloadType;
-    return !(payload.isAny() || payload.isUnknown() || payload.isUndefined() || payload.getText() === 'void');
+    return unwrap.wasUnwrapped && !unwrap.verifiedMachinery && !!unwrap.payloadType;
   }
 
   /**

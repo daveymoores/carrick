@@ -361,13 +361,12 @@ describe('carrick#1843: a wrapper rule that names a type alias unwraps it', () =
       const inferred = await infer('Stamped_Response', 'stamped(`', [REPLY_RULE]);
       assert.strictEqual(collapse(inferred.type_string), 'unknown');
       assert.strictEqual(inferred.primary_type_symbol, undefined);
-      // The source states no type for the body it reads, so the abstain is
-      // decided: the capture's own read of the call would publish the
-      // library's object (carrick#2714).
+      // The result is no carrier, so the answer is the one it had: undecided,
+      // which leaves the capture's own read of the call its turn.
       assert.deepStrictEqual(
-        (inferred.any_provenance ?? []).filter((p) => p.path === '').map((p) => p.reason),
-        ['machinery_envelope'],
-        "a response object whose body the source states nothing about is a decided abstain"
+        (inferred.any_provenance ?? []).filter((p) => p.path === ''),
+        [],
+        'only a carrier of verified transport is a decided abstain'
       );
     });
 

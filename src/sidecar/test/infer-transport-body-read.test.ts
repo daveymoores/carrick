@@ -73,9 +73,10 @@ export interface WireResponse {
   json(): Promise<unknown>;
 }
 export declare function send(url: string): Promise<WireResponse>;
+export declare function echo<R = HttpResponse<any>>(value: R): Promise<R>;
 `;
 
-const SERVICE_TS = `import { http, results, bodies, send, type HttpResponse } from "tiny-http";
+const SERVICE_TS = `import { http, results, bodies, send, echo, type HttpResponse, type WireResponse } from "tiny-http";
 
 export interface Widget {
   id: string;
@@ -132,9 +133,51 @@ export async function bodyReturned(): Promise<Widget> {
   return bodies.fetch("/v1/widgets/body");
 }
 
+async function readJson<T>(res: WireResponse): Promise<T> {
+  return (await res.json()) as T;
+}
+
 export async function sentAndRead() {
   const res = await send("/v1/widgets/sent");
-  return (await res.json()) as Widget;
+  if (!res.ok) {
+    throw new Error("failed");
+  }
+  const widget: Widget = await readJson(res);
+  return widget;
+}
+
+export async function inPlace(): Promise<Widget> {
+  return (await http.get("/v1/widgets/in-place")).data;
+}
+
+export async function restatedAfterRead() {
+  const res = await apiFetch("/v1/widgets/restated");
+  const json = (await res.json()) as WidgetPage;
+  return json as unknown as Gadget;
+}
+
+export async function destructured() {
+  const { data } = await http.get("/v1/widgets/destructured");
+  return data as Widget;
+}
+
+export interface Gadget {
+  serial: number;
+}
+
+export interface WidgetPage {
+  data: Widget[];
+}
+
+export async function twoStatements() {
+  const res = await http.get("/v1/widgets/two");
+  const widget = res.data as Widget;
+  const gadget = res.data as Gadget;
+  return [widget, gadget];
+}
+
+export async function echoed(widget: Widget): Promise<Widget> {
+  return echo(widget);
 }
 
 declare function apiFetch(url: string): Promise<{ ok: boolean; json(): Promise<unknown> }>;
@@ -264,8 +307,11 @@ describe('carrick#2714: a consumer reads the body, never the transport response 
     assert.strictEqual(inferred.primary_type_symbol, undefined);
   }
 
-  it('a cast on the payload member is the body', async () => {
-    assertStatedBody(await infer('Cast', 'http.get("/v1/widgets/cast")'), WIDGET);
+  it('a cast on the payload member is the body, reported as stated', async () => {
+    const inferred = await infer('Cast', 'http.get("/v1/widgets/cast")');
+    assertStatedBody(inferred, WIDGET);
+    assert.strictEqual(inferred.stated_body?.root, 'Widget');
+    assert.strictEqual(inferred.primary_type_symbol, 'Widget');
   });
 
   it('an annotation on the name the payload member initialises is the body', async () => {
@@ -302,10 +348,39 @@ describe('carrick#2714: a consumer reads the body, never the transport response 
     assert.deepStrictEqual((inferred.any_provenance ?? []).filter((p) => p.path === ''), []);
   });
 
-  it('a response whose rule names no payload member is read by its body read, as before', async () => {
+  it('a response with no payload member is left to its body reads, as before', async () => {
+    // `WireResponse` is the package's too, and the `HttpResponse` rule's
+    // members and origin match it, but it has no `data` member: its body is
+    // read (`res.json()`), so this site keeps the answer it had and is not
+    // decided as a response object around a member.
     const inferred = await infer('Sent', 'send("/v1/widgets/sent")');
-    assert.strictEqual(collapse(inferred.type_string), WIDGET, JSON.stringify(inferred));
-    assert.strictEqual(inferred.is_explicit, true);
+    assert.deepStrictEqual((inferred.any_provenance ?? []).filter((p) => p.path === ''), [], JSON.stringify(inferred));
+  });
+
+  it('a payload member read in place on the awaited call is the body', async () => {
+    assertStatedBody(await infer('InPlace', 'http.get("/v1/widgets/in-place")'), WIDGET);
+  });
+
+  it('a payload member destructured out of the response object is the body', async () => {
+    assertStatedBody(await infer('Destructured', 'http.get("/v1/widgets/destructured")'), WIDGET);
+  });
+
+  it('two different statements for the payload member decide nothing', async () => {
+    assertDecidedTransport(await infer('Two', 'http.get("/v1/widgets/two")'));
+  });
+
+  it('a type parameter fixed by an argument is not free, so its default is not the result', async () => {
+    const inferred = await infer('Echo', 'echo(widget)');
+    assert.deepStrictEqual((inferred.any_provenance ?? []).filter((p) => p.path === ''), [], JSON.stringify(inferred));
+    assert.strictEqual(inferred.type_string, 'Widget', JSON.stringify(inferred));
+  });
+
+  it('a closed statement at the body read is kept over a later recast', async () => {
+    // Only a placeholder is narrowed: a closed statement keeps the answer it
+    // had, its anchor included (the call's, here none).
+    const inferred = await infer('Restated', 'apiFetch("/v1/widgets/restated")');
+    assert.strictEqual(collapse(inferred.type_string), `{ data: ${WIDGET}[]; }`, JSON.stringify(inferred));
+    assert.strictEqual(inferred.primary_type_symbol, undefined, JSON.stringify(inferred));
   });
 
   it('a call that states its payload type keeps that payload', async () => {
