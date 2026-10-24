@@ -35,6 +35,7 @@ import {
   testsOnPath,
   type Statuses,
 } from './failure-path.js';
+import { statesNoBody } from './capture/index.js';
 import { lineIndex } from './line-index.js';
 import { typeToStringAsDeclared } from './print-type.js';
 import { fileDiagnostics, type FileDiagnostic } from './unwidened.js';
@@ -567,6 +568,9 @@ function resultEscapes(call: CallExpression, throughCasts = false): string | und
   ) {
     top = top.getParentOrThrow();
   }
+  if (returnedFromNoBodyFunction(top)) {
+    return 'the response is returned from a function that declares it returns no body, so there is no body to judge';
+  }
   if (returnsUndeclared(top)) {
     return 'the response is returned from a function with no declared return type, so its readers are elsewhere';
   }
@@ -589,6 +593,42 @@ function resultEscapes(call: CallExpression, throughCasts = false): string | und
     }
   }
   return undefined;
+}
+
+/**
+ * `top` is returned whole from a function whose declared return states no
+ * body (carrick#2743): `Promise<void>`, `Promise<undefined>`, or a reference
+ * every written type argument of which is one of those
+ * (`Promise<ClientResponse<void>>`). In source the compiler takes a client's
+ * free result parameter from that return position, so the file compiles;
+ * the retype's written type argument turns that inference off and the
+ * declared return then reports the default response object. That is a
+ * diagnostic about the written argument, not a body anyone reads.
+ */
+function returnedFromNoBodyFunction(top: Node): boolean {
+  const parent = top.getParent();
+  const fn = Node.isReturnStatement(parent)
+    ? parent.getFirstAncestor(
+        (n) =>
+          Node.isFunctionDeclaration(n) ||
+          Node.isFunctionExpression(n) ||
+          Node.isArrowFunction(n) ||
+          Node.isMethodDeclaration(n)
+      )
+    : Node.isArrowFunction(parent)
+      ? parent
+      : undefined;
+  let declared = Node.isReturnTyped(fn) ? fn.getReturnTypeNode() : undefined;
+  while (
+    Node.isTypeReference(declared) &&
+    ['Promise', 'PromiseLike'].includes(declared.getTypeName().getText())
+  ) {
+    declared = declared.getTypeArguments()[0];
+  }
+  if (!declared) return false;
+  if (statesNoBody(declared.getType().compilerType)) return true;
+  const args = Node.isTypeReference(declared) ? declared.getTypeArguments() : [];
+  return args.length > 0 && args.every((arg) => statesNoBody(arg.getType().compilerType));
 }
 
 /** `node` is (part of) what a function with an inferred return type returns. */
